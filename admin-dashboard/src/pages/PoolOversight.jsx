@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
-import { ChevronDown, ChevronRight, Zap, RefreshCw, AlertCircle, Shield } from 'lucide-react'
+import { ChevronDown, ChevronRight, Zap, RefreshCw, AlertCircle, Shield, AlertTriangle, UserX } from 'lucide-react'
 import Spinner from '../components/Spinner'
 import StatusBadge from '../components/StatusBadge'
-import { getPools, getUsers, triggerDraw } from '../api/client'
+import { getPools, getUsers, triggerDraw, applyDailyPenalty, eliminateUnpaid, BASE_URL } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
 const LEVEL_COLOR = {
@@ -117,7 +117,7 @@ function PoolRow({ pool, members, onDraw }) {
               <table className="w-full text-sm mt-3 bg-white rounded-xl overflow-hidden shadow-sm border border-slate-100">
                 <thead>
                   <tr className="bg-slate-50 border-b border-slate-100">
-                    {['#', 'Name', 'Username', 'Level', 'Weekly Payment', 'Status'].map(h => (
+                    {['#', 'Name', 'Username', 'Level', 'Weekly Payment', 'Late Fees', 'Status'].map(h => (
                       <th key={h} className="text-left px-4 py-2.5 text-xs font-semibold text-slate-400 uppercase tracking-wider">{h}</th>
                     ))}
                   </tr>
@@ -134,6 +134,11 @@ function PoolRow({ pool, members, onDraw }) {
                         </span>
                       </td>
                       <td className="px-4 py-2.5"><StatusBadge status={m.weekly_payment_status} /></td>
+                      <td className="px-4 py-2.5">
+                        {Number(m.late_fees_inr) > 0
+                          ? <span className="text-xs font-semibold text-red-600">−₹{Number(m.late_fees_inr).toLocaleString('en-IN')}</span>
+                          : <span className="text-xs text-slate-300">—</span>}
+                      </td>
                       <td className="px-4 py-2.5"><StatusBadge status={m.status} /></td>
                     </tr>
                   ))}
@@ -154,6 +159,8 @@ export default function PoolOversight() {
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState(null)
+  const [penaltyLoading, setPenaltyLoading] = useState(false)
+  const [eliminateLoading, setEliminateLoading] = useState(false)
 
   const fetchAll = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
@@ -165,7 +172,7 @@ export default function PoolOversight() {
       setUsers(usersRes.data)
     } catch (err) {
       const msg = err.code === 'ERR_NETWORK'
-        ? 'Cannot reach API at localhost:8000'
+        ? `Cannot reach API at ${BASE_URL}`
         : err.response?.data?.detail ?? 'Failed to load pool data'
       setError(msg)
     } finally {
@@ -175,6 +182,34 @@ export default function PoolOversight() {
   }, [])
 
   useEffect(() => { fetchAll() }, [fetchAll])
+
+  const handleApplyPenalty = async () => {
+    if (!window.confirm('Apply ₹50 late fee to all unpaid active members?')) return
+    setPenaltyLoading(true)
+    try {
+      const res = await applyDailyPenalty()
+      toast(res.data.message, 'success')
+      fetchAll(true)
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Failed to apply penalty', 'error')
+    } finally {
+      setPenaltyLoading(false)
+    }
+  }
+
+  const handleEliminateUnpaid = async () => {
+    if (!window.confirm('ELIMINATE all currently unpaid active members? This is irreversible.')) return
+    setEliminateLoading(true)
+    try {
+      const res = await eliminateUnpaid()
+      toast(res.data.message, res.data.eliminated_count > 0 ? 'success' : 'info')
+      fetchAll(true)
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Elimination failed', 'error')
+    } finally {
+      setEliminateLoading(false)
+    }
+  }
 
   const membersOf = poolId => users.filter(u => u.current_pool_id === poolId)
 
@@ -222,6 +257,36 @@ export default function PoolOversight() {
           <AlertCircle className="w-5 h-5 flex-shrink-0" />{error}
         </div>
       )}
+
+      {/* Penalty Actions */}
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div className="flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-amber-500" />
+          <h2 className="font-semibold text-slate-800">Penalty Controls</h2>
+        </div>
+        <p className="text-xs text-slate-400">
+          Run <strong>Apply Daily Penalty</strong> Monday–Saturday to accrue ₹50/day on unpaid members.
+          Run <strong>Eliminate Unpaid</strong> on Sunday before the draw to forfeit delinquent slots.
+        </p>
+        <div className="flex gap-3 flex-wrap">
+          <button
+            onClick={handleApplyPenalty}
+            disabled={penaltyLoading}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-amber-50 border border-amber-200 text-amber-700 hover:bg-amber-100 rounded-xl text-sm font-semibold disabled:opacity-50 transition"
+          >
+            {penaltyLoading ? <Spinner className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
+            Apply ₹50 Daily Penalty
+          </button>
+          <button
+            onClick={handleEliminateUnpaid}
+            disabled={eliminateLoading}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 rounded-xl text-sm font-semibold disabled:opacity-50 transition"
+          >
+            {eliminateLoading ? <Spinner className="w-4 h-4" /> : <UserX className="w-4 h-4" />}
+            Eliminate Unpaid Members
+          </button>
+        </div>
+      </div>
 
       {/* Pools table */}
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">

@@ -2,7 +2,7 @@ import axios from 'axios'
 
 // In development this falls back to localhost.
 // In production Vercel injects VITE_API_URL from your project environment variables.
-const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+export const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
 const api = axios.create({ baseURL: BASE_URL })
 
@@ -29,5 +29,9 @@ export const triggerDraw = (poolId) => api.post(`/admin/pools/${poolId}/draw`)
 
 // ── Waitlist ─────────────────────────────────────────────────────────────────
 export const checkWaitlist = () => api.post('/admin/waitlist/check')
+
+// ── Penalties ────────────────────────────────────────────────────────────────
+export const applyDailyPenalty   = () => api.post('/admin/penalty/apply-daily')
+export const eliminateUnpaid     = () => api.post('/admin/penalty/eliminate-unpaid')
 
 export default api

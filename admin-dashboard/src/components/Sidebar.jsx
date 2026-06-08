@@ -1,5 +1,6 @@
 import { NavLink } from 'react-router-dom'
 import { LayoutDashboard, Key, Users, Shield, Dot } from 'lucide-react'
+import { BASE_URL } from '../api/client'
 
 const NAV = [
   { to: '/',       icon: LayoutDashboard, label: 'Dashboard'      },
@@ -46,7 +47,9 @@ export default function Sidebar() {
       <div className="px-5 py-4 border-t border-slate-700/60">
         <div className="flex items-center gap-2">
           <Dot className="w-5 h-5 text-emerald-400 -ml-1 animate-pulse" />
-          <span className="text-xs text-slate-400">API: localhost:8000</span>
+          <span className="text-xs text-slate-400 truncate" title={BASE_URL}>
+            API: {BASE_URL.replace(/^https?:\/\//, '')}
+          </span>
         </div>
         <p className="text-xs text-slate-600 mt-1 pl-4">v1.0.0</p>
       </div>

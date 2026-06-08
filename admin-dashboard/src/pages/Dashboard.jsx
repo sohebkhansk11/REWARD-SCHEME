@@ -3,7 +3,7 @@ import { IndianRupee, Users, LayoutGrid, Clock, RefreshCw, Zap, AlertCircle } fr
 import MetricCard from '../components/MetricCard'
 import StatusBadge from '../components/StatusBadge'
 import Spinner from '../components/Spinner'
-import { getStats, getPools, checkWaitlist } from '../api/client'
+import { getStats, getPools, checkWaitlist, BASE_URL } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
 const INR = v =>
@@ -30,7 +30,7 @@ export default function Dashboard() {
       setLastUpdated(new Date())
     } catch (err) {
       const msg = err.code === 'ERR_NETWORK'
-        ? 'Cannot reach API at localhost:8000 — is the FastAPI server running?'
+        ? `Cannot reach API at ${BASE_URL} — is the backend running?`
         : err.response?.data?.detail ?? 'Failed to load dashboard data'
       setError(msg)
     } finally {

@@ -18,18 +18,31 @@ function DrawResult({ result }) {
   const INR = v => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(v)
   return (
     <div className="mt-4 border border-emerald-200 bg-emerald-50 rounded-xl p-4 space-y-3">
-      <p className="text-xs font-semibold text-emerald-700 uppercase tracking-wider flex items-center gap-1.5">
-        <Zap className="w-3.5 h-3.5" /> Draw Result — {result.pool_name}
-      </p>
-      {[result.winner_low_level, result.winner_high_level].map((w, i) => (
+      <div className="flex items-center gap-2 flex-wrap">
+        <p className="text-xs font-semibold text-emerald-700 uppercase tracking-wider flex items-center gap-1.5">
+          <Zap className="w-3.5 h-3.5" /> Draw Result — {result.pool_name}
+        </p>
+        {result.edge_case_used && (
+          <span className="text-[10px] font-semibold bg-amber-100 text-amber-700 border border-amber-200 rounded-full px-2 py-0.5 uppercase tracking-wide">
+            Early-pool mode (no L4+ members)
+          </span>
+        )}
+      </div>
+      {[result.winner_1, result.winner_2].map((w, i) => (
         <div key={i} className="bg-white rounded-lg p-3 flex flex-wrap items-center gap-x-6 gap-y-1.5 text-sm">
           <div>
-            <span className="text-xs text-slate-400">Winner {i + 1} (L{w.winner_level})</span>
+            <span className="text-xs text-slate-400">
+              Winner {i + 1} {result.edge_case_used ? `(L${w.winner_level} — fallback)` : i === 0 ? `(L${w.winner_level} low-tier)` : `(L${w.winner_level} high-tier)`}
+            </span>
             <p className="font-semibold text-slate-800">@{w.winner_username}</p>
           </div>
           <div>
             <span className="text-xs text-slate-400">Net Payout</span>
             <p className="font-bold text-emerald-700">{INR(w.net_payout_inr)}</p>
+          </div>
+          <div>
+            <span className="text-xs text-slate-400">Gross → Fee</span>
+            <p className="text-slate-500 text-xs">{INR(w.gross_payout_inr)} − {INR(w.fee_inr)}</p>
           </div>
           <div>
             <span className="text-xs text-slate-400">Withdraw Code</span>

@@ -44,8 +44,9 @@ class WinnerResultResponse(BaseModel):
 class DrawResultResponse(BaseModel):
     pool_id: int
     pool_name: str
-    winner_low_level: WinnerResultResponse
-    winner_high_level: WinnerResultResponse
+    winner_1: WinnerResultResponse          # Low-tier winner (L1-L3) or edge-case fallback
+    winner_2: WinnerResultResponse          # High-tier winner (L4-L6) or edge-case fallback
+    edge_case_used: bool = False            # True when pool had no L4+ members (early weeks)
 
 
 # --- Waitlist check endpoint ---

@@ -1,10 +1,36 @@
+"""
+Smart Pairing Dual-Draw Service
+================================
+Implements the exact algorithm from the V1.0 architecture document.
+
+Normal draw (pool has matured, week 4+):
+  Winner 1 — random from Level 1-3
+  Winner 2 — random from Level 4-6
+
+Edge case (early weeks 1-3, no L4+ members yet):
+  Both winners drawn randomly from the available low-tier pool.
+  Two DISTINCT members are selected via random.sample() — never the same person.
+
+Post-draw sequence (always):
+  1. Generate level-based Withdraw token for each winner.
+  2. Set winner status → Eliminated_Won, detach from pool.
+  3. Pull top-2 paid Waitlist members as replacements at Level 1.
+  4. Issue ₹250 REF token to any replacement's referrer.
+  5. Advance surviving original members by +1 level (hard cap: L6).
+  6. Reset weekly_payment_status = Unpaid for ALL pool members.
+  7. Sync pool.total_members to actual active count.
+"""
+
 import random
 import string
 from dataclasses import dataclass
 from decimal import Decimal
 from sqlalchemy.orm import Session
 
-from app.core.config import POOL_CAPACITY, LEVEL_LOW, LEVEL_HIGH, LEVEL_PAYOUTS, PAYOUT_FEE_INR, REFERRAL_REWARD_INR
+from app.core.config import (
+    POOL_CAPACITY, LEVEL_LOW, LEVEL_HIGH,
+    LEVEL_PAYOUTS, PAYOUT_FEE_INR, REFERRAL_REWARD_INR,
+)
 from app.crud import token as crud_token, user as crud_user, pool as crud_pool
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.models.pool import Pool, PoolStatus
@@ -13,6 +39,8 @@ from app.schemas.token import TokenCreate
 from app.schemas.user import UserUpdate
 from app.schemas.pool import PoolUpdate
 
+
+# ── Data Transfer Objects ──────────────────────────────────────────────────────
 
 @dataclass
 class WinnerResult:
@@ -31,11 +59,15 @@ class WinnerResult:
 class DrawResult:
     pool_id: int
     pool_name: str
-    winner_low_level: WinnerResult   # selected from Level 1–3
-    winner_high_level: WinnerResult  # selected from Level 4–6
+    winner_1: WinnerResult          # Low-tier winner (L1-L3), or fallback
+    winner_2: WinnerResult          # High-tier winner (L4-L6), or fallback
+    edge_case_used: bool = False    # True when pool had no L4+ members (weeks 1-3)
 
+
+# ── Internal helpers ───────────────────────────────────────────────────────────
 
 def _unique_token_code(db: Session, prefix: str) -> str:
+    """Generate a collision-free token code with the given prefix."""
     while True:
         code = prefix + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
         if not crud_token.get_token_by_code(db, code):
@@ -43,16 +75,23 @@ def _unique_token_code(db: Session, prefix: str) -> str:
 
 
 def _next_paid_waitlist_member(db: Session) -> User | None:
+    """Return the earliest-joined paid Waitlist member, or None."""
     return (
         db.query(User)
-        .filter(User.status == UserStatus.Waitlist, User.weekly_payment_status == WeeklyPaymentStatus.Paid)
+        .filter(
+            User.status == UserStatus.Waitlist,
+            User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+        )
         .order_by(User.join_date)
         .first()
     )
 
 
 def _issue_referral_token(db: Session, new_active_user: User) -> None:
-    """If new_active_user was referred, generate a ₹250 REF token for the referrer."""
+    """
+    Generate a ₹250 REF token for the referrer ONLY when the referred user
+    officially enters an Active Pool (not while on the Waitlist).
+    """
     if not new_active_user.referred_by_user_id:
         return
     code = _unique_token_code(db, "REF-")
@@ -70,16 +109,19 @@ def _issue_referral_token(db: Session, new_active_user: User) -> None:
 
 def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
     """
-    1. Generate level-based Withdraw token for the winner.
-    2. Set winner status → Eliminated_Won, detach from pool.
-    3. Pull next paid Waitlist member as replacement at Level 1.
-    4. Issue referral token for replacement's referrer (if any).
+    For a single winner:
+    1. Look up their level-based payout from LEVEL_PAYOUTS.
+    2. Generate a WIT-XXXXXX Withdraw token for the net amount.
+    3. Mark them Eliminated_Won and detach from the pool.
+    4. Pull the next paid Waitlist member as their replacement at Level 1.
+    5. Issue a referral token if the replacement was referred.
     """
     gross, net = LEVEL_PAYOUTS.get(winner.current_level, (2500, 2000))
     gross_d = Decimal(str(gross))
-    net_d = Decimal(str(net))
-    fee_d = Decimal(str(PAYOUT_FEE_INR))
+    net_d   = Decimal(str(net))
+    fee_d   = Decimal(str(PAYOUT_FEE_INR))
 
+    # Generate Withdraw token
     code = _unique_token_code(db, "WIT-")
     crud_token.create_token(
         db,
@@ -92,12 +134,14 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
         ),
     )
 
+    # Eliminate winner
     crud_user.update_user(
         db,
         winner.id,
         UserUpdate(status=UserStatus.Eliminated_Won, current_pool_id=None),
     )
 
+    # Pull replacement from Waitlist
     replacement = _next_paid_waitlist_member(db)
     if replacement:
         crud_user.update_user(
@@ -107,10 +151,8 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
         )
         db.refresh(replacement)
         _issue_referral_token(db, replacement)
-    else:
-        crud_pool.update_pool(
-            db, pool.id, PoolUpdate(total_members=max(0, pool.total_members - 1))
-        )
+    # If no replacement is available, pool.total_members is synced at the end of
+    # run_dual_draw — no partial update needed here.
 
     return WinnerResult(
         winner_id=winner.id,
@@ -125,22 +167,22 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
     )
 
 
+# ── Public draw entry-point ────────────────────────────────────────────────────
+
 def run_dual_draw(db: Session, pool_id: int) -> DrawResult:
     """
-    Dual-Draw Algorithm:
-    - Pool must be Active with exactly POOL_CAPACITY members.
-    - Winner 1: random pick from members at Level LEVEL_LOW (1–3).
-    - Winner 2: random pick from members at Level LEVEL_HIGH (4–6).
-    - Each winner receives a Withdraw token sized to their level.
-    - Each winner is replaced by the next paid Waitlist member at Level 1.
-    - After both draws: surviving original members advance one level (max 6).
-    - After both draws: all active pool members reset to weekly_payment_status=Unpaid.
+    Execute the Smart Pairing Dual-Draw for the given pool.
+
+    Raises ValueError with a human-readable message on any validation failure.
     """
+    # ── Validate pool ──────────────────────────────────────────────────────────
     pool: Pool | None = crud_pool.get_pool(db, pool_id)
     if not pool:
-        raise ValueError(f"Pool {pool_id} not found")
+        raise ValueError(f"Pool {pool_id} not found.")
     if pool.status != PoolStatus.Active:
-        raise ValueError(f"Pool '{pool.name}' is not Active (status={pool.status.value})")
+        raise ValueError(
+            f"Pool '{pool.name}' is not Active (current status: {pool.status.value})."
+        )
 
     members: list[User] = (
         db.query(User)
@@ -150,35 +192,53 @@ def run_dual_draw(db: Session, pool_id: int) -> DrawResult:
 
     if len(members) != POOL_CAPACITY:
         raise ValueError(
-            f"Pool '{pool.name}' has {len(members)} active members; need exactly {POOL_CAPACITY}"
+            f"Pool '{pool.name}' has {len(members)} active member(s); "
+            f"exactly {POOL_CAPACITY} are required to run the draw."
         )
 
-    low_pool = [m for m in members if LEVEL_LOW[0] <= m.current_level <= LEVEL_LOW[1]]
+    # ── Split by tier ──────────────────────────────────────────────────────────
+    low_pool  = [m for m in members if LEVEL_LOW[0]  <= m.current_level <= LEVEL_LOW[1]]
     high_pool = [m for m in members if LEVEL_HIGH[0] <= m.current_level <= LEVEL_HIGH[1]]
 
-    if not low_pool:
-        raise ValueError(f"No members at Level {LEVEL_LOW[0]}–{LEVEL_LOW[1]} in pool '{pool.name}'")
-    if not high_pool:
-        raise ValueError(f"No members at Level {LEVEL_HIGH[0]}–{LEVEL_HIGH[1]} in pool '{pool.name}'")
+    edge_case = (len(high_pool) == 0)
 
-    winner_low = random.choice(low_pool)
-    winner_high = random.choice(high_pool)
+    if edge_case:
+        # ── Edge case: weeks 1–3, pool has not yet matured to L4 ──────────────
+        # Per spec: "simply select 2 random winners from the available lower
+        # levels until the pool matures."
+        # We need at least 2 distinct members in the low pool.
+        if len(low_pool) < 2:
+            raise ValueError(
+                f"Pool '{pool.name}' has fewer than 2 eligible members for the "
+                f"early-pool edge-case draw (low_pool size: {len(low_pool)})."
+            )
+        winner_1, winner_2 = random.sample(low_pool, 2)  # guaranteed distinct
+    else:
+        # ── Normal draw: one winner from each tier ─────────────────────────────
+        if not low_pool:
+            raise ValueError(
+                f"Pool '{pool.name}' has no members at Level "
+                f"{LEVEL_LOW[0]}–{LEVEL_LOW[1]} for the low-tier draw."
+            )
+        winner_1 = random.choice(low_pool)
+        winner_2 = random.choice(high_pool)
 
-    # Snapshot the original member IDs before any mutations
+    # ── Snapshot IDs before any mutations ─────────────────────────────────────
     original_ids = {m.id for m in members}
-    winner_ids = {winner_low.id, winner_high.id}
+    winner_ids   = {winner_1.id, winner_2.id}
 
-    result_low = _process_winner(db, winner_low, pool)
+    # ── Process both winners (token generation + replacement) ─────────────────
+    result_1 = _process_winner(db, winner_1, pool)
     db.refresh(pool)
-    result_high = _process_winner(db, winner_high, pool)
+    result_2 = _process_winner(db, winner_2, pool)
 
-    # ── Post-draw maintenance ────────────────────────────────────────────────
-    # 1. Advance surviving original members by one level (capped at 6).
-    # 2. Reset weekly payment for ALL currently active pool members (new week starts).
+    # ── Post-draw maintenance ──────────────────────────────────────────────────
     surviving_ids = original_ids - winner_ids
+
     for member_id in surviving_ids:
         member = crud_user.get_user(db, member_id)
         if member and member.status == UserStatus.Active and member.current_pool_id == pool_id:
+            # Advance level — hard cap at L6 (per spec: L7 is mathematically impossible)
             crud_user.update_user(
                 db,
                 member_id,
@@ -188,17 +248,27 @@ def run_dual_draw(db: Session, pool_id: int) -> DrawResult:
                 ),
             )
 
-    # Reset payment for replacement members too — new week begins after the draw
-    for rep_id in filter(None, [result_low.replaced_by_user_id, result_high.replaced_by_user_id]):
+    # Reset payment status for replacement members — new week begins after the draw
+    for rep_id in filter(None, [result_1.replaced_by_user_id, result_2.replaced_by_user_id]):
         member = crud_user.get_user(db, rep_id)
         if member and member.status == UserStatus.Active:
             crud_user.update_user(
-                db, rep_id, UserUpdate(weekly_payment_status=WeeklyPaymentStatus.Unpaid)
+                db, rep_id,
+                UserUpdate(weekly_payment_status=WeeklyPaymentStatus.Unpaid),
             )
+
+    # Sync pool.total_members to actual active count (handles missing replacements cleanly)
+    actual_count = (
+        db.query(User)
+        .filter(User.current_pool_id == pool_id, User.status == UserStatus.Active)
+        .count()
+    )
+    crud_pool.update_pool(db, pool_id, PoolUpdate(total_members=actual_count))
 
     return DrawResult(
         pool_id=pool.id,
         pool_name=pool.name,
-        winner_low_level=result_low,
-        winner_high_level=result_high,
+        winner_1=result_1,
+        winner_2=result_2,
+        edge_case_used=edge_case,
     )

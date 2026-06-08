@@ -55,18 +55,28 @@ def get_stats(db: Session = Depends(get_db)):
 # ── Token Burn ────────────────────────────────────────────────────────────────
 
 @router.post("/admin/tokens/{code}/burn", response_model=TokenResponse)
-def burn_withdraw_token(code: str, db: Session = Depends(get_db)):
-    """Admin: mark a Withdraw token as Burned when paying out a winner."""
+def burn_token(code: str, db: Session = Depends(get_db)):
+    """
+    Admin: mark a Withdraw or Referral token as Burned once the cash/UPI/USDT
+    payout has been physically handed to the user.
+
+    Accepts:
+    - WIT-XXXXXX  (winner payout, ₹2,000 – ₹8,000)
+    - REF-XXXXXX  (referral reward, ₹250)
+    """
     from app.crud import token as crud_token
     from app.schemas.token import TokenUpdate
 
     token = crud_token.get_token_by_code(db, code)
     if not token:
         raise HTTPException(status_code=404, detail="Token not found")
-    if token.type != TokenType.Withdraw:
-        raise HTTPException(status_code=400, detail="Only Withdraw tokens can be burned this way")
+    if token.type not in (TokenType.Withdraw, TokenType.Referral):
+        raise HTTPException(
+            status_code=400,
+            detail="Only Withdraw (WIT-) or Referral (REF-) tokens can be burned.",
+        )
     if token.status == TokenStatus.Burned:
-        raise HTTPException(status_code=400, detail="Token is already burned")
+        raise HTTPException(status_code=400, detail="Token is already burned.")
 
     return crud_token.update_token(db, token.id, TokenUpdate(status=TokenStatus.Burned))
 
@@ -153,12 +163,23 @@ def trigger_waitlist_check(db: Session = Depends(get_db)):
 @router.post("/admin/pools/{pool_id}/draw", response_model=DrawResultResponse)
 def trigger_draw(pool_id: int, db: Session = Depends(get_db)):
     """
-    Admin: run the Dual-Draw for an active pool.
+    Admin: run the Smart Pairing Dual-Draw for an active pool.
 
-    - Selects one winner from Level 1–3 and one from Level 4–6.
-    - Generates a Withdraw token for each winner (net = ₹{BASE} − ₹500 fee).
-    - Marks both winners as Eliminated_Won.
-    - Replaces each winner with the earliest paid Waitlist member at Level 1.
+    Normal mode (pool matured, week 4+):
+      Winner 1 — randomly selected from Level 1–3
+      Winner 2 — randomly selected from Level 4–6
+
+    Edge-case mode (early weeks 1–3, no L4+ members yet):
+      Two distinct winners randomly selected from the available levels.
+      edge_case_used = true is returned in the response.
+
+    Post-draw actions (both modes):
+      - Level-based Withdraw token generated for each winner.
+      - Both winners marked Eliminated_Won.
+      - Top 2 paid Waitlist members inserted at Level 1 as replacements.
+      - Referral tokens (₹250) issued for any referred replacements.
+      - Surviving members advance one level (cap: L6).
+      - All pool members reset to Unpaid for the new week.
     """
     try:
         result = svc_draw.run_dual_draw(db, pool_id)
@@ -171,8 +192,9 @@ def trigger_draw(pool_id: int, db: Session = Depends(get_db)):
     return DrawResultResponse(
         pool_id=result.pool_id,
         pool_name=result.pool_name,
-        winner_low_level=_to_response(result.winner_low_level),
-        winner_high_level=_to_response(result.winner_high_level),
+        winner_1=_to_response(result.winner_1),
+        winner_2=_to_response(result.winner_2),
+        edge_case_used=result.edge_case_used,
     )
 
 

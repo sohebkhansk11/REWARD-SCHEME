@@ -1,5 +1,6 @@
 from pydantic import BaseModel, field_validator
 from typing import Optional
+from decimal import Decimal
 from datetime import datetime
 from app.models.user import UserStatus, WeeklyPaymentStatus
 
@@ -12,6 +13,8 @@ class UserBase(BaseModel):
     current_level: int = 1
     status: UserStatus = UserStatus.Waitlist
     weekly_payment_status: WeeklyPaymentStatus = WeeklyPaymentStatus.Unpaid
+    late_fees_inr: Decimal = Decimal("0")
+    referred_by_user_id: Optional[int] = None
 
     @field_validator("current_level")
     @classmethod
@@ -33,6 +36,8 @@ class UserUpdate(BaseModel):
     current_level: Optional[int] = None
     status: Optional[UserStatus] = None
     weekly_payment_status: Optional[WeeklyPaymentStatus] = None
+    late_fees_inr: Optional[Decimal] = None
+    referred_by_user_id: Optional[int] = None
 
     @field_validator("current_level")
     @classmethod

@@ -7,7 +7,7 @@ import NeonInput from '../components/NeonInput'
 import NeonButton from '../components/NeonButton'
 import GlassCard from '../components/GlassCard'
 import { generateUsername, typewriterReveal } from '../utils/username'
-import { registerUser, findUserByMobile } from '../api/client'
+import { registerUser, findUserByMobile, findUserByUsername } from '../api/client'
 import { useUser } from '../context/UserContext'
 
 export default function Auth() {
@@ -19,6 +19,7 @@ export default function Auth() {
   const [mobile, setMobile] = useState('')
   const [username, setUsername] = useState('')
   const [displayUsername, setDisplayUsername] = useState('')
+  const [referralUsername, setReferralUsername] = useState('')
   const [generating, setGenerating] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -47,6 +48,11 @@ export default function Auth() {
       } else {
         if (!name.trim()) { setError('Name is required'); setLoading(false); return }
         const payload = { name: name.trim(), mobile: mobile.trim(), username: username || undefined }
+        if (referralUsername.trim()) {
+          const refRes = await findUserByUsername(referralUsername.trim())
+          if (!refRes.data.length) { setError('Referral username not found'); setLoading(false); return }
+          payload.referred_by_user_id = refRes.data[0].id
+        }
         const res = await registerUser(payload)
         login(res.data)
         nav('/dashboard', { replace: true })
@@ -187,6 +193,14 @@ export default function Auth() {
                     : <><Zap className="w-4 h-4" /> AUTO-GENERATE USERNAME</>
                   }
                 </motion.button>
+
+                <NeonInput
+                  label="Referral Username (optional)"
+                  placeholder="Who referred you?"
+                  value={referralUsername}
+                  onChange={e => setReferralUsername(e.target.value)}
+                  autoComplete="off"
+                />
               </motion.div>
             )}
           </AnimatePresence>

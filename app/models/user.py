@@ -1,5 +1,5 @@
 import enum
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, CheckConstraint
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, CheckConstraint, Numeric
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
@@ -34,6 +34,8 @@ class User(Base):
     weekly_payment_status = Column(
         Enum(WeeklyPaymentStatus), default=WeeklyPaymentStatus.Unpaid, nullable=False
     )
+    late_fees_inr = Column(Numeric(12, 2), default=0, server_default="0", nullable=False)
+    referred_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     pool = relationship("Pool", back_populates="members")
     tokens = relationship("Token", back_populates="user")

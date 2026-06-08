@@ -1,8 +1,8 @@
 import axios from 'axios'
 
-// In development this falls back to localhost.
-// In production Vercel injects VITE_API_URL from your project environment variables.
-export const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+// Uses VITE_API_URL env var if set, otherwise falls back to the live Render backend.
+// For local development override this in admin-dashboard/.env
+export const BASE_URL = import.meta.env.VITE_API_URL || 'https://reward-scheme-api.onrender.com'
 
 const api = axios.create({ baseURL: BASE_URL })
 

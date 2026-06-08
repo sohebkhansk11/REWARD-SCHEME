@@ -43,7 +43,6 @@ export default function DrawPage() {
             {[
               { label: 'Tier 1 Winner',  desc: 'Randomly selected from members at Level 1–3', color: '#00f0ff' },
               { label: 'Tier 2 Winner',  desc: 'Randomly selected from members at Level 4–6', color: '#bf00ff' },
-              { label: 'Net Payout',     desc: '₹5,000 gross − ₹500 platform fee = ₹4,500 each', color: '#00ff88' },
               { label: 'Replacement',   desc: 'Each winner is replaced by the next Waitlist member at Level 1', color: '#ffaa00' },
             ].map(({ label, desc, color }) => (
               <div key={label} className="flex gap-3">
@@ -54,6 +53,26 @@ export default function DrawPage() {
                 </div>
               </div>
             ))}
+
+            {/* Level-based payout table */}
+            <div className="mt-2">
+              <p className="text-[10px] font-mono tracking-widest text-white/30 uppercase mb-2">Payout by Level (−₹500 fee)</p>
+              <div className="grid grid-cols-3 gap-1 text-center">
+                {[
+                  { level: 'L1', net: '₹2,000' },
+                  { level: 'L2', net: '₹3,000' },
+                  { level: 'L3', net: '₹4,000' },
+                  { level: 'L4', net: '₹5,500' },
+                  { level: 'L5', net: '₹6,500' },
+                  { level: 'L6', net: '₹8,000' },
+                ].map(({ level, net }) => (
+                  <div key={level} className="rounded-lg py-2 px-1" style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.07)' }}>
+                    <p className="text-[10px] font-mono text-white/30">{level}</p>
+                    <p className="text-xs font-bold text-white/70 mt-0.5">{net}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         </GlassCard>
 

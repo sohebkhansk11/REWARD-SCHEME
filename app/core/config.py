@@ -1,11 +1,21 @@
-POOL_CAPACITY: int = 12          # members per active pool
-WAITLIST_TRIGGER: int = 24       # paid waitlist count that fires auto-scale
-NEW_POOL_INTAKE: int = 12        # members moved from waitlist into the new pool
+POOL_CAPACITY: int = 12
+WAITLIST_TRIGGER: int = 24
+NEW_POOL_INTAKE: int = 12
 
-DEPOSIT_AMOUNT_INR: int = 1000   # required face-value of a redeemable Deposit token
-BASE_PAYOUT_INR: int = 5000      # gross payout per winner before fee
-PAYOUT_FEE_INR: int = 500        # platform fee deducted from gross payout
-NET_PAYOUT_INR: int = BASE_PAYOUT_INR - PAYOUT_FEE_INR  # 4 500
+DEPOSIT_AMOUNT_INR: int = 1000
+PAYOUT_FEE_INR: int = 500
+REFERRAL_REWARD_INR: int = 250   # REF token issued when referred user enters Active Pool
+LATE_FEE_DAILY_INR: int = 50     # accrues each day a member is Unpaid after Sunday
 
-LEVEL_LOW: tuple[int, int] = (1, 3)   # level range for the first draw winner
-LEVEL_HIGH: tuple[int, int] = (4, 6)  # level range for the second draw winner
+# Per-level payouts: level → (gross_inr, net_inr after ₹500 fee)
+LEVEL_PAYOUTS: dict[int, tuple[int, int]] = {
+    1: (2500, 2000),
+    2: (3500, 3000),
+    3: (4500, 4000),
+    4: (6000, 5500),
+    5: (7000, 6500),
+    6: (8500, 8000),
+}
+
+LEVEL_LOW: tuple[int, int] = (1, 3)
+LEVEL_HIGH: tuple[int, int] = (4, 6)

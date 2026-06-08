@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from sqlalchemy.orm import Session
 
-from app.core.config import POOL_CAPACITY, LEVEL_LOW, LEVEL_HIGH, NET_PAYOUT_INR, PAYOUT_FEE_INR, BASE_PAYOUT_INR
+from app.core.config import POOL_CAPACITY, LEVEL_LOW, LEVEL_HIGH, LEVEL_PAYOUTS, PAYOUT_FEE_INR, REFERRAL_REWARD_INR
 from app.crud import token as crud_token, user as crud_user, pool as crud_pool
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.models.pool import Pool, PoolStatus
@@ -35,15 +35,14 @@ class DrawResult:
     winner_high_level: WinnerResult  # selected from Level 4–6
 
 
-def _unique_withdraw_code(db: Session) -> str:
+def _unique_token_code(db: Session, prefix: str) -> str:
     while True:
-        code = "WIT-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        code = prefix + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
         if not crud_token.get_token_by_code(db, code):
             return code
 
 
 def _next_paid_waitlist_member(db: Session) -> User | None:
-    """Return the earliest-joined paid Waitlist member, or None."""
     return (
         db.query(User)
         .filter(User.status == UserStatus.Waitlist, User.weekly_payment_status == WeeklyPaymentStatus.Paid)
@@ -52,22 +51,42 @@ def _next_paid_waitlist_member(db: Session) -> User | None:
     )
 
 
+def _issue_referral_token(db: Session, new_active_user: User) -> None:
+    """If new_active_user was referred, generate a ₹250 REF token for the referrer."""
+    if not new_active_user.referred_by_user_id:
+        return
+    code = _unique_token_code(db, "REF-")
+    crud_token.create_token(
+        db,
+        TokenCreate(
+            code=code,
+            type=TokenType.Referral,
+            value_inr=Decimal(str(REFERRAL_REWARD_INR)),
+            user_id=new_active_user.referred_by_user_id,
+            status=TokenStatus.Active,
+        ),
+    )
+
+
 def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
     """
-    For a single winner:
-    1. Generate a Withdraw token for the net payout.
-    2. Set status → Eliminated_Won and detach from pool.
-    3. Replace with the next paid Waitlist member at Level 1.
+    1. Generate level-based Withdraw token for the winner.
+    2. Set winner status → Eliminated_Won, detach from pool.
+    3. Pull next paid Waitlist member as replacement at Level 1.
+    4. Issue referral token for replacement's referrer (if any).
     """
-    code = _unique_withdraw_code(db)
-    net = Decimal(str(NET_PAYOUT_INR))
+    gross, net = LEVEL_PAYOUTS.get(winner.current_level, (2500, 2000))
+    gross_d = Decimal(str(gross))
+    net_d = Decimal(str(net))
+    fee_d = Decimal(str(PAYOUT_FEE_INR))
 
+    code = _unique_token_code(db, "WIT-")
     crud_token.create_token(
         db,
         TokenCreate(
             code=code,
             type=TokenType.Withdraw,
-            value_inr=net,
+            value_inr=net_d,
             user_id=winner.id,
             status=TokenStatus.Active,
         ),
@@ -86,8 +105,9 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
             replacement.id,
             UserUpdate(status=UserStatus.Active, current_pool_id=pool.id, current_level=1),
         )
+        db.refresh(replacement)
+        _issue_referral_token(db, replacement)
     else:
-        # No one waiting — pool shrinks by one
         crud_pool.update_pool(
             db, pool.id, PoolUpdate(total_members=max(0, pool.total_members - 1))
         )
@@ -96,9 +116,9 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
         winner_id=winner.id,
         winner_username=winner.username,
         winner_level=winner.current_level,
-        gross_payout_inr=Decimal(str(BASE_PAYOUT_INR)),
-        fee_inr=Decimal(str(PAYOUT_FEE_INR)),
-        net_payout_inr=net,
+        gross_payout_inr=gross_d,
+        fee_inr=fee_d,
+        net_payout_inr=net_d,
         withdraw_token_code=code,
         replaced_by_user_id=replacement.id if replacement else None,
         replaced_by_username=replacement.username if replacement else None,
@@ -111,8 +131,10 @@ def run_dual_draw(db: Session, pool_id: int) -> DrawResult:
     - Pool must be Active with exactly POOL_CAPACITY members.
     - Winner 1: random pick from members at Level LEVEL_LOW (1–3).
     - Winner 2: random pick from members at Level LEVEL_HIGH (4–6).
-    - Each winner receives a Withdraw token for NET_PAYOUT_INR.
+    - Each winner receives a Withdraw token sized to their level.
     - Each winner is replaced by the next paid Waitlist member at Level 1.
+    - After both draws: surviving original members advance one level (max 6).
+    - After both draws: all active pool members reset to weekly_payment_status=Unpaid.
     """
     pool: Pool | None = crud_pool.get_pool(db, pool_id)
     if not pool:
@@ -142,13 +164,37 @@ def run_dual_draw(db: Session, pool_id: int) -> DrawResult:
     winner_low = random.choice(low_pool)
     winner_high = random.choice(high_pool)
 
-    # Process low-level winner first so their slot opens before the high-level
-    # winner's replacement is pulled from the waitlist
-    result_low = _process_winner(db, winner_low, pool)
+    # Snapshot the original member IDs before any mutations
+    original_ids = {m.id for m in members}
+    winner_ids = {winner_low.id, winner_high.id}
 
-    # Re-fetch pool after first replacement (total_members may have changed)
+    result_low = _process_winner(db, winner_low, pool)
     db.refresh(pool)
     result_high = _process_winner(db, winner_high, pool)
+
+    # ── Post-draw maintenance ────────────────────────────────────────────────
+    # 1. Advance surviving original members by one level (capped at 6).
+    # 2. Reset weekly payment for ALL currently active pool members (new week starts).
+    surviving_ids = original_ids - winner_ids
+    for member_id in surviving_ids:
+        member = crud_user.get_user(db, member_id)
+        if member and member.status == UserStatus.Active and member.current_pool_id == pool_id:
+            crud_user.update_user(
+                db,
+                member_id,
+                UserUpdate(
+                    current_level=min(member.current_level + 1, 6),
+                    weekly_payment_status=WeeklyPaymentStatus.Unpaid,
+                ),
+            )
+
+    # Reset payment for replacement members too — new week begins after the draw
+    for rep_id in filter(None, [result_low.replaced_by_user_id, result_high.replaced_by_user_id]):
+        member = crud_user.get_user(db, rep_id)
+        if member and member.status == UserStatus.Active:
+            crud_user.update_user(
+                db, rep_id, UserUpdate(weekly_payment_status=WeeklyPaymentStatus.Unpaid)
+            )
 
     return DrawResult(
         pool_id=pool.id,

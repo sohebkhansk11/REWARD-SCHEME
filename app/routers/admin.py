@@ -1,8 +1,10 @@
+from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from dataclasses import asdict
 
+from app.core.config import LATE_FEE_DAILY_INR
 from app.database import get_db
 from app.models.user import UserStatus, WeeklyPaymentStatus
 from app.models.pool import Pool, PoolStatus
@@ -172,3 +174,91 @@ def trigger_draw(pool_id: int, db: Session = Depends(get_db)):
         winner_low_level=_to_response(result.winner_low_level),
         winner_high_level=_to_response(result.winner_high_level),
     )
+
+
+# ── Late Payment Penalties ────────────────────────────────────────────────────
+
+@router.post("/admin/penalty/apply-daily")
+def apply_daily_penalty(db: Session = Depends(get_db)):
+    """
+    Admin: call once per day (Monday–Saturday) to accrue ₹50 on every Active
+    member who has not yet paid for the current week.
+    """
+    unpaid: list[User] = (
+        db.query(User)
+        .filter(User.status == UserStatus.Active, User.weekly_payment_status == WeeklyPaymentStatus.Unpaid)
+        .all()
+    )
+    if not unpaid:
+        return {"penalised_count": 0, "message": "No unpaid active members."}
+
+    from app.crud import user as crud_user
+    from app.schemas.user import UserUpdate
+
+    for member in unpaid:
+        new_late = Decimal(str(member.late_fees_inr or 0)) + Decimal(str(LATE_FEE_DAILY_INR))
+        crud_user.update_user(db, member.id, UserUpdate(late_fees_inr=new_late))
+
+    return {
+        "penalised_count": len(unpaid),
+        "daily_fee_inr": LATE_FEE_DAILY_INR,
+        "message": f"₹{LATE_FEE_DAILY_INR} penalty applied to {len(unpaid)} unpaid member(s).",
+    }
+
+
+@router.post("/admin/penalty/eliminate-unpaid")
+def eliminate_unpaid_members(db: Session = Depends(get_db)):
+    """
+    Admin: call each Sunday before the draw to eliminate Active members who are
+    still Unpaid. Their slot is forfeited (no refund); the next paid Waitlist
+    member fills the vacancy.
+    """
+    from app.crud import user as crud_user
+    from app.schemas.user import UserUpdate
+
+    unpaid: list[User] = (
+        db.query(User)
+        .filter(User.status == UserStatus.Active, User.weekly_payment_status == WeeklyPaymentStatus.Unpaid)
+        .all()
+    )
+    if not unpaid:
+        return {"eliminated_count": 0, "message": "No unpaid active members to eliminate."}
+
+    eliminated = []
+    for member in unpaid:
+        # Forfeit the slot — no refund
+        crud_user.update_user(
+            db,
+            member.id,
+            UserUpdate(status=UserStatus.Eliminated, current_pool_id=None, late_fees_inr=Decimal("0")),
+        )
+
+        # Pull next replacement from waitlist
+        replacement = (
+            db.query(User)
+            .filter(User.status == UserStatus.Waitlist, User.weekly_payment_status == WeeklyPaymentStatus.Paid)
+            .order_by(User.join_date)
+            .first()
+        )
+        if replacement and member.current_pool_id:
+            crud_user.update_user(
+                db,
+                replacement.id,
+                UserUpdate(status=UserStatus.Active, current_pool_id=member.current_pool_id, current_level=1),
+            )
+            db.refresh(replacement)
+            from app.services.draw import _issue_referral_token
+            _issue_referral_token(db, replacement)
+
+        eliminated.append({
+            "user_id": member.id,
+            "username": member.username,
+            "forfeited_late_fees_inr": float(member.late_fees_inr or 0),
+            "replaced_by": replacement.username if replacement else None,
+        })
+
+    return {
+        "eliminated_count": len(eliminated),
+        "eliminated": eliminated,
+        "message": f"{len(eliminated)} unpaid member(s) eliminated. Slots forfeited.",
+    }

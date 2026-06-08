@@ -13,10 +13,14 @@ def list_users(
     skip: int = 0,
     limit: int = 100,
     mobile: Optional[str] = None,
+    username: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
     if mobile:
         user = crud_user.get_user_by_mobile(db, mobile)
+        return [user] if user else []
+    if username:
+        user = crud_user.get_user_by_username(db, username)
         return [user] if user else []
     return crud_user.get_users(db, skip=skip, limit=limit)
 

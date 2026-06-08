@@ -6,6 +6,7 @@ from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.models.pool import Pool, PoolStatus
 from app.schemas.pool import PoolCreate, PoolUpdate
 from app.schemas.user import UserUpdate
+from app.services.draw import _issue_referral_token
 
 
 def _next_pool_name(db: Session) -> str:
@@ -50,5 +51,7 @@ def check_and_scale_waitlist(db: Session) -> Pool | None:
             member.id,
             UserUpdate(status=UserStatus.Active, current_pool_id=new_pool.id, current_level=1),
         )
+        db.refresh(member)
+        _issue_referral_token(db, member)
 
     return new_pool

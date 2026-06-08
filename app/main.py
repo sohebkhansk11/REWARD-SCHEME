@@ -1,6 +1,8 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exception_handlers import http_exception_handler
 from app.database import engine, Base
 import app.models  # noqa: F401 — registers all ORM models with SQLAlchemy metadata
 from app.routers import users, pools, tokens
@@ -13,6 +15,23 @@ app = FastAPI(
     description="Pools, Users, Tokens — with Dual-Draw and Waitlist Auto-Scaling",
     version="1.0.0",
 )
+
+
+# ── Global exception handler ──────────────────────────────────────────────────
+# Without this, unhandled exceptions (e.g. SQLAlchemy DataError) propagate
+# PAST the CORSMiddleware before any response headers are sent.  ServerError-
+# Middleware then returns a 500 with no CORS headers, and the browser blocks
+# the response with "No Access-Control-Allow-Origin" even though CORS is
+# configured correctly.  Registering this handler inside FastAPI ensures the
+# error response always travels back through the CORS layer.
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    if isinstance(exc, HTTPException):
+        return await http_exception_handler(request, exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error — {type(exc).__name__}: {exc}"},
+    )
 
 # CORS — reads from ALLOWED_ORIGINS env var (comma-separated list).
 # Defaults to wildcard so the deployed frontends work immediately.

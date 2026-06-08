@@ -6,6 +6,8 @@ import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import TokenManager from './pages/TokenManager'
 import PoolOversight from './pages/PoolOversight'
+import UserDirectory from './pages/UserDirectory'
+import Diagnostics from './pages/Diagnostics'
 
 // Redirect to /login when no valid JWT is present
 function ProtectedRoute({ children }) {
@@ -45,9 +47,11 @@ export default function App() {
               }
             >
               <Route index element={<Dashboard />} />
-              <Route path="tokens" element={<TokenManager />} />
-              <Route path="pools" element={<PoolOversight />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
+              <Route path="tokens"      element={<TokenManager />} />
+              <Route path="pools"       element={<PoolOversight />} />
+              <Route path="users"       element={<UserDirectory />} />
+              <Route path="diagnostics" element={<Diagnostics />} />
+              <Route path="*"           element={<Navigate to="/" replace />} />
             </Route>
           </Routes>
         </BrowserRouter>

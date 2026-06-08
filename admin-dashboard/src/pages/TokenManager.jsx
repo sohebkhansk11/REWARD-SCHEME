@@ -1,9 +1,17 @@
-import { useState, useEffect } from 'react'
-import { Copy, Check, Flame, Plus, Clock, AlertCircle } from 'lucide-react'
+import { useState, useEffect, useCallback } from 'react'
+import { Copy, Check, Flame, Plus, Clock, AlertCircle, Download, RefreshCw, Filter } from 'lucide-react'
 import Spinner from '../components/Spinner'
 import StatusBadge from '../components/StatusBadge'
-import { generateToken, burnToken, getTokens } from '../api/client'
+import { generateToken, burnToken, getAdminTokens, downloadTokensCSV, triggerDownload } from '../api/client'
 import { useToast } from '../context/ToastContext'
+
+function fmtDate(iso) {
+  if (!iso) return '—'
+  return new Date(iso).toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short',
+    year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+  })
+}
 
 const INR = v =>
   new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(v)
@@ -47,19 +55,38 @@ export default function TokenManager() {
   const [burnLoading, setBurnLoading] = useState(false)
   const [burnResult, setBurnResult] = useState(null)
 
-  // Recent tokens
-  const [tokens, setTokens] = useState([])
-  const [tokensLoading, setTokensLoading] = useState(true)
+  // Token audit ledger
+  const [tokens,          setTokens]          = useState([])
+  const [tokensLoading,   setTokensLoading]   = useState(true)
+  const [tokensRefreshing,setTokensRefreshing]= useState(false)
+  const [typeFilter,      setTypeFilter]      = useState('')
+  const [statusFilter,    setStatusFilter]    = useState('')
+  const [downloading,     setDownloading]     = useState(false)
 
-  const loadTokens = async () => {
+  const loadTokens = useCallback(async (silent = false) => {
+    if (!silent) setTokensLoading(true)
+    else setTokensRefreshing(true)
     try {
-      const res = await getTokens({ limit: 20 })
-      setTokens(res.data.slice().reverse())
+      const params = {}
+      if (typeFilter)   params.type   = typeFilter
+      if (statusFilter) params.status = statusFilter
+      const res = await getAdminTokens(params)
+      setTokens(res.data)
     } catch { /* ignore */ }
-    finally { setTokensLoading(false) }
-  }
+    finally { setTokensLoading(false); setTokensRefreshing(false) }
+  }, [typeFilter, statusFilter])
 
-  useEffect(() => { loadTokens() }, [])
+  useEffect(() => { loadTokens() }, [loadTokens])
+
+  const handleDownloadTokens = async () => {
+    setDownloading(true)
+    try {
+      const res = await downloadTokensCSV()
+      triggerDownload(res.data, `tokens_${new Date().toISOString().slice(0, 10)}.csv`)
+      toast('Tokens CSV downloaded', 'success')
+    } catch { toast('Download failed', 'error') }
+    finally { setDownloading(false) }
+  }
 
   const handleGenerate = async e => {
     e.preventDefault()
@@ -216,44 +243,139 @@ export default function TokenManager() {
         </div>
       </div>
 
-      {/* Recent Tokens */}
+      {/* ── Token Audit Ledger ───────────────────────────────────── */}
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100">
-        <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-2">
-          <Clock className="w-4 h-4 text-slate-400" />
-          <h2 className="font-semibold text-slate-800">Recent Tokens</h2>
-          <span className="ml-auto text-xs text-slate-400">Latest 20</span>
+        {/* Ledger header */}
+        <div className="px-6 py-4 border-b border-slate-100 flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2 mr-auto">
+            <Clock className="w-4 h-4 text-slate-400" />
+            <h2 className="font-semibold text-slate-800">Token Audit Ledger</h2>
+            <span className="text-xs text-slate-400">{tokens.length} tokens</span>
+          </div>
+
+          {/* Type filter */}
+          <select
+            value={typeFilter}
+            onChange={e => setTypeFilter(e.target.value)}
+            className="px-3 py-1.5 border border-slate-200 rounded-lg text-xs text-slate-700 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value="">All Types</option>
+            <option value="Deposit">Deposit</option>
+            <option value="Withdraw">Withdraw</option>
+            <option value="Referral">Referral</option>
+          </select>
+
+          {/* Status filter */}
+          <select
+            value={statusFilter}
+            onChange={e => setStatusFilter(e.target.value)}
+            className="px-3 py-1.5 border border-slate-200 rounded-lg text-xs text-slate-700 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value="">All Statuses</option>
+            <option value="Active">Active</option>
+            <option value="Burned">Burned</option>
+          </select>
+
+          {/* Refresh */}
+          <button
+            onClick={() => loadTokens(true)}
+            disabled={tokensRefreshing}
+            className="p-1.5 border border-slate-200 rounded-lg text-slate-500 hover:bg-slate-50 disabled:opacity-50 transition"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${tokensRefreshing ? 'animate-spin' : ''}`} />
+          </button>
+
+          {/* Download */}
+          <button
+            onClick={handleDownloadTokens}
+            disabled={downloading}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50 transition"
+          >
+            {downloading ? <Spinner className="w-3.5 h-3.5" /> : <Download className="w-3.5 h-3.5" />}
+            Export CSV
+          </button>
         </div>
+
+        {/* Ledger table */}
         {tokensLoading ? (
           <div className="flex justify-center py-10"><Spinner /></div>
         ) : tokens.length === 0 ? (
-          <div className="py-12 text-center text-slate-400 text-sm">No tokens yet</div>
+          <div className="py-12 text-center text-slate-400 text-sm">No tokens match the current filters.</div>
         ) : (
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-slate-100">
-                {['Code', 'Type', 'Value', 'User ID', 'Status'].map(h => (
-                  <th key={h} className="text-left px-6 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {tokens.map((t, i) => (
-                <tr key={t.id} className={`border-b border-slate-50 ${i % 2 === 0 ? 'bg-white' : 'bg-slate-50/40'}`}>
-                  <td className="px-6 py-3 font-mono font-semibold text-slate-800 tracking-widest">{t.code}</td>
-                  <td className="px-6 py-3">
-                    <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
-                      t.type === 'Deposit' ? 'bg-blue-100 text-blue-700' :
-                      t.type === 'Withdraw' ? 'bg-violet-100 text-violet-700' :
-                      'bg-slate-100 text-slate-600'
-                    }`}>{t.type}</span>
-                  </td>
-                  <td className="px-6 py-3 font-semibold text-slate-700">{INR(t.value_inr)}</td>
-                  <td className="px-6 py-3 text-slate-500">{t.user_id ?? '—'}</td>
-                  <td className="px-6 py-3"><StatusBadge status={t.status} /></td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm min-w-[920px]">
+              <thead className="bg-slate-50 border-b border-slate-100">
+                <tr>
+                  {['Code', 'Type', 'Value', 'Status', 'Owner', 'Redeemed By', 'Created', 'Redeemed At'].map(h => (
+                    <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">{h}</th>
+                  ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-slate-50">
+                {tokens.map(t => (
+                  <tr key={t.id} className="hover:bg-slate-50/60 transition-colors">
+                    {/* Code */}
+                    <td className="px-4 py-3 font-mono font-semibold text-slate-800 tracking-widest text-xs">
+                      {t.code}
+                    </td>
+
+                    {/* Type badge */}
+                    <td className="px-4 py-3">
+                      <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                        t.type === 'Deposit'  ? 'bg-blue-100 text-blue-700' :
+                        t.type === 'Withdraw' ? 'bg-violet-100 text-violet-700' :
+                        'bg-teal-100 text-teal-700'
+                      }`}>
+                        {t.type}
+                      </span>
+                    </td>
+
+                    {/* Value */}
+                    <td className="px-4 py-3 font-semibold text-slate-700 tabular-nums">
+                      {INR(t.value_inr)}
+                    </td>
+
+                    {/* Status */}
+                    <td className="px-4 py-3"><StatusBadge status={t.status} /></td>
+
+                    {/* Owner (assigned to) */}
+                    <td className="px-4 py-3">
+                      {t.user_username ? (
+                        <div>
+                          <p className="font-medium text-slate-700 text-xs">@{t.user_username}</p>
+                          <p className="text-slate-400 text-[10px]">{t.user_name}</p>
+                        </div>
+                      ) : <span className="text-slate-300 text-xs">Unassigned</span>}
+                    </td>
+
+                    {/* Redeemed by */}
+                    <td className="px-4 py-3">
+                      {t.redeemed_by_username ? (
+                        <span className="text-xs font-mono text-emerald-700">@{t.redeemed_by_username}</span>
+                      ) : (
+                        <span className="text-slate-300 text-xs">
+                          {t.status === 'Burned' ? 'Admin' : '—'}
+                        </span>
+                      )}
+                    </td>
+
+                    {/* Created at */}
+                    <td className="px-4 py-3 text-xs text-slate-400 whitespace-nowrap">
+                      {fmtDate(t.created_at)}
+                    </td>
+
+                    {/* Redeemed at */}
+                    <td className="px-4 py-3 text-xs whitespace-nowrap">
+                      {t.redeemed_at
+                        ? <span className="text-slate-600">{fmtDate(t.redeemed_at)}</span>
+                        : <span className="text-slate-300">Pending</span>
+                      }
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
     </div>

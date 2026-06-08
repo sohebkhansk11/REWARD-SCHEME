@@ -33,13 +33,10 @@ api.interceptors.response.use(
 // ── Stats ────────────────────────────────────────────────────────────────────
 export const getStats   = ()       => api.get('/admin/stats')
 
-// ── Users ────────────────────────────────────────────────────────────────────
-export const getUsers   = (params) => api.get('/users/',   { params: { limit: 500, ...params } })
-
 // ── Pools ────────────────────────────────────────────────────────────────────
 export const getPools   = (params) => api.get('/pools/',   { params: { limit: 100, ...params } })
 
-// ── Tokens ───────────────────────────────────────────────────────────────────
+// ── Tokens (legacy public endpoint — used for quick recent list) ──────────────
 export const getTokens  = (params) => api.get('/tokens/',  { params: { limit: 200, ...params } })
 
 export const generateToken = (type, valueInr) =>
@@ -55,15 +52,55 @@ export const triggerDraw = (poolId) => api.post(`/admin/pools/${poolId}/draw`)
 export const checkWaitlist = () => api.post('/admin/waitlist/check')
 
 // ── Penalties ────────────────────────────────────────────────────────────────
-export const applyDailyPenalty   = () => api.post('/admin/penalty/apply-daily')
-export const eliminateUnpaid     = () => api.post('/admin/penalty/eliminate-unpaid')
+export const applyDailyPenalty = () => api.post('/admin/penalty/apply-daily')
+export const eliminateUnpaid   = () => api.post('/admin/penalty/eliminate-unpaid')
 
-// ── Auth (no JWT needed for these two calls) ──────────────────────────────────
-export const adminLogin      = (username, password)    =>
+// ── Users (legacy public read — used by PoolOversight for member lists) ───────
+export const getUsers = (params) => api.get('/users/', { params: { limit: 500, ...params } })
+
+// ── Admin User Directory ──────────────────────────────────────────────────────
+export const getAdminUsers  = (params) =>
+  api.get('/admin/users', { params: { limit: 500, ...params } })
+
+export const getAdminUser   = (userId) => api.get(`/admin/users/${userId}`)
+
+export const importUsersCsv = (file) => {
+  const form = new FormData()
+  form.append('file', file)
+  return api.post('/admin/import/users', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
+}
+
+// ── Admin Token Audit ─────────────────────────────────────────────────────────
+export const getAdminTokens = (params) =>
+  api.get('/admin/tokens', { params: { limit: 500, ...params } })
+
+// ── CSV Downloads (returns Blob for browser download) ─────────────────────────
+export const downloadUsersCSV  = () =>
+  api.get('/admin/export/users',  { responseType: 'blob' })
+
+export const downloadTokensCSV = () =>
+  api.get('/admin/export/tokens', { responseType: 'blob' })
+
+/** Helper: trigger a browser file download from a Blob response. */
+export function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const a   = document.createElement('a')
+  a.href     = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+// ── Auth (no JWT needed for these calls) ──────────────────────────────────────
+export const adminLogin     = (username, password) =>
   api.post('/admin/auth/login',      { username, password })
-export const adminVerifyOTP  = (temp_token, otp)       =>
+export const adminVerifyOTP = (temp_token, otp)    =>
   api.post('/admin/auth/verify-otp', { temp_token, otp })
-export const adminSetup      = (username, password, telegram_chat_id, setup_secret) =>
-  api.post('/admin/auth/setup',      { username, password, telegram_chat_id, setup_secret })
+export const adminSetup     = (username, password, setup_secret) =>
+  api.post('/admin/auth/setup',      { username, password, setup_secret })
 
 export default api

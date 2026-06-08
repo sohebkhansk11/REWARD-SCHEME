@@ -8,6 +8,8 @@ import app.models  # noqa: F401 — registers all ORM models with SQLAlchemy met
 from app.routers import users, pools, tokens
 from app.routers import admin
 from app.routers import admin_data
+from app.routers import admin_comms
+from app.routers import dev as dev_router
 from app.routers import auth as auth_router
 from app.routers import user_auth as user_auth_router
 
@@ -56,8 +58,10 @@ app.include_router(auth_router.router)       # /admin/auth/* — public admin au
 app.include_router(pools.router)
 app.include_router(users.router)
 app.include_router(tokens.router)
-app.include_router(admin.router)        # /admin/*         — core admin ops (JWT required)
-app.include_router(admin_data.router)   # /admin/users|tokens|export|import — data engine (JWT required)
+app.include_router(admin.router)        # /admin/*              — core admin ops (JWT required)
+app.include_router(admin_data.router)   # /admin/users|tokens|export|import  — data engine (JWT required)
+app.include_router(admin_comms.router)  # /admin/broadcast      — communications (JWT required)
+app.include_router(dev_router.router)   # /dev/*                — DEV MODE ONLY (JWT + ENABLE_DEV_MODE=true)
 
 
 @app.get("/", tags=["Health"])

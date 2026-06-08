@@ -38,6 +38,7 @@ class UserUpdate(BaseModel):
     weekly_payment_status: Optional[WeeklyPaymentStatus] = None
     late_fees_inr: Optional[Decimal] = None
     referred_by_user_id: Optional[int] = None
+    telegram_chat_id: Optional[str] = None
 
     @field_validator("current_level")
     @classmethod

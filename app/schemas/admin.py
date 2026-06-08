@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from decimal import Decimal
 from datetime import datetime
@@ -130,3 +130,33 @@ class ImportSummaryResponse(BaseModel):
     created_count: int
     skipped_count: int
     errors:        list[ImportError]
+
+
+# ── Broadcast ─────────────────────────────────────────────────────────────────
+
+from typing import Literal
+
+class BroadcastRequest(BaseModel):
+    message:       str = Field(min_length=1, max_length=1000)
+    audience_type: Literal["all", "active", "waitlist", "winners", "pool"] = "all"
+    pool_id:       Optional[int] = Field(
+        None,
+        description="Required when audience_type='pool'. The target pool's ID.",
+    )
+    channels:      list[Literal["whatsapp", "telegram"]] = Field(
+        default=["whatsapp"],
+        description="One or more: whatsapp, telegram",
+    )
+
+
+class BroadcastChannelResult(BaseModel):
+    sent:    int
+    failed:  int
+    skipped: int
+    errors:  list[str] = []
+
+
+class BroadcastResponse(BaseModel):
+    audience_type:   str
+    total_targeted:  int
+    channels:        dict[str, BroadcastChannelResult]

@@ -21,7 +21,10 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.models.token import Token, TokenType, TokenStatus
-from app.schemas.auth import UserRegisterRequest, UserLoginRequest, UserJWTResponse
+from app.schemas.auth import (
+    UserRegisterRequest, UserLoginRequest, UserJWTResponse,
+    UserProfileUpdate, ChangePasswordRequest, RejoinRequest,
+)
 from app.schemas.user import UserResponse
 from app.crud import user as crud_user, token as crud_token
 from app.services.auth import hash_password, verify_password, create_user_jwt
@@ -150,3 +153,102 @@ def get_me(
     # Re-issue token so the 30-day window slides on active use
     access_token = create_user_jwt(user.id)
     return UserJWTResponse(access_token=access_token, user=_serialize_user(user))
+
+
+# ── Update profile (name + mobile only — username is immutable) ───────────────
+
+@router.patch("/profile", response_model=UserJWTResponse)
+def update_profile(
+    body: UserProfileUpdate,
+    user_id: int = Depends(require_user_jwt),
+    db: Session = Depends(get_db),
+):
+    """Update name and/or mobile number. Username cannot be changed."""
+    user = crud_user.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    if body.mobile and body.mobile != user.mobile:
+        if crud_user.get_user_by_mobile(db, body.mobile):
+            raise HTTPException(status_code=400, detail="Mobile number already in use.")
+
+    if body.name is not None:
+        user.name = body.name.strip()
+    if body.mobile is not None:
+        user.mobile = body.mobile.strip()
+
+    db.commit()
+    db.refresh(user)
+    return UserJWTResponse(access_token=create_user_jwt(user.id), user=_serialize_user(user))
+
+
+# ── Change password ────────────────────────────────────────────────────────────
+
+@router.post("/change-password")
+def change_password(
+    body: ChangePasswordRequest,
+    user_id: int = Depends(require_user_jwt),
+    db: Session = Depends(get_db),
+):
+    """Verify old password then set a new bcrypt hash."""
+    user = crud_user.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    stored = user.hashed_password or "$2b$12$invalidhashplaceholderXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    if not verify_password(body.old_password, stored):
+        raise HTTPException(status_code=401, detail="Current password is incorrect.")
+
+    user.hashed_password = hash_password(body.new_password)
+    db.commit()
+    return {"message": "Password updated successfully."}
+
+
+# ── Re-join (Eliminated_Won users only) ───────────────────────────────────────
+
+@router.post("/rejoin", response_model=UserJWTResponse)
+def rejoin(
+    body: RejoinRequest,
+    background_tasks: BackgroundTasks,
+    user_id: int = Depends(require_user_jwt),
+    db: Session = Depends(get_db),
+):
+    """
+    Allow a user with status Eliminated_Won to re-enter the waitlist
+    by providing a fresh Deposit Token. Resets their level to 1.
+    """
+    user = crud_user.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    if user.status != UserStatus.Eliminated_Won:
+        raise HTTPException(
+            status_code=400,
+            detail="Only accounts with Eliminated_Won status can re-join.",
+        )
+
+    token = crud_token.get_token_by_code(db, body.deposit_token)
+    if not token:
+        raise HTTPException(status_code=400, detail="Deposit token not found.")
+    if token.type != TokenType.Deposit:
+        raise HTTPException(status_code=400, detail="Only Deposit tokens (DEP-...) are accepted.")
+    if token.status != TokenStatus.Active:
+        raise HTTPException(status_code=400, detail="This deposit token has already been used.")
+    if float(token.value_inr) != float(DEPOSIT_AMOUNT_INR):
+        raise HTTPException(status_code=400, detail=f"Token face value must be ₹{DEPOSIT_AMOUNT_INR}.")
+
+    # Reset user to Waitlist at Level 1
+    user.status                = UserStatus.Waitlist
+    user.weekly_payment_status = WeeklyPaymentStatus.Paid
+    user.current_level         = 1
+    user.current_pool_id       = None
+
+    # Burn the deposit token
+    token.user_id = user.id
+    token.status  = TokenStatus.Burned
+    db.commit()
+    db.refresh(user)
+
+    background_tasks.add_task(check_and_scale_waitlist, db)
+
+    return UserJWTResponse(access_token=create_user_jwt(user.id), user=_serialize_user(user))

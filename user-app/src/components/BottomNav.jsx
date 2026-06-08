@@ -1,11 +1,12 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Wallet, Dices } from 'lucide-react'
+import { LayoutDashboard, Wallet, Dices, UserCircle } from 'lucide-react'
 import { motion } from 'framer-motion'
 
 const TABS = [
-  { to: '/dashboard', icon: LayoutDashboard, label: 'Home' },
+  { to: '/dashboard', icon: LayoutDashboard, label: 'Home'    },
   { to: '/wallet',    icon: Wallet,          label: 'Wallet'  },
   { to: '/draw',      icon: Dices,           label: 'Draw'    },
+  { to: '/profile',   icon: UserCircle,      label: 'Account' },
 ]
 
 export default function BottomNav() {
@@ -23,13 +24,13 @@ export default function BottomNav() {
           {({ isActive }) => (
             <motion.div
               whileTap={{ scale: 0.88 }}
-              className="flex flex-col items-center gap-1 px-6 py-1"
+              className="flex flex-col items-center gap-1 px-4 py-1"
             >
               <div
                 className="p-2 rounded-xl transition-all"
                 style={isActive ? {
-                  background: 'rgba(0,240,255,0.1)',
-                  boxShadow: '0 0 12px rgba(0,240,255,0.3)',
+                  background: 'rgba(0,240,255,0.10)',
+                  boxShadow:  '0 0 12px rgba(0,240,255,0.30)',
                 } : {}}
               >
                 <Icon
@@ -40,7 +41,7 @@ export default function BottomNav() {
               </div>
               <span
                 className="text-[10px] font-mono font-semibold tracking-widest transition-colors"
-                style={{ color: isActive ? '#00f0ff' : 'rgba(255,255,255,0.3)' }}
+                style={{ color: isActive ? '#00f0ff' : 'rgba(255,255,255,0.30)' }}
               >
                 {label}
               </span>

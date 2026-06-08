@@ -5,6 +5,7 @@ import Auth from './pages/Auth'
 import Dashboard from './pages/Dashboard'
 import TokenWallet from './pages/TokenWallet'
 import DrawPage from './pages/DrawPage'
+import Profile from './pages/Profile'
 
 function Wrap({ children }) {
   return (
@@ -35,6 +36,7 @@ function AppRoutes() {
         <Route path="/dashboard" element={<Guard><Wrap><Dashboard /></Wrap></Guard>} />
         <Route path="/wallet"    element={<Guard><Wrap><TokenWallet /></Wrap></Guard>} />
         <Route path="/draw"      element={<Guard><Wrap><DrawPage /></Wrap></Guard>} />
+        <Route path="/profile"   element={<Guard><Wrap><Profile /></Wrap></Guard>} />
         <Route path="*"          element={<Navigate to="/" replace />} />
       </Routes>
     </AnimatePresence>

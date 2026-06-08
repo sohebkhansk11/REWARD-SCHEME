@@ -61,3 +61,20 @@ class AdminSetupResponse(BaseModel):
     totp_uri:    str   # otpauth:// URI — scan with Google Authenticator / Authy
     totp_secret: str   # base32 secret — for manual entry if QR scan fails
     message:     str
+
+
+# ── User profile management ────────────────────────────────────────────────────
+
+class UserProfileUpdate(BaseModel):
+    """Only name and mobile may be changed. Username is immutable."""
+    name:   Optional[str] = None
+    mobile: Optional[str] = None
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str = Field(min_length=6)
+
+
+class RejoinRequest(BaseModel):
+    deposit_token: str = Field(description="Active DEP-XXXXXX token for re-entry")

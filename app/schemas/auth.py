@@ -52,7 +52,12 @@ class AdminJWTResponse(BaseModel):
 # ── One-time setup ─────────────────────────────────────────────────────────────
 
 class AdminSetupRequest(BaseModel):
-    username: str
-    password: str = Field(min_length=8)
-    telegram_chat_id: str          # numeric Telegram user ID as string
+    username:     str
+    password:     str = Field(min_length=8)
     setup_secret: str              # must match ADMIN_SETUP_SECRET env var
+
+
+class AdminSetupResponse(BaseModel):
+    totp_uri:    str   # otpauth:// URI — scan with Google Authenticator / Authy
+    totp_secret: str   # base32 secret — for manual entry if QR scan fails
+    message:     str

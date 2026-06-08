@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Shield, Eye, EyeOff, MessageCircle, ArrowRight, RotateCcw } from 'lucide-react'
+import { Shield, Eye, EyeOff, Smartphone, ArrowRight, RotateCcw } from 'lucide-react'
 import { adminLogin, adminVerifyOTP } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 
@@ -29,7 +29,7 @@ function Steps({ current }) {
             {n < current ? '✓' : n}
           </div>
           <span className={`text-xs font-medium ${n === current ? 'text-slate-300' : 'text-slate-600'}`}>
-            {n === 1 ? 'Credentials' : 'Telegram OTP'}
+            {n === 1 ? 'Credentials' : 'Authenticator'}
           </span>
           {n < 2 && <div className={`w-8 h-px ${current > 1 ? 'bg-emerald-600' : 'bg-slate-700'}`} />}
         </div>
@@ -56,7 +56,8 @@ export default function Login() {
   const [error,       setError]       = useState('')
 
   const otpRef = useRef(null)
-  const countdown = useCountdown(step === 2 ? 300 : 0)   // 5-minute OTP timer
+  // TOTP codes refresh every 30 s — no expiry countdown needed on our side
+  const countdown = useCountdown(step === 2 ? 30 : 0)
 
   // Redirect if already logged in
   useEffect(() => { if (isAuthed) nav('/', { replace: true }) }, [isAuthed, nav])
@@ -84,12 +85,12 @@ export default function Login() {
     }
   }
 
-  // ── Step 2: verify OTP ────────────────────────────────────────────────────
+  // ── Step 2: verify TOTP ───────────────────────────────────────────────────
   const handleVerifyOTP = async e => {
     e.preventDefault()
     setError('')
     if (otp.length !== 6 || !/^\d{6}$/.test(otp)) {
-      setError('Enter the 6-digit code from Telegram.')
+      setError('Enter the 6-digit code from your authenticator app.')
       return
     }
     setLoading(true)
@@ -103,9 +104,6 @@ export default function Login() {
       setLoading(false)
     }
   }
-
-  const mm = String(Math.floor(countdown / 60)).padStart(2, '0')
-  const ss = String(countdown % 60).padStart(2, '0')
 
   return (
     <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
@@ -192,13 +190,13 @@ export default function Login() {
           {/* ── Step 2 ─────────────────────────────────────────────────── */}
           {step === 2 && (
             <form onSubmit={handleVerifyOTP} className="space-y-4">
-              {/* Telegram notice */}
-              <div className="flex items-start gap-3 bg-blue-950/50 border border-blue-800/40 rounded-xl p-4">
-                <MessageCircle className="w-5 h-5 text-blue-400 flex-shrink-0 mt-0.5" />
+              {/* Authenticator app notice */}
+              <div className="flex items-start gap-3 bg-emerald-950/50 border border-emerald-800/40 rounded-xl p-4">
+                <Smartphone className="w-5 h-5 text-emerald-400 flex-shrink-0 mt-0.5" />
                 <div>
-                  <p className="text-sm text-blue-300 font-medium">Check Telegram</p>
-                  <p className="text-xs text-blue-400/70 mt-0.5">
-                    A 6-digit OTP has been sent to your registered Telegram account.
+                  <p className="text-sm text-emerald-300 font-medium">Open your authenticator app</p>
+                  <p className="text-xs text-emerald-400/70 mt-0.5">
+                    Enter the 6-digit code shown in Google Authenticator or Authy for <strong>RewardScheme Admin</strong>.
                   </p>
                 </div>
               </div>
@@ -206,10 +204,11 @@ export default function Login() {
               <div>
                 <div className="flex items-center justify-between mb-1.5">
                   <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    One-Time Password
+                    Authenticator Code
                   </label>
-                  <span className={`text-xs font-mono tabular-nums ${countdown < 60 ? 'text-red-400' : 'text-slate-500'}`}>
-                    {mm}:{ss}
+                  <span className={`text-xs font-mono tabular-nums ${countdown <= 5 ? 'text-amber-400' : 'text-slate-500'}`}
+                    title="Codes refresh every 30 s">
+                    {countdown}s
                   </span>
                 </div>
                 <input
@@ -255,7 +254,7 @@ export default function Login() {
         </div>
 
         <p className="text-center text-xs text-slate-700 mt-6">
-          Reward Scheme Admin Console · 2FA Protected
+          Reward Scheme Admin Console · TOTP 2FA
         </p>
       </div>
     </div>

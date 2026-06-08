@@ -1,35 +1,38 @@
 """
 Authentication service
 ======================
-- Password hashing via passlib / bcrypt
-- Temporary OTP generation + in-memory storage (single-use, 5-minute TTL)
-- Telegram OTP delivery via Bot API (async httpx)
-- Final Admin JWT creation + decoding (python-jose, HS256, 8-hour TTL)
+Password hashing      — bcrypt (12 rounds), direct library, no passlib
+Admin 2FA             — TOTP (RFC 6238), pyotp, Google Authenticator / Authy
+Admin JWT             — python-jose HS256, 8-hour TTL  (ADMIN_JWT_SECRET)
+User JWT              — python-jose HS256, 30-day TTL  (USER_JWT_SECRET)
 
-NOTE: The OTP store is in-process memory.  If the Render free tier restarts
-the worker between Step-1 and Step-2, the admin simply retries the login.
-A Redis store is the production-grade upgrade path.
+No external API calls.  No bot tokens.  No third-party services.
+
+Login flow:
+  Step 1 — verify username + password → create short-lived session → temp_token
+  Step 2 — admin opens their authenticator app, submits 6-digit code
+            verify code against stored totp_secret → issue final JWT
+
+Setup flow (one-time):
+  generate_totp_secret() → base32 string  (store in Admin.totp_secret)
+  get_totp_uri()         → otpauth:// URI (admin scans with authenticator app)
 """
 
 import os
 import secrets
-import random
 from datetime import datetime, timedelta, timezone
 
 import bcrypt as _bcrypt
-import httpx
+import pyotp
 from jose import jwt, JWTError
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 _ALGORITHM         = "HS256"
-_JWT_EXPIRE_H      = 8     # admin JWT — 8 hours
-_USER_JWT_EXPIRE_D = 30    # user JWT  — 30 days (mobile app: long session)
-_OTP_EXPIRE_MIN    = 5
-
-# temp_token → {otp, admin_id, admin_username, expires_at}
-_otp_store: dict[str, dict] = {}
+_JWT_EXPIRE_H      = 8     # admin JWT  — 8 hours
+_USER_JWT_EXPIRE_D = 30    # user JWT   — 30 days (mobile app: long session)
+_SESSION_EXPIRE_M  = 5     # temp login session between step 1 and step 2
 
 
 # ── Password helpers (direct bcrypt — no passlib dependency) ───────────────────
@@ -47,9 +50,83 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
-# ── JWT helpers ────────────────────────────────────────────────────────────────
+# ── TOTP helpers (no external service required) ────────────────────────────────
 
-def _jwt_secret() -> str:
+def generate_totp_secret() -> str:
+    """
+    Generate a cryptographically random base32 TOTP secret.
+    Store this in Admin.totp_secret at setup time.
+    """
+    return pyotp.random_base32()
+
+
+def get_totp_uri(secret: str, username: str) -> str:
+    """
+    Return the otpauth:// URI for QR code generation.
+    Admin scans this once with Google Authenticator / Authy.
+    """
+    totp = pyotp.TOTP(secret)
+    return totp.provisioning_uri(name=username, issuer_name="RewardScheme Admin")
+
+
+def verify_totp(secret: str, code: str) -> bool:
+    """
+    Verify a 6-digit TOTP code against the stored secret.
+    valid_window=1 allows ±30 seconds of clock drift (industry standard).
+    """
+    totp = pyotp.TOTP(secret)
+    return totp.verify(code.strip(), valid_window=1)
+
+
+# ── Login session (in-process, 5-minute TTL between step 1 and step 2) ────────
+# Maps temp_token → {admin_id, admin_username, expires_at}
+# No OTP is stored here — the authenticator app holds the secret independently.
+
+_session_store: dict[str, dict] = {}
+
+
+def create_login_session(admin_id: int, admin_username: str) -> str:
+    """
+    Called after password is verified (step 1).
+    Revokes any prior pending session for this admin, then creates a new one.
+    Returns a cryptographically random temp_token.
+    """
+    for key, val in list(_session_store.items()):
+        if val["admin_id"] == admin_id:
+            del _session_store[key]
+
+    temp_token = secrets.token_urlsafe(32)
+    _session_store[temp_token] = {
+        "admin_id":       admin_id,
+        "admin_username": admin_username,
+        "expires_at":     datetime.now(timezone.utc) + timedelta(minutes=_SESSION_EXPIRE_M),
+    }
+    return temp_token
+
+
+def consume_login_session(temp_token: str) -> str:
+    """
+    Called when the TOTP code is submitted (step 2).
+    Validates the session is still within the 5-minute window,
+    destroys it (single-use), and returns admin_username.
+    Raises ValueError on any failure.
+    """
+    entry = _session_store.get(temp_token)
+    if not entry:
+        raise ValueError("Session expired or invalid. Please log in again.")
+
+    if datetime.now(timezone.utc) > entry["expires_at"]:
+        del _session_store[temp_token]
+        raise ValueError("Session timed out. Please log in again.")
+
+    username = entry["admin_username"]
+    del _session_store[temp_token]   # single-use: destroy on success
+    return username
+
+
+# ── Admin JWT (ADMIN_JWT_SECRET, 8-hour TTL) ──────────────────────────────────
+
+def _admin_jwt_secret() -> str:
     s = os.getenv("ADMIN_JWT_SECRET")
     if not s:
         raise RuntimeError("ADMIN_JWT_SECRET is not set in environment variables.")
@@ -62,19 +139,19 @@ def create_jwt(admin_username: str) -> str:
         "type": "admin_access",
         "exp":  datetime.now(timezone.utc) + timedelta(hours=_JWT_EXPIRE_H),
     }
-    return jwt.encode(payload, _jwt_secret(), algorithm=_ALGORITHM)
+    return jwt.encode(payload, _admin_jwt_secret(), algorithm=_ALGORITHM)
 
 
 def decode_jwt(token: str) -> str:
     """Decode and validate an admin JWT. Returns admin_username or raises JWTError."""
-    payload = jwt.decode(token, _jwt_secret(), algorithms=[_ALGORITHM])
+    payload = jwt.decode(token, _admin_jwt_secret(), algorithms=[_ALGORITHM])
     sub: str | None = payload.get("sub")
     if not sub or payload.get("type") != "admin_access":
         raise JWTError("Token payload is invalid.")
     return sub
 
 
-# ── User JWT (separate secret, 30-day TTL) ────────────────────────────────────
+# ── User JWT (USER_JWT_SECRET, 30-day TTL) ────────────────────────────────────
 
 def _user_jwt_secret() -> str:
     s = os.getenv("USER_JWT_SECRET")
@@ -99,85 +176,3 @@ def decode_user_jwt(token: str) -> int:
     if not sub or payload.get("type") != "user_access":
         raise JWTError("Token payload is invalid.")
     return int(sub)
-
-
-# ── OTP helpers ────────────────────────────────────────────────────────────────
-
-def generate_otp(admin_id: int, admin_username: str) -> tuple[str, str]:
-    """
-    Create a random 6-digit OTP and a cryptographically random temp_token.
-    Stores them in the in-memory OTP store.
-    Returns (temp_token, otp).
-    """
-    # Revoke any previous pending OTP for this admin (prevents flooding)
-    for key, val in list(_otp_store.items()):
-        if val["admin_id"] == admin_id:
-            del _otp_store[key]
-
-    temp_token = secrets.token_urlsafe(32)
-    otp        = str(random.randint(100_000, 999_999))
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=_OTP_EXPIRE_MIN)
-
-    _otp_store[temp_token] = {
-        "otp":            otp,
-        "admin_id":       admin_id,
-        "admin_username": admin_username,
-        "expires_at":     expires_at,
-    }
-    return temp_token, otp
-
-
-def consume_otp(temp_token: str, otp: str) -> str:
-    """
-    Validate the OTP for the given temp_token.
-    Deletes the entry on success (single-use) or expiry.
-    Returns admin_username on success; raises ValueError on failure.
-    """
-    entry = _otp_store.get(temp_token)
-    if not entry:
-        raise ValueError("Invalid or expired session token. Please log in again.")
-
-    if datetime.now(timezone.utc) > entry["expires_at"]:
-        del _otp_store[temp_token]
-        raise ValueError(f"OTP expired. Please log in again.")
-
-    if entry["otp"] != otp.strip():
-        raise ValueError("Incorrect OTP. Please try again.")
-
-    username = entry["admin_username"]
-    del _otp_store[temp_token]   # single-use: destroy after successful verification
-    return username
-
-
-# ── Telegram delivery ──────────────────────────────────────────────────────────
-
-async def send_telegram_otp(chat_id: str, otp: str, admin_username: str) -> None:
-    """
-    Send the 6-digit OTP to the admin's Telegram chat via the Bot API.
-    Raises RuntimeError on any failure.
-    """
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not bot_token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in environment variables.")
-
-    message = (
-        f"🔐 *Reward Scheme Admin*\n\n"
-        f"Login attempt detected for account `{admin_username}`.\n\n"
-        f"Your one-time OTP is:\n\n"
-        f"*{otp}*\n\n"
-        f"⏰ Expires in {_OTP_EXPIRE_MIN} minutes.\n"
-        f"🚫 Do *not* share this code with anyone."
-    )
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(url, json={
-            "chat_id":    chat_id,
-            "text":       message,
-            "parse_mode": "Markdown",
-        })
-
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Telegram API returned {resp.status_code}: {resp.text}"
-        )

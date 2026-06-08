@@ -1,0 +1,4 @@
+REWARD_Sk@30sk
+
+
+postgresql://postgres:REWARD_Sk@30sk@db.cynknurnzljcomandqyg.supabase.co:5432/postgres

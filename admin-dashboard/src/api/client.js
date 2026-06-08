@@ -95,6 +95,32 @@ export function triggerDownload(blob, filename) {
   URL.revokeObjectURL(url)
 }
 
+// ── Analytics — Phase 4A endpoints ───────────────────────────────────────────
+
+/** GET /admin/stats/financials — full financial & liability snapshot */
+export const getFinancials = () =>
+  api.get('/admin/stats/financials')
+
+/** GET /admin/stats/pools — pool-wise micro analytics + member lists */
+export const getPoolStats = () =>
+  api.get('/admin/stats/pools')
+
+/** GET /admin/stats/tokens — DEP / WIT / REF breakdown by status */
+export const getTokenStats = () =>
+  api.get('/admin/stats/tokens')
+
+/** GET /admin/stats/ai-forecast — waitlist velocity + liquidity runway */
+export const getAiForecast = (lookbackDays = 30) =>
+  api.get('/admin/stats/ai-forecast', { params: { lookback_days: lookbackDays } })
+
+/** GET /admin/stats/charts — time-series chart data (day or week) */
+export const getChartData = (days = 30, granularity = 'auto') =>
+  api.get('/admin/stats/charts', { params: { days, granularity } })
+
+/** PUT /admin/tokens/{id}/status — approve or reject a pending WIT token */
+export const updateTokenStatus = (tokenId, action, note = undefined) =>
+  api.put(`/admin/tokens/${tokenId}/status`, { action, ...(note ? { note } : {}) })
+
 // ── Auth (no JWT needed for these calls) ──────────────────────────────────────
 export const adminLogin     = (username, password) =>
   api.post('/admin/auth/login',      { username, password })

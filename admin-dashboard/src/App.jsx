@@ -7,6 +7,7 @@ import Dashboard from './pages/Dashboard'
 import TokenManager from './pages/TokenManager'
 import PoolOversight from './pages/PoolOversight'
 import UserDirectory from './pages/UserDirectory'
+import Statistics from './pages/Statistics'
 import Diagnostics from './pages/Diagnostics'
 
 // Redirect to /login when no valid JWT is present
@@ -50,6 +51,7 @@ export default function App() {
               <Route path="tokens"      element={<TokenManager />} />
               <Route path="pools"       element={<PoolOversight />} />
               <Route path="users"       element={<UserDirectory />} />
+              <Route path="statistics"  element={<Statistics />} />
               <Route path="diagnostics" element={<Diagnostics />} />
               <Route path="*"           element={<Navigate to="/" replace />} />
             </Route>

@@ -1,14 +1,15 @@
 import { NavLink, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, Key, Users, UserSearch, Shield, Dot, LogOut, Activity } from 'lucide-react'
+import { LayoutDashboard, Key, Users, UserSearch, Shield, Dot, LogOut, Activity, BarChart3 } from 'lucide-react'
 import { BASE_URL } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 
 const NAV = [
-  { to: '/',           icon: LayoutDashboard, label: 'Dashboard'      },
-  { to: '/tokens',     icon: Key,             label: 'Token Manager'  },
-  { to: '/pools',      icon: Users,           label: 'Pool Oversight' },
-  { to: '/users',      icon: UserSearch,      label: 'User Directory' },
-  { to: '/diagnostics',icon: Activity,        label: 'Diagnostics'    },
+  { to: '/',            icon: LayoutDashboard, label: 'Dashboard'      },
+  { to: '/tokens',      icon: Key,             label: 'Token Manager'  },
+  { to: '/pools',       icon: Users,           label: 'Pool Oversight' },
+  { to: '/users',       icon: UserSearch,      label: 'User Directory' },
+  { to: '/statistics',  icon: BarChart3,       label: 'Statistics'     },
+  { to: '/diagnostics', icon: Activity,        label: 'Diagnostics'    },
 ]
 
 export default function Sidebar() {

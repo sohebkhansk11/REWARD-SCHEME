@@ -23,9 +23,10 @@ from jose import jwt, JWTError
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-_ALGORITHM       = "HS256"
-_JWT_EXPIRE_H    = 8        # hours until the final JWT expires
-_OTP_EXPIRE_MIN  = 5        # minutes until the temp OTP expires
+_ALGORITHM         = "HS256"
+_JWT_EXPIRE_H      = 8     # admin JWT — 8 hours
+_USER_JWT_EXPIRE_D = 30    # user JWT  — 30 days (mobile app: long session)
+_OTP_EXPIRE_MIN    = 5
 
 # temp_token → {otp, admin_id, admin_username, expires_at}
 _otp_store: dict[str, dict] = {}
@@ -71,6 +72,33 @@ def decode_jwt(token: str) -> str:
     if not sub or payload.get("type") != "admin_access":
         raise JWTError("Token payload is invalid.")
     return sub
+
+
+# ── User JWT (separate secret, 30-day TTL) ────────────────────────────────────
+
+def _user_jwt_secret() -> str:
+    s = os.getenv("USER_JWT_SECRET")
+    if not s:
+        raise RuntimeError("USER_JWT_SECRET is not set in environment variables.")
+    return s
+
+
+def create_user_jwt(user_id: int) -> str:
+    payload = {
+        "sub":  str(user_id),
+        "type": "user_access",
+        "exp":  datetime.now(timezone.utc) + timedelta(days=_USER_JWT_EXPIRE_D),
+    }
+    return jwt.encode(payload, _user_jwt_secret(), algorithm=_ALGORITHM)
+
+
+def decode_user_jwt(token: str) -> int:
+    """Decode a user JWT. Returns user_id (int) or raises JWTError."""
+    payload = jwt.decode(token, _user_jwt_secret(), algorithms=[_ALGORITHM])
+    sub: str | None = payload.get("sub")
+    if not sub or payload.get("type") != "user_access":
+        raise JWTError("Token payload is invalid.")
+    return int(sub)
 
 
 # ── OTP helpers ────────────────────────────────────────────────────────────────

@@ -1,17 +1,49 @@
 import axios from 'axios'
 
-// Uses VITE_API_URL env var if set, otherwise falls back to the live Render backend.
-// For local development override this in user-app/.env
 const BASE_URL = import.meta.env.VITE_API_URL || 'https://reward-scheme-api.onrender.com'
 
 const api = axios.create({ baseURL: BASE_URL })
 
-export const findUserByMobile    = (mobile)   => api.get('/users/', { params: { mobile } })
-export const findUserByUsername  = (username) => api.get('/users/', { params: { username } })
-export const registerUser        = (data)     => api.post('/users/', data)
-export const getUser             = (id)       => api.get(`/users/${id}`)
-export const getUsers            = (params)   => api.get('/users/', { params: { limit: 200, ...params } })
-export const redeemToken         = (code, userId) =>
+// ── Auth interceptors ─────────────────────────────────────────────────────────
+
+// Attach the user JWT to every request if one is stored in localStorage.
+api.interceptors.request.use(config => {
+  const token = localStorage.getItem('rs_user_jwt')
+  if (token) config.headers['Authorization'] = `Bearer ${token}`
+  return config
+})
+
+// On 401, wipe credentials and send the user back to the auth screen.
+api.interceptors.response.use(
+  res => res,
+  err => {
+    if (err.response?.status === 401) {
+      localStorage.removeItem('rs_user_jwt')
+      localStorage.removeItem('rs_user')
+      if (!window.location.pathname.endsWith('/')) {
+        window.location.href = '/'
+      }
+    }
+    return Promise.reject(err)
+  }
+)
+
+// ── User Auth ─────────────────────────────────────────────────────────────────
+export const authRegister = (data)               => api.post('/auth/register', data)
+export const authLogin    = (username, password) => api.post('/auth/login', { username, password })
+export const authMe       = ()                   => api.get('/auth/me')
+
+// ── Users (public read — no JWT required) ────────────────────────────────────
+export const findUserByMobile   = (mobile)   => api.get('/users/', { params: { mobile } })
+export const findUserByUsername = (username) => api.get('/users/', { params: { username } })
+export const getUser            = (id)       => api.get(`/users/${id}`)
+export const getUsers           = (params)   => api.get('/users/', { params: { limit: 200, ...params } })
+
+// ── Tokens ────────────────────────────────────────────────────────────────────
+export const redeemToken = (code, userId) =>
   api.post(`/tokens/${encodeURIComponent(code)}/redeem`, { user_id: userId })
+
+// Keep these for any remaining legacy code
+export const registerUser = (data) => api.post('/users/', data)
 
 export default api

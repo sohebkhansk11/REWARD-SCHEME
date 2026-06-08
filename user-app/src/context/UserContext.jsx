@@ -1,29 +1,52 @@
-import { createContext, useContext, useState } from 'react'
+import { createContext, useContext, useState, useCallback } from 'react'
 
 const Ctx = createContext(null)
 
+const JWT_KEY  = 'rs_user_jwt'
+const USER_KEY = 'rs_user'
+
 export function UserProvider({ children }) {
-  const [user, setUser] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('rs_user')) } catch { return null }
+  const [token, setToken] = useState(() => localStorage.getItem(JWT_KEY) ?? null)
+  const [user,  setUser]  = useState(() => {
+    try { return JSON.parse(localStorage.getItem(USER_KEY)) } catch { return null }
   })
 
-  const login = data => {
-    setUser(data)
-    localStorage.setItem('rs_user', JSON.stringify(data))
-  }
+  /** Called after successful login or registration. */
+  const login = useCallback((userData, jwt) => {
+    setUser(userData)
+    localStorage.setItem(USER_KEY, JSON.stringify(userData))
+    if (jwt) {
+      setToken(jwt)
+      localStorage.setItem(JWT_KEY, jwt)
+    }
+  }, [])
 
-  const logout = () => {
+  /** Clear everything and send to auth screen. */
+  const logout = useCallback(() => {
     setUser(null)
-    localStorage.removeItem('rs_user')
-  }
+    setToken(null)
+    localStorage.removeItem(USER_KEY)
+    localStorage.removeItem(JWT_KEY)
+  }, [])
 
-  const refresh = data => {
-    const updated = { ...user, ...data }
-    setUser(updated)
-    localStorage.setItem('rs_user', JSON.stringify(updated))
-  }
+  /** Refresh only the user object (e.g. after a token redemption). */
+  const refresh = useCallback((updatedUser) => {
+    setUser(updatedUser)
+    localStorage.setItem(USER_KEY, JSON.stringify(updatedUser))
+  }, [])
 
-  return <Ctx.Provider value={{ user, login, logout, refresh }}>{children}</Ctx.Provider>
+  return (
+    <Ctx.Provider value={{
+      user,
+      token,
+      isAuthed: !!token,   // true only when a real JWT is present
+      login,
+      logout,
+      refresh,
+    }}>
+      {children}
+    </Ctx.Provider>
+  )
 }
 
 export const useUser = () => useContext(Ctx)

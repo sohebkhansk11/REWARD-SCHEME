@@ -19,9 +19,10 @@ function Wrap({ children }) {
   )
 }
 
+/** Redirect to auth screen when no valid JWT is present in localStorage. */
 function Guard({ children }) {
-  const { user } = useUser()
-  if (!user) return <Navigate to="/" replace />
+  const { isAuthed } = useUser()
+  if (!isAuthed) return <Navigate to="/" replace />
   return children
 }
 

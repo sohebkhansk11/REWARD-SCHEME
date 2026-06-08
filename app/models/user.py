@@ -36,6 +36,7 @@ class User(Base):
     )
     late_fees_inr = Column(Numeric(12, 2), default=0, server_default="0", nullable=False)
     referred_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    hashed_password = Column(String, nullable=True)   # nullable for users created before auth update
 
     pool = relationship("Pool", back_populates="members")
     tokens = relationship("Token", back_populates="user")

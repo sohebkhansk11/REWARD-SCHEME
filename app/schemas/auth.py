@@ -1,7 +1,30 @@
 from pydantic import BaseModel, Field
+from typing import Optional
 
 
-# ── Step 1: Password login ─────────────────────────────────────────────────────
+# ── User registration & login ──────────────────────────────────────────────────
+
+class UserRegisterRequest(BaseModel):
+    name:              str
+    mobile:            str
+    username:          str
+    password:          str = Field(min_length=6)
+    deposit_token:     str = Field(description="Active DEP-XXXXXX token code")
+    referred_by_username: Optional[str] = None
+
+
+class UserLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class UserJWTResponse(BaseModel):
+    access_token: str
+    token_type:   str = "bearer"
+    user:         dict                   # full UserResponse serialised as dict
+
+
+# ── Step 1: Admin password login ───────────────────────────────────────────────
 
 class AdminLoginRequest(BaseModel):
     username: str

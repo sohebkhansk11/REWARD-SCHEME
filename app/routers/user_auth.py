@@ -15,6 +15,7 @@ Registration atomically:
   6. Returns a 30-day User JWT.
 """
 
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 
@@ -94,9 +95,12 @@ def register(
     db.commit()
     db.refresh(new_user)
 
-    # 5. Burn the deposit token and link it to the new user
-    token.user_id = new_user.id
-    token.status  = TokenStatus.Burned
+    # 5. Burn the deposit token — stamp the full audit trail
+    now = datetime.now(timezone.utc)
+    token.user_id             = new_user.id
+    token.status              = TokenStatus.Burned
+    token.redeemed_at         = now
+    token.redeemed_by_user_id = new_user.id
     db.commit()
     db.refresh(new_user)
 
@@ -243,9 +247,12 @@ def rejoin(
     user.current_level         = 1
     user.current_pool_id       = None
 
-    # Burn the deposit token
-    token.user_id = user.id
-    token.status  = TokenStatus.Burned
+    # Burn the deposit token — stamp full audit trail
+    now = datetime.now(timezone.utc)
+    token.user_id             = user.id
+    token.status              = TokenStatus.Burned
+    token.redeemed_at         = now
+    token.redeemed_by_user_id = user.id
     db.commit()
     db.refresh(user)
 

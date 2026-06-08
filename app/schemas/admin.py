@@ -1,11 +1,13 @@
 from pydantic import BaseModel
 from typing import Optional
 from decimal import Decimal
+from datetime import datetime
 
-from app.models.token import TokenType
+from app.models.token import TokenType, TokenStatus
 from app.schemas.token import TokenResponse
 from app.schemas.user import UserResponse
 from app.schemas.pool import PoolResponse
+from app.models.user import UserStatus
 
 
 # --- Token endpoints ---
@@ -55,3 +57,76 @@ class WaitlistCheckResponse(BaseModel):
     paid_waitlist_count: int
     pool_created: Optional[PoolResponse] = None
     message: str
+
+
+# ── Admin User Management ──────────────────────────────────────────────────────
+
+class AdminUserListItem(BaseModel):
+    """One row in GET /admin/users — includes computed payment timestamp."""
+    id:                     int
+    name:                   str
+    mobile:                 str
+    username:               str
+    status:                 str
+    current_level:          int
+    current_pool_id:        Optional[int]
+    weekly_payment_status:  str
+    late_fees_inr:          Decimal
+    join_date:              datetime
+    first_payment_at:       Optional[datetime]   # earliest burned DEP token
+    referred_by_user_id:    Optional[int]
+
+    model_config = {"from_attributes": True}
+
+
+class AdminTokenSummary(BaseModel):
+    """Token summary embedded inside AdminUserDetail."""
+    id:                  int
+    code:                str
+    type:                str
+    value_inr:           Decimal
+    status:              str
+    created_at:          Optional[datetime]
+    redeemed_at:         Optional[datetime]
+
+    model_config = {"from_attributes": True}
+
+
+class AdminUserDetail(AdminUserListItem):
+    """GET /admin/users/{id} — comprehensive profile."""
+    total_wins:       int              # count of WIT tokens
+    total_won_inr:    Decimal          # sum of WIT token values
+    tokens:           list[AdminTokenSummary]
+
+
+# ── Admin Token Audit ──────────────────────────────────────────────────────────
+
+class AdminTokenAudit(BaseModel):
+    """One row in GET /admin/tokens — enriched with owner + redeemer usernames."""
+    id:                  int
+    code:                str
+    type:                str
+    value_inr:           Decimal
+    status:              str
+    created_at:          Optional[datetime]
+    redeemed_at:         Optional[datetime]
+    user_id:             Optional[int]
+    user_username:       Optional[str]
+    user_name:           Optional[str]
+    redeemed_by_user_id: Optional[int]
+    redeemed_by_username: Optional[str]
+
+
+# ── CSV Import ─────────────────────────────────────────────────────────────────
+
+class ImportError(BaseModel):
+    row:    int
+    mobile: str
+    reason: str
+
+
+class ImportSummaryResponse(BaseModel):
+    total_rows:    int
+    created_count: int
+    skipped_count: int
+    errors:        list[ImportError]

@@ -1,4 +1,5 @@
 from decimal import Decimal
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -81,7 +82,10 @@ def burn_token(code: str, db: Session = Depends(get_db)):
     if token.status == TokenStatus.Burned:
         raise HTTPException(status_code=400, detail="Token is already burned.")
 
-    return crud_token.update_token(db, token.id, TokenUpdate(status=TokenStatus.Burned))
+    return crud_token.update_token(
+        db, token.id,
+        TokenUpdate(status=TokenStatus.Burned, redeemed_at=datetime.now(timezone.utc)),
+    )
 
 
 # ── Token Management ──────────────────────────────────────────────────────────

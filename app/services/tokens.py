@@ -1,6 +1,7 @@
 import random
 import string
 from decimal import Decimal
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.core.config import DEPOSIT_AMOUNT_INR
@@ -65,8 +66,13 @@ def redeem_deposit_token(db: Session, code: str, user_id: int):
     if user.weekly_payment_status == WeeklyPaymentStatus.Paid:
         raise ValueError("User has already paid for this week")
 
-    # Burn the token and assign to user
-    crud_token.update_token(db, token.id, TokenUpdate(user_id=user_id, status=TokenStatus.Burned))
+    # Burn the token, assign to user, stamp the redemption audit trail
+    crud_token.update_token(db, token.id, TokenUpdate(
+        user_id=user_id,
+        status=TokenStatus.Burned,
+        redeemed_at=datetime.now(timezone.utc),
+        redeemed_by_user_id=user_id,
+    ))
 
     # Determine new user status: nudge unclassified users to Waitlist
     new_status = user.status if user.status in (UserStatus.Active, UserStatus.Waitlist) else UserStatus.Waitlist

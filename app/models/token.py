@@ -12,8 +12,9 @@ class TokenType(str, enum.Enum):
 
 
 class TokenStatus(str, enum.Enum):
-    Active = "Active"
-    Burned = "Burned"
+    Active   = "Active"
+    Burned   = "Burned"
+    Rejected = "Rejected"   # admin-voided (fraud / admin override) — requires DB migration
 
 
 class Token(Base):

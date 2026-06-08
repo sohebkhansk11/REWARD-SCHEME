@@ -24,8 +24,11 @@ from app.services import draw as svc_draw
 from app.models.user import User
 from app.schemas.user import UserResponse
 from app.schemas.pool import PoolResponse
+from app.core.security import require_admin_jwt
 
-router = APIRouter(tags=["Admin"])
+# Every endpoint on this router requires a valid Admin JWT.
+# The JWT is validated by require_admin_jwt before the handler runs.
+router = APIRouter(tags=["Admin"], dependencies=[Depends(require_admin_jwt)])
 
 
 # ── Aggregate Stats ───────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ from app.database import engine, Base
 import app.models  # noqa: F401 — registers all ORM models with SQLAlchemy metadata
 from app.routers import users, pools, tokens
 from app.routers import admin
+from app.routers import auth as auth_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -48,10 +49,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router.router)  # /admin/auth/* — public, no JWT required
 app.include_router(pools.router)
 app.include_router(users.router)
 app.include_router(tokens.router)
-app.include_router(admin.router)
+app.include_router(admin.router)        # /admin/* — ALL routes require Admin JWT
 
 
 @app.get("/", tags=["Health"])

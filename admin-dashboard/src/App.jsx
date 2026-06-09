@@ -11,6 +11,7 @@ import Statistics from './pages/Statistics'
 import ReferralQueue from './pages/ReferralQueue'
 import Diagnostics from './pages/Diagnostics'
 import DevTools from './pages/DevTools'
+import SystemSettings from './pages/SystemSettings'
 
 // Dev Tools route is only accessible when the build was compiled with
 // VITE_ENABLE_DEV_MODE=true.  Any other value redirects to the dashboard.
@@ -65,6 +66,7 @@ export default function App() {
               <Route path="statistics"  element={<Statistics />} />
               <Route path="referrals"   element={<ReferralQueue />} />
               <Route path="diagnostics" element={<Diagnostics />} />
+              <Route path="settings"    element={<SystemSettings />} />
               <Route path="dev-tools"   element={<DevModeRoute><DevTools /></DevModeRoute>} />
               <Route path="*"           element={<Navigate to="/" replace />} />
             </Route>

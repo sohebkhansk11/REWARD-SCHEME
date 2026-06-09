@@ -8,27 +8,31 @@ import GlassCard from '../components/GlassCard'
 import BottomNav from '../components/BottomNav'
 import CountdownTimer from '../components/CountdownTimer'
 
-// ─── Payout matrix (L1–L6 only — the system maxes at Level 6) ────────────────
+// ─── Payout matrix ────────────────────────────────────────────────────────────
 const PAYOUT_TABLE = [
-  { level: 1, net: 2000 },
-  { level: 2, net: 3000 },
-  { level: 3, net: 4000 },
-  { level: 4, net: 5500 },
-  { level: 5, net: 6500 },
-  { level: 6, net: 8000 },
+  { level: 1,  net: 2000  },
+  { level: 2,  net: 3000  },
+  { level: 3,  net: 4000  },
+  { level: 4,  net: 5500  },
+  { level: 5,  net: 6500  },
+  { level: 6,  net: 8000  },
+  { level: 7,  net: 10000 },
+  { level: 8,  net: 12500 },
+  { level: 9,  net: 15500 },
+  { level: 10, net: 19000 },
+  { level: 11, net: 23000 },
+  { level: 12, net: 28000 },
 ]
 
 // ─── Indian Rupee format: ₹ 5,500 💸 ─────────────────────────────────────────
 const INR = (v) => `₹ ${Number(v).toLocaleString('en-IN')} 💸`
 
-// ─── Tier accent colours (one per level, L1–L6) ───────────────────────────────
+// ─── Tier accent colours ──────────────────────────────────────────────────────
 const TIER_COLOR = [
-  '#00f0ff',  // L1
-  '#00c8ff',  // L2
-  '#0090ff',  // L3
-  '#bf00ff',  // L4
-  '#9900dd',  // L5
-  '#ff00aa',  // L6
+  '#00f0ff','#00c8ff','#0090ff',
+  '#bf00ff','#9900dd','#ff00aa',
+  '#ff4400','#ff6600','#ff8800',
+  '#ffaa00','#ffcc00','#ffe500',
 ]
 
 // ─── Floating gem particle ────────────────────────────────────────────────────
@@ -446,7 +450,7 @@ export default function DrawPage() {
           </div>
 
           <p className="text-[10px] text-white/15 font-mono mt-3 text-center">
-            Net payout after ₹ 500 platform fee · Draws every Sunday 7 PM IST
+            L7–L12 represent extended pool projections
           </p>
         </GlassCard>
 

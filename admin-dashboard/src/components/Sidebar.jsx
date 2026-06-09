@@ -1,7 +1,11 @@
 import { NavLink, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, Key, Users, UserSearch, Shield, Dot, LogOut, Activity, BarChart3 } from 'lucide-react'
+import { LayoutDashboard, Key, Users, UserSearch, Shield, Dot, LogOut, Activity, BarChart3, Terminal } from 'lucide-react'
 import { BASE_URL } from '../api/client'
 import { useAuth } from '../context/AuthContext'
+
+// Dev Tools tab is ONLY shown when the build was compiled with VITE_ENABLE_DEV_MODE=true.
+// In all other cases the link does not appear in the sidebar at all.
+const IS_DEV_MODE = import.meta.env.VITE_ENABLE_DEV_MODE === 'true'
 
 const NAV = [
   { to: '/',            icon: LayoutDashboard, label: 'Dashboard'      },
@@ -10,6 +14,8 @@ const NAV = [
   { to: '/users',       icon: UserSearch,      label: 'User Directory' },
   { to: '/statistics',  icon: BarChart3,       label: 'Statistics'     },
   { to: '/diagnostics', icon: Activity,        label: 'Diagnostics'    },
+  // Conditionally append the Dev Tools entry — never shown in production builds
+  ...(IS_DEV_MODE ? [{ to: '/dev-tools', icon: Terminal, label: 'Dev Tools', devOnly: true }] : []),
 ]
 
 export default function Sidebar() {
@@ -36,21 +42,33 @@ export default function Sidebar() {
 
       {/* Nav */}
       <nav className="flex-1 px-3 pt-4 space-y-0.5">
-        {NAV.map(({ to, icon: Icon, label }) => (
+        {NAV.map(({ to, icon: Icon, label, devOnly }) => (
           <NavLink
             key={to}
             to={to}
             end={to === '/'}
-            className={({ isActive }) =>
-              `flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+            className={({ isActive }) => {
+              if (devOnly) {
+                return `flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors mt-1 ${
+                  isActive
+                    ? 'bg-red-700/80 text-red-100 shadow-md shadow-red-900/40'
+                    : 'text-red-400/80 hover:text-red-300 hover:bg-red-900/30 border border-red-900/40'
+                }`
+              }
+              return `flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
                 isActive
                   ? 'bg-blue-600 text-white shadow-md shadow-blue-900/30'
                   : 'text-slate-400 hover:text-white hover:bg-slate-800'
               }`
-            }
+            }}
           >
             <Icon className="w-4 h-4 flex-shrink-0" />
             {label}
+            {devOnly && (
+              <span className="ml-auto text-[9px] font-bold bg-red-900/60 text-red-400 border border-red-800/60 px-1.5 py-0.5 rounded tracking-widest">
+                DEV
+              </span>
+            )}
           </NavLink>
         ))}
       </nav>

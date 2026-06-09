@@ -121,6 +121,25 @@ export const getChartData = (days = 30, granularity = 'auto') =>
 export const updateTokenStatus = (tokenId, action, note = undefined) =>
   api.put(`/admin/tokens/${tokenId}/status`, { action, ...(note ? { note } : {}) })
 
+// ── Developer Mode — /dev/* endpoints (JWT + ENABLE_DEV_MODE=true required) ───
+// JWT is attached automatically by the request interceptor above.
+
+/** POST /dev/force-draw — instantly run Sunday draw; auto-pays unpaid members */
+export const forceDrawDev = (poolId = undefined) =>
+  api.post('/dev/force-draw', poolId ? { pool_id: poolId } : {})
+
+/** POST /dev/simulate-cycle — generate fake users + run N draw cycles */
+export const simulateCycleDev = (nCycles = 3, cleanup = true) =>
+  api.post('/dev/simulate-cycle', { n_cycles: nCycles, cleanup })
+
+/** POST /dev/simulate-users — bulk-insert fake Waitlist users with Burned DEP tokens */
+export const simulateUsersDev = (count, autoPool = true) =>
+  api.post('/dev/simulate-users', { count, auto_pool: autoPool })
+
+/** DELETE /dev/reset-data — nuke all users/pools/tokens; reset DB sequences */
+export const resetDataDev = () =>
+  api.delete('/dev/reset-data', { data: { confirm: 'CONFIRM_NUKE' } })
+
 // ── Auth (no JWT needed for these calls) ──────────────────────────────────────
 export const adminLogin     = (username, password) =>
   api.post('/admin/auth/login',      { username, password })

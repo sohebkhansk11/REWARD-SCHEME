@@ -47,9 +47,11 @@ def _credit_referral_bonus(db: Session, referrer_id: int) -> None:
     Add REFERRAL_REWARD_INR to the referrer's accumulated_referral_bonus_inr
     and increment their total_referrals_count.
 
-    Called at registration time (user_auth.py) when a new user joins with a
-    referral code.  No individual token is generated — the balance accumulates
-    in the user's profile and is paid out on request via POST /users/request-referral-payout.
+    Called when a referred user ENTERS AN ACTIVE POOL (Rule 39) — never at
+    registration.  No individual token is generated; the balance accumulates
+    in the user's profile and is paid out on request via
+    POST /users/request-referral-payout.
+    Caller is responsible for db.commit().
     """
     referrer: User | None = db.query(User).filter(User.id == referrer_id).first()
     if not referrer:
@@ -111,13 +113,17 @@ def _next_paid_waitlist_member(db: Session) -> User | None:
 
 def _issue_referral_token(db: Session, new_active_user: User) -> None:
     """
-    Phase 5+ NOTE: referral bonuses are no longer issued as individual REF tokens
-    when a user enters an active pool.  Bonuses are now credited at REGISTRATION
-    TIME as a cumulative balance (User.accumulated_referral_bonus_inr) via
-    _credit_referral_bonus() called from user_auth.py.
+    Legacy no-op — retained only to avoid import errors in waitlist.py.
 
-    This function is retained as a no-op to avoid import errors in callers
-    (waitlist.py) and will be removed in a future cleanup pass.
+    Phase 5 design: referral bonuses are credited as a cumulative balance
+    (User.accumulated_referral_bonus_inr) via _credit_referral_bonus() at the
+    moment a referred user ENTERS AN ACTIVE POOL (Rule 39), NOT at registration.
+    There are three pool-entry paths:
+      1. waitlist.py  — bulk auto-scale (24 paid waitlist → new pool)
+      2. draw.py      — replacement fill after each winner is drawn
+      3. admin.py     — vacancy fill after elimination
+
+    This stub will be removed in a future cleanup pass.
     """
     return  # intentional no-op — see docstring above
 

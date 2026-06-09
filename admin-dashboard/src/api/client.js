@@ -57,7 +57,11 @@ export const getPoolSettings     = ()        => api.get('/admin/pool-settings')
 /** POST /admin/pool-settings/auto-creation?enabled=bool — flips the toggle */
 export const setAutoPoolCreation = (enabled) => api.post(`/admin/pool-settings/auto-creation?enabled=${enabled}`)
 /** POST /admin/pools/manual-create — force-create pool from oldest paid waitlist members */
-export const manualCreatePool    = ()        => api.post('/admin/pools/manual-create')
+export const manualCreatePool       = ()        => api.post('/admin/pools/manual-create')
+/** POST /admin/waitlist/check — fill existing pool vacancies then auto-scale */
+export const fillPoolVacancies      = ()        => api.post('/admin/waitlist/check')
+/** POST /admin/pools/sync-member-counts — recompute + fix stale pool.total_members */
+export const syncPoolMemberCounts   = ()        => api.post('/admin/pools/sync-member-counts')
 
 // ── Penalties ────────────────────────────────────────────────────────────────
 export const applyDailyPenalty = () => api.post('/admin/penalty/apply-daily')

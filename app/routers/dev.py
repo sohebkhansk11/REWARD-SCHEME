@@ -26,17 +26,19 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import insert as sa_insert, text
+from sqlalchemy import func, insert as sa_insert, text
 from sqlalchemy.orm import Session
 
-from app.core.config import DEPOSIT_AMOUNT_INR
+from app.core.config import DEPOSIT_AMOUNT_INR, NEW_POOL_INTAKE, POOL_CAPACITY
 from app.core.dev_guard import require_dev_mode
 from app.database import get_db
+from app.crud import pool as crud_pool
 from app.models.pool import Pool, PoolStatus
 from app.models.token import Token, TokenType, TokenStatus
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
+from app.schemas.pool import PoolCreate
 from app.services.draw import run_dual_draw
-from app.services.waitlist import check_and_scale_waitlist
+from app.services.waitlist import fill_pool_vacancies, manual_create_pool
 
 router = APIRouter(
     prefix="/dev",
@@ -218,9 +220,34 @@ def force_draw(body: ForceDrawRequest, db: Session = Depends(get_db)):
         if not pool:
             raise HTTPException(status_code=404, detail=f"Pool {body.pool_id} not found.")
     else:
-        pool = db.query(Pool).filter(Pool.status == PoolStatus.Active).first()
+        # Auto-select: find the first Active pool that currently has exactly
+        # POOL_CAPACITY members.  A pool with fewer members causes run_dual_draw
+        # to raise ValueError, so we skip incomplete pools here and tell the
+        # admin to run FIFO fill first if none qualify.
+        pool = None
+        for _p in (
+            db.query(Pool)
+            .filter(Pool.status == PoolStatus.Active)
+            .order_by(Pool.id.asc())
+            .all()
+        ):
+            _actual = (
+                db.query(func.count(User.id))
+                .filter(User.current_pool_id == _p.id, User.status == UserStatus.Active)
+                .scalar() or 0
+            )
+            if _actual == POOL_CAPACITY:
+                pool = _p
+                break
         if not pool:
-            raise HTTPException(status_code=404, detail="No active pools found.")
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No active pool with exactly 12 members found. "
+                    "Run 'Fill Pool Vacancies' (POST /admin/waitlist/check) first, "
+                    "then retry — or specify a pool_id explicitly."
+                ),
+            )
 
     # ── Pay unpaid members ────────────────────────────────────────────────────
     unpaid = (
@@ -331,19 +358,54 @@ def simulate_cycle(body: SimulateCycleRequest, db: Session = Depends(get_db)):
         db.execute(sa_insert(User), user_rows[start : start + _BULK_BATCH])
     db.commit()
 
-    # ── 2. Trigger pool creation ──────────────────────────────────────────────
-    new_pool = check_and_scale_waitlist(db)
-    if not new_pool:
-        _cleanup_dev_users(db, prefix, pool_id=None)
+    # ── 2. Create isolated dev pool (bypasses AUTO_POOL_CREATION_ENABLED toggle) ─
+    #
+    # We create the pool directly instead of calling check_and_scale_waitlist so:
+    #   (a) The admin toggle state does NOT block the simulation.
+    #   (b) Real waitlisted users are NOT consumed for the initial 12-member fill;
+    #       only the freshly-created dev users are assigned.
+    #
+    # Derive next sequential pool name using the same alphabet logic used in
+    # waitlist._next_pool_name (Pool A → B → … → Z → AA → …).
+    _pool_count = db.query(Pool).count()
+    _letters    = ""
+    _n          = _pool_count
+    while True:
+        _letters = chr(65 + _n % 26) + _letters
+        _n       = _n // 26 - 1
+        if _n < 0:
+            break
+    dev_pool_name = f"Pool {_letters}"
+
+    new_pool = crud_pool.create_pool(
+        db,
+        PoolCreate(name=dev_pool_name, status=PoolStatus.Active, total_members=NEW_POOL_INTAKE),
+    )
+    pool_id = new_pool.id
+
+    # Pull the first NEW_POOL_INTAKE dev-prefix users and activate them directly.
+    first_batch: list[User] = (
+        db.query(User)
+        .filter(User.username.like(f"{prefix}%"))
+        .order_by(User.id.asc())
+        .limit(NEW_POOL_INTAKE)
+        .all()
+    )
+    if len(first_batch) < NEW_POOL_INTAKE:
+        _cleanup_dev_users(db, prefix, pool_id=pool_id)
         raise HTTPException(
             status_code=500,
             detail=(
-                "Waitlist scaling did not trigger. "
-                "Combined real + fake waitlist count may still be below the 24-user threshold."
+                f"Only {len(first_batch)} dev users were inserted; "
+                f"need {NEW_POOL_INTAKE} to populate the dev pool."
             ),
         )
-
-    pool_id = new_pool.id
+    for _member in first_batch:
+        _member.status                = UserStatus.Active
+        _member.current_pool_id       = pool_id
+        _member.current_level         = 1
+        _member.weekly_payment_status = WeeklyPaymentStatus.Paid
+    db.commit()
 
     # ── 3. Run N draw cycles ──────────────────────────────────────────────────
     traces:           list[DrawTrace] = []
@@ -512,8 +574,16 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
     # ── Auto-form pools ───────────────────────────────────────────────────────
     pools_formed = 0
     if body.auto_pool:
+        # Step 1: fill existing pool vacancies before creating new pools.
+        # This fixes any under-capacity active pools (e.g. after eliminations)
+        # regardless of the AUTO_POOL_CREATION_ENABLED toggle state.
+        fill_pool_vacancies(db)
+
+        # Step 2: create new pools while ≥ NEW_POOL_INTAKE paid members remain.
+        # Use manual_create_pool (ignores the toggle) so this dev tool works
+        # whether auto-creation is ON or OFF.
         while True:
-            new_pool = check_and_scale_waitlist(db)
+            new_pool = manual_create_pool(db)
             if not new_pool:
                 break
             pools_formed += 1

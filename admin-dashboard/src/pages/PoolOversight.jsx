@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from 'react'
-import { ChevronDown, ChevronRight, Zap, RefreshCw, AlertCircle, Shield, AlertTriangle, UserX, Settings, PlusCircle, ToggleLeft, ToggleRight } from 'lucide-react'
+import { ChevronDown, ChevronRight, Zap, RefreshCw, AlertCircle, Shield, AlertTriangle, UserX, Settings, PlusCircle, ToggleLeft, ToggleRight, Layers, BarChart2 } from 'lucide-react'
 import Spinner from '../components/Spinner'
 import StatusBadge from '../components/StatusBadge'
 import {
   getPools, getUsers, triggerDraw, applyDailyPenalty, eliminateUnpaid, BASE_URL,
   getPoolSettings, setAutoPoolCreation, manualCreatePool,
+  fillPoolVacancies, syncPoolMemberCounts,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -204,6 +205,12 @@ export default function PoolOversight() {
   const [manualCreateLoading,   setManualCreateLoading]   = useState(false)
   const [manualCreateResult,    setManualCreateResult]    = useState(null)
 
+  // ── Maintenance actions ───────────────────────────────────────────────────
+  const [fillVacanciesLoading,  setFillVacanciesLoading]  = useState(false)
+  const [fillVacanciesResult,   setFillVacanciesResult]   = useState(null)
+  const [syncCountsLoading,     setSyncCountsLoading]     = useState(false)
+  const [syncCountsResult,      setSyncCountsResult]      = useState(null)
+
   const fetchAll = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     else setRefreshing(true)
@@ -262,6 +269,39 @@ export default function PoolOversight() {
       toast(err.response?.data?.detail ?? 'Manual pool creation failed', 'error')
     } finally {
       setManualCreateLoading(false)
+    }
+  }
+
+  // ── Fill pool vacancies (FIFO from waitlist) ─────────────────────────────
+  const handleFillVacancies = async () => {
+    setFillVacanciesLoading(true)
+    setFillVacanciesResult(null)
+    try {
+      const res = await fillPoolVacancies()
+      setFillVacanciesResult(res.data)
+      const msg = res.data.message ?? 'Vacancy fill complete'
+      toast(msg, 'success')
+      fetchAll(true)
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Vacancy fill failed', 'error')
+    } finally {
+      setFillVacanciesLoading(false)
+    }
+  }
+
+  // ── Sync stale pool.total_members ─────────────────────────────────────────
+  const handleSyncCounts = async () => {
+    setSyncCountsLoading(true)
+    setSyncCountsResult(null)
+    try {
+      const res = await syncPoolMemberCounts()
+      setSyncCountsResult(res.data)
+      toast(res.data.message, res.data.synced_count > 0 ? 'success' : 'info')
+      fetchAll(true)
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Sync failed', 'error')
+    } finally {
+      setSyncCountsLoading(false)
     }
   }
 
@@ -417,6 +457,82 @@ export default function PoolOversight() {
             )}
           </div>
         )}
+      </div>
+
+      {/* ── Maintenance Actions ─────────────────────────────────────────────── */}
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 space-y-5">
+        <div className="flex items-center gap-2">
+          <Layers className="w-4 h-4 text-sky-500" />
+          <h2 className="font-semibold text-slate-800">Pool Maintenance</h2>
+        </div>
+
+        {/* Fill vacancies row */}
+        <div className="flex items-start gap-4 p-4 rounded-xl bg-slate-50 border border-slate-100">
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium text-slate-700">Fill Pool Vacancies (FIFO)</p>
+            <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
+              Assigns the oldest paid Waitlist members into any active pools that have fewer than
+              12 members. Fixes under-capacity pools caused by eliminations or manual changes.
+              Run this whenever Pool Oversight shows member counts below 12.
+            </p>
+            {fillVacanciesResult && (
+              <p className="mt-2 text-xs font-medium text-sky-700">
+                {fillVacanciesResult.message}
+                {fillVacanciesResult.pool_created && (
+                  <span className="ml-1 text-emerald-600">
+                    — also created pool <span className="font-mono">{fillVacanciesResult.pool_created.name}</span>
+                  </span>
+                )}
+              </p>
+            )}
+          </div>
+          <button
+            onClick={handleFillVacancies}
+            disabled={fillVacanciesLoading}
+            className="flex-shrink-0 inline-flex items-center gap-2 px-4 py-2.5 bg-sky-600 hover:bg-sky-700 text-white rounded-xl text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed shadow-sm transition-colors"
+          >
+            {fillVacanciesLoading
+              ? <><Spinner className="w-4 h-4" />Filling…</>
+              : <><Layers className="w-4 h-4" />Fill Vacancies</>
+            }
+          </button>
+        </div>
+
+        {/* Sync member counts row */}
+        <div className="flex items-start gap-4 p-4 rounded-xl bg-slate-50 border border-slate-100">
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium text-slate-700">Sync Member Count Cache</p>
+            <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
+              Recalculates and corrects <span className="font-mono">pool.total_members</span> for
+              every pool based on the actual active user count. Fixes the Dashboard showing
+              stale values like "12/12" when a pool actually has fewer members.
+            </p>
+            {syncCountsResult && (
+              <p className="mt-2 text-xs font-medium text-slate-600">
+                {syncCountsResult.message}
+              </p>
+            )}
+            {syncCountsResult?.changes?.length > 0 && (
+              <ul className="mt-1.5 space-y-0.5">
+                {syncCountsResult.changes.map(c => (
+                  <li key={c.pool_id} className="text-xs text-slate-500 font-mono">
+                    {c.pool_name}: {c.was} → <span className="text-emerald-600 font-semibold">{c.now}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <button
+            onClick={handleSyncCounts}
+            disabled={syncCountsLoading}
+            className="flex-shrink-0 inline-flex items-center gap-2 px-4 py-2.5 bg-slate-700 hover:bg-slate-800 text-white rounded-xl text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed shadow-sm transition-colors"
+          >
+            {syncCountsLoading
+              ? <><Spinner className="w-4 h-4" />Syncing…</>
+              : <><BarChart2 className="w-4 h-4" />Sync Counts</>
+            }
+          </button>
+        </div>
       </div>
 
       {/* Penalty Actions */}

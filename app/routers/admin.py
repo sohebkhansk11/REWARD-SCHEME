@@ -24,7 +24,7 @@ from app.services import waitlist as svc_waitlist
 from app.services import draw as svc_draw
 from app.models.user import User
 from app.schemas.user import UserResponse
-from app.schemas.pool import PoolResponse
+from app.schemas.pool import PoolResponse, PoolUpdate
 from app.core.security import require_admin_jwt
 
 # Every endpoint on this router requires a valid Admin JWT.
@@ -269,6 +269,47 @@ def manual_create_pool(db: Session = Depends(get_db)):
     }
 
 
+# ── Pool Member Count Sync ────────────────────────────────────────────────────
+
+@router.post("/admin/pools/sync-member-counts")
+def sync_pool_member_counts(db: Session = Depends(get_db)):
+    """
+    Admin: recompute and persist pool.total_members for EVERY pool by counting
+    Active users actually assigned to each pool.
+
+    Use this to fix dashboard discrepancies caused by stale cached counts
+    (e.g. after eliminations that didn't re-sync, or data migrations).
+    Returns a list of pools whose stored count differed from reality.
+    """
+    pools = db.query(Pool).all()
+    synced = []
+    for pool in pools:
+        actual: int = (
+            db.query(func.count(User.id))
+            .filter(User.current_pool_id == pool.id, User.status == UserStatus.Active)
+            .scalar() or 0
+        )
+        if pool.total_members != actual:
+            synced.append({
+                "pool_id":   pool.id,
+                "pool_name": pool.name,
+                "was":       pool.total_members,
+                "now":       actual,
+            })
+            from app.crud import pool as crud_pool
+            crud_pool.update_pool(db, pool.id, PoolUpdate(total_members=actual))
+
+    return {
+        "synced_count": len(synced),
+        "changes":      synced,
+        "message": (
+            f"{len(synced)} pool(s) had stale member counts and were corrected."
+            if synced else
+            "All pool member counts are already accurate — no changes needed."
+        ),
+    }
+
+
 # ── Dual-Draw ─────────────────────────────────────────────────────────────────
 
 @router.post("/admin/pools/{pool_id}/draw", response_model=DrawResultResponse)
@@ -359,6 +400,11 @@ def eliminate_unpaid_members(db: Session = Depends(get_db)):
 
     eliminated = []
     for member in unpaid:
+        # Snapshot the pool_id BEFORE nullifying it — the ORM object's attribute
+        # is set to None by update_user, so reading it afterwards always returns
+        # None and the inline replacement placement was silently skipped.
+        slot_pool_id = member.current_pool_id
+
         # Forfeit the slot — no refund
         crud_user.update_user(
             db,
@@ -373,11 +419,11 @@ def eliminate_unpaid_members(db: Session = Depends(get_db)):
             .order_by(User.join_date)
             .first()
         )
-        if replacement and member.current_pool_id:
+        if replacement and slot_pool_id:
             crud_user.update_user(
                 db,
                 replacement.id,
-                UserUpdate(status=UserStatus.Active, current_pool_id=member.current_pool_id, current_level=1),
+                UserUpdate(status=UserStatus.Active, current_pool_id=slot_pool_id, current_level=1),
             )
             db.refresh(replacement)
             from app.services.draw import _issue_referral_token, _credit_referral_bonus

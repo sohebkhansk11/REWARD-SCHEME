@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { LogOut, RefreshCw, Hexagon, Wifi, WifiOff } from 'lucide-react'
 import Background from '../components/Background'
@@ -163,11 +163,14 @@ function VaultOpenOverlay({ visible, onDone }) {
 // ─────────────────────────────────────────────────────────────────────────────
 export default function Dashboard() {
   const { user, logout, refresh } = useUser()
-  const nav = useNavigate()
-  const [apiOk,        setApiOk]        = useState(true)
-  const [refreshing,   setRefreshing]   = useState(false)
-  const [showVault,    setShowVault]    = useState(false)
-  const [rankData,     setRankData]     = useState(null)   // { rank, total_waiting, message }
+  const nav      = useNavigate()
+  const location = useLocation()    // key changes on every navigation — used as effect dep
+
+  const [apiOk,       setApiOk]       = useState(true)
+  const [refreshing,  setRefreshing]  = useState(false)
+  const [showVault,   setShowVault]   = useState(false)
+  const [rankData,    setRankData]    = useState(null)    // { rank, total_waiting, status, message }
+  const [rankLoading, setRankLoading] = useState(false)  // shows spinner / skeleton
 
   const fetchFresh = async (silent = false) => {
     if (!user?.id) return
@@ -180,31 +183,34 @@ export default function Dashboard() {
     finally { setRefreshing(false) }
   }
 
-  // Fetch waitlist rank only when the user is on the Waitlist
+  // Fetch live waitlist rank — called on every navigation to the Dashboard
+  // so the position is always current without a hard reload.
   const fetchRank = async () => {
+    setRankLoading(true)
     try {
       const res = await getWaitlistRank()
-      if (res.data.rank !== null && res.data.rank !== undefined) {
-        setRankData(res.data)
-      }
-    } catch { /* non-fatal — rank display is optional */ }
+      if (res.data?.rank != null) setRankData(res.data)
+    } catch { /* non-fatal */ }
+    finally { setRankLoading(false) }
   }
 
+  // Combined refresh — called by the header button and on every navigation
+  const handleRefresh = () => {
+    fetchFresh()
+    if (user?.status === 'Waitlist') fetchRank()
+  }
+
+  // Re-run on every navigation to /dashboard via location.key.
+  // React Router v6 gives each navigation a unique key, so this effect fires
+  // whether the component just mounted OR the user tapped Home a second time.
   useEffect(() => {
     fetchFresh(true)
-    // Show vault animation once per session for Active users
     if (user?.status === 'Active') {
       const key = `vault_shown_${user.id}`
-      if (!sessionStorage.getItem(key)) {
-        sessionStorage.setItem(key, '1')
-        setShowVault(true)
-      }
+      if (!sessionStorage.getItem(key)) { sessionStorage.setItem(key, '1'); setShowVault(true) }
     }
-    // Fetch queue position for Waitlist users
-    if (user?.status === 'Waitlist') {
-      fetchRank()
-    }
-  }, [])  // eslint-disable-line
+    if (user?.status === 'Waitlist') fetchRank()
+  }, [location.key])  // eslint-disable-line
 
   const handleLogout = () => { logout(); nav('/', { replace: true }) }
 
@@ -240,9 +246,9 @@ export default function Dashboard() {
               : <WifiOff className="w-4 h-4 text-red-400" />
             }
           </div>
-          <motion.button whileTap={{ scale: 0.9 }} onClick={() => fetchFresh()}
+          <motion.button whileTap={{ scale: 0.9 }} onClick={handleRefresh}
             className="p-2 rounded-xl" style={{ background: 'rgba(255,255,255,0.05)' }}>
-            <RefreshCw className={`w-4 h-4 text-white/50 ${refreshing ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`w-4 h-4 text-white/50 ${refreshing || rankLoading ? 'animate-spin' : ''}`} />
           </motion.button>
           <motion.button whileTap={{ scale: 0.9 }} onClick={handleLogout}
             className="p-2 rounded-xl" style={{ background: 'rgba(255,255,255,0.05)' }}>
@@ -281,40 +287,130 @@ export default function Dashboard() {
           </div>
         </GlassCard>
 
-        {/* Waitlist rank — visible only to Waitlist users */}
-        {status === 'Waitlist' && rankData?.rank && (
-          <GlassCard className="p-5" animate>
-            <p className="text-[10px] font-mono tracking-[0.2em] text-white/30 uppercase mb-3">
-              Your Queue Position
-            </p>
-            <div className="flex items-end gap-3">
-              <div>
-                <span
-                  className="text-5xl font-black tabular-nums"
-                  style={{ color: '#ffaa00', textShadow: '0 0 18px rgba(255,170,0,0.35)' }}
+        {/* ── Waitlist Position Badge ──────────────────────────────────────
+            Visible only when status === 'Waitlist'.
+            Shows a loading skeleton while the first fetch is in flight,
+            then the live rank with a subtle refresh indicator thereafter.
+        ────────────────────────────────────────────────────────────────── */}
+        {status === 'Waitlist' && (
+          <GlassCard className="p-6" animate>
+
+            {/* Card header row */}
+            <div className="flex items-center justify-between mb-4">
+              <p className="text-[10px] font-mono tracking-[0.25em] text-white/30 uppercase">
+                Your Waitlist Position
+              </p>
+              {/* Spinning indicator whenever a fetch is in progress */}
+              {rankLoading && (
+                <motion.div
+                  animate={{ rotate: 360 }}
+                  transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
                 >
-                  #{rankData.rank}
-                </span>
-                <span className="ml-2 text-sm text-white/40">
-                  of {rankData.total_waiting?.toLocaleString('en-IN')} waiting
-                </span>
+                  <RefreshCw className="w-3.5 h-3.5 text-amber-400/60" />
+                </motion.div>
+              )}
+            </div>
+
+            {/* ── Loading skeleton (first fetch only) ── */}
+            {rankLoading && !rankData && (
+              <div className="animate-pulse space-y-4">
+                <div className="mx-auto h-24 w-52 rounded-2xl"
+                  style={{ background: 'rgba(255,170,0,0.07)', border: '1px solid rgba(255,170,0,0.1)' }} />
+                <div className="h-2 rounded-full" style={{ background: 'rgba(255,255,255,0.05)' }} />
+                <div className="h-3 w-4/5 mx-auto rounded" style={{ background: 'rgba(255,255,255,0.04)' }} />
               </div>
-            </div>
-            {/* Progress bar */}
-            <div className="mt-3 h-1.5 rounded-full overflow-hidden"
-              style={{ background: 'rgba(255,255,255,0.06)' }}>
-              <motion.div
-                className="h-full rounded-full"
-                style={{ background: 'linear-gradient(90deg,#ffaa00,#ff6600)' }}
-                initial={{ width: 0 }}
-                animate={{ width: `${Math.max(2, Math.min(100, ((rankData.total_waiting - rankData.rank + 1) / rankData.total_waiting) * 100))}%` }}
-                transition={{ duration: 1, ease: 'easeOut' }}
-              />
-            </div>
-            <p className="mt-2 text-[11px] text-white/35 leading-relaxed">
-              Positions are allocated strictly by join date (FIFO). You move up as members ahead of you
-              enter active pools. Your spot is reserved — no action needed.
-            </p>
+            )}
+
+            {/* ── Live rank display ── */}
+            {rankData && (
+              <>
+                {/* THE MASSIVE BADGE — central hero element */}
+                <div
+                  className="flex flex-col items-center py-5 mb-5 rounded-2xl"
+                  style={{
+                    background: 'rgba(255,170,0,0.05)',
+                    border:     '1px solid rgba(255,170,0,0.18)',
+                    boxShadow:  '0 0 32px rgba(255,170,0,0.06) inset',
+                  }}
+                >
+                  <span className="text-[9px] font-mono tracking-[0.35em] text-white/25 uppercase mb-2">
+                    Queue Number
+                  </span>
+
+                  {/* The number itself — re-animates each time rank changes */}
+                  <motion.span
+                    key={rankData.rank}
+                    className="text-8xl font-black tabular-nums leading-none"
+                    style={{
+                      color:      '#ffaa00',
+                      textShadow: '0 0 28px rgba(255,170,0,0.65), 0 0 60px rgba(255,170,0,0.22)',
+                    }}
+                    initial={{ scale: 0.7, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    transition={{ type: 'spring', stiffness: 280, damping: 22 }}
+                  >
+                    #{rankData.rank}
+                  </motion.span>
+
+                  <span className="mt-3 text-[12px] text-white/35 font-mono">
+                    of{' '}
+                    <strong className="text-white/55 font-semibold">
+                      {rankData.total_waiting?.toLocaleString('en-IN') ?? '—'}
+                    </strong>{' '}
+                    in queue
+                  </span>
+                </div>
+
+                {/* Progress bar — shows how far along in the queue */}
+                <div className="mb-4 space-y-2">
+                  <div className="flex justify-between text-[9px] font-mono text-white/20 px-0.5">
+                    <span>▶ Next to enter pool</span>
+                    <span>Back of queue ▶</span>
+                  </div>
+                  <div
+                    className="h-2 rounded-full overflow-hidden"
+                    style={{ background: 'rgba(255,255,255,0.05)' }}
+                  >
+                    <motion.div
+                      className="h-full rounded-full"
+                      style={{ background: 'linear-gradient(90deg, #ffaa00 0%, #ff6600 100%)' }}
+                      initial={{ width: '2%' }}
+                      animate={{
+                        width: `${Math.max(2, Math.min(99,
+                          ((rankData.total_waiting - rankData.rank + 1) / rankData.total_waiting) * 100
+                        ))}%`,
+                      }}
+                      transition={{ duration: 1.2, ease: 'easeOut' }}
+                    />
+                  </div>
+                </div>
+
+                {/* Spec-exact helper text */}
+                <p
+                  className="text-center text-[11px] leading-relaxed px-1"
+                  style={{ color: 'rgba(255,255,255,0.3)' }}
+                >
+                  This number updates automatically in real-time as pools are formed
+                  on a First-Come, First-Serve basis.
+                </p>
+              </>
+            )}
+
+            {/* ── Edge case: loaded but rank not available ── */}
+            {!rankLoading && !rankData && (
+              <div className="flex flex-col items-center gap-2 py-6">
+                <p className="text-sm text-white/25 font-mono">Position unavailable</p>
+                <motion.button
+                  whileTap={{ scale: 0.92 }}
+                  onClick={fetchRank}
+                  className="text-[11px] font-mono text-amber-400/60 hover:text-amber-400 transition-colors flex items-center gap-1.5"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  Retry
+                </motion.button>
+              </div>
+            )}
+
           </GlassCard>
         )}
 

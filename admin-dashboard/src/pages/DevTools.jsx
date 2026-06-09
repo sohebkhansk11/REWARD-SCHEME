@@ -14,7 +14,7 @@ import { useState, Fragment } from 'react'
 import {
   Terminal, Zap, Clock, UserPlus, Skull,
   AlertTriangle, CheckCircle2, XCircle, Play,
-  Info, Users,
+  Info, Users, IndianRupee,
 } from 'lucide-react'
 import Spinner from '../components/Spinner'
 import {
@@ -173,6 +173,14 @@ function ForceDrawResult({ r }) {
           </span>
         )}
 
+        {/* Cash inflow simulation indicator */}
+        {r.simulated_tokens_created > 0 && (
+          <span className="bg-emerald-950 border border-emerald-800 text-emerald-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+            <IndianRupee className="w-3 h-3" />
+            {r.simulated_tokens_created} cash inflow token{r.simulated_tokens_created !== 1 ? 's' : ''} created — stats updated
+          </span>
+        )}
+
         {r.edge_case_used ? (
           <span className="bg-blue-950 border border-blue-800 text-blue-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
             <Info className="w-3 h-3" />
@@ -198,11 +206,18 @@ function SimCycleResult({ r }) {
   return (
     <>
       {/* Summary stats */}
-      <div className="grid grid-cols-4 gap-3 mb-5">
+      <div className={`grid gap-3 mb-5 ${r.simulated_tokens_created > 0 ? 'grid-cols-5' : 'grid-cols-4'}`}>
         <StatPill label="Cycles Run"    value={`${r.n_executed} / ${r.n_requested}`} accent="blue" />
         <StatPill label="Users Created" value={r.users_created} />
         <StatPill label="Total Paid Out" value={INR(r.total_paid_out_inr)} accent="emerald" />
         <StatPill label="Pool"          value={r.pool_id ? `#${r.pool_id}` : 'Cleaned'} accent={r.pool_id ? 'purple' : 'amber'} />
+        {r.simulated_tokens_created > 0 && (
+          <StatPill
+            label="DEP Tokens Simulated"
+            value={r.simulated_tokens_created.toLocaleString('en-IN')}
+            accent="amber"
+          />
+        )}
       </div>
 
       {/* Draw timeline table */}
@@ -373,15 +388,17 @@ export default function DevTools() {
   const [serverDevError, setServerDevError] = useState(null)
 
   // ── Force Draw ────────────────────────────────────────────────────────────
-  const [drawPoolId,  setDrawPoolId]  = useState('')
-  const [drawLoading, setDrawLoading] = useState(false)
-  const [drawResult,  setDrawResult]  = useState(null)
+  const [drawPoolId,              setDrawPoolId]              = useState('')
+  const [drawLoading,             setDrawLoading]             = useState(false)
+  const [drawResult,              setDrawResult]              = useState(null)
+  const [drawAutoPayInstallments, setDrawAutoPayInstallments] = useState(false)
 
   // ── Simulate Cycle ────────────────────────────────────────────────────────
-  const [simCycles,  setSimCycles]  = useState(3)
-  const [simCleanup, setSimCleanup] = useState(true)
-  const [simLoading, setSimLoading] = useState(false)
-  const [simResult,  setSimResult]  = useState(null)
+  const [simCycles,              setSimCycles]              = useState(3)
+  const [simCleanup,             setSimCleanup]             = useState(true)
+  const [simLoading,             setSimLoading]             = useState(false)
+  const [simResult,              setSimResult]              = useState(null)
+  const [simAutoPayInstallments, setSimAutoPayInstallments] = useState(false)
 
   // ── Mass User Injection ───────────────────────────────────────────────────
   const [injectCount,    setInjectCount]    = useState(1_000)
@@ -413,7 +430,7 @@ export default function DevTools() {
     setDrawResult(null)
     try {
       const pid = drawPoolId.trim() ? parseInt(drawPoolId.trim(), 10) : undefined
-      const res = await forceDrawDev(pid)
+      const res = await forceDrawDev(pid, drawAutoPayInstallments)
       setDrawResult(res.data)
       toast(`Draw complete — ${res.data.pool_name}`, 'success')
     } catch (err) {
@@ -428,7 +445,7 @@ export default function DevTools() {
     setSimLoading(true)
     setSimResult(null)
     try {
-      const res = await simulateCycleDev(simCycles, simCleanup)
+      const res = await simulateCycleDev(simCycles, simCleanup, simAutoPayInstallments)
       setSimResult(res.data)
       toast(`Simulation complete — ${res.data.n_executed} of ${res.data.n_requested} cycles run`, 'success')
     } catch (err) {
@@ -560,6 +577,42 @@ export default function DevTools() {
                 Unpaid members are automatically marked <span className="text-amber-400">Paid</span> before the draw, so it never fails due to payment status.
               </p>
 
+              {/* ── Cash Inflow Simulation toggle ───────────────────────────────── */}
+              <div
+                role="checkbox"
+                aria-checked={drawAutoPayInstallments}
+                tabIndex={0}
+                onClick={() => setDrawAutoPayInstallments(v => !v)}
+                onKeyDown={e => e.key === ' ' && setDrawAutoPayInstallments(v => !v)}
+                className={`flex items-start gap-3 p-3.5 rounded-xl border cursor-pointer select-none transition-colors ${
+                  drawAutoPayInstallments
+                    ? 'bg-amber-950/30 border-amber-700/60'
+                    : 'bg-slate-800/50 border-slate-700/50 hover:border-slate-600/70'
+                }`}
+              >
+                <div className={`mt-0.5 w-4 h-4 rounded border-2 flex items-center justify-center flex-shrink-0 transition-colors ${
+                  drawAutoPayInstallments
+                    ? 'bg-amber-500 border-amber-500'
+                    : 'border-slate-500 bg-transparent'
+                }`}>
+                  {drawAutoPayInstallments && (
+                    <svg viewBox="0 0 12 12" className="w-2.5 h-2.5 text-white" fill="none" stroke="currentColor" strokeWidth={2.5}>
+                      <polyline points="1.5,6 4.5,9 10.5,3" />
+                    </svg>
+                  )}
+                </div>
+                <div>
+                  <p className={`text-xs font-semibold leading-none ${drawAutoPayInstallments ? 'text-amber-300' : 'text-slate-300'}`}>
+                    Simulate Token Cash Inflow (Mark Unpaid as Paid)
+                  </p>
+                  <p className="text-[10px] text-slate-500 mt-1.5 leading-relaxed">
+                    Creates real <span className="text-slate-400 font-mono">Burned</span> DEP token records for each
+                    unpaid member before drawing. Admin financial stats (Cash Inflow / Total Collection)
+                    will reflect this simulation accurately. Without this, only payment status flips.
+                  </p>
+                </div>
+              </div>
+
               <button
                 onClick={handleForceDraw}
                 disabled={drawLoading}
@@ -621,6 +674,42 @@ export default function DevTools() {
               <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl px-4 py-3 space-y-1 text-xs text-slate-500">
                 <p>Creates <span className="text-slate-300 font-medium">{fakesForSim} fake users</span> → 1 pool of 12 → runs <span className="text-slate-300 font-medium">{simCycles} draw cycle{simCycles !== 1 ? 's' : ''}</span>.</p>
                 <p>Watch <span className="text-amber-400 font-semibold">⚡ Early Pool</span> flip to <span className="text-emerald-400 font-semibold">✓ Mature</span> at cycle 4.</p>
+              </div>
+
+              {/* ── Cash Inflow Simulation toggle ───────────────────────────────── */}
+              <div
+                role="checkbox"
+                aria-checked={simAutoPayInstallments}
+                tabIndex={0}
+                onClick={() => setSimAutoPayInstallments(v => !v)}
+                onKeyDown={e => e.key === ' ' && setSimAutoPayInstallments(v => !v)}
+                className={`flex items-start gap-3 p-3.5 rounded-xl border cursor-pointer select-none transition-colors ${
+                  simAutoPayInstallments
+                    ? 'bg-blue-950/40 border-blue-700/60'
+                    : 'bg-slate-800/50 border-slate-700/50 hover:border-slate-600/70'
+                }`}
+              >
+                <div className={`mt-0.5 w-4 h-4 rounded border-2 flex items-center justify-center flex-shrink-0 transition-colors ${
+                  simAutoPayInstallments
+                    ? 'bg-blue-500 border-blue-500'
+                    : 'border-slate-500 bg-transparent'
+                }`}>
+                  {simAutoPayInstallments && (
+                    <svg viewBox="0 0 12 12" className="w-2.5 h-2.5 text-white" fill="none" stroke="currentColor" strokeWidth={2.5}>
+                      <polyline points="1.5,6 4.5,9 10.5,3" />
+                    </svg>
+                  )}
+                </div>
+                <div>
+                  <p className={`text-xs font-semibold leading-none ${simAutoPayInstallments ? 'text-blue-300' : 'text-slate-300'}`}>
+                    Simulate Token Cash Inflow (Mark Unpaid as Paid)
+                  </p>
+                  <p className="text-[10px] text-slate-500 mt-1.5 leading-relaxed">
+                    Before each draw cycle, creates real <span className="text-slate-400 font-mono">Burned</span> DEP records
+                    for unpaid members. Admin financial statistics (Total Collection / Cash Inflow) will
+                    reflect the simulated instalments accurately. Without this, only payment status flips.
+                  </p>
+                </div>
               </div>
 
               <button

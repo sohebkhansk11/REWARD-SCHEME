@@ -51,6 +51,14 @@ export const triggerDraw = (poolId) => api.post(`/admin/pools/${poolId}/draw`)
 // ── Waitlist ─────────────────────────────────────────────────────────────────
 export const checkWaitlist = () => api.post('/admin/waitlist/check')
 
+// ── Pool Creation Settings ────────────────────────────────────────────────────
+/** GET  /admin/pool-settings — returns { auto_pool_creation_enabled, message } */
+export const getPoolSettings     = ()        => api.get('/admin/pool-settings')
+/** POST /admin/pool-settings/auto-creation?enabled=bool — flips the toggle */
+export const setAutoPoolCreation = (enabled) => api.post(`/admin/pool-settings/auto-creation?enabled=${enabled}`)
+/** POST /admin/pools/manual-create — force-create pool from oldest paid waitlist members */
+export const manualCreatePool    = ()        => api.post('/admin/pools/manual-create')
+
 // ── Penalties ────────────────────────────────────────────────────────────────
 export const applyDailyPenalty = () => api.post('/admin/penalty/apply-daily')
 export const eliminateUnpaid   = () => api.post('/admin/penalty/eliminate-unpaid')
@@ -148,13 +156,27 @@ export const updateReferralStatus = (tokenId, action, note = undefined) =>
 // ── Developer Mode — /dev/* endpoints (JWT + ENABLE_DEV_MODE=true required) ───
 // JWT is attached automatically by the request interceptor above.
 
-/** POST /dev/force-draw — instantly run Sunday draw; auto-pays unpaid members */
-export const forceDrawDev = (poolId = undefined) =>
-  api.post('/dev/force-draw', poolId ? { pool_id: poolId } : {})
+/** POST /dev/force-draw — instantly run Sunday draw; auto-pays unpaid members.
+ *  @param poolId              Target pool (undefined → first active pool)
+ *  @param autoPayInstallments When true, backend creates real Burned DEP records
+ *                             before drawing so Cash Inflow stats are accurate.
+ */
+export const forceDrawDev = (poolId = undefined, autoPayInstallments = false) =>
+  api.post('/dev/force-draw', {
+    ...(poolId ? { pool_id: poolId } : {}),
+    auto_pay_installments: autoPayInstallments,
+  })
 
-/** POST /dev/simulate-cycle — generate fake users + run N draw cycles */
-export const simulateCycleDev = (nCycles = 3, cleanup = true) =>
-  api.post('/dev/simulate-cycle', { n_cycles: nCycles, cleanup })
+/** POST /dev/simulate-cycle — generate fake users + run N draw cycles.
+ *  @param autoPayInstallments When true, backend creates Burned DEP records per
+ *                             cycle so Total Collection figures stay accurate.
+ */
+export const simulateCycleDev = (nCycles = 3, cleanup = true, autoPayInstallments = false) =>
+  api.post('/dev/simulate-cycle', {
+    n_cycles: nCycles,
+    cleanup,
+    auto_pay_installments: autoPayInstallments,
+  })
 
 /** POST /dev/simulate-users — bulk-insert fake Waitlist users with Burned DEP tokens */
 export const simulateUsersDev = (count, autoPool = true) =>

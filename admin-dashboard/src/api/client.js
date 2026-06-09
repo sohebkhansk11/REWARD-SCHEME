@@ -190,6 +190,20 @@ export const simulateUsersDev = (count, autoPool = true) =>
 export const resetDataDev = () =>
   api.delete('/dev/reset-data', { data: { confirm: 'CONFIRM_NUKE' } })
 
+/**
+ * POST /dev/advanced-simulation — isolated stress-test engine
+ * @param {Object} params
+ * @param {number} params.total_cycles        1–1000
+ * @param {number} params.late_fee_pct        default 5.0
+ * @param {number} params.late_users_ratio_pct default 2.0
+ * @param {boolean} params.volatility_mode    default false
+ * @param {number} params.volatility_max_inflow default 100
+ */
+export const advancedSimulationDev = (params) =>
+  api.post('/dev/advanced-simulation', params, {
+    timeout: 300_000,   // 5-minute timeout for 1000-cycle runs
+  })
+
 // ── System Settings ───────────────────────────────────────────────────────────
 
 /** GET  /admin/settings/threshold — current pool-creation threshold */

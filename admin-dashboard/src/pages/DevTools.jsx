@@ -14,7 +14,7 @@ import { useState, Fragment } from 'react'
 import {
   Terminal, Zap, Clock, UserPlus, Skull,
   AlertTriangle, CheckCircle2, XCircle, Play,
-  Info, Users, IndianRupee,
+  Info, Users, IndianRupee, FlaskConical,
 } from 'lucide-react'
 import Spinner from '../components/Spinner'
 import {
@@ -22,6 +22,7 @@ import {
   simulateCycleDev,
   simulateUsersDev,
   resetDataDev,
+  advancedSimulationDev,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -310,6 +311,81 @@ function RefillSummary({ refill }) {
         )}
       </div>
     </div>
+  )
+}
+
+function AdvSimResult({ r }) {
+  const s = r.simulation_summary
+  const hasCondensations = s.total_condensation_events > 0
+  const hasPauses        = s.total_draw_pauses_triggered > 0
+  const liq              = s.final_virtual_liquidity_float
+
+  return (
+    <>
+      {/* ── Summary stat grid ── */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
+        <StatPill label="Cycles Run"     value={s.total_cycles_run}              accent="blue" />
+        <StatPill label="Users Created"  value={s.total_simulated_users_created.toLocaleString('en-IN')} />
+        <StatPill label="Winners Drawn"  value={s.total_winners_drawn.toLocaleString('en-IN')} accent="emerald" />
+        <StatPill label="Pools Scaled"   value={s.total_pools_auto_scaled}        accent="purple" />
+        <StatPill label="Condensations"  value={s.total_condensation_events}      accent={hasCondensations ? 'amber' : 'slate'} />
+        <StatPill label="Draw Pauses"    value={s.total_draw_pauses_triggered}    accent={hasPauses ? 'red' : 'slate'} />
+        <StatPill label="Late Fees ₹"    value={INR(s.total_late_fees_collected_inr)} accent="amber" />
+        <StatPill
+          label="Liquidity Float"
+          value={INR(liq)}
+          accent={liq >= 0 ? 'emerald' : 'red'}
+        />
+      </div>
+
+      {/* ── Liquidity explainer ── */}
+      <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl px-4 py-3 mb-4">
+        <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-widest mb-1">
+          Liquidity Formula
+        </p>
+        <p className="text-xs font-mono text-slate-400">
+          (Deposits + Late Fees) − Payouts
+          = {INR(s.total_simulated_users_created * 1000)}
+          + {INR(s.total_late_fees_collected_inr)}
+          − {INR(s.total_winners_drawn > 0 ? (s.total_simulated_users_created * 1000 + s.total_late_fees_collected_inr - liq) : 0)}
+          = <span className={liq >= 0 ? 'text-emerald-400 font-bold' : 'text-red-400 font-bold'}>{INR(liq)}</span>
+        </p>
+      </div>
+
+      {/* ── Per-cycle log table ── */}
+      {r.cycle_logs?.length > 0 && (
+        <div className="overflow-x-auto rounded-xl border border-slate-700/60 max-h-72">
+          <table className="w-full text-xs whitespace-nowrap">
+            <thead className="bg-slate-800/80 sticky top-0 z-10">
+              <tr>
+                {['Week', 'Active Pools', 'Waitlist', 'Pauses', 'Merges'].map(h => (
+                  <th key={h} className="text-left py-2.5 px-3 text-slate-400 font-semibold uppercase tracking-wider text-[10px]">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {r.cycle_logs.map(row => (
+                <tr key={row.week} className="border-b border-slate-800/60 hover:bg-slate-800/30">
+                  <td className="py-2 px-3 font-bold text-slate-400 tabular-nums">W{row.week}</td>
+                  <td className="py-2 px-3 font-bold text-emerald-400 tabular-nums">{row.active_pools}</td>
+                  <td className="py-2 px-3 text-slate-400 tabular-nums">{row.waitlist_count.toLocaleString('en-IN')}</td>
+                  <td className="py-2 px-3 tabular-nums">
+                    {row.pauses > 0
+                      ? <span className="text-orange-400 font-bold">{row.pauses}</span>
+                      : <span className="text-slate-600">—</span>}
+                  </td>
+                  <td className="py-2 px-3 tabular-nums">
+                    {row.merges > 0
+                      ? <span className="text-red-400 font-bold">{row.merges}</span>
+                      : <span className="text-slate-600">—</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </>
   )
 }
 
@@ -611,6 +687,15 @@ export default function DevTools() {
   const [injectLoading,  setInjectLoading]  = useState(false)
   const [injectResult,   setInjectResult]   = useState(null)
 
+  // ── Advanced Simulation ───────────────────────────────────────────────────
+  const [advCycles,    setAdvCycles]    = useState(50)
+  const [advLateFee,   setAdvLateFee]   = useState(5.0)
+  const [advLateRatio, setAdvLateRatio] = useState(2.0)
+  const [advVol,       setAdvVol]       = useState(false)
+  const [advVolMax,    setAdvVolMax]    = useState(100)
+  const [advLoading,   setAdvLoading]   = useState(false)
+  const [advResult,    setAdvResult]    = useState(null)
+
   // ── Database Nuke ─────────────────────────────────────────────────────────
   const [nukeConfirm, setNukeConfirm] = useState('')
   const [nukeLoading, setNukeLoading] = useState(false)
@@ -675,6 +760,31 @@ export default function DevTools() {
       handleErr(err, 'User injection failed')
     } finally {
       setInjectLoading(false)
+    }
+  }
+
+  // ── Advanced Simulation handler ───────────────────────────────────────────
+  const handleAdvSim = async () => {
+    setAdvLoading(true)
+    setAdvResult(null)
+    try {
+      const res = await advancedSimulationDev({
+        total_cycles:          advCycles,
+        late_fee_pct:          advLateFee,
+        late_users_ratio_pct:  advLateRatio,
+        volatility_mode:       advVol,
+        volatility_max_inflow: advVolMax,
+      })
+      setAdvResult(res.data)
+      const s = res.data.simulation_summary
+      toast(
+        `Simulation complete — ${s.total_cycles_run} cycles · ${s.total_winners_drawn} winners · ₹${s.final_virtual_liquidity_float.toLocaleString('en-IN')} liquidity`,
+        'success',
+      )
+    } catch (err) {
+      handleErr(err, 'Advanced simulation failed')
+    } finally {
+      setAdvLoading(false)
     }
   }
 
@@ -1019,7 +1129,104 @@ export default function DevTools() {
           </div>
         </DevCard>
 
-        {/* ── Row 3: Danger Zone ───────────────────────────────────────────────── */}
+        {/* ── Row 3: Advanced Simulation ──────────────────────────────────────── */}
+        <DevCard
+          icon={FlaskConical}
+          iconBg="bg-violet-900/40 border border-violet-700/50"
+          iconColor="text-violet-400"
+          title="Advanced Stress Simulator"
+          subtitle="Isolated N-cycle engine — full FIFO refill, condensation, draw safeguards"
+        >
+          <div className="space-y-4">
+            {/* ── Parameter grid ── */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+              <DevInput
+                label="Total Cycles"
+                hint="(1–1000)"
+                type="number"
+                min={1} max={1000}
+                value={advCycles}
+                onChange={e => setAdvCycles(Math.min(1000, Math.max(1, parseInt(e.target.value, 10) || 1)))}
+                className="focus:ring-violet-600"
+              />
+              <DevInput
+                label="Late Fee %"
+                hint="of ₹1,000"
+                type="number"
+                min={0} step={0.5}
+                value={advLateFee}
+                onChange={e => setAdvLateFee(Math.max(0, parseFloat(e.target.value) || 0))}
+                className="focus:ring-violet-600"
+              />
+              <DevInput
+                label="Late Users %"
+                hint="of active"
+                type="number"
+                min={0} max={100} step={0.5}
+                value={advLateRatio}
+                onChange={e => setAdvLateRatio(Math.min(100, Math.max(0, parseFloat(e.target.value) || 0)))}
+                className="focus:ring-violet-600"
+              />
+              <div>
+                <p className="text-xs text-slate-400 font-medium mb-1.5">Volatility Mode</p>
+                <div className="flex items-center gap-3 h-10">
+                  <Toggle checked={advVol} onChange={setAdvVol} label="Randomise weekly inflow" />
+                  <span className="text-xs text-slate-300">{advVol ? 'Random' : 'Fixed 12'}</span>
+                </div>
+              </div>
+              {advVol && (
+                <DevInput
+                  label="Max Inflow / Week"
+                  hint="(≥5)"
+                  type="number"
+                  min={5}
+                  value={advVolMax}
+                  onChange={e => setAdvVolMax(Math.max(5, parseInt(e.target.value, 10) || 5))}
+                  className="focus:ring-violet-600"
+                />
+              )}
+            </div>
+
+            {/* ── Info box ── */}
+            <div className="bg-slate-800/50 border border-slate-700/40 rounded-xl px-4 py-3 space-y-1 text-xs text-slate-500">
+              <p>
+                Runs <span className="text-violet-300 font-semibold">{advCycles} weekly cycle{advCycles !== 1 ? 's' : ''}</span> entirely in-memory.
+                All dummy user records are bulk-inserted in chunks of 500 and
+                <span className="text-emerald-400 font-semibold"> auto-deleted</span> after every run — database stays clean.
+              </p>
+              <p>
+                Measures: FIFO refill accuracy · Condensation engine triggers ·
+                Draw safeguard pauses · Liquidity float over time.
+              </p>
+              {advCycles >= 500 && (
+                <p className="text-amber-400 flex items-center gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+                  {advCycles} cycles may take 20–60 seconds. Response timeout is 5 minutes.
+                </p>
+              )}
+            </div>
+
+            <button
+              onClick={handleAdvSim}
+              disabled={advLoading}
+              className="w-full flex items-center justify-center gap-2 bg-violet-700 hover:bg-violet-600 active:bg-violet-800 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-bold py-3 px-4 rounded-xl transition-colors shadow-lg shadow-violet-900/20"
+            >
+              {advLoading ? (
+                <><Spinner className="w-4 h-4 text-white" />Running {advCycles} cycle{advCycles !== 1 ? 's' : ''}…</>
+              ) : (
+                <><FlaskConical className="w-4 h-4" />Run Advanced Simulation</>
+              )}
+            </button>
+
+            {advResult && (
+              <ResultBox>
+                <AdvSimResult r={advResult} />
+              </ResultBox>
+            )}
+          </div>
+        </DevCard>
+
+        {/* ── Row 4: Danger Zone ───────────────────────────────────────────────── */}
         <div className="bg-red-950/20 border-2 border-red-800/50 rounded-2xl overflow-hidden shadow-2xl shadow-red-950/20">
           {/* Danger Zone header */}
           <div className="flex items-center gap-3 px-6 py-4 bg-red-950/60 border-b-2 border-red-800/50">

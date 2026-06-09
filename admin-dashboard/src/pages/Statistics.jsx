@@ -4,7 +4,7 @@ import {
   IndianRupee, Users, Layers, Clock, Zap, AlertTriangle,
   CheckCircle2, XCircle, Shield, Target, Activity,
   ChevronDown, ChevronRight, CheckCheck, AlertCircle,
-  Calculator,
+  Calculator, Info,
 } from 'lucide-react'
 import {
   ResponsiveContainer,
@@ -119,6 +119,43 @@ function KPICard({ label, value, sub, icon: Icon, iconBg, iconColor, trend, load
             : <TrendingDown className="w-3.5 h-3.5" />
           }
           {trend === 'positive' ? 'Cash-flow positive' : 'Monitor closely'}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Hover tooltip for financial metric explanations
+function InfoTooltip({ text }) {
+  const [show, setShow] = useState(false)
+  return (
+    <div className="relative inline-flex ml-auto">
+      <button
+        type="button"
+        onMouseEnter={() => setShow(true)}
+        onMouseLeave={() => setShow(false)}
+        onFocus={() => setShow(true)}
+        onBlur={() => setShow(false)}
+        className="w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 transition-colors bg-white/20 hover:bg-white/35 text-white/60 hover:text-white focus:outline-none"
+        aria-label="More information"
+      >
+        <Info className="w-3 h-3" />
+      </button>
+      {show && (
+        <div
+          className="absolute z-50 bottom-full right-0 mb-2.5 w-72 bg-slate-900 border border-slate-700 text-slate-100 text-[11px] rounded-2xl px-4 py-3 shadow-2xl leading-relaxed pointer-events-none"
+        >
+          {text}
+          {/* Downward arrow */}
+          <div
+            className="absolute top-full right-4"
+            style={{
+              width: 0, height: 0,
+              borderLeft: '6px solid transparent',
+              borderRight: '6px solid transparent',
+              borderTop: '6px solid #1e293b',
+            }}
+          />
         </div>
       )}
     </div>
@@ -392,8 +429,375 @@ export default function Statistics() {
         </button>
       </div>
 
-      {/* ── 1. KPI Card Grid ──────────────────────────────────────────────── */}
-      <div className="grid grid-cols-2 xl:grid-cols-3 gap-5">
+      {/* ══ 1. SYSTEM LIQUIDITY  ·  ORGANIZER REVENUE ═══════════════════════ */}
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+
+        {/* ── A. System Liquidity (takes 2 of 3 columns on xl) ───────────── */}
+        <div className="xl:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+          <div
+            className="px-6 py-4 border-b border-slate-100 flex items-center gap-3"
+            style={{ background: 'linear-gradient(90deg, #eff6ff 0%, #ffffff 65%)' }}
+          >
+            <div className="w-7 h-7 rounded-xl bg-blue-100 flex items-center justify-center flex-shrink-0">
+              <IndianRupee className="w-3.5 h-3.5 text-blue-600" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-[9px] font-semibold text-blue-500 uppercase tracking-widest leading-none">System Float</p>
+              <h2 className="text-sm font-bold text-slate-800 leading-none mt-0.5">System Liquidity</h2>
+            </div>
+            <span className="ml-auto text-[10px] font-mono text-slate-400 flex-shrink-0">All-Time</span>
+          </div>
+
+          <div className="p-6 space-y-4">
+            {mainLoading ? (
+              <>
+                <div className="grid grid-cols-3 gap-4">
+                  <Skeleton className="h-24" />
+                  <Skeleton className="h-24" />
+                  <Skeleton className="h-24" />
+                </div>
+                <Skeleton className="h-10" />
+              </>
+            ) : (
+              <>
+                <div className="grid grid-cols-3 gap-4">
+
+                  {/* Total Cash Inflow */}
+                  <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4">
+                    <div className="flex items-center gap-1.5 mb-2.5">
+                      <TrendingUp className="w-3.5 h-3.5 text-emerald-600 flex-shrink-0" />
+                      <p className="text-[10px] font-semibold text-emerald-600 uppercase tracking-wider leading-none">
+                        Total Cash Inflow
+                      </p>
+                    </div>
+                    <p className="text-2xl font-black text-emerald-700 tabular-nums leading-none">
+                      {INR(financials?.total_cash_inflow_inr)}
+                    </p>
+                    <p className="text-[10px] text-emerald-500 mt-2 leading-snug">
+                      All DEP tokens redeemed
+                    </p>
+                  </div>
+
+                  {/* Total Cash Outflow */}
+                  <div className="bg-red-50 border border-red-200 rounded-2xl p-4">
+                    <div className="flex items-center gap-1.5 mb-2.5">
+                      <TrendingDown className="w-3.5 h-3.5 text-red-600 flex-shrink-0" />
+                      <p className="text-[10px] font-semibold text-red-600 uppercase tracking-wider leading-none">
+                        Total Cash Outflow
+                      </p>
+                    </div>
+                    <p className="text-2xl font-black text-red-700 tabular-nums leading-none">
+                      {INR(financials?.total_cash_outflow_inr)}
+                    </p>
+                    <p className="text-[10px] text-red-400 mt-2 leading-snug">
+                      WIT &amp; Referral_Withdraw paid
+                    </p>
+                  </div>
+
+                  {/* Active Liability — colour-coded by severity vs. liquidity */}
+                  {(() => {
+                    const liq    = fP(financials?.in_hand_liquidity_inr ?? 0)
+                    const ratio  = liq > 0 ? activeLiab / liq : (activeLiab > 0 ? 9 : 0)
+                    const danger = ratio > 1
+                    const warn   = !danger && ratio > 0.5
+                    return (
+                      <div className={`rounded-2xl p-4 border ${
+                        danger ? 'bg-red-50 border-red-400' :
+                        warn   ? 'bg-amber-50 border-amber-300' :
+                                 'bg-amber-50/60 border-amber-200'
+                      }`}>
+                        <div className="flex items-center gap-1.5 mb-2.5">
+                          {(danger || warn)
+                            ? <AlertTriangle className={`w-3.5 h-3.5 flex-shrink-0 ${danger ? 'text-red-600' : 'text-amber-600'}`} />
+                            : <Shield className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" />
+                          }
+                          <p className={`text-[10px] font-semibold uppercase tracking-wider leading-none ${
+                            danger ? 'text-red-600' : 'text-amber-600'
+                          }`}>
+                            Active Liability
+                          </p>
+                          {(danger || warn) && (
+                            <span className={`ml-auto text-[8px] font-black px-1.5 py-0.5 rounded-full uppercase tracking-wide flex-shrink-0 ${
+                              danger
+                                ? 'bg-red-100 text-red-700 border border-red-200'
+                                : 'bg-amber-100 text-amber-700 border border-amber-200'
+                            }`}>
+                              {danger ? 'HIGH ⚠' : 'MONITOR'}
+                            </span>
+                          )}
+                        </div>
+                        <p className={`text-2xl font-black tabular-nums leading-none ${
+                          danger ? 'text-red-700' : 'text-amber-700'
+                        }`}>
+                          {INR(financials?.current_active_liability_inr)}
+                        </p>
+                        <p className={`text-[10px] mt-2 leading-snug ${danger ? 'text-red-400' : 'text-amber-500'}`}>
+                          Principal owed · Active &amp; Waitlist
+                        </p>
+                      </div>
+                    )
+                  })()}
+                </div>
+
+                {/* Net Float summary bar */}
+                <div className="flex items-center justify-between bg-slate-50 rounded-xl px-5 py-3 border border-slate-100">
+                  <p className="text-[11px] text-slate-500">
+                    Net Float
+                    <span className="text-slate-300 mx-1.5">·</span>
+                    Inflow − Outflow
+                    <span className="text-slate-300 mx-1.5">·</span>
+                    Available cash in hand
+                  </p>
+                  <span className={`text-base font-black tabular-nums ${
+                    fP(financials?.in_hand_liquidity_inr) >= 0 ? 'text-emerald-600' : 'text-red-600'
+                  }`}>
+                    {INR(financials?.in_hand_liquidity_inr)}
+                  </span>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* ── B. Organizer Revenue (1 of 3 columns on xl) ──────────────────── */}
+        <div className="flex flex-col gap-4">
+
+          {/* Maintenance Fees — fixed income */}
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden flex-1">
+            <div
+              className="px-5 py-3.5 border-b border-slate-100 flex items-center gap-2.5"
+              style={{ background: 'linear-gradient(90deg, #f5f3ff 0%, #ffffff 60%)' }}
+            >
+              <div className="w-6 h-6 rounded-lg bg-violet-100 flex items-center justify-center flex-shrink-0">
+                <Zap className="w-3 h-3 text-violet-600" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[9px] font-semibold text-violet-500 uppercase tracking-widest leading-none">Fixed Income</p>
+                <h3 className="text-xs font-bold text-slate-800 leading-none mt-0.5">Maintenance Fees</h3>
+              </div>
+            </div>
+            <div className="p-5">
+              {mainLoading ? (
+                <div className="space-y-2.5">
+                  <Skeleton className="h-9 w-36" />
+                  <Skeleton className="h-4 w-28" />
+                  <Skeleton className="h-4 w-40" />
+                </div>
+              ) : (
+                <>
+                  <p className="text-3xl font-black text-violet-700 tabular-nums leading-none">
+                    {INR(financials?.maintenance_fees_total_inr)}
+                  </p>
+                  <p className="text-[11px] text-slate-400 mt-2">
+                    {NUM(financials?.maintenance_fees_count)} draws × ₹500 per winner
+                  </p>
+                  <div className="mt-3 flex items-center gap-1.5 text-[11px] font-semibold text-violet-600">
+                    <TrendingUp className="w-3.5 h-3.5" />
+                    Always positive · Earned at draw time
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Pure Realized Profit — hero card with tooltip */}
+          <div
+            className="rounded-2xl overflow-hidden flex-1"
+            style={mainLoading ? {
+              background: '#f8fafc',
+              border: '2px solid #e2e8f0',
+              boxShadow: 'none',
+            } : pureProfit >= 0 ? {
+              background: 'linear-gradient(145deg, #065f46 0%, #059669 100%)',
+              border: '2px solid #10b981',
+              boxShadow: '0 8px 32px rgba(5,150,105,0.22)',
+            } : {
+              background: 'linear-gradient(145deg, #7f1d1d 0%, #dc2626 100%)',
+              border: '2px solid #ef4444',
+              boxShadow: '0 8px 32px rgba(220,38,38,0.22)',
+            }}
+          >
+            {/* Card header */}
+            <div className={`px-5 py-3.5 flex items-center gap-2 ${
+              mainLoading ? 'border-b border-slate-100' : 'border-b border-white/15'
+            }`}>
+              <Calculator className={`w-4 h-4 flex-shrink-0 ${mainLoading ? 'text-slate-400' : 'text-white/80'}`} />
+              <span className={`text-xs font-bold leading-none ${mainLoading ? 'text-slate-600' : 'text-white/90'}`}>
+                Pure Realized Profit
+              </span>
+              {/* Info tooltip — only shown once the card is coloured */}
+              {!mainLoading && (
+                <InfoTooltip text="Total Cash Inflow minus Total Cash Outflow minus Active Member Principal Liability. This is safe, withdrawable profit — the exact net yield the organiser has captured after all known obligations are fully accounted for." />
+              )}
+            </div>
+
+            {/* Card body */}
+            <div className="p-5">
+              {mainLoading ? (
+                <div className="space-y-2.5">
+                  <Skeleton className="h-10 w-36" />
+                  <Skeleton className="h-4 w-48" />
+                  <Skeleton className="h-7 w-32" />
+                </div>
+              ) : (
+                <>
+                  <p className="text-4xl font-black text-white tabular-nums leading-none">
+                    {INR(financials?.pure_realized_profit_inr)}
+                  </p>
+                  <p className="text-[11px] text-white/55 mt-2">
+                    Inflow − Outflow − Active Liability
+                  </p>
+                  <div className={`mt-4 inline-flex items-center gap-1.5 text-[11px] font-bold px-3 py-1.5 rounded-full ${
+                    pureProfit >= 0 ? 'bg-white/15 text-white' : 'bg-white/10 text-white/80'
+                  }`}>
+                    {pureProfit >= 0
+                      ? <><CheckCircle2 className="w-3.5 h-3.5" />Safe to withdraw</>
+                      : <><AlertTriangle className="w-3.5 h-3.5" />Deficit — monitor closely</>
+                    }
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      {/* ══ 2. WEEKLY CASH FLOW HEALTH ════════════════════════════════════════ */}
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+        <div
+          className="px-6 py-4 border-b border-slate-100 flex items-center gap-3"
+          style={{ background: 'linear-gradient(90deg, #f5f3ff 0%, #ffffff 65%)' }}
+        >
+          <div className="w-7 h-7 rounded-xl bg-violet-100 flex items-center justify-center flex-shrink-0">
+            <Clock className="w-3.5 h-3.5 text-violet-600" />
+          </div>
+          <div className="min-w-0">
+            <p className="text-[9px] font-semibold text-violet-500 uppercase tracking-widest leading-none">Real-Time</p>
+            <h2 className="text-sm font-bold text-slate-800 leading-none mt-0.5">Weekly Cash Flow Health</h2>
+          </div>
+          {!mainLoading && financials?.week_start_date && (
+            <span className="ml-auto text-[10px] font-mono text-slate-400 bg-slate-50 border border-slate-100 px-2.5 py-1 rounded-lg flex-shrink-0">
+              Week since {financials.week_start_date}
+            </span>
+          )}
+        </div>
+
+        <div className="p-6">
+          {mainLoading ? (
+            <div className="flex gap-6">
+              <div className="flex-1 space-y-4">
+                <Skeleton className="h-5 w-full" />
+                <Skeleton className="h-3 w-full" />
+                <Skeleton className="h-5 w-3/4" />
+                <Skeleton className="h-3 w-3/4" />
+              </div>
+              <div className="w-52 space-y-3 flex-shrink-0">
+                <Skeleton className="h-12 w-full" />
+                <Skeleton className="h-8 w-full" />
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col sm:flex-row items-start gap-6">
+
+              {/* Left: proportional bar chart */}
+              <div className="flex-1 min-w-0 space-y-4">
+
+                {/* Collections bar */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-semibold text-slate-600 flex items-center gap-1.5">
+                      <TrendingUp className="w-3.5 h-3.5 text-blue-500" />
+                      Collections this week
+                    </span>
+                    <span className="text-sm font-black text-blue-700 tabular-nums">
+                      {INR(financials?.weekly_collections_inr)}
+                    </span>
+                  </div>
+                  <div className="w-full h-3 bg-slate-100 rounded-full overflow-hidden">
+                    <div
+                      className="h-full rounded-full"
+                      style={{
+                        background: 'linear-gradient(90deg, #3b82f6, #60a5fa)',
+                        width: weeklyCol + weeklyPay > 0
+                          ? `${Math.max(2, Math.min(100, weeklyCol / (weeklyCol + weeklyPay) * 100))}%`
+                          : '0%',
+                        transition: 'width 0.7s ease-out',
+                      }}
+                    />
+                  </div>
+                </div>
+
+                {/* Payouts bar */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-semibold text-slate-600 flex items-center gap-1.5">
+                      <TrendingDown className="w-3.5 h-3.5 text-rose-500" />
+                      Payouts this week
+                    </span>
+                    <span className="text-sm font-black text-rose-700 tabular-nums">
+                      {INR(financials?.weekly_payouts_inr)}
+                    </span>
+                  </div>
+                  <div className="w-full h-3 bg-slate-100 rounded-full overflow-hidden">
+                    <div
+                      className="h-full rounded-full"
+                      style={{
+                        background: 'linear-gradient(90deg, #f43f5e, #fb7185)',
+                        width: weeklyCol + weeklyPay > 0
+                          ? `${Math.max(2, Math.min(100, weeklyPay / (weeklyCol + weeklyPay) * 100))}%`
+                          : '0%',
+                        transition: 'width 0.7s ease-out',
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <p className="text-[10px] text-slate-400 leading-relaxed pt-1">
+                  Bars show proportional share of weekly activity.
+                  Collections = DEP tokens redeemed &nbsp;·&nbsp; Payouts = WIT tokens burned (admin-approved).
+                </p>
+              </div>
+
+              {/* Vertical divider */}
+              <div className="hidden sm:block w-px self-stretch bg-slate-100 flex-shrink-0" />
+
+              {/* Right: surplus hero */}
+              <div className="flex-shrink-0 sm:text-right min-w-[200px]">
+                <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                  Net Weekly Surplus
+                </p>
+                <p className={`text-4xl font-black tabular-nums leading-none ${
+                  weeklySurplus >= 0 ? 'text-violet-700' : 'text-red-600'
+                }`}>
+                  {weeklySurplus >= 0 ? '+' : ''}{INR(financials?.weekly_rolling_surplus_inr)}
+                </p>
+                <p className="text-[11px] text-slate-400 mt-1.5">
+                  Collections − Payouts
+                </p>
+                <div className={`mt-3 inline-flex items-center gap-1.5 text-[11px] font-semibold px-3 py-1.5 rounded-full border ${
+                  weeklyCol === 0 && weeklyPay === 0
+                    ? 'bg-slate-50 text-slate-500 border-slate-200'
+                    : weeklySurplus >= 0
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : 'bg-red-50 text-red-700 border-red-200'
+                }`}>
+                  {weeklyCol === 0 && weeklyPay === 0 ? (
+                    'No activity yet this week'
+                  ) : weeklySurplus >= 0 ? (
+                    <><CheckCircle2 className="w-3.5 h-3.5" />Healthy cash flow</>
+                  ) : (
+                    <><AlertTriangle className="w-3.5 h-3.5" />Payout-heavy week — monitor</>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ══ 3. QUICK REFERENCE METRICS ════════════════════════════════════════ */}
+      <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
         <KPICard
           loading={mainLoading}
           label="In-Hand Liquidity"
@@ -401,39 +805,11 @@ export default function Statistics() {
           sub="DEP received minus all payouts made"
           icon={IndianRupee}
           iconBg="bg-emerald-50" iconColor="text-emerald-600"
-          trend={!mainLoading
-            ? (fP(financials?.in_hand_liquidity_inr) >= 0 ? 'positive' : 'negative')
-            : null}
+          trend={!mainLoading ? (fP(financials?.in_hand_liquidity_inr) >= 0 ? 'positive' : 'negative') : null}
         />
         <KPICard
           loading={mainLoading}
-          label="Total Collected"
-          value={INR(financials?.total_collected_inr)}
-          sub="Sum of all burned Deposit tokens"
-          icon={TrendingUp}
-          iconBg="bg-blue-50" iconColor="text-blue-600"
-        />
-        <KPICard
-          loading={mainLoading}
-          label="Organiser Revenue"
-          value={INR(financials?.maintenance_fees_total_inr)}
-          sub={`${NUM(financials?.maintenance_fees_count)} draw fees × ₹500`}
-          icon={Zap}
-          iconBg="bg-violet-50" iconColor="text-violet-600"
-          trend="positive"
-        />
-        <KPICard
-          loading={mainLoading}
-          label="Doomsday Liability"
-          value={INR(financials?.doomsday_liability_inr)}
-          sub="Max refund if all active members exit today"
-          icon={AlertTriangle}
-          iconBg="bg-red-50" iconColor="text-red-500"
-          trend="negative"
-        />
-        <KPICard
-          loading={mainLoading}
-          label="Outstanding Liability"
+          label="Outstanding WIT + REF"
           value={INR(financials?.total_liability_inr)}
           sub={!mainLoading
             ? `${INR(financials?.wit_liability_inr)} WIT · ${INR(financials?.ref_liability_inr)} REF`
@@ -441,6 +817,15 @@ export default function Statistics() {
           icon={Clock}
           iconBg="bg-amber-50" iconColor="text-amber-600"
           trend={!mainLoading && fP(financials?.total_liability_inr) > 0 ? 'warn' : null}
+        />
+        <KPICard
+          loading={mainLoading}
+          label="Doomsday Liability"
+          value={INR(financials?.doomsday_liability_inr)}
+          sub="Max refund if all active users exit today"
+          icon={AlertTriangle}
+          iconBg="bg-red-50" iconColor="text-red-500"
+          trend="negative"
         />
         <KPICard
           loading={mainLoading}
@@ -452,189 +837,6 @@ export default function Statistics() {
           icon={Users}
           iconBg="bg-slate-50" iconColor="text-slate-600"
         />
-      </div>
-
-      {/* ── 2. Liability-Adjusted Profit Calculator ──────────────────────── */}
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
-
-        {/* Header */}
-        <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-2"
-          style={{ background: 'linear-gradient(90deg, #f0fdf4 0%, #ffffff 60%)' }}>
-          <Calculator className="w-4 h-4 text-emerald-600 flex-shrink-0" />
-          <h2 className="font-semibold text-slate-800">Liability-Adjusted Profit Calculator</h2>
-          <span className="ml-auto text-[10px] uppercase tracking-widest text-slate-400 font-semibold">
-            Pure Net Yield
-          </span>
-        </div>
-
-        <div className="p-6 space-y-5">
-
-          {mainLoading ? (
-            <div className="space-y-3">
-              <Skeleton className="h-24" />
-              <Skeleton className="h-16" />
-              <Skeleton className="h-20" />
-            </div>
-          ) : (
-            <>
-              {/* ── Equation row: Inflow − Outflow − Liability = Profit ─────── */}
-              <div className="flex items-stretch gap-2">
-
-                {/* Cash Inflow */}
-                <div className="flex-1 bg-emerald-50 border border-emerald-200 rounded-2xl p-4 text-center">
-                  <p className="text-[10px] font-semibold text-emerald-600 uppercase tracking-wider mb-1.5">
-                    Total Cash Inflow
-                  </p>
-                  <p className="text-xl font-black text-emerald-700 tabular-nums leading-none">
-                    {INR(financials?.total_cash_inflow_inr)}
-                  </p>
-                  <p className="text-[10px] text-emerald-500 mt-1.5">
-                    All DEP tokens redeemed
-                  </p>
-                </div>
-
-                <div className="flex items-center text-slate-300 font-bold text-xl px-1 flex-shrink-0">−</div>
-
-                {/* Cash Outflow */}
-                <div className="flex-1 bg-red-50 border border-red-200 rounded-2xl p-4 text-center">
-                  <p className="text-[10px] font-semibold text-red-600 uppercase tracking-wider mb-1.5">
-                    Total Cash Outflow
-                  </p>
-                  <p className="text-xl font-black text-red-700 tabular-nums leading-none">
-                    {INR(financials?.total_cash_outflow_inr)}
-                  </p>
-                  <p className="text-[10px] text-red-400 mt-1.5">
-                    WIT + Referral_Withdraw paid
-                  </p>
-                </div>
-
-                <div className="flex items-center text-slate-300 font-bold text-xl px-1 flex-shrink-0">−</div>
-
-                {/* Active Liability */}
-                <div className="flex-1 bg-amber-50 border border-amber-200 rounded-2xl p-4 text-center">
-                  <p className="text-[10px] font-semibold text-amber-600 uppercase tracking-wider mb-1.5">
-                    Active Liability
-                  </p>
-                  <p className="text-xl font-black text-amber-700 tabular-nums leading-none">
-                    {INR(financials?.current_active_liability_inr)}
-                  </p>
-                  <p className="text-[10px] text-amber-500 mt-1.5">
-                    Principal owed · Active + Waitlist
-                  </p>
-                </div>
-
-                <div className="flex items-center text-slate-300 font-bold text-xl px-1 flex-shrink-0">=</div>
-
-                {/* Pure Realized Profit — hero tile */}
-                <div
-                  className="flex-1 rounded-2xl p-4 text-center border-2"
-                  style={pureProfit >= 0 ? {
-                    background: '#059669',
-                    borderColor: '#047857',
-                  } : {
-                    background: '#dc2626',
-                    borderColor: '#b91c1c',
-                  }}
-                >
-                  <p className="text-[10px] font-semibold text-white/70 uppercase tracking-wider mb-1.5">
-                    Pure Realized Profit
-                  </p>
-                  <p className="text-xl font-black text-white tabular-nums leading-none">
-                    {INR(financials?.pure_realized_profit_inr)}
-                  </p>
-                  <p className="text-[10px] text-white/60 mt-1.5">
-                    {pureProfit >= 0 ? 'Net yield captured ✓' : 'Deficit — monitor closely ⚠'}
-                  </p>
-                </div>
-              </div>
-
-              {/* ── Formula explanation ─────────────────────────────────────── */}
-              <div className="bg-slate-50 rounded-xl px-4 py-3 border border-slate-100">
-                <p className="text-[11px] text-slate-500 leading-relaxed">
-                  <span className="font-semibold text-slate-700">Active Liability</span> = exact principal
-                  the organiser owes if every current participant claims a refund today.
-                  Active <span className="font-mono text-amber-600">Paid</span> Level L →{' '}
-                  <span className="font-mono text-amber-600">L × ₹1,000</span>. &nbsp;
-                  Active <span className="font-mono text-red-500">Unpaid</span> Level L →{' '}
-                  <span className="font-mono text-amber-600">(L−1) × ₹1,000</span>. &nbsp;
-                  Waitlist → <span className="font-mono text-amber-600">₹1,000</span>.
-                  &nbsp;·&nbsp; Cash Outflow counts only{' '}
-                  <span className="font-mono text-slate-600">Withdraw</span> (WIT) and{' '}
-                  <span className="font-mono text-slate-600">Referral_Withdraw</span> tokens with
-                  status <span className="font-mono text-slate-600">Burned</span>.
-                </p>
-              </div>
-
-              {/* ── Weekly Rolling Surplus ──────────────────────────────────── */}
-              <div>
-                <div className="flex items-center gap-2 mb-3">
-                  <Clock className="w-3.5 h-3.5 text-violet-500 flex-shrink-0" />
-                  <p className="text-xs font-semibold text-slate-600 uppercase tracking-wider">
-                    Weekly Rolling Surplus
-                  </p>
-                  <span className="text-[10px] text-slate-400 font-mono">
-                    Since {financials?.week_start_date ?? '—'} (Mon 00:00 UTC)
-                  </span>
-                </div>
-
-                <div className="flex items-stretch gap-2">
-                  {/* This week collections */}
-                  <div className="flex-1 bg-blue-50 border border-blue-100 rounded-xl p-3 text-center">
-                    <p className="text-[10px] font-semibold text-blue-600 uppercase tracking-wider mb-1">
-                      This Week Collections
-                    </p>
-                    <p className="text-lg font-black text-blue-700 tabular-nums leading-none">
-                      {INR(financials?.weekly_collections_inr)}
-                    </p>
-                    <p className="text-[10px] text-blue-400 mt-1">DEP tokens redeemed</p>
-                  </div>
-
-                  <div className="flex items-center text-slate-300 font-bold text-lg px-1 flex-shrink-0">−</div>
-
-                  {/* This week payouts */}
-                  <div className="flex-1 bg-rose-50 border border-rose-100 rounded-xl p-3 text-center">
-                    <p className="text-[10px] font-semibold text-rose-600 uppercase tracking-wider mb-1">
-                      This Week Payouts
-                    </p>
-                    <p className="text-lg font-black text-rose-700 tabular-nums leading-none">
-                      {INR(financials?.weekly_payouts_inr)}
-                    </p>
-                    <p className="text-[10px] text-rose-400 mt-1">WIT tokens burned</p>
-                  </div>
-
-                  <div className="flex items-center text-slate-300 font-bold text-lg px-1 flex-shrink-0">=</div>
-
-                  {/* Weekly surplus */}
-                  <div
-                    className={`flex-1 rounded-xl p-3 text-center border ${
-                      weeklySurplus >= 0
-                        ? 'bg-violet-50 border-violet-200'
-                        : 'bg-red-50 border-red-200'
-                    }`}
-                  >
-                    <p className={`text-[10px] font-semibold uppercase tracking-wider mb-1 ${
-                      weeklySurplus >= 0 ? 'text-violet-600' : 'text-red-600'
-                    }`}>
-                      Rolling Surplus
-                    </p>
-                    <p className={`text-lg font-black tabular-nums leading-none ${
-                      weeklySurplus >= 0 ? 'text-violet-700' : 'text-red-700'
-                    }`}>
-                      {INR(financials?.weekly_rolling_surplus_inr)}
-                    </p>
-                    <p className={`text-[10px] mt-1 ${
-                      weeklySurplus >= 0 ? 'text-violet-400' : 'text-red-400'
-                    }`}>
-                      {weeklySurplus >= 0
-                        ? `+${INR_COMPACT(weeklySurplus)} surplus`
-                        : `${INR_COMPACT(weeklySurplus)} deficit`}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            </>
-          )}
-        </div>
       </div>
 
       {/* ── 3. AI Forecast Panel ──────────────────────────────────────────── */}

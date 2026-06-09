@@ -20,7 +20,8 @@ import random
 import secrets
 import string
 import time
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -37,7 +38,9 @@ from app.models.pool import Pool, PoolStatus
 from app.models.token import Token, TokenType, TokenStatus
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.schemas.pool import PoolCreate
+from app.services.auth import hash_password as _hash_password
 from app.services.draw import run_dual_draw
+from app.services.settings import get_pool_threshold
 from app.services.waitlist import fill_pool_vacancies, manual_create_pool
 
 router = APIRouter(
@@ -51,6 +54,19 @@ _BULK_BATCH = 5_000
 
 # Pre-computed deposit amount as Decimal to avoid repeated conversions
 _DEPOSIT_DEC = Decimal(str(DEPOSIT_AMOUNT_INR))
+
+# Lazily-computed bcrypt hash for dev users' default password.
+# Bcrypt is intentionally slow (~100 ms per call); computing it once and caching
+# it avoids spending minutes hashing the same string for every row in a bulk insert.
+_DEV_PW_HASH: str | None = None
+
+
+def _get_dev_pw_hash() -> str:
+    """Return a bcrypt hash of the dev-user default password, computed at most once."""
+    global _DEV_PW_HASH
+    if _DEV_PW_HASH is None:
+        _DEV_PW_HASH = _hash_password("dev_default_1234")
+    return _DEV_PW_HASH
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,9 +346,20 @@ def simulate_cycle(body: SimulateCycleRequest, db: Session = Depends(get_db)):
     ts     = int(time.time())
     nonce  = random.randint(100_000, 999_999)
     prefix = f"dev_sim_{ts}_{nonce}_"
-    n_users = 24 + 2 * N
 
-    # ── 1. Bulk-insert dummy users ────────────────────────────────────────────
+    # ── Dynamic user count: threshold (from DB) + 2 replacements per cycle ────
+    # This replaces the previous hardcoded "24 + 2*N" so the simulation always
+    # creates enough users to satisfy the live pool_creation_threshold setting.
+    # max(threshold, POOL_CAPACITY) guards against thresholds below 12 (pool size).
+    threshold = get_pool_threshold(db)
+    n_users   = max(threshold, POOL_CAPACITY) + 2 * N
+
+    # ── 1. Bulk-insert dummy users with realistic sequential timestamps ────────
+    # Each user gets join_date = base_time + i minutes so their FIFO ordering is
+    # deterministic and reflects real sequential growth rather than one instant.
+    hashed_pw = _get_dev_pw_hash()   # bcrypt computed once — reused for all rows
+    base_time = datetime.now(timezone.utc)
+
     # Generate unique referral codes for all sim users upfront
     _sim_ref_codes: set[str] = set()
     while len(_sim_ref_codes) < n_users:
@@ -346,7 +373,10 @@ def simulate_cycle(body: SimulateCycleRequest, db: Session = Depends(get_db)):
         {
             "name":                  f"SimUser-{i + 1}",
             "mobile":                f"+99{ts:010d}{nonce:06d}{i:05d}",
-            "username":              f"{prefix}{i + 1}",
+            # UUID-based username keeps the shared prefix for cleanup + is unique per user
+            "username":              f"{prefix}{uuid.uuid4().hex[:12]}",
+            "hashed_password":       hashed_pw,
+            "join_date":             base_time + timedelta(minutes=i),
             "status":                UserStatus.Waitlist,
             "weekly_payment_status": WeeklyPaymentStatus.Paid,
             "current_level":         1,
@@ -502,6 +532,19 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
     prefix = f"dev_user_{ts}_{nonce}_"
     count  = body.count
 
+    # ── Hashed password — computed ONCE, reused for every row ─────────────────
+    # bcrypt intentionally takes ~100 ms.  Computing it per-row for 100k users
+    # would take ~2.8 hours.  One hash for all dev users is correct here because
+    # they are synthetic test accounts, not real credentials.
+    hashed_pw = _get_dev_pw_hash()
+
+    # ── Sequential base timestamp ─────────────────────────────────────────────
+    # Each user gets join_date = base_time + i minutes so their FIFO rank is
+    # deterministic and reflects realistic sequential growth.
+    # PostgreSQL's server_default=NOW() would assign the SAME instant to every
+    # row in the same bulk INSERT statement — explicit values avoid this.
+    base_time = datetime.now(timezone.utc)
+
     # ── Generate unique DEP token codes entirely in Python ────────────────────
     # token_hex(4) → 8 hex chars → ~4.3 billion possibilities; collision at
     # 100k records is astronomically unlikely (~0.0000012%).
@@ -513,9 +556,7 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
         )
     code_list = list(codes)
 
-    # ── Build user rows ───────────────────────────────────────────────────────
-    # Pre-generate unique referral codes for all dev users in Python to avoid
-    # individual DB round-trips inside the bulk insert.
+    # ── Pre-generate unique 8-char referral codes ─────────────────────────────
     _ref_codes: set[str] = set()
     while len(_ref_codes) < count:
         _ref_codes.update(
@@ -524,11 +565,20 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
         )
     _ref_list = list(_ref_codes)
 
+    # ── Build user rows ───────────────────────────────────────────────────────
+    # username  = "{prefix}{12-hex UUID fragment}" — unique by construction;
+    #             starts with the shared prefix so _cleanup_dev_users() can
+    #             still identify and delete these rows with LIKE '{prefix}%'.
+    # join_date = base_time + i minutes — guarantees perfect FIFO ordering and
+    #             places newer dev users AFTER any real users (real users have
+    #             historical join_dates; dev users join "from now forward").
     user_rows = [
         {
             "name":                  f"DevUser-{i + 1}",
             "mobile":                f"+99{ts:010d}{nonce:06d}{i:05d}",
-            "username":              f"{prefix}{i + 1}",
+            "username":              f"{prefix}{uuid.uuid4().hex[:12]}",
+            "hashed_password":       hashed_pw,
+            "join_date":             base_time + timedelta(minutes=i),
             "status":                UserStatus.Waitlist,
             "weekly_payment_status": WeeklyPaymentStatus.Paid,
             "current_level":         1,
@@ -597,17 +647,20 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
+    live_threshold = get_pool_threshold(db)
     if pools_formed:
         note = (
-            f"{len(user_ids)} users + {len(user_ids)} DEP tokens created. "
+            f"{len(user_ids)} users + {len(user_ids)} DEP tokens created "
+            f"(sequential join_dates, bcrypt passwords). "
             f"{pools_formed} pool(s) auto-formed. "
             f"{waitlist_remaining} users still on waitlist — "
             f"run POST /dev/force-draw to draw from the new pool(s)."
         )
     else:
         note = (
-            f"{len(user_ids)} users + {len(user_ids)} DEP tokens created. "
-            f"No pools formed yet (need ≥24 total paid waitlist users). "
+            f"{len(user_ids)} users + {len(user_ids)} DEP tokens created "
+            f"(sequential join_dates, bcrypt passwords). "
+            f"No pools formed yet (threshold: {live_threshold} paid waitlist users needed). "
             f"Call POST /admin/waitlist/check when ready."
         )
 

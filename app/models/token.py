@@ -6,15 +6,17 @@ from app.database import Base
 
 
 class TokenType(str, enum.Enum):
-    Deposit  = "Deposit"
-    Withdraw = "Withdraw"
-    Referral = "Referral"
+    Deposit           = "Deposit"
+    Withdraw          = "Withdraw"
+    Referral          = "Referral"           # legacy — individual REF tokens (phase 1-3)
+    Referral_Withdraw = "Referral_Withdraw"  # cumulative payout request (phase 5+) — requires DB migration
 
 
 class TokenStatus(str, enum.Enum):
-    Active   = "Active"
-    Burned   = "Burned"
-    Rejected = "Rejected"   # admin-voided (fraud / admin override) — requires DB migration
+    Active           = "Active"
+    Burned           = "Burned"
+    Rejected         = "Rejected"         # admin-voided (fraud / admin override)      — requires DB migration
+    Pending_Approval = "Pending_Approval" # awaiting admin review (Referral_Withdraw)  — requires DB migration
 
 
 class Token(Base):

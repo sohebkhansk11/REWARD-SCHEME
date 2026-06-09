@@ -30,6 +30,7 @@ from app.schemas.user import UserResponse
 from app.crud import user as crud_user, token as crud_token
 from app.services.auth import hash_password, verify_password, create_user_jwt
 from app.services.waitlist import check_and_scale_waitlist
+from app.services.draw import _credit_referral_bonus
 from app.core.security import require_user_jwt
 from app.core.config import DEPOSIT_AMOUNT_INR
 
@@ -104,7 +105,15 @@ def register(
     db.commit()
     db.refresh(new_user)
 
-    # 6. Check if waitlist has hit 24 paid members (non-blocking)
+    # 6. Credit referral bonus to the referrer immediately at registration time.
+    #    Increments total_referrals_count and accumulated_referral_bonus_inr (₹250).
+    #    No individual REF token is generated — balance accumulates in the profile.
+    if referred_by_id:
+        _credit_referral_bonus(db, referred_by_id)
+        db.commit()
+        db.refresh(new_user)
+
+    # 7. Check if waitlist has hit 24 paid members (non-blocking)
     background_tasks.add_task(check_and_scale_waitlist, db)
 
     access_token = create_user_jwt(new_user.id)

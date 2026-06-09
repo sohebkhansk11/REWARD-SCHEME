@@ -49,8 +49,11 @@ class UserUpdate(BaseModel):
 
 
 class UserResponse(UserBase):
-    id: int
+    id:       int
     username: str
     join_date: datetime
+    # Cumulative referral fields (read-only — set by system)
+    total_referrals_count:          int     = 0
+    accumulated_referral_bonus_inr: Decimal = Decimal("0")
 
     model_config = {"from_attributes": True}

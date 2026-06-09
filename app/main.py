@@ -10,6 +10,8 @@ from app.routers import admin
 from app.routers import admin_data
 from app.routers import admin_comms
 from app.routers import admin_analytics
+from app.routers import admin_user_mgmt
+from app.routers import referrals as referrals_router
 from app.routers import dev as dev_router
 from app.routers import auth as auth_router
 from app.routers import user_auth as user_auth_router
@@ -62,8 +64,10 @@ app.include_router(tokens.router)
 app.include_router(admin.router)        # /admin/*              — core admin ops (JWT required)
 app.include_router(admin_data.router)   # /admin/users|tokens|export|import  — data engine (JWT required)
 app.include_router(admin_comms.router)      # /admin/broadcast         — communications (JWT required)
-app.include_router(admin_analytics.router) # /admin/stats/*          — analytics & ERP (JWT required)
-app.include_router(dev_router.router)      # /dev/*                  — DEV MODE ONLY (JWT + ENABLE_DEV_MODE=true)
+app.include_router(admin_analytics.router)    # /admin/stats/*                — analytics & ERP (JWT required)
+app.include_router(admin_user_mgmt.router)    # /admin/users|tokens (destroy) — deep management (JWT required)
+app.include_router(referrals_router.router)   # /users/request-referral-payout + /admin/referrals/* (JWT required)
+app.include_router(dev_router.router)         # /dev/*                        — DEV MODE ONLY (JWT + ENABLE_DEV_MODE=true)
 
 
 @app.get("/", tags=["Health"])

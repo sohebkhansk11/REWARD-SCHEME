@@ -39,5 +39,9 @@ class User(Base):
     hashed_password    = Column(String, nullable=True)   # nullable for users created before auth update
     telegram_chat_id   = Column(String, nullable=True)   # numeric Telegram user ID — used for broadcasts
 
+    # Cumulative referral tracking — replaces individual REF-token-per-referral model
+    total_referrals_count          = Column(Integer,          default=0, server_default="0", nullable=False)
+    accumulated_referral_bonus_inr = Column(Numeric(12, 2),   default=0, server_default="0", nullable=False)
+
     pool   = relationship("Pool", back_populates="members")
     tokens = relationship("Token", foreign_keys="Token.user_id", back_populates="user")

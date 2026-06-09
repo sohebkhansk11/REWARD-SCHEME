@@ -40,6 +40,28 @@ from app.schemas.user import UserUpdate
 from app.schemas.pool import PoolUpdate
 
 
+# ── Referral bonus helper ──────────────────────────────────────────────────────
+
+def _credit_referral_bonus(db: Session, referrer_id: int) -> None:
+    """
+    Add REFERRAL_REWARD_INR to the referrer's accumulated_referral_bonus_inr
+    and increment their total_referrals_count.
+
+    Called at registration time (user_auth.py) when a new user joins with a
+    referral code.  No individual token is generated — the balance accumulates
+    in the user's profile and is paid out on request via POST /users/request-referral-payout.
+    """
+    referrer: User | None = db.query(User).filter(User.id == referrer_id).first()
+    if not referrer:
+        return
+    referrer.total_referrals_count          = (referrer.total_referrals_count or 0) + 1
+    referrer.accumulated_referral_bonus_inr = (
+        Decimal(str(referrer.accumulated_referral_bonus_inr or 0))
+        + Decimal(str(REFERRAL_REWARD_INR))
+    )
+    # Caller is responsible for db.commit()
+
+
 # ── Data Transfer Objects ──────────────────────────────────────────────────────
 
 @dataclass
@@ -89,22 +111,15 @@ def _next_paid_waitlist_member(db: Session) -> User | None:
 
 def _issue_referral_token(db: Session, new_active_user: User) -> None:
     """
-    Generate a ₹250 REF token for the referrer ONLY when the referred user
-    officially enters an Active Pool (not while on the Waitlist).
+    Phase 5+ NOTE: referral bonuses are no longer issued as individual REF tokens
+    when a user enters an active pool.  Bonuses are now credited at REGISTRATION
+    TIME as a cumulative balance (User.accumulated_referral_bonus_inr) via
+    _credit_referral_bonus() called from user_auth.py.
+
+    This function is retained as a no-op to avoid import errors in callers
+    (waitlist.py) and will be removed in a future cleanup pass.
     """
-    if not new_active_user.referred_by_user_id:
-        return
-    code = _unique_token_code(db, "REF-")
-    crud_token.create_token(
-        db,
-        TokenCreate(
-            code=code,
-            type=TokenType.Referral,
-            value_inr=Decimal(str(REFERRAL_REWARD_INR)),
-            user_id=new_active_user.referred_by_user_id,
-            status=TokenStatus.Active,
-        ),
-    )
+    return  # intentional no-op — see docstring above
 
 
 def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
@@ -150,7 +165,7 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
             UserUpdate(status=UserStatus.Active, current_pool_id=pool.id, current_level=1),
         )
         db.refresh(replacement)
-        _issue_referral_token(db, replacement)
+        # Referral bonus credited at registration time (Phase 5+); no token issued here.
     # If no replacement is available, pool.total_members is synced at the end of
     # run_dual_draw — no partial update needed here.
 

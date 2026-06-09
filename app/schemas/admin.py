@@ -1,13 +1,13 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Literal
 from decimal import Decimal
 from datetime import datetime
 
 from app.models.token import TokenType, TokenStatus
+from app.models.user import UserStatus, WeeklyPaymentStatus
 from app.schemas.token import TokenResponse
 from app.schemas.user import UserResponse
 from app.schemas.pool import PoolResponse
-from app.models.user import UserStatus
 
 
 # --- Token endpoints ---
@@ -63,18 +63,20 @@ class WaitlistCheckResponse(BaseModel):
 
 class AdminUserListItem(BaseModel):
     """One row in GET /admin/users — includes computed payment timestamp."""
-    id:                     int
-    name:                   str
-    mobile:                 str
-    username:               str
-    status:                 str
-    current_level:          int
-    current_pool_id:        Optional[int]
-    weekly_payment_status:  str
-    late_fees_inr:          Decimal
-    join_date:              datetime
-    first_payment_at:       Optional[datetime]   # earliest burned DEP token
-    referred_by_user_id:    Optional[int]
+    id:                             int
+    name:                           str
+    mobile:                         str
+    username:                       str
+    status:                         str
+    current_level:                  int
+    current_pool_id:                Optional[int]
+    weekly_payment_status:          str
+    late_fees_inr:                  Decimal
+    join_date:                      datetime
+    first_payment_at:               Optional[datetime]   # earliest burned DEP token
+    referred_by_user_id:            Optional[int]
+    total_referrals_count:          int     = 0
+    accumulated_referral_bonus_inr: Decimal = Decimal("0")
 
     model_config = {"from_attributes": True}
 
@@ -132,12 +134,74 @@ class ImportSummaryResponse(BaseModel):
     errors:        list[ImportError]
 
 
+# ── Admin Deep User Management (Phase 5) ──────────────────────────────────────
+
+class AdminFullUpdateRequest(BaseModel):
+    """PUT /admin/users/{id}/full-update — any field may be patched. All optional."""
+    name:                           Optional[str]                 = None
+    mobile:                         Optional[str]                 = None
+    username:                       Optional[str]                 = None
+    new_password:                   Optional[str]                 = Field(None, min_length=6,
+                                                                          description="Plain-text; hashed before saving.")
+    status:                         Optional[UserStatus]          = None
+    current_level:                  Optional[int]                 = Field(None, ge=1, le=6)
+    weekly_payment_status:          Optional[WeeklyPaymentStatus] = None
+    current_pool_id:                Optional[int]                 = None
+    late_fees_inr:                  Optional[Decimal]             = Field(None, ge=0)
+    referred_by_user_id:            Optional[int]                 = None
+    total_referrals_count:          Optional[int]                 = Field(None, ge=0)
+    accumulated_referral_bonus_inr: Optional[Decimal]             = Field(None, ge=0)
+    telegram_chat_id:               Optional[str]                 = None
+
+
+class AdminDeleteTokenRequest(BaseModel):
+    """DELETE /admin/tokens/{id} — admin password required as a second-factor safety gate."""
+    admin_password: str = Field(..., description="Current admin account password (verified before deletion).")
+
+
+class DeleteUserResponse(BaseModel):
+    deleted_user_id:        int
+    deleted_username:       str
+    tokens_deleted:         int
+    was_in_active_pool:     bool
+    pool_id:                Optional[int]
+    pool_members_remaining: Optional[int]
+    message:                str
+
+
+class DeleteTokenResponse(BaseModel):
+    deleted_token_id:   int
+    deleted_token_code: str
+    token_type:         str
+    token_value_inr:    Decimal
+    message:            str
+
+
+# ── Admin Referral Queue (Phase 5) ─────────────────────────────────────────────
+
+class PendingReferralItem(BaseModel):
+    """One row in GET /admin/referrals/pending."""
+    token_id:                       int
+    token_code:                     str
+    token_value_inr:                Decimal
+    created_at:                     Optional[datetime]
+    user_id:                        Optional[int]
+    username:                       Optional[str]
+    user_name:                      Optional[str]
+    total_referrals_count:          int
+    accumulated_bonus_inr:          Decimal
+
+
+class ReferralStatusUpdateRequest(BaseModel):
+    """PUT /admin/referrals/{id}/status — approve or reject a pending payout."""
+    action: Literal["approve", "reject"]
+    note:   Optional[str] = None
+
+
 # ── Broadcast ─────────────────────────────────────────────────────────────────
 
-from typing import Literal
-
 class BroadcastRequest(BaseModel):
-    message:       str = Field(min_length=1, max_length=1000)
+    message:       str  = Field(min_length=1, max_length=1000)
     audience_type: Literal["all", "active", "waitlist", "winners", "pool"] = "all"
     pool_id:       Optional[int] = Field(
         None,

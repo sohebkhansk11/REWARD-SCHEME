@@ -6,7 +6,7 @@ from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.models.pool import Pool, PoolStatus
 from app.schemas.pool import PoolCreate, PoolUpdate
 from app.schemas.user import UserUpdate
-from app.services.draw import _issue_referral_token
+from app.services.draw import _issue_referral_token, _credit_referral_bonus
 
 
 def _next_pool_name(db: Session) -> str:
@@ -52,6 +52,10 @@ def check_and_scale_waitlist(db: Session) -> Pool | None:
             UserUpdate(status=UserStatus.Active, current_pool_id=new_pool.id, current_level=1),
         )
         db.refresh(member)
-        _issue_referral_token(db, member)
+        # Rule 39: credit referral bonus NOW — at Active pool entry, not at registration.
+        if member.referred_by_user_id:
+            _credit_referral_bonus(db, member.referred_by_user_id)
+        _issue_referral_token(db, member)   # no-op kept for backward compat
 
+    db.commit()   # flush the referral bonus updates
     return new_pool

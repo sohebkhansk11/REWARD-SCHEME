@@ -73,3 +73,14 @@ app.include_router(dev_router.router)         # /dev/*                        â€
 @app.get("/", tags=["Health"])
 def root():
     return {"status": "ok", "message": "Reward Scheme API is running"}
+
+
+@app.get("/time", tags=["Health"])
+def server_time():
+    """
+    Return the current UTC epoch (milliseconds since 1970-01-01T00:00:00Z).
+    Used by the user-app CountdownTimer to sync against server time and
+    eliminate client-clock drift from the Sunday 7 PM IST draw countdown.
+    """
+    from datetime import datetime, timezone
+    return {"epoch_ms": int(datetime.now(timezone.utc).timestamp() * 1000)}

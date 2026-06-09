@@ -276,8 +276,11 @@ def eliminate_unpaid_members(db: Session = Depends(get_db)):
                 UserUpdate(status=UserStatus.Active, current_pool_id=member.current_pool_id, current_level=1),
             )
             db.refresh(replacement)
-            from app.services.draw import _issue_referral_token
-            _issue_referral_token(db, replacement)
+            from app.services.draw import _issue_referral_token, _credit_referral_bonus
+            # Rule 39: credit referral bonus when replacement enters the active pool.
+            if replacement.referred_by_user_id:
+                _credit_referral_bonus(db, replacement.referred_by_user_id)
+            _issue_referral_token(db, replacement)   # no-op kept for backward compat
 
         eliminated.append({
             "user_id": member.id,

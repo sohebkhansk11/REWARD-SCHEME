@@ -165,7 +165,9 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
             UserUpdate(status=UserStatus.Active, current_pool_id=pool.id, current_level=1),
         )
         db.refresh(replacement)
-        # Referral bonus credited at registration time (Phase 5+); no token issued here.
+        # Rule 39: credit referral bonus when replacement ENTERS the active pool.
+        if replacement.referred_by_user_id:
+            _credit_referral_bonus(db, replacement.referred_by_user_id)
     # If no replacement is available, pool.total_members is synced at the end of
     # run_dual_draw — no partial update needed here.
 

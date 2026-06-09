@@ -1,26 +1,46 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 
-function getTarget() {
-  const now = new Date()
-  const t = new Date(now)
-  const day = now.getDay()
-  if (day === 0 && now.getHours() < 19) {
-    t.setHours(19, 0, 0, 0)
-  } else {
-    t.setDate(now.getDate() + ((7 - day) % 7 || 7))
-    t.setHours(19, 0, 0, 0)
+const BASE_URL = import.meta.env.VITE_API_URL || 'https://reward-scheme-api.onrender.com'
+
+/**
+ * Returns the epoch-ms of the next Sunday at 19:00:00 IST (UTC+5:30)
+ * relative to a given `nowMs` value so the calculation is testable.
+ */
+function nextSundayDraw(nowMs) {
+  // IST = UTC + 5h 30m = UTC + 19800 s
+  const IST_OFFSET_MS = 5.5 * 3600 * 1000
+  const nowIST = nowMs + IST_OFFSET_MS                        // ms in IST epoch
+  const d = new Date(nowIST)
+
+  const day  = d.getUTCDay()   // 0=Sun … 6=Sat (in IST space)
+  const hour = d.getUTCHours()
+  const min  = d.getUTCMinutes()
+  const sec  = d.getUTCSeconds()
+
+  // Days until next Sunday
+  let daysUntil = (7 - day) % 7
+  // If it is already Sunday but before 19:00 IST, use today
+  if (day === 0 && (hour < 19 || (hour === 19 && min === 0 && sec === 0))) {
+    daysUntil = 0
+  } else if (daysUntil === 0) {
+    daysUntil = 7  // already past 19:00 on Sunday — next week
   }
-  return t
+
+  // Build target in IST epoch, then convert back to UTC epoch
+  const target = new Date(nowIST)
+  target.setUTCDate(d.getUTCDate() + daysUntil)
+  target.setUTCHours(19, 0, 0, 0)
+  return target.getTime() - IST_OFFSET_MS   // UTC epoch ms
 }
 
-function calcRemaining() {
-  const diff = Math.max(0, getTarget() - Date.now())
+function decompose(diffMs) {
+  const d = Math.max(0, diffMs)
   return {
-    d: Math.floor(diff / 86400000),
-    h: Math.floor((diff % 86400000) / 3600000),
-    m: Math.floor((diff % 3600000) / 60000),
-    s: Math.floor((diff % 60000) / 1000),
+    d: Math.floor(d / 86400000),
+    h: Math.floor((d % 86400000) / 3600000),
+    m: Math.floor((d % 3600000) / 60000),
+    s: Math.floor((d % 60000) / 1000),
   }
 }
 
@@ -45,17 +65,56 @@ function Digit({ value }) {
 }
 
 export default function CountdownTimer() {
-  const [t, setT] = useState(calcRemaining)
+  // clockOffset: server_epoch_ms - client_epoch_ms
+  // Allows us to correct for client clock drift.
+  const offsetRef = useRef(0)
+  const [synced, setSynced] = useState(false)
+
+  // Fetch server time once on mount and calculate offset
   useEffect(() => {
-    const id = setInterval(() => setT(calcRemaining()), 1000)
-    return () => clearInterval(id)
+    let cancelled = false
+    const fetchServerTime = async () => {
+      try {
+        const clientBefore = Date.now()
+        const res = await fetch(`${BASE_URL}/time`)
+        const clientAfter = Date.now()
+        if (cancelled) return
+
+        const { epoch_ms } = await res.json()
+        // Mid-point correction to account for network latency
+        const rtt = clientAfter - clientBefore
+        const clientMid = clientBefore + rtt / 2
+        offsetRef.current = epoch_ms - clientMid
+      } catch {
+        // If the fetch fails, fall back to local clock (offset stays 0)
+      } finally {
+        if (!cancelled) setSynced(true)
+      }
+    }
+    fetchServerTime()
+    return () => { cancelled = true }
   }, [])
 
+  const nowCorrected = () => Date.now() + offsetRef.current
+
+  const [t, setT] = useState(() => {
+    const now = nowCorrected()
+    return decompose(nextSundayDraw(now) - now)
+  })
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      const now = nowCorrected()
+      setT(decompose(nextSundayDraw(now) - now))
+    }, 1000)
+    return () => clearInterval(id)
+  }, [synced]) // restart after sync so first tick uses corrected offset
+
   const units = [
-    { label: 'DAYS',  val: t.d },
-    { label: 'HRS',   val: t.h },
-    { label: 'MINS',  val: t.m },
-    { label: 'SECS',  val: t.s },
+    { label: 'DAYS', val: t.d },
+    { label: 'HRS',  val: t.h },
+    { label: 'MINS', val: t.m },
+    { label: 'SECS', val: t.s },
   ]
 
   return (

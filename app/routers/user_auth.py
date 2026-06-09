@@ -28,6 +28,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
+from sqlalchemy import func, over
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -453,6 +454,92 @@ def redeem_deposit(
         access_token=create_user_jwt(user.id),
         user=_serialize_user(user),
     )
+
+
+# ── Waitlist Rank ──────────────────────────────────────────────────────────────
+
+@users_me_router.get("/waitlist-rank")
+def get_waitlist_rank(
+    user_id: int = Depends(require_user_jwt),
+    db: Session = Depends(get_db),
+):
+    """
+    Return the authenticated user's real-time position in the Waitlist queue.
+
+    Uses an SQL window function so the rank is always live and never needs a
+    mass-update when other members join or leave:
+
+        SELECT rank FROM (
+            SELECT id,
+                   ROW_NUMBER() OVER (ORDER BY join_date ASC) AS rank
+            FROM   users
+            WHERE  status = 'Waitlist'
+        ) sub
+        WHERE id = :user_id
+
+    Response:
+        {
+          "rank":           7,          -- 1-based position (1 = next to enter a pool)
+          "total_waiting":  1077,       -- all paid + unpaid Waitlist members
+          "status":         "Waitlist"  -- or "Active" / "Eliminated_Won" / …
+        }
+
+    Non-Waitlist users receive rank: null with their current status.
+    """
+    user = crud_user.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    # Not on the waitlist — return status with no rank
+    if user.status != UserStatus.Waitlist:
+        return {
+            "rank":          None,
+            "total_waiting": None,
+            "status":        user.status.value,
+            "message":       f"Your account status is '{user.status.value}' — not currently on the Waitlist.",
+        }
+
+    # ── Window function subquery ──────────────────────────────────────────────
+    # ROW_NUMBER() OVER (ORDER BY join_date ASC) gives each Waitlist user their
+    # exact FIFO position.  Wrapping it in a subquery lets us filter to the
+    # specific user in the outer WHERE clause without recomputing the window.
+    rank_col  = func.row_number().over(order_by=User.join_date.asc()).label("rank")
+    subq = (
+        db.query(User.id, rank_col)
+        .filter(User.status == UserStatus.Waitlist)
+        .subquery()
+    )
+
+    rank: int | None = (
+        db.query(subq.c.rank)
+        .filter(subq.c.id == user_id)
+        .scalar()
+    )
+
+    total_waiting: int = (
+        db.query(func.count(User.id))
+        .filter(User.status == UserStatus.Waitlist)
+        .scalar() or 0
+    )
+
+    if rank is None:
+        # Rare edge: user is Waitlist but somehow not in the window (shouldn't happen)
+        return {
+            "rank":          None,
+            "total_waiting": total_waiting,
+            "status":        user.status.value,
+            "message":       "Could not determine rank — please try again.",
+        }
+
+    return {
+        "rank":          int(rank),
+        "total_waiting": total_waiting,
+        "status":        user.status.value,
+        "message":       (
+            f"You are #{rank} in the waitlist queue out of {total_waiting} members. "
+            f"The next pool forms when the queue reaches the configured threshold."
+        ),
+    }
 
 
 # ── Wallet History ─────────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@ import {
   getPools, getUsers, triggerDraw, applyDailyPenalty, eliminateUnpaid, BASE_URL,
   getPoolSettings, setAutoPoolCreation, manualCreatePool,
   fillPoolVacancies, syncPoolMemberCounts,
+  getThreshold, updateThreshold,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -211,6 +212,12 @@ export default function PoolOversight() {
   const [syncCountsLoading,     setSyncCountsLoading]     = useState(false)
   const [syncCountsResult,      setSyncCountsResult]      = useState(null)
 
+  // ── Configurable threshold ────────────────────────────────────────────────
+  const [threshold,         setThreshold]         = useState(null)   // current value from API
+  const [thresholdInput,    setThresholdInput]    = useState('')      // controlled input
+  const [thresholdPassword, setThresholdPassword] = useState('')
+  const [thresholdLoading,  setThresholdLoading]  = useState(false)
+
   const fetchAll = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     else setRefreshing(true)
@@ -233,9 +240,11 @@ export default function PoolOversight() {
   // ── Pool settings fetch ───────────────────────────────────────────────────
   const fetchPoolSettings = useCallback(async () => {
     try {
-      const res = await getPoolSettings()
-      setAutoPoolEnabled(res.data.auto_pool_creation_enabled)
-    } catch { /* non-fatal — default to true (backend default) */ }
+      const [toggleRes, threshRes] = await Promise.all([getPoolSettings(), getThreshold()])
+      setAutoPoolEnabled(toggleRes.data.auto_pool_creation_enabled)
+      setThreshold(threshRes.data.pool_creation_threshold)
+      setThresholdInput(String(threshRes.data.pool_creation_threshold))
+    } catch { /* non-fatal — defaults apply */ }
   }, [])
 
   useEffect(() => { fetchAll(); fetchPoolSettings() }, [fetchAll, fetchPoolSettings])
@@ -302,6 +311,30 @@ export default function PoolOversight() {
       toast(err.response?.data?.detail ?? 'Sync failed', 'error')
     } finally {
       setSyncCountsLoading(false)
+    }
+  }
+
+  // ── Update pool-creation threshold ───────────────────────────────────────
+  const handleUpdateThreshold = async () => {
+    const val = parseInt(thresholdInput, 10)
+    if (isNaN(val) || val < 1 || val > 1000) {
+      toast('Threshold must be a whole number between 1 and 1000', 'error')
+      return
+    }
+    if (!thresholdPassword.trim()) {
+      toast('Admin password is required', 'error')
+      return
+    }
+    setThresholdLoading(true)
+    try {
+      const res = await updateThreshold(val, thresholdPassword)
+      setThreshold(res.data.pool_creation_threshold)
+      setThresholdPassword('')
+      toast(res.data.message, 'success')
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Failed to update threshold', 'error')
+    } finally {
+      setThresholdLoading(false)
     }
   }
 
@@ -457,6 +490,59 @@ export default function PoolOversight() {
             )}
           </div>
         )}
+
+        {/* Configurable threshold */}
+        <div className="border-t border-slate-100 pt-5 space-y-3">
+          <div>
+            <p className="text-sm font-semibold text-slate-700">
+              Auto-Pool Trigger Threshold
+              {threshold !== null && (
+                <span className="ml-2 text-xs font-normal text-indigo-600 bg-indigo-50 border border-indigo-100 rounded-full px-2 py-0.5">
+                  current: {threshold} members
+                </span>
+              )}
+            </p>
+            <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
+              When Auto AI Pool Creation is <strong>ON</strong>, a new pool forms once this many
+              paid Waitlist members accumulate. Default is 24. Requires admin password.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="flex-1 min-w-[80px] max-w-[140px]">
+              <label className="block text-xs font-medium text-slate-500 mb-1">New threshold</label>
+              <input
+                type="number"
+                min="1"
+                max="1000"
+                value={thresholdInput}
+                onChange={e => setThresholdInput(e.target.value)}
+                className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                placeholder="24"
+              />
+            </div>
+            <div className="flex-1 min-w-[160px]">
+              <label className="block text-xs font-medium text-slate-500 mb-1">Admin password</label>
+              <input
+                type="password"
+                value={thresholdPassword}
+                onChange={e => setThresholdPassword(e.target.value)}
+                className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                placeholder="Your admin password"
+                autoComplete="current-password"
+              />
+            </div>
+            <button
+              onClick={handleUpdateThreshold}
+              disabled={thresholdLoading}
+              className="flex-shrink-0 inline-flex items-center gap-2 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed shadow-sm transition-colors"
+            >
+              {thresholdLoading
+                ? <><Spinner className="w-4 h-4" />Saving…</>
+                : 'Save Threshold'
+              }
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* ── Maintenance Actions ─────────────────────────────────────────────── */}

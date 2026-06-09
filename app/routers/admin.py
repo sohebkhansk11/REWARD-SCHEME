@@ -17,6 +17,8 @@ from app.schemas.admin import (
     DrawResultResponse,
     WinnerResultResponse,
     WaitlistCheckResponse,
+    UpdateThresholdRequest,
+    ThresholdResponse,
 )
 from app.schemas.token import TokenResponse
 from app.services import tokens as svc_tokens
@@ -175,6 +177,76 @@ def trigger_waitlist_check(db: Session = Depends(get_db)):
         paid_waitlist_count=paid_count,
         pool_created=None,
         message=f"Waitlist has {paid_count} paid members; {24 - paid_count} more needed to trigger pool creation.{filled_msg}",
+    )
+
+
+# ── System Settings — Configurable Threshold ──────────────────────────────────
+
+@router.get("/admin/settings/threshold", response_model=ThresholdResponse)
+def get_threshold(db: Session = Depends(get_db)):
+    """
+    Return the current pool-creation threshold.
+
+    This is the minimum number of paid Waitlist members that must accumulate
+    before check_and_scale_waitlist() creates a new pool automatically.
+    Default: 24.  Configurable via PUT /admin/settings/threshold.
+    """
+    from app.services.settings import get_pool_threshold
+    threshold = get_pool_threshold(db)
+    return ThresholdResponse(
+        pool_creation_threshold=threshold,
+        message=(
+            f"Current threshold: {threshold} paid Waitlist members needed to auto-trigger a new pool."
+        ),
+    )
+
+
+@router.put("/admin/settings/threshold", response_model=ThresholdResponse)
+def update_threshold(
+    body: UpdateThresholdRequest,
+    admin_username: str = Depends(require_admin_jwt),
+    db: Session = Depends(get_db),
+):
+    """
+    Update the pool-creation threshold.
+
+    Security gate: the admin's account password is required in the request body
+    alongside `new_threshold`.  The password is bcrypt-verified before the
+    change is persisted.  This prevents CSRF-style tampering and accidental
+    mis-clicks.
+
+    The new value takes effect immediately for every subsequent call to
+    check_and_scale_waitlist() — no server restart required.
+    """
+    from app.models.admin import Admin as AdminModel
+    from app.services.settings import set_pool_threshold
+
+    # ── Verify admin password ─────────────────────────────────────────────────
+    admin: AdminModel | None = (
+        db.query(AdminModel).filter(AdminModel.username == admin_username).first()
+    )
+    if not admin:
+        raise HTTPException(status_code=401, detail="Admin account not found — re-authenticate.")
+
+    dummy = "$2b$12$invalidhashplaceholderXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    stored = admin.hashed_password or dummy
+    from app.services.auth import verify_password
+    if not verify_password(body.admin_password, stored):
+        raise HTTPException(
+            status_code=401,
+            detail="Admin password verification failed. Threshold was NOT changed.",
+        )
+
+    # ── Persist new threshold ─────────────────────────────────────────────────
+    new_val = set_pool_threshold(db, body.new_threshold)
+
+    return ThresholdResponse(
+        pool_creation_threshold=new_val,
+        message=(
+            f"Pool-creation threshold updated to {new_val}. "
+            "The auto-scale algorithm will now wait for "
+            f"{new_val} paid Waitlist members before creating a new pool."
+        ),
     )
 
 

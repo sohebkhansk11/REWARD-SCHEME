@@ -25,6 +25,7 @@ from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.schemas.admin import (
     AdminFullUpdateRequest,
     AdminDeleteTokenRequest,
+    DeleteUserRequest,
     DeleteUserResponse,
     DeleteTokenResponse,
 )
@@ -135,21 +136,43 @@ def full_update_user(
 @router.delete("/admin/users/{user_id}", response_model=DeleteUserResponse)
 def delete_user(
     user_id: int,
+    body: DeleteUserRequest,
+    admin_username: str = Depends(require_admin_jwt),
     db: Session = Depends(get_db),
 ):
     """
     Permanently delete a user and all tokens they own.
 
+    Security gate: the calling admin's account password must be supplied in
+    the request body (`admin_password`).  It is bcrypt-verified before any
+    deletion proceeds — this prevents CSRF, accidental UI taps, and ensures
+    only the authenticated admin can authorise the destructive action.
+
     Safety cascade:
-    1. Null out `referred_by_user_id` on any users who were referred by this user
-       (so their accounts are not broken).
-    2. Null out `redeemed_by_user_id` on any tokens burned by this user.
-    3. Delete all tokens WHERE user_id = this user.
-    4. If the user is in an Active pool, decrement pool.total_members.
-    5. Delete the user row.
+    1. Verify admin password.
+    2. Null out `referred_by_user_id` on any users referred by this user.
+    3. Null out `redeemed_by_user_id` on any tokens burned by this user.
+    4. Delete all tokens WHERE user_id = this user.
+    5. If the user is in an Active pool, resync pool.total_members.
+    6. Delete the user row.
 
     Returns a summary including pool impact, tokens deleted, etc.
     """
+    # ── Verify admin password ─────────────────────────────────────────────────
+    admin: Admin | None = (
+        db.query(Admin).filter(Admin.username == admin_username).first()
+    )
+    if not admin:
+        raise HTTPException(status_code=401, detail="Admin account not found — re-authenticate.")
+
+    dummy = "$2b$12$invalidhashplaceholderXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    stored = admin.hashed_password or dummy
+    if not verify_password(body.admin_password, stored):
+        raise HTTPException(
+            status_code=401,
+            detail="Admin password verification failed. User was NOT deleted.",
+        )
+
     user: User | None = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail=f"User {user_id} not found.")

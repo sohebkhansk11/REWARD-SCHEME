@@ -57,6 +57,11 @@ export const redeemDeposit = (code) =>
 // ── Wallet history ─────────────────────────────────────────────────────────────
 export const getWalletHistory = () => api.get('/users/me/wallet-history')
 
+// ── Waitlist rank (JWT required — Waitlist users only) ────────────────────────
+// Returns: { rank, total_waiting, status, message }
+// rank is null when the user is not currently on the Waitlist.
+export const getWaitlistRank = () => api.get('/users/me/waitlist-rank')
+
 // Keep these for any remaining legacy code
 export const registerUser = (data) => api.post('/users/', data)
 

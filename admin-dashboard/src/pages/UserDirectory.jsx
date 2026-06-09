@@ -129,6 +129,7 @@ export default function UserDirectory() {
   // ── Delete modal state ──────────────────────────────────────────────────
   const [delTarget,   setDelTarget]   = useState(null)   // full user object
   const [delConfirm,  setDelConfirm]  = useState('')
+  const [delPassword, setDelPassword] = useState('')     // admin password — required by backend
   const [delLoading,  setDelLoading]  = useState(false)
 
   // ── Load ─────────────────────────────────────────────────────────────────
@@ -248,15 +249,17 @@ export default function UserDirectory() {
   const openDelete = user => {
     setDelTarget(user)
     setDelConfirm('')
+    setDelPassword('')
   }
+
+  const _resetDel = () => { setDelTarget(null); setDelConfirm(''); setDelPassword('') }
 
   const handleDeleteUser = async () => {
     setDelLoading(true)
     try {
-      const res = await adminDeleteUser(delTarget.id)
+      const res = await adminDeleteUser(delTarget.id, delPassword)
       toast(res.data.message ?? `User deleted`, 'success')
-      setDelTarget(null)
-      setDelConfirm('')
+      _resetDel()
       setUsers(u => u.filter(x => x.id !== delTarget.id))
     } catch (err) {
       toast(err.response?.data?.detail ?? 'Delete failed', 'error')
@@ -537,7 +540,7 @@ export default function UserDirectory() {
       ══════════════════════════════════════════════════════════════════════ */}
       <Modal
         open={!!delTarget}
-        onClose={() => !delLoading && (setDelTarget(null), setDelConfirm(''))}
+        onClose={() => !delLoading && _resetDel()}
         title="Delete User"
         maxWidth="max-w-md"
       >
@@ -593,10 +596,28 @@ export default function UserDirectory() {
               />
             </div>
 
+            {/* Admin password — required by backend security gate */}
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">
+                Your Admin Password
+              </label>
+              <input
+                type="password"
+                className={`${inputCls} ${delPassword.length > 0 ? 'border-slate-400' : ''}`}
+                value={delPassword}
+                onChange={e => setDelPassword(e.target.value)}
+                placeholder="Enter your admin password to authorise deletion"
+                autoComplete="current-password"
+              />
+              <p className="mt-1 text-xs text-slate-400">
+                Required for security — verified server-side before any data is deleted.
+              </p>
+            </div>
+
             {/* Actions */}
             <div className="flex items-center justify-end gap-3">
               <button
-                onClick={() => { setDelTarget(null); setDelConfirm('') }}
+                onClick={_resetDel}
                 disabled={delLoading}
                 className="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition-colors disabled:opacity-50"
               >
@@ -604,7 +625,7 @@ export default function UserDirectory() {
               </button>
               <button
                 onClick={handleDeleteUser}
-                disabled={delConfirm !== 'DELETE' || delLoading}
+                disabled={delConfirm !== 'DELETE' || !delPassword.trim() || delLoading}
                 className="flex items-center gap-2 px-5 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
               >
                 {delLoading

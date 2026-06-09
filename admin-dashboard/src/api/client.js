@@ -139,9 +139,9 @@ export const updateTokenStatus = (tokenId, action, note = undefined) =>
 export const adminFullUpdateUser = (userId, data) =>
   api.put(`/admin/users/${userId}/full-update`, data)
 
-/** DELETE /admin/users/{id} — permanently delete user + owned tokens */
-export const adminDeleteUser = (userId) =>
-  api.delete(`/admin/users/${userId}`)
+/** DELETE /admin/users/{id} — permanently delete user + owned tokens (admin password required) */
+export const adminDeleteUser = (userId, adminPassword) =>
+  api.delete(`/admin/users/${userId}`, { data: { admin_password: adminPassword } })
 
 /** DELETE /admin/tokens/{id} — permanently delete token (admin password required) */
 export const adminDeleteToken = (tokenId, adminPassword) =>
@@ -189,6 +189,16 @@ export const simulateUsersDev = (count, autoPool = true) =>
 /** DELETE /dev/reset-data — nuke all users/pools/tokens; reset DB sequences */
 export const resetDataDev = () =>
   api.delete('/dev/reset-data', { data: { confirm: 'CONFIRM_NUKE' } })
+
+// ── System Settings ───────────────────────────────────────────────────────────
+
+/** GET  /admin/settings/threshold — current pool-creation threshold */
+export const getThreshold = () =>
+  api.get('/admin/settings/threshold')
+
+/** PUT  /admin/settings/threshold — update threshold (admin password required) */
+export const updateThreshold = (newThreshold, adminPassword) =>
+  api.put('/admin/settings/threshold', { new_threshold: newThreshold, admin_password: adminPassword })
 
 // ── Auth (no JWT needed for these calls) ──────────────────────────────────────
 export const adminLogin     = (username, password) =>

@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import WAITLIST_TRIGGER, NEW_POOL_INTAKE, POOL_CAPACITY
 from app.crud import user as crud_user, pool as crud_pool
+from app.services.settings import get_pool_threshold
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.models.pool import Pool, PoolStatus
 from app.schemas.pool import PoolCreate, PoolUpdate
@@ -186,7 +187,10 @@ def check_and_scale_waitlist(db: Session) -> Pool | None:
         .all()
     )
 
-    if len(paid_waitlist) < WAITLIST_TRIGGER:
+    # Use DB-persisted threshold so admins can tune it without a redeploy.
+    # Falls back to WAITLIST_TRIGGER (24) when no row exists yet.
+    threshold = get_pool_threshold(db)
+    if len(paid_waitlist) < threshold:
         return None
 
     pool_name = _next_pool_name(db)

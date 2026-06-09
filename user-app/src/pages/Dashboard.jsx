@@ -7,7 +7,7 @@ import GlassCard from '../components/GlassCard'
 import CountdownTimer from '../components/CountdownTimer'
 import BottomNav from '../components/BottomNav'
 import { useUser } from '../context/UserContext'
-import { getUser } from '../api/client'
+import { getUser, getWaitlistRank } from '../api/client'
 
 const STATUS_COLORS = {
   Active:        { bg: 'rgba(0,255,136,0.1)',  border: 'rgba(0,255,136,0.3)',  text: '#00ff88' },
@@ -164,9 +164,10 @@ function VaultOpenOverlay({ visible, onDone }) {
 export default function Dashboard() {
   const { user, logout, refresh } = useUser()
   const nav = useNavigate()
-  const [apiOk,      setApiOk]      = useState(true)
-  const [refreshing, setRefreshing] = useState(false)
-  const [showVault,  setShowVault]  = useState(false)
+  const [apiOk,        setApiOk]        = useState(true)
+  const [refreshing,   setRefreshing]   = useState(false)
+  const [showVault,    setShowVault]    = useState(false)
+  const [rankData,     setRankData]     = useState(null)   // { rank, total_waiting, message }
 
   const fetchFresh = async (silent = false) => {
     if (!user?.id) return
@@ -179,6 +180,16 @@ export default function Dashboard() {
     finally { setRefreshing(false) }
   }
 
+  // Fetch waitlist rank only when the user is on the Waitlist
+  const fetchRank = async () => {
+    try {
+      const res = await getWaitlistRank()
+      if (res.data.rank !== null && res.data.rank !== undefined) {
+        setRankData(res.data)
+      }
+    } catch { /* non-fatal — rank display is optional */ }
+  }
+
   useEffect(() => {
     fetchFresh(true)
     // Show vault animation once per session for Active users
@@ -188,6 +199,10 @@ export default function Dashboard() {
         sessionStorage.setItem(key, '1')
         setShowVault(true)
       }
+    }
+    // Fetch queue position for Waitlist users
+    if (user?.status === 'Waitlist') {
+      fetchRank()
     }
   }, [])  // eslint-disable-line
 
@@ -265,6 +280,43 @@ export default function Dashboard() {
             <LevelBadge level={user?.current_level ?? 1} paymentStatus={user?.weekly_payment_status} />
           </div>
         </GlassCard>
+
+        {/* Waitlist rank — visible only to Waitlist users */}
+        {status === 'Waitlist' && rankData?.rank && (
+          <GlassCard className="p-5" animate>
+            <p className="text-[10px] font-mono tracking-[0.2em] text-white/30 uppercase mb-3">
+              Your Queue Position
+            </p>
+            <div className="flex items-end gap-3">
+              <div>
+                <span
+                  className="text-5xl font-black tabular-nums"
+                  style={{ color: '#ffaa00', textShadow: '0 0 18px rgba(255,170,0,0.35)' }}
+                >
+                  #{rankData.rank}
+                </span>
+                <span className="ml-2 text-sm text-white/40">
+                  of {rankData.total_waiting?.toLocaleString('en-IN')} waiting
+                </span>
+              </div>
+            </div>
+            {/* Progress bar */}
+            <div className="mt-3 h-1.5 rounded-full overflow-hidden"
+              style={{ background: 'rgba(255,255,255,0.06)' }}>
+              <motion.div
+                className="h-full rounded-full"
+                style={{ background: 'linear-gradient(90deg,#ffaa00,#ff6600)' }}
+                initial={{ width: 0 }}
+                animate={{ width: `${Math.max(2, Math.min(100, ((rankData.total_waiting - rankData.rank + 1) / rankData.total_waiting) * 100))}%` }}
+                transition={{ duration: 1, ease: 'easeOut' }}
+              />
+            </div>
+            <p className="mt-2 text-[11px] text-white/35 leading-relaxed">
+              Positions are allocated strictly by join date (FIFO). You move up as members ahead of you
+              enter active pools. Your spot is reserved — no action needed.
+            </p>
+          </GlassCard>
+        )}
 
         {/* Countdown — with ambient vault glow when Active */}
         <GlassCard className="p-6" animate>

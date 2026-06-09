@@ -159,6 +159,24 @@ class AdminDeleteTokenRequest(BaseModel):
     admin_password: str = Field(..., description="Current admin account password (verified before deletion).")
 
 
+class DeleteUserRequest(BaseModel):
+    """DELETE /admin/users/{id} — admin password required before permanent deletion."""
+    admin_password: str = Field(..., description="Current admin account password (verified before deletion).")
+
+
+class UpdateThresholdRequest(BaseModel):
+    """PUT /admin/settings/threshold — change the pool-creation waitlist threshold."""
+    new_threshold: int = Field(..., ge=1, le=1000,
+                               description="Minimum paid Waitlist members needed to auto-trigger a new pool (1–1000).")
+    admin_password: str = Field(..., description="Admin account password — required to authorise this change.")
+
+
+class ThresholdResponse(BaseModel):
+    """Response body for GET / PUT /admin/settings/threshold."""
+    pool_creation_threshold: int
+    message:                 str
+
+
 class DeleteUserResponse(BaseModel):
     deleted_user_id:        int
     deleted_username:       str

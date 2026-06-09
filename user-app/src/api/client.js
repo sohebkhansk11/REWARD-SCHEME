@@ -29,9 +29,11 @@ api.interceptors.response.use(
 )
 
 // ── User Auth ─────────────────────────────────────────────────────────────────
-export const authRegister = (data)               => api.post('/auth/register', data)
-export const authLogin    = (username, password) => api.post('/auth/login', { username, password })
-export const authMe       = ()                   => api.get('/auth/me')
+export const authRegister     = (data)               => api.post('/auth/register', data)
+export const authLogin        = (username, password) => api.post('/auth/login', { username, password })
+export const authMe           = ()                   => api.get('/auth/me')
+// Real-time referral code validation — no auth required, called during registration
+export const validateReferral = (code)               => api.get(`/auth/validate-referral/${encodeURIComponent(code.trim().toUpperCase())}`)
 
 // ── Users (public read — no JWT required) ────────────────────────────────────
 export const findUserByMobile   = (mobile)   => api.get('/users/', { params: { mobile } })

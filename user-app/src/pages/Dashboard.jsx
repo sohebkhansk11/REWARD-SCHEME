@@ -16,11 +16,13 @@ const STATUS_COLORS = {
   Eliminated_Won:{ bg: 'rgba(191,0,255,0.1)',  border: 'rgba(191,0,255,0.3)',  text: '#d580ff' },
 }
 
-function LevelBadge({ level }) {
+function LevelBadge({ level, paymentStatus }) {
   const colors = ['','#00f0ff','#00f0ff','#54b4ff','#ffaa00','#ff6600','#bf00ff']
-  const c = colors[level] ?? '#ffffff'
+  const c      = colors[Math.min(level, 6)] ?? '#ffffff'
+  const isPaid = paymentStatus === 'Paid'
+
   return (
-    <div className="flex flex-col items-center gap-1">
+    <div className="flex flex-col items-center gap-0.5">
       <div className="relative">
         <Hexagon className="w-14 h-14" style={{ color: c, filter: `drop-shadow(0 0 8px ${c})` }} strokeWidth={1.5} />
         <span className="absolute inset-0 flex items-center justify-center text-xl font-black"
@@ -29,6 +31,19 @@ function LevelBadge({ level }) {
         </span>
       </div>
       <span className="text-[10px] font-mono tracking-[0.2em] text-white/35 uppercase">Level</span>
+      {paymentStatus && (
+        <motion.span
+          className="text-[9px] font-black font-mono tracking-widest px-2 py-0.5 rounded-full mt-0.5"
+          style={isPaid
+            ? { background: 'rgba(0,255,136,0.12)', color: '#00ff88', border: '1px solid rgba(0,255,136,0.25)' }
+            : { background: 'rgba(255,80,80,0.10)', color: '#ff5555', border: '1px solid rgba(255,80,80,0.25)' }
+          }
+          animate={isPaid ? {} : { opacity: [1, 0.45, 1] }}
+          transition={{ duration: 1.6, repeat: Infinity, ease: 'easeInOut' }}
+        >
+          {isPaid ? '✓ PAID' : '✗ UNPAID'}
+        </motion.span>
+      )}
     </div>
   )
 }
@@ -247,7 +262,7 @@ export default function Dashboard() {
                 )}
               </div>
             </div>
-            <LevelBadge level={user?.current_level ?? 1} />
+            <LevelBadge level={user?.current_level ?? 1} paymentStatus={user?.weekly_payment_status} />
           </div>
         </GlassCard>
 

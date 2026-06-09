@@ -1,13 +1,13 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Zap, RefreshCw, ChevronRight, Shield, Eye, EyeOff, Ticket } from 'lucide-react'
+import { Zap, RefreshCw, ChevronRight, Shield, Eye, EyeOff, Ticket, CheckCircle2, AlertCircle } from 'lucide-react'
 import Background from '../components/Background'
 import NeonInput from '../components/NeonInput'
 import NeonButton from '../components/NeonButton'
 import GlassCard from '../components/GlassCard'
 import { generateUsername, typewriterReveal } from '../utils/username'
-import { authRegister, authLogin } from '../api/client'
+import { authRegister, authLogin, validateReferral } from '../api/client'
 import { useUser } from '../context/UserContext'
 
 // ── Password input with show/hide toggle ──────────────────────────────────────
@@ -55,7 +55,11 @@ export default function Auth() {
   const [password,      setPassword]      = useState('')
   const [confirmPass,   setConfirmPass]   = useState('')
   const [depositToken,  setDepositToken]  = useState('')
-  const [referralUser,  setReferralUser]  = useState('')
+  const [referralCode,  setReferralCode]  = useState('')
+  // null | 'loading' | 'valid' | 'invalid'
+  const [refStatus,     setRefStatus]     = useState(null)
+  const [refOwner,      setRefOwner]      = useState('')
+  const refDebounce = useRef(null)
 
   // ── Login fields ───────────────────────────────────────────────────────────
   const [loginUsername, setLoginUsername] = useState('')
@@ -74,6 +78,40 @@ export default function Auth() {
     await typewriterReveal(u, setDisplayUser)
     setGenerating(false)
   }
+
+  // ── Referral code real-time validation ────────────────────────────────────
+  useEffect(() => {
+    const code = referralCode.trim()
+    if (!code) {
+      setRefStatus(null)
+      setRefOwner('')
+      return
+    }
+    if (code.length < 8) {
+      // Keep UI neutral while still typing
+      setRefStatus(null)
+      setRefOwner('')
+      return
+    }
+    setRefStatus('loading')
+    clearTimeout(refDebounce.current)
+    refDebounce.current = setTimeout(async () => {
+      try {
+        const res = await validateReferral(code)
+        if (res.data?.valid) {
+          setRefStatus('valid')
+          setRefOwner(res.data.referrer_name ?? res.data.referrer_username ?? 'your inviter')
+        } else {
+          setRefStatus('invalid')
+          setRefOwner('')
+        }
+      } catch {
+        setRefStatus('invalid')
+        setRefOwner('')
+      }
+    }, 600)
+    return () => clearTimeout(refDebounce.current)
+  }, [referralCode])
 
   // ── Submit ─────────────────────────────────────────────────────────────────
   const handleSubmit = async e => {
@@ -105,16 +143,24 @@ export default function Auth() {
     if (password.length < 6)  { setError('Password must be at least 6 characters.'); return }
     if (password !== confirmPass) { setError('Passwords do not match.');       return }
     if (!depositToken.trim()) { setError('A Deposit Token code is required to join.'); return }
+    if (referralCode.trim() && refStatus === 'invalid') {
+      setError('Invalid referral code. Clear it or enter a valid 8-character code.')
+      return
+    }
+    if (referralCode.trim() && refStatus === 'loading') {
+      setError('Referral code is still validating — wait a moment and try again.')
+      return
+    }
 
     setLoading(true)
     try {
       const payload = {
-        name:          name.trim(),
-        mobile:        mobile.trim(),
-        username:      username.trim(),
+        name:           name.trim(),
+        mobile:         mobile.trim(),
+        username:       username.trim(),
         password,
-        deposit_token: depositToken.trim().toUpperCase(),
-        referred_by_username: referralUser.trim() || undefined,
+        deposit_token:  depositToken.trim().toUpperCase(),
+        referred_by_code: referralCode.trim() || undefined,
       }
       const res = await authRegister(payload)
       login(res.data.user, res.data.access_token)
@@ -329,14 +375,54 @@ export default function Auth() {
                   </p>
                 </div>
 
-                {/* Referral (optional) */}
-                <NeonInput
-                  label="Referral Username (optional)"
-                  placeholder="Who invited you?"
-                  value={referralUser}
-                  onChange={e => setReferralUser(e.target.value)}
-                  autoComplete="off"
-                />
+                {/* Referral Code (optional) — real-time validated */}
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-mono font-semibold text-white/40 uppercase tracking-widest">
+                    Referral Code{' '}
+                    <span className="text-white/20 normal-case tracking-normal font-normal">(optional)</span>
+                  </label>
+                  <div className="relative">
+                    <input
+                      className="neon-input w-full pr-10 font-mono tracking-[0.18em] uppercase text-sm"
+                      placeholder="XXXXXXXX"
+                      value={referralCode}
+                      onChange={e =>
+                        setReferralCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8))
+                      }
+                      autoComplete="off"
+                      spellCheck={false}
+                      maxLength={8}
+                    />
+                    {/* Status indicator */}
+                    <div className="absolute right-3.5 top-1/2 -translate-y-1/2">
+                      {refStatus === 'loading' && (
+                        <RefreshCw className="w-4 h-4 animate-spin" style={{ color: 'rgba(255,255,255,0.28)' }} />
+                      )}
+                      {refStatus === 'valid' && (
+                        <CheckCircle2 className="w-4 h-4" style={{ color: '#00ff88' }} />
+                      )}
+                      {refStatus === 'invalid' && (
+                        <AlertCircle className="w-4 h-4" style={{ color: '#ff5555' }} />
+                      )}
+                    </div>
+                  </div>
+                  {/* Contextual hint line */}
+                  {refStatus === 'valid' && refOwner && (
+                    <p className="text-[10px] font-mono pl-1" style={{ color: '#00ff88' }}>
+                      ✓ Referred by {refOwner}
+                    </p>
+                  )}
+                  {refStatus === 'invalid' && (
+                    <p className="text-[10px] font-mono pl-1 text-red-400">
+                      ✗ Code not found — leave blank to continue without a referral.
+                    </p>
+                  )}
+                  {(!refStatus || refStatus === 'loading') && (
+                    <p className="text-[10px] text-white/22 font-mono pl-1">
+                      Ask your inviter for their 8-character code.
+                    </p>
+                  )}
+                </div>
               </motion.div>
             )}
           </AnimatePresence>

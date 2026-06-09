@@ -343,8 +343,13 @@ export default function DrawPage() {
                     <p className="text-[10px] font-mono text-white/30 uppercase">Win Now</p>
                     <p className="text-lg font-black mt-0.5 font-mono"
                       style={{ color: '#00ff88', textShadow: '0 0 14px rgba(0,255,136,0.45)' }}>
-                      {currentPayout ? `₹ ${currentPayout.net.toLocaleString('en-IN')}` : '—'}
+                      {currentPayout ? `₹ ${(currentPayout.net + 500).toLocaleString('en-IN')}` : '—'}
                     </p>
+                    {currentPayout && (
+                      <p className="text-[9px] font-mono text-white/22 mt-0.5">
+                        Net ₹{currentPayout.net.toLocaleString('en-IN')} −₹500 fee
+                      </p>
+                    )}
                   </div>
                 </div>
 
@@ -380,78 +385,181 @@ export default function DrawPage() {
           )}
         </AnimatePresence>
 
-        {/* ── Payout matrix L1–L12 ───────────────────────────── */}
-        <GlassCard animate className="p-5" neon="none">
-          <div className="flex items-center justify-between mb-4">
+        {/* ── Level Ladder L1–L12 ────────────────────────────── */}
+        {/* Backend logic caps at L6. L7–L12 are aspirational projections shown
+            intentionally to illustrate long-term earning potential. */}
+        <GlassCard animate className="p-5 pb-4" neon="none">
+          <div className="flex items-center justify-between mb-5">
             <p className="text-[10px] font-mono tracking-widest text-white/30 uppercase">
-              Payout Matrix
+              Level Ladder
             </p>
-            <span className="text-[10px] font-mono text-white/20">Net after ₹ 500 fee</span>
+            <span className="text-[10px] font-mono text-white/18">
+              Gross · Net −₹500 fee
+            </span>
           </div>
 
-          <div className="grid grid-cols-2 gap-2">
-            {PAYOUT_TABLE.map(({ level, net }) => {
-              const color  = TIER_COLOR[level - 1]
-              const isMe   = level === userLevel && userStatus === 'Active'
-              const isPast = level < userLevel   && userStatus === 'Active'
+          <div className="relative">
+            {/* Vertical spine — runs along the left edge of the level bubbles */}
+            <div
+              className="absolute top-5 bottom-5 w-px pointer-events-none"
+              style={{
+                left: 18,
+                background:
+                  'linear-gradient(180deg,' +
+                  'rgba(0,240,255,0.55) 0%,' +
+                  'rgba(0,240,255,0.25) 45%,' +
+                  'rgba(255,170,0,0.25) 70%,' +
+                  'rgba(255,170,0,0.05) 100%)',
+              }}
+            />
 
-              return (
-                <motion.div
-                  key={level}
-                  className="rounded-xl px-3 py-2.5 flex items-center justify-between relative"
-                  style={{
-                    background: isMe
-                      ? 'rgba(0,240,255,0.08)'
-                      : isPast ? 'rgba(255,255,255,0.03)' : 'rgba(255,255,255,0.025)',
-                    border: isMe
-                      ? '1px solid rgba(0,240,255,0.45)'
-                      : `1px solid rgba(255,255,255,${isPast ? '0.07' : '0.04'})`,
-                  }}
-                  animate={isMe
-                    ? { boxShadow: ['0 0 6px rgba(0,240,255,0.15)', '0 0 18px rgba(0,240,255,0.40)', '0 0 6px rgba(0,240,255,0.15)'] }
-                    : {}}
-                  transition={{ duration: 1.8, repeat: Infinity }}
-                >
-                  {/* Level label */}
-                  <div className="flex items-center gap-2">
-                    <div
-                      className="w-6 h-6 rounded-lg flex items-center justify-center text-[9px] font-black flex-shrink-0"
+            {/* Ladder rows */}
+            {(() => {
+              const rows = []
+              PAYOUT_TABLE.forEach(({ level, net }) => {
+                const gross        = net + 500
+                const color        = TIER_COLOR[level - 1]
+                const isMe         = level === userLevel && userStatus === 'Active'
+                const isPast       = level < userLevel  && userStatus === 'Active'
+                const isProjection = level > 6
+
+                // Divider before extended projections
+                if (level === 7) {
+                  rows.push(
+                    <div key="ext-div" className="flex items-center gap-2 py-2.5">
+                      {/* Spacer to align with bubbles */}
+                      <div className="w-9 flex-shrink-0" />
+                      <div className="flex flex-1 items-center gap-2">
+                        <div className="flex-1 h-px" style={{ background: 'rgba(255,255,255,0.07)' }} />
+                        <span className="text-[9px] font-mono uppercase tracking-[0.22em] whitespace-nowrap"
+                          style={{ color: 'rgba(255,255,255,0.18)' }}>
+                          Extended Projections
+                        </span>
+                        <div className="flex-1 h-px" style={{ background: 'rgba(255,255,255,0.07)' }} />
+                      </div>
+                    </div>
+                  )
+                }
+
+                rows.push(
+                  <motion.div
+                    key={level}
+                    className="flex items-center gap-3 py-1"
+                    animate={isMe ? { opacity: [0.85, 1, 0.85] } : {}}
+                    transition={isMe ? { duration: 2.8, repeat: Infinity, ease: 'easeInOut' } : {}}
+                  >
+                    {/* ── Level bubble (node on the spine) ── */}
+                    <motion.div
+                      className="relative z-10 w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 text-[10px] font-black"
                       style={{
-                        background: `${color}18`,
-                        border: `1px solid ${color}44`,
-                        color,
+                        background: isMe
+                          ? `${color}22`
+                          : isProjection
+                            ? 'rgba(255,255,255,0.03)'
+                            : isPast
+                              ? `${color}12`
+                              : `${color}0d`,
+                        border: isMe
+                          ? `1.5px solid ${color}`
+                          : isProjection
+                            ? '1px solid rgba(255,255,255,0.09)'
+                            : `1px solid ${color}44`,
+                        color: isMe
+                          ? color
+                          : isProjection
+                            ? 'rgba(255,255,255,0.18)'
+                            : `${color}88`,
+                        boxShadow: isMe ? `0 0 14px ${color}55, 0 0 28px ${color}1a` : 'none',
                       }}
+                      animate={isMe
+                        ? { boxShadow: [
+                            `0 0 10px ${color}44, 0 0 20px ${color}15`,
+                            `0 0 20px ${color}77, 0 0 36px ${color}28`,
+                            `0 0 10px ${color}44, 0 0 20px ${color}15`,
+                          ]}
+                        : {}}
+                      transition={isMe ? { duration: 2.2, repeat: Infinity } : {}}
                     >
                       {level}
+                    </motion.div>
+
+                    {/* ── Row content ── */}
+                    <div
+                      className="flex-1 flex items-center justify-between rounded-xl px-3 py-2.5"
+                      style={{
+                        background: isMe
+                          ? `${color}0d`
+                          : 'transparent',
+                        border: isMe
+                          ? `1px solid ${color}30`
+                          : '1px solid transparent',
+                        boxShadow: isMe ? `0 0 16px ${color}12` : 'none',
+                      }}
+                    >
+                      {/* Left: label + YOU tag */}
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span
+                          className="text-[11px] font-mono truncate"
+                          style={{
+                            color: isMe
+                              ? 'rgba(255,255,255,0.90)'
+                              : isProjection
+                                ? 'rgba(255,255,255,0.22)'
+                                : 'rgba(255,255,255,0.48)',
+                            fontWeight: isMe ? 700 : 400,
+                          }}
+                        >
+                          Level {level}
+                        </span>
+                        {isMe && (
+                          <span
+                            className="text-[8px] font-black px-1.5 py-0.5 rounded-full tracking-widest flex-shrink-0"
+                            style={{
+                              background: `${color}25`,
+                              color,
+                              border: `1px solid ${color}55`,
+                            }}
+                          >
+                            YOU
+                          </span>
+                        )}
+                        {isProjection && (
+                          <span className="text-[8px] font-mono flex-shrink-0"
+                            style={{ color: 'rgba(255,255,255,0.18)' }}>
+                            est.
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Right: gross + net breakdown */}
+                      <div className="text-right flex-shrink-0 ml-2">
+                        <p
+                          className="text-[12px] font-black font-mono tabular-nums leading-none"
+                          style={{
+                            color: isMe
+                              ? color
+                              : isProjection
+                                ? 'rgba(255,255,255,0.18)'
+                                : isPast
+                                  ? 'rgba(255,255,255,0.30)'
+                                  : 'rgba(255,255,255,0.58)',
+                            textShadow: isMe ? `0 0 10px ${color}77` : 'none',
+                          }}
+                        >
+                          ₹ {gross.toLocaleString('en-IN')}
+                        </p>
+                        <p className="text-[9px] font-mono mt-0.5"
+                          style={{ color: 'rgba(255,255,255,0.18)' }}>
+                          Net ₹{net.toLocaleString('en-IN')}
+                        </p>
+                      </div>
                     </div>
-                    {isMe && (
-                      <span
-                        className="text-[8px] font-black px-1.5 py-0.5 rounded-full"
-                        style={{ background: 'rgba(0,240,255,0.2)', color: '#00f0ff' }}
-                      >
-                        YOU
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Payout */}
-                  <p
-                    className="text-[11px] font-black font-mono"
-                    style={{
-                      color: isMe ? '#00f0ff' : isPast ? 'rgba(255,255,255,0.30)' : 'rgba(255,255,255,0.60)',
-                      textShadow: isMe ? '0 0 8px rgba(0,240,255,0.5)' : 'none',
-                    }}
-                  >
-                    ₹ {net.toLocaleString('en-IN')} 💸
-                  </p>
-                </motion.div>
-              )
-            })}
+                  </motion.div>
+                )
+              })
+              return rows
+            })()}
           </div>
-
-          <p className="text-[10px] text-white/15 font-mono mt-3 text-center">
-            L7–L12 represent extended pool projections
-          </p>
         </GlassCard>
 
         {/* ── Recent Winners ─────────────────────────────────── */}

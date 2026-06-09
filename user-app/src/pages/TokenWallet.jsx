@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import {
   Clipboard, CheckCircle2, XCircle, Zap, Lock,
   History, TrendingUp, TrendingDown, ArrowDownCircle, ArrowUpCircle,
-  RefreshCw, IndianRupee,
+  RefreshCw, IndianRupee, AlertTriangle,
 } from 'lucide-react'
 import Background from '../components/Background'
 import GlassCard from '../components/GlassCard'
@@ -49,50 +49,88 @@ function TabPill({ active, onClick, children }) {
 }
 
 // ─── Transaction row ──────────────────────────────────────────────────────────
+// For Withdraw (WIT) tokens the backend stores the NET payout.
+// Gross = net + ₹500 platform fee.  We surface both values with the full
+// fee breakdown so users understand exactly what they received.
+const PLATFORM_FEE = 500
+
 function TxRow({ tx }) {
+  const isWin     = tx.type === 'Withdraw'
   const isDeposit = tx.type === 'Deposit'
-  const accent    = isDeposit ? '#ff5555' : '#00ff88'
+  const accent    = isWin ? '#00ff88' : '#ff5555'
   const Icon      = isDeposit ? ArrowDownCircle : ArrowUpCircle
-  const sign      = isDeposit ? '−' : '+'
+
+  const netAmount   = Number(tx.amount_inr)
+  // For wins: display GROSS (net + fee) as the headline amount.
+  // For deposits: amount is exact ₹1,000 — no adjustment needed.
+  const displayAmt  = isWin ? netAmount + PLATFORM_FEE : netAmount
+  const sign        = isDeposit ? '−' : '+'
 
   return (
     <motion.div
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      className="flex items-center gap-3 py-3"
+      className="py-3"
       style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}
     >
-      {/* Icon */}
-      <div
-        className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
-        style={{
-          background: isDeposit ? 'rgba(255,80,80,0.08)' : 'rgba(0,255,136,0.08)',
-          border: `1px solid ${isDeposit ? 'rgba(255,80,80,0.20)' : 'rgba(0,255,136,0.20)'}`,
-        }}
-      >
-        <Icon className="w-4 h-4" style={{ color: accent }} />
-      </div>
-
-      {/* Details */}
-      <div className="flex-1 min-w-0">
-        <p className="text-xs font-mono font-bold text-white/80 truncate">{tx.code}</p>
-        <p className="text-[10px] font-mono text-white/30 truncate mt-0.5">
-          {tx.pool_name ? `${tx.pool_name} · ` : ''}{formatDate(tx.date)}
-        </p>
-      </div>
-
-      {/* Amount */}
-      <div className="text-right flex-shrink-0">
-        <p className="text-sm font-black font-mono tabular-nums" style={{ color: accent }}>
-          {sign}{INR(tx.amount_inr)}
-        </p>
-        <p
-          className="text-[9px] font-mono uppercase tracking-wider mt-0.5"
-          style={{ color: 'rgba(255,255,255,0.25)' }}
+      <div className="flex items-center gap-3">
+        {/* Icon */}
+        <div
+          className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
+          style={{
+            background: isWin ? 'rgba(0,255,136,0.08)' : 'rgba(255,80,80,0.08)',
+            border: `1px solid ${isWin ? 'rgba(0,255,136,0.20)' : 'rgba(255,80,80,0.20)'}`,
+          }}
         >
-          {tx.status}
-        </p>
+          <Icon className="w-4 h-4" style={{ color: accent }} />
+        </div>
+
+        {/* Details */}
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-mono font-bold text-white/80 truncate">{tx.code}</p>
+          <p className="text-[10px] font-mono text-white/30 truncate mt-0.5">
+            {tx.pool_name ? `${tx.pool_name} · ` : ''}{formatDate(tx.date)}
+          </p>
+        </div>
+
+        {/* Headline amount */}
+        <div className="text-right flex-shrink-0">
+          <p className="text-sm font-black font-mono tabular-nums" style={{ color: accent }}>
+            {sign}{INR(displayAmt)}
+          </p>
+          {!isWin && (
+            <p className="text-[9px] font-mono uppercase tracking-wider mt-0.5"
+              style={{ color: 'rgba(255,255,255,0.22)' }}>
+              {tx.status}
+            </p>
+          )}
+        </div>
       </div>
+
+      {/* ── Winning fee breakdown ──────────────────────────────────────────── */}
+      {/* Only shown for WIT tokens; makes the gross → net math explicit */}
+      {isWin && (
+        <div
+          className="mt-2 ml-12 rounded-xl px-3 py-2 flex items-center justify-between gap-2"
+          style={{
+            background: 'rgba(0,255,136,0.04)',
+            border: '1px solid rgba(0,255,136,0.12)',
+          }}
+        >
+          <span className="text-[10px] font-mono text-white/30">
+            Gross Amount
+          </span>
+          <span className="text-[10px] font-mono text-white/50 tabular-nums">
+            {INR(displayAmt)}
+          </span>
+          <span className="text-[10px] font-mono" style={{ color: '#ff5555' }}>
+            − Fee ₹500
+          </span>
+          <span className="text-[10px] font-black font-mono tabular-nums" style={{ color: '#00ff88' }}>
+            Net {INR(netAmount)}
+          </span>
+        </div>
+      )}
     </motion.div>
   )
 }
@@ -251,6 +289,27 @@ export default function TokenWallet() {
                 )}
               </GlassCard>
 
+              {/* ── Advance payment limit warning ───────────────────────────────
+                  System allows at most 1 advance installment beyond the current
+                  week.  When already Paid, inform the user before they try. */}
+              {isPaid && (
+                <motion.div
+                  initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}
+                  className="flex items-start gap-3 rounded-2xl px-4 py-3"
+                  style={{
+                    background: 'rgba(255,170,0,0.06)',
+                    border: '1px solid rgba(255,170,0,0.28)',
+                  }}
+                >
+                  <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" style={{ color: '#ffaa00' }} />
+                  <p className="text-[11px] font-mono leading-relaxed" style={{ color: 'rgba(255,170,0,0.80)' }}>
+                    <span className="font-black">Already paid this week.</span> You may redeem one
+                    advance installment — but not more. The system will reject a third token until
+                    the next draw resets your weekly status.
+                  </p>
+                </motion.div>
+              )}
+
               {/* Redeem form */}
               <GlassCard animate className="p-5 space-y-5">
                 <div>
@@ -394,7 +453,7 @@ export default function TokenWallet() {
                       {INR(histData.total_won_all_time)}
                     </p>
                     <p className="text-[9px] font-mono uppercase tracking-widest text-white/30 mt-1">
-                      Total Won
+                      Total Won (Net)
                     </p>
                   </GlassCard>
 

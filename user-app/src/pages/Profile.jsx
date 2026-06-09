@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   User, Phone, Lock, Eye, EyeOff, CheckCircle2,
-  Clock, MapPin, Ticket, RefreshCw, AlertCircle, Gift,
+  Clock, MapPin, Ticket, RefreshCw, AlertCircle, Gift, Copy,
 } from 'lucide-react'
 import Background from '../components/Background'
 import GlassCard from '../components/GlassCard'
@@ -190,6 +190,7 @@ export default function Profile() {
   const [refLoading,     setRefLoading]     = useState(false)
   const [payoutLoading,  setPayoutLoading]  = useState(false)
   const [refFb,          setRefFb]          = useState({ ok: false, msg: '' })
+  const [codeCopied,     setCodeCopied]     = useState(false)
 
   const refreshRefProfile = useCallback(async () => {
     if (!user?.id) return
@@ -411,9 +412,66 @@ export default function Profile() {
           </motion.div>
         )}
 
+        {/* ══ YOUR INVITE CODE ════════════════════════════════════ */}
+        {/* Shown whether the user is Active, Waitlist, or Eliminated_Won */}
+        {(() => {
+          const myCode = refProfile?.referral_code ?? user?.referral_code
+          if (!myCode) return null
+          const handleCopy = () => {
+            navigator.clipboard.writeText(myCode).then(() => {
+              setCodeCopied(true)
+              setTimeout(() => setCodeCopied(false), 2200)
+            }).catch(() => {})
+          }
+          return (
+            <GlassCard animate className="p-5">
+              <SectionLabel>Your Invite Code</SectionLabel>
+              <p className="text-[11px] text-white/35 mb-3 leading-relaxed">
+                Share this code with friends. You earn{' '}
+                <span style={{ color: 'rgba(255,170,0,0.85)' }}>₹250</span> when each referred
+                friend enters an active pool.
+              </p>
+              <div
+                className="flex items-center gap-3 rounded-2xl px-4 py-3 mb-1"
+                style={{
+                  background: 'rgba(0,240,255,0.05)',
+                  border: '1.5px solid rgba(0,240,255,0.28)',
+                  boxShadow: '0 0 18px rgba(0,240,255,0.07)',
+                }}
+              >
+                <span
+                  className="flex-1 text-xl font-black font-mono tracking-[0.28em] select-all"
+                  style={{ color: '#00f0ff', textShadow: '0 0 14px rgba(0,240,255,0.45)' }}
+                >
+                  {myCode}
+                </span>
+                <motion.button
+                  whileTap={{ scale: 0.88 }}
+                  onClick={handleCopy}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-[10px] font-black font-mono uppercase tracking-widest flex-shrink-0 transition-all duration-200"
+                  style={codeCopied ? {
+                    background: 'rgba(0,255,136,0.14)',
+                    color: '#00ff88',
+                    border: '1px solid rgba(0,255,136,0.35)',
+                  } : {
+                    background: 'rgba(0,240,255,0.10)',
+                    color: '#00f0ff',
+                    border: '1px solid rgba(0,240,255,0.28)',
+                  }}
+                >
+                  {codeCopied
+                    ? <><CheckCircle2 className="w-3.5 h-3.5" /> COPIED!</>
+                    : <><Copy className="w-3.5 h-3.5" /> COPY</>
+                  }
+                </motion.button>
+              </div>
+            </GlassCard>
+          )
+        })()}
+
         {/* ══ REFERRAL PROGRAM ════════════════════════════════════ */}
         <GlassCard animate className="p-5">
-          <SectionLabel>Referral Program</SectionLabel>
+          <SectionLabel>Referral Earnings</SectionLabel>
 
           {refLoading ? (
             /* Spinner while fetching fresh stats */

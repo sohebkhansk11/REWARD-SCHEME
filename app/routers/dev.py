@@ -268,18 +268,19 @@ def force_draw(body: ForceDrawRequest, db: Session = Depends(get_db)):
                 tokens_made += _simulate_installment_payments(db, members, dr.pool_id)
 
         return {
-            "mode":                   "mass_draw",
-            "pools_drawn":            mass.pools_drawn,
-            "skipped_pools":          mass.skipped_pools,
-            "total_auto_paid":        mass.total_auto_paid,
+            "mode":                     "mass_draw",
+            "pools_drawn":              mass.pools_drawn,
+            "skipped_pools":            mass.skipped_pools,
+            "paused_pools":             mass.paused_pools,
+            "total_auto_paid":          mass.total_auto_paid,
             "simulated_tokens_created": tokens_made,
             "draws": [
                 {
-                    "pool_id":       dr.pool_id,
-                    "pool_name":     dr.pool_name,
+                    "pool_id":        dr.pool_id,
+                    "pool_name":      dr.pool_name,
                     "edge_case_used": dr.edge_case_used,
-                    "winner_1":      _winner_dict(dr.winner_1),
-                    "winner_2":      _winner_dict(dr.winner_2),
+                    "winner_1":       _winner_dict(dr.winner_1),
+                    "winner_2":       _winner_dict(dr.winner_2),
                 }
                 for dr in mass.draw_results
             ],
@@ -288,10 +289,14 @@ def force_draw(body: ForceDrawRequest, db: Session = Depends(get_db)):
                 "phase1_pool_changes": mass.refill["phase1_pool_changes"],
                 "phase2_pool_created": mass.refill["phase2_pool_created"],
                 "phase2_assigned":     mass.refill["phase2_assigned"],
+                "phase3_transfers":    mass.refill["phase3_transfers"],
+                "phase3_events":       mass.refill["phase3_events"],
+                "phase3_dissolved":    mass.refill["phase3_dissolved"],
             },
             "dev_note": (
                 "Global Mass Draw — all full pools drawn simultaneously; "
-                "Double-FIFO refill ran once after all draws."
+                "Triple-phase FIFO refill (P1: waitlist fill, P2: auto-scale, "
+                "P3: condensation) ran once after all draws."
             ),
         }
 

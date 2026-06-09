@@ -189,34 +189,126 @@ function SingleDrawBadges({ r }) {
 
 function RefillSummary({ refill }) {
   if (!refill) return null
+
+  const hasP3 = (refill.phase3_transfers ?? 0) > 0
+  const hasP3Dissolved = refill.phase3_dissolved?.length > 0
+
   return (
-    <div className="mt-4 bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 space-y-1.5">
-      <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest mb-2">
-        Double-FIFO Refill Summary
+    <div className="mt-4 bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 space-y-3">
+      <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">
+        Triple-Phase FIFO Refill Summary
       </p>
-      <div className="flex flex-wrap gap-2">
-        <StatPill label="P1 Assigned" value={refill.phase1_assigned} accent="blue" />
-        <StatPill
-          label="P2 New Pool"
-          value={refill.phase2_pool_created ?? 'none'}
-          accent={refill.phase2_pool_created ? 'emerald' : 'slate'}
-        />
-        {refill.phase2_assigned > 0 && (
-          <StatPill label="P2 Members" value={refill.phase2_assigned} accent="purple" />
+
+      {/* ── Phase 1 ── */}
+      <div>
+        <p className="text-[9px] font-bold text-blue-400 uppercase tracking-widest mb-1.5">
+          Phase 1 — Waitlist Fill
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <StatPill label="Assigned" value={refill.phase1_assigned} accent="blue" />
+        </div>
+        {refill.phase1_pool_changes?.length > 0 && (
+          <div className="pt-2 space-y-1">
+            {refill.phase1_pool_changes.map(c => (
+              <p key={c.pool_id} className="text-[10px] font-mono text-slate-500">
+                {c.pool_name}&nbsp;←&nbsp;
+                <span className="text-sky-400">+{c.filled}</span>
+                &nbsp;member{c.filled !== 1 ? 's' : ''}
+                &nbsp;(now <span className="text-emerald-400">{c.total_after}/12</span>)
+              </p>
+            ))}
+          </div>
+        )}
+        {refill.phase1_assigned === 0 && (
+          <p className="text-[10px] text-slate-600 italic mt-1">Waitlist empty — no assignments.</p>
         )}
       </div>
-      {refill.phase1_pool_changes?.length > 0 && (
-        <div className="pt-2 space-y-1">
-          {refill.phase1_pool_changes.map(c => (
-            <p key={c.pool_id} className="text-[10px] font-mono text-slate-500">
-              {c.pool_name}&nbsp;←&nbsp;
-              <span className="text-sky-400">+{c.filled}</span>
-              &nbsp;member{c.filled !== 1 ? 's' : ''}
-              &nbsp;(now <span className="text-emerald-400">{c.total_after}/12</span>)
-            </p>
-          ))}
+
+      {/* ── Phase 2 ── */}
+      <div>
+        <p className="text-[9px] font-bold text-emerald-400 uppercase tracking-widest mb-1.5">
+          Phase 2 — Auto-Scale
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <StatPill
+            label="New Pool"
+            value={refill.phase2_pool_created ?? 'none'}
+            accent={refill.phase2_pool_created ? 'emerald' : 'slate'}
+          />
+          {(refill.phase2_assigned ?? 0) > 0 && (
+            <StatPill label="Members" value={refill.phase2_assigned} accent="purple" />
+          )}
         </div>
-      )}
+      </div>
+
+      {/* ── Phase 3 ── */}
+      <div>
+        <p className="text-[9px] font-bold text-amber-400 uppercase tracking-widest mb-1.5">
+          Phase 3 — Inter-Pool Condensation
+        </p>
+        {!hasP3 ? (
+          <p className="text-[10px] text-slate-600 italic">
+            No condensation needed — all pools at capacity after Phase 1.
+          </p>
+        ) : (
+          <>
+            <div className="flex flex-wrap gap-2 mb-2">
+              <StatPill label="Members Transferred" value={refill.phase3_transfers} accent="amber" />
+              {hasP3Dissolved && (
+                <StatPill
+                  label="Pools Dissolved"
+                  value={refill.phase3_dissolved.length}
+                  accent="red"
+                />
+              )}
+            </div>
+
+            {/* Condensation event log */}
+            {refill.phase3_events?.length > 0 && (
+              <div className="overflow-x-auto rounded-lg border border-slate-700/50">
+                <table className="w-full text-[10px] whitespace-nowrap">
+                  <thead className="bg-slate-900/60">
+                    <tr>
+                      {['From (source)', 'To (target)', 'Moved', 'Outcome'].map(h => (
+                        <th key={h} className="text-left py-2 px-3 text-slate-500 font-semibold uppercase tracking-wider">
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {refill.phase3_events.map((ev, i) => (
+                      <tr key={i} className="border-t border-slate-800/60">
+                        <td className="py-2 px-3 font-mono text-slate-400">{ev.from_pool}</td>
+                        <td className="py-2 px-3 font-mono text-slate-300 font-semibold">{ev.to_pool}</td>
+                        <td className="py-2 px-3 text-amber-300 font-bold tabular-nums">+{ev.members_moved}</td>
+                        <td className="py-2 px-3">
+                          {ev.dissolved ? (
+                            <span className="bg-red-950 border border-red-800 text-red-300 px-2 py-0.5 rounded-full font-semibold">
+                              Dissolved
+                            </span>
+                          ) : (
+                            <span className="bg-slate-800 border border-slate-700 text-slate-400 px-2 py-0.5 rounded-full">
+                              Partial harvest
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {hasP3Dissolved && (
+              <p className="text-[10px] text-red-400/80 flex items-center gap-1.5 pt-1">
+                <span>⚠</span>
+                Dissolved: {refill.phase3_dissolved.join(', ')}
+              </p>
+            )}
+          </>
+        )}
+      </div>
     </div>
   )
 }
@@ -245,7 +337,13 @@ function ForceDrawResult({ r }) {
           {r.skipped_pools?.length > 0 && (
             <span className="bg-red-950 border border-red-800 text-red-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
               <AlertTriangle className="w-3 h-3" />
-              Skipped: {r.skipped_pools.join(', ')}
+              Errored: {r.skipped_pools.join(', ')}
+            </span>
+          )}
+          {r.paused_pools?.length > 0 && (
+            <span className="bg-orange-950 border border-orange-800 text-orange-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+              <AlertTriangle className="w-3 h-3" />
+              Paused (partial): {r.paused_pools.join(', ')}
             </span>
           )}
         </div>

@@ -98,7 +98,8 @@ class MassDrawResult:
     draw_results:    list[DrawResult]
     total_auto_paid: int
     refill:          dict                    # assign_waitlist_to_pools() summary
-    skipped_pools:   list[str] = field(default_factory=list)  # pool names that errored
+    skipped_pools:   list[str] = field(default_factory=list)  # pool names that errored mid-draw
+    paused_pools:    list[str] = field(default_factory=list)  # Active pools with < 12 — paused pre-draw
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -370,15 +371,26 @@ def execute_weekly_draw(
     """
     from app.services.waitlist import assign_waitlist_to_pools
 
-    # ── 1. Discover eligible pools ────────────────────────────────────────────
+    # ── 1. Discover eligible pools + apply draw-protection safeguard ─────────
+    #
+    # Draw protection (spec requirement):
+    #   Any Active pool whose actual member count < POOL_CAPACITY is NOT eligible
+    #   for the draw.  Running a draw on a partial pool breaks the L1-L3 / L4-L6
+    #   payout mathematics.  Such pools are immediately marked
+    #   Paused_Awaiting_Members and skipped.  They re-enter Active status
+    #   automatically once assign_waitlist_to_pools (Phase 1 or Phase 3) fills
+    #   them back to capacity.
+
     candidate_pools: list[Pool] = (
         db.query(Pool)
-        .filter(Pool.status == PoolStatus.Active)
+        .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
         .order_by(Pool.id.asc())
         .all()
     )
 
-    eligible: list[Pool] = []
+    eligible:     list[Pool] = []
+    paused_now:   list[str]  = []   # newly paused this run (were Active, < 12)
+
     for pool in candidate_pools:
         actual: int = (
             db.query(User)
@@ -387,6 +399,24 @@ def execute_weekly_draw(
         )
         if actual == POOL_CAPACITY:
             eligible.append(pool)
+        elif pool.status == PoolStatus.Active:
+            # Draw protection: Active pool with < 12 members — pause it
+            pool.status = PoolStatus.Paused_Awaiting_Members
+            paused_now.append(pool.name)
+            _logger.warning(
+                "execute_weekly_draw: ⏸  %s has %d/%d members — "
+                "marking Paused_Awaiting_Members (DRAW SKIPPED for this pool).",
+                pool.name, actual, POOL_CAPACITY,
+            )
+        # Already Paused_Awaiting_Members → just skip silently
+
+    if paused_now:
+        db.commit()
+        _logger.info(
+            "execute_weekly_draw: draw-protection paused %d pool(s): %s",
+            len(paused_now),
+            ", ".join(paused_now),
+        )
 
     if not eligible:
         raise ValueError(
@@ -467,4 +497,5 @@ def execute_weekly_draw(
         total_auto_paid=total_auto_paid,
         refill=refill,
         skipped_pools=skipped,
+        paused_pools=paused_now,
     )

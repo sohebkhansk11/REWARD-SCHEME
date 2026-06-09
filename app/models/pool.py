@@ -9,6 +9,8 @@ class PoolStatus(str, enum.Enum):
     Active = "Active"
     Full = "Full"
     Waiting = "Waiting"
+    Paused_Awaiting_Members = "Paused_Awaiting_Members"
+    Merged_Dissolved = "Merged_Dissolved"
 
 
 class Pool(Base):

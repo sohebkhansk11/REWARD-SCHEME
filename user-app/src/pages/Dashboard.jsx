@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { motion } from 'framer-motion'
+import { motion, AnimatePresence } from 'framer-motion'
 import { LogOut, RefreshCw, Hexagon, Wifi, WifiOff } from 'lucide-react'
 import Background from '../components/Background'
 import GlassCard from '../components/GlassCard'
@@ -33,11 +33,125 @@ function LevelBadge({ level }) {
   )
 }
 
+// ─── Vault Open Animation Overlay ─────────────────────────────────────────────
+// Shows briefly on first Dashboard load for Active-status users as a
+// motivational "you're in the vault" moment.
+function VaultOpenOverlay({ visible, onDone }) {
+  return (
+    <AnimatePresence>
+      {visible && (
+        <motion.div
+          className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.4 }}
+          onAnimationComplete={() => {
+            // Auto-dismiss after the full animation sequence (~2.8 s)
+            setTimeout(onDone, 2800)
+          }}
+        >
+          {/* Dark overlay */}
+          <motion.div
+            className="absolute inset-0"
+            style={{ background: 'rgba(3,3,24,0.85)' }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: [0, 0.85, 0.85, 0] }}
+            transition={{ duration: 2.8, times: [0, 0.15, 0.75, 1] }}
+          />
+
+          {/* Concentric glow rings */}
+          {[180, 140, 100, 65].map((size, i) => (
+            <motion.div
+              key={size}
+              className="absolute rounded-full"
+              style={{
+                width: size,
+                height: size,
+                border: `1.5px solid rgba(0,240,255,${0.55 - i * 0.1})`,
+                boxShadow: `0 0 ${20 + i * 10}px rgba(0,240,255,${0.25 - i * 0.04})`,
+              }}
+              initial={{ scale: 0, opacity: 0 }}
+              animate={{ scale: [0, 1.15, 1], opacity: [0, 0.9, 0.6] }}
+              transition={{ duration: 0.7, delay: i * 0.12, ease: [0.22, 1, 0.36, 1] }}
+            />
+          ))}
+
+          {/* Radiating light beams */}
+          {[0, 45, 90, 135, 180, 225, 270, 315].map((angle, i) => (
+            <motion.div
+              key={angle}
+              className="absolute"
+              style={{
+                width: 2,
+                height: 120,
+                borderRadius: 4,
+                background: 'linear-gradient(to top, transparent, rgba(0,240,255,0.6))',
+                transformOrigin: 'bottom center',
+                transform: `rotate(${angle}deg)`,
+                bottom: '50%',
+                left: '50%',
+                marginLeft: -1,
+              }}
+              initial={{ scaleY: 0, opacity: 0 }}
+              animate={{ scaleY: [0, 1, 0], opacity: [0, 0.7, 0] }}
+              transition={{ duration: 1.4, delay: 0.3 + i * 0.05, ease: 'easeOut' }}
+            />
+          ))}
+
+          {/* Central vault icon */}
+          <motion.div
+            className="relative z-10 flex flex-col items-center gap-3"
+            initial={{ scale: 0.4, opacity: 0 }}
+            animate={{ scale: [0.4, 1.1, 1], opacity: [0, 1, 1, 0] }}
+            transition={{ duration: 2.6, times: [0, 0.25, 0.55, 1], ease: [0.22, 1, 0.36, 1] }}
+          >
+            <div
+              className="w-20 h-20 rounded-2xl flex items-center justify-center text-4xl"
+              style={{
+                background: 'rgba(0,240,255,0.10)',
+                border:     '2px solid rgba(0,240,255,0.50)',
+                boxShadow:  '0 0 40px rgba(0,240,255,0.35)',
+              }}
+            >
+              🔓
+            </div>
+            <motion.p
+              className="font-mono font-black text-xs tracking-[0.35em] uppercase"
+              style={{ color: '#00f0ff', textShadow: '0 0 12px rgba(0,240,255,0.6)' }}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: [0, 1, 1, 0] }}
+              transition={{ duration: 2.4, delay: 0.3, times: [0, 0.2, 0.7, 1] }}
+            >
+              Vault Active
+            </motion.p>
+          </motion.div>
+
+          {/* Outer pulse ring */}
+          <motion.div
+            className="absolute rounded-full"
+            style={{
+              width: 260,
+              height: 260,
+              border: '1px solid rgba(0,240,255,0.18)',
+            }}
+            initial={{ scale: 0.3, opacity: 0 }}
+            animate={{ scale: [0.3, 1.6], opacity: [0.6, 0] }}
+            transition={{ duration: 1.8, delay: 0.2, ease: 'easeOut' }}
+          />
+        </motion.div>
+      )}
+    </AnimatePresence>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 export default function Dashboard() {
   const { user, logout, refresh } = useUser()
   const nav = useNavigate()
-  const [apiOk, setApiOk] = useState(true)
+  const [apiOk,      setApiOk]      = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [showVault,  setShowVault]  = useState(false)
 
   const fetchFresh = async (silent = false) => {
     if (!user?.id) return
@@ -50,20 +164,39 @@ export default function Dashboard() {
     finally { setRefreshing(false) }
   }
 
-  useEffect(() => { fetchFresh(true) }, [])
+  useEffect(() => {
+    fetchFresh(true)
+    // Show vault animation once per session for Active users
+    if (user?.status === 'Active') {
+      const key = `vault_shown_${user.id}`
+      if (!sessionStorage.getItem(key)) {
+        sessionStorage.setItem(key, '1')
+        setShowVault(true)
+      }
+    }
+  }, [])  // eslint-disable-line
 
   const handleLogout = () => { logout(); nav('/', { replace: true }) }
 
   const status = user?.status ?? 'Waitlist'
-  const sc = STATUS_COLORS[status] ?? STATUS_COLORS.Waitlist
+  const sc     = STATUS_COLORS[status] ?? STATUS_COLORS.Waitlist
+
+  // Prefer human-readable pool name; fall back gracefully
+  const poolDisplay = user?.current_pool_name
+    ?? (user?.current_pool_id ? `Pool #${user.current_pool_id}` : 'Not Assigned')
 
   return (
     <div className="min-h-dvh pb-28 relative">
       <Background />
 
+      {/* Vault open animation — Active users only, once per session */}
+      <VaultOpenOverlay visible={showVault} onDone={() => setShowVault(false)} />
+
       {/* Header */}
-      <div className="sticky top-0 z-30 px-5 pt-12 pb-4 flex items-center justify-between"
-        style={{ background: 'rgba(3,3,24,0.7)', backdropFilter: 'blur(20px)' }}>
+      <div
+        className="sticky top-0 z-30 px-5 pt-12 pb-4 flex items-center justify-between"
+        style={{ background: 'rgba(3,3,24,0.7)', backdropFilter: 'blur(20px)' }}
+      >
         <div className="min-w-0">
           <p className="text-[10px] font-mono tracking-[0.25em] text-white/30 uppercase">Welcome back</p>
           <p className="font-mono font-bold text-white truncate" style={{ textShadow: '0 0 10px rgba(0,240,255,0.4)' }}>
@@ -73,7 +206,7 @@ export default function Dashboard() {
         <div className="flex items-center gap-2">
           <div title={apiOk ? 'API Connected' : 'API Offline'}>
             {apiOk
-              ? <Wifi className="w-4 h-4 text-emerald-400" />
+              ? <Wifi    className="w-4 h-4 text-emerald-400" />
               : <WifiOff className="w-4 h-4 text-red-400" />
             }
           </div>
@@ -94,8 +227,9 @@ export default function Dashboard() {
           <div className="flex items-center justify-between gap-4">
             <div className="min-w-0 flex-1">
               <p className="text-[10px] font-mono tracking-[0.2em] text-white/30 uppercase mb-1">Active Pool</p>
+              {/* Uses actual pool name from backend — no more hardcoded "Pool #ID" */}
               <p className="text-2xl font-black text-white truncate">
-                {user?.current_pool_id ? `Pool #${user.current_pool_id}` : 'Not Assigned'}
+                {poolDisplay}
               </p>
               <div className="flex items-center gap-2 mt-2">
                 <span className="text-[11px] font-mono font-bold px-2.5 py-1 rounded-full border"
@@ -117,11 +251,26 @@ export default function Dashboard() {
           </div>
         </GlassCard>
 
-        {/* Countdown */}
+        {/* Countdown — with ambient vault glow when Active */}
         <GlassCard className="p-6" animate>
           <p className="text-[10px] font-mono tracking-[0.3em] text-white/30 uppercase text-center mb-5">
             Next Draw · Sunday 7 PM
           </p>
+          {/* Vault glow ring around countdown for Active users */}
+          {status === 'Active' && (
+            <div className="relative flex justify-center mb-4">
+              <motion.div
+                className="absolute rounded-full"
+                style={{
+                  width: 200, height: 200,
+                  background: 'radial-gradient(circle, rgba(0,240,255,0.06) 0%, transparent 70%)',
+                  border: '1px solid rgba(0,240,255,0.08)',
+                }}
+                animate={{ scale: [1, 1.06, 1], opacity: [0.6, 1, 0.6] }}
+                transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
+              />
+            </div>
+          )}
           <CountdownTimer />
           <motion.p
             className="text-center mt-5 text-[10px] font-mono tracking-widest"

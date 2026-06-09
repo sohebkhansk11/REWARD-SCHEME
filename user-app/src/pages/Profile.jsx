@@ -10,8 +10,8 @@ import NeonButton from '../components/NeonButton'
 import BottomNav from '../components/BottomNav'
 import { useUser } from '../context/UserContext'
 import {
-  getUsers, updateProfile, changePassword, rejoinWaitlist,
-  authMe, requestReferralPayout,
+  getUsers, getUser, updateProfile, changePassword, rejoinWaitlist,
+  requestReferralPayout,
 } from '../api/client'
 
 // ─── IST date formatter ───────────────────────────────────────────────────────
@@ -116,6 +116,13 @@ export default function Profile() {
   const [detailsLoading, setDetailsLoading] = useState(false)
   const [detailsFb,  setDetailsFb]  = useState({ ok: false, msg: '' })
 
+  // Track the values as they were when the form last saved (or on mount).
+  // The Save button is disabled whenever the current values match these — no
+  // point submitting a no-op update.
+  const [initName,   setInitName]   = useState(user?.name   ?? '')
+  const [initMobile, setInitMobile] = useState(user?.mobile ?? '')
+  const detailsDirty = dName.trim() !== initName || dMobile.trim() !== initMobile
+
   const handleSaveDetails = async e => {
     e.preventDefault()
     if (!dName.trim())   { setDetailsFb({ ok: false, msg: 'Name cannot be empty.' }); return }
@@ -125,6 +132,9 @@ export default function Profile() {
     try {
       const res = await updateProfile({ name: dName.trim(), mobile: dMobile.trim() })
       login(res.data.user, res.data.access_token)
+      // Reset baseline so button disables again after a successful save
+      setInitName(dName.trim())
+      setInitMobile(dMobile.trim())
       setDetailsFb({ ok: true, msg: 'Details updated successfully.' })
     } catch (err) {
       setDetailsFb({ ok: false, msg: err.response?.data?.detail ?? 'Update failed.' })
@@ -174,22 +184,23 @@ export default function Profile() {
   }
 
   // ── Referral program ──────────────────────────────────────────────────────
-  // Keep a locally-fresh copy of the user profile so referral counts/balance
-  // reflect the real-time server state rather than the (possibly stale) JWT payload.
+  // Uses the PUBLIC /users/{id} endpoint — no JWT required — so a stale or
+  // expired token can never trigger the 401-interceptor logout on Profile mount.
   const [refProfile,     setRefProfile]     = useState(user)
   const [refLoading,     setRefLoading]     = useState(false)
   const [payoutLoading,  setPayoutLoading]  = useState(false)
   const [refFb,          setRefFb]          = useState({ ok: false, msg: '' })
 
   const refreshRefProfile = useCallback(async () => {
+    if (!user?.id) return
     setRefLoading(true)
     try {
-      const res = await authMe()
+      const res = await getUser(user.id)   // public endpoint — safe on mount
       setRefProfile(res.data)
-      refresh(res.data)          // keep localStorage in sync
-    } catch { /* silent – stale is better than broken */ }
+      refresh(res.data)                    // sync localStorage (user object only)
+    } catch { /* silent – stale display is better than a crash */ }
     finally { setRefLoading(false) }
-  }, [refresh])
+  }, [user?.id, refresh])
 
   useEffect(() => { refreshRefProfile() }, [refreshRefProfile])
 
@@ -564,9 +575,9 @@ export default function Profile() {
               {detailsFb.msg && <Feedback ok={detailsFb.ok} msg={detailsFb.msg} />}
             </AnimatePresence>
 
-            <NeonButton type="submit" disabled={detailsLoading}>
+            <NeonButton type="submit" disabled={detailsLoading || !detailsDirty}>
               <span className="text-sm tracking-widest">
-                {detailsLoading ? 'SAVING…' : 'SAVE DETAILS'}
+                {detailsLoading ? 'SAVING…' : detailsDirty ? 'SAVE DETAILS' : 'NO CHANGES'}
               </span>
             </NeonButton>
           </form>

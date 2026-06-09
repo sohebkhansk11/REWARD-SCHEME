@@ -45,3 +45,8 @@ class User(Base):
 
     pool   = relationship("Pool", back_populates="members")
     tokens = relationship("Token", foreign_keys="Token.user_id", back_populates="user")
+
+    @property
+    def current_pool_name(self) -> str | None:
+        """Returns the name of the pool the user is currently in, or None."""
+        return self.pool.name if self.pool else None

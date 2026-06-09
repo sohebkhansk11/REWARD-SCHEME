@@ -10,6 +10,7 @@ class TokenBase(BaseModel):
     type:      TokenType
     value_inr: Decimal
     user_id:   Optional[int] = None
+    pool_id:   Optional[int] = None    # set for WIT tokens at draw time (for wallet history)
     status:    TokenStatus = TokenStatus.Active
 
 
@@ -22,6 +23,7 @@ class TokenUpdate(BaseModel):
     type:                Optional[TokenType]   = None
     value_inr:           Optional[Decimal]     = None
     user_id:             Optional[int]         = None
+    pool_id:             Optional[int]         = None
     status:              Optional[TokenStatus] = None
     redeemed_at:         Optional[datetime]    = None
     redeemed_by_user_id: Optional[int]         = None
@@ -29,6 +31,7 @@ class TokenUpdate(BaseModel):
 
 class TokenResponse(TokenBase):
     id:                  int
+    pool_id:             Optional[int]      = None
     created_at:          Optional[datetime] = None
     redeemed_at:         Optional[datetime] = None
     redeemed_by_user_id: Optional[int]      = None

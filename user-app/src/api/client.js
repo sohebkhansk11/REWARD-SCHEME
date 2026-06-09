@@ -45,9 +45,15 @@ export const changePassword        = (oldPw, newPw)   => api.post('/auth/change-
 export const rejoinWaitlist        = (depositToken)   => api.post('/auth/rejoin', { deposit_token: depositToken })
 export const requestReferralPayout = ()               => api.post('/users/request-referral-payout')
 
-// ── Tokens ────────────────────────────────────────────────────────────────────
-export const redeemToken = (code, userId) =>
-  api.post(`/tokens/${encodeURIComponent(code)}/redeem`, { user_id: userId })
+// ── Deposit redemption (user-facing — uses user JWT, never admin JWT) ──────────
+// The old redeemToken() called the admin-gated /tokens/{code}/redeem endpoint
+// which returned 401 for user JWTs and triggered the logout interceptor.
+// redeemDeposit() calls the correct user-facing endpoint instead.
+export const redeemDeposit = (code) =>
+  api.post('/auth/deposit/redeem', { deposit_token: code })
+
+// ── Wallet history ─────────────────────────────────────────────────────────────
+export const getWalletHistory = () => api.get('/users/me/wallet-history')
 
 // Keep these for any remaining legacy code
 export const registerUser = (data) => api.post('/users/', data)

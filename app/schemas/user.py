@@ -52,6 +52,8 @@ class UserResponse(UserBase):
     id:       int
     username: str
     join_date: datetime
+    # Human-readable pool name populated via the User.current_pool_name property
+    current_pool_name: Optional[str] = None
     # Cumulative referral fields (read-only — set by system)
     total_referrals_count:          int     = 0
     accumulated_referral_bonus_inr: Decimal = Decimal("0")

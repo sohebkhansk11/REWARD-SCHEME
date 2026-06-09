@@ -56,7 +56,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(user_auth_router.router)  # /auth/*       — public user auth
+app.include_router(user_auth_router.router)          # /auth/*           — public user auth
+app.include_router(user_auth_router.users_me_router) # /users/me/*       — authenticated user profile
 app.include_router(auth_router.router)       # /admin/auth/* — public admin auth
 app.include_router(pools.router)
 app.include_router(users.router)

@@ -2,21 +2,30 @@
 User Authentication Router
 ===========================
 
-POST /auth/register   — Name + Mobile + Username + Password + Deposit Token
-POST /auth/login      — Username + Password → JWT
-GET  /auth/me         — Return current user's profile (requires user JWT)
+POST /auth/register           — Name + Mobile + Username + Password + Deposit Token
+POST /auth/login              — Username + Password → JWT
+GET  /auth/me                 — Return current user's profile (requires user JWT)
+PATCH /auth/profile           — Update name / mobile (requires user JWT)
+POST /auth/change-password    — Change password (requires user JWT)
+POST /auth/rejoin             — Re-join waitlist after Eliminated_Won (requires user JWT)
+POST /auth/deposit/redeem     — User-facing deposit token redemption (requires user JWT)
+GET  /users/me/wallet-history — Full ledger of deposits + wins (requires user JWT)
 
 Registration atomically:
   1. Validates the Deposit Token (must be active DEP-XXXXXX, value = ₹1,000).
   2. Resolves optional referral username → referred_by_user_id.
   3. Creates the User (status=Waitlist, weekly_payment=Paid).
   4. Burns the Deposit Token and assigns it to the new user.
-  5. Triggers the Waitlist auto-scaling check in the background.
+  5. Triggers waitlist scaling + FIFO vacancy fill in the background.
   6. Returns a 30-day User JWT.
 """
 
 from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -29,15 +38,31 @@ from app.schemas.auth import (
 from app.schemas.user import UserResponse
 from app.crud import user as crud_user, token as crud_token
 from app.services.auth import hash_password, verify_password, create_user_jwt
-from app.services.waitlist import check_and_scale_waitlist
+from app.services.waitlist import check_and_scale_waitlist, fill_pool_vacancies
 from app.core.security import require_user_jwt
 from app.core.config import DEPOSIT_AMOUNT_INR
 
 router = APIRouter(prefix="/auth", tags=["User Auth"])
 
+# Separate router for /users/me/* routes (wallet history, etc.)
+users_me_router = APIRouter(prefix="/users/me", tags=["User Profile"])
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _serialize_user(user: User) -> dict:
+    """Serialize a User ORM object to a plain dict (via UserResponse)."""
     return UserResponse.model_validate(user).model_dump(mode="json")
+
+
+def _background_waitlist_tasks(db: Session) -> None:
+    """
+    Run after every event that adds a user to the waitlist.
+    Step 1: Fill existing pool vacancies (FIFO).
+    Step 2: Create a new pool if ≥24 paid Waitlist members remain.
+    """
+    fill_pool_vacancies(db)
+    check_and_scale_waitlist(db)
 
 
 # ── Register ───────────────────────────────────────────────────────────────────
@@ -104,10 +129,10 @@ def register(
     db.commit()
     db.refresh(new_user)
 
-    # 6. Check if waitlist has hit 24 paid members (non-blocking)
-    # NOTE: Referral bonus (₹250) is credited to the referrer when the new user
-    # ENTERS AN ACTIVE POOL — not at registration.  See waitlist.py and draw.py.
-    background_tasks.add_task(check_and_scale_waitlist, db)
+    # 6. Check vacancies + waitlist threshold in background (non-blocking)
+    # NOTE: Referral bonus (₹250) is credited when the new user ENTERS AN ACTIVE POOL,
+    # not at registration.  See waitlist.py and draw.py.
+    background_tasks.add_task(_background_waitlist_tasks, db)
 
     access_token = create_user_jwt(new_user.id)
     return UserJWTResponse(access_token=access_token, user=_serialize_user(new_user))
@@ -258,6 +283,168 @@ def rejoin(
     db.commit()
     db.refresh(user)
 
-    background_tasks.add_task(check_and_scale_waitlist, db)
+    background_tasks.add_task(_background_waitlist_tasks, db)
 
     return UserJWTResponse(access_token=create_user_jwt(user.id), user=_serialize_user(user))
+
+
+# ── User-facing deposit token redemption ──────────────────────────────────────
+
+class DepositRedeemRequest(BaseModel):
+    deposit_token: str = Field(description="Active DEP-XXXXXX token code")
+
+
+@router.post("/deposit/redeem", response_model=UserJWTResponse)
+def redeem_deposit(
+    body: DepositRedeemRequest,
+    background_tasks: BackgroundTasks,
+    user_id: int = Depends(require_user_jwt),
+    db: Session = Depends(get_db),
+):
+    """
+    User redeems a Deposit token (DEP-XXXXXX) to mark their weekly instalment
+    as Paid.  This endpoint uses the user's own JWT — NOT the admin JWT — so it
+    never risks triggering the frontend 401-logout interceptor.
+
+    Advance-payment guard:
+      Active users who are already Paid for the current week cannot deposit
+      again until the Sunday draw resets their payment status to Unpaid.
+      (Maximum 1 advance instalment at a time.)
+
+    On success:
+      - Token burned, stamped with user_id and redeemed_at.
+      - User's weekly_payment_status → Paid.
+      - Waitlist FIFO fill triggered in background (covers Waitlist→Active on join).
+      - Returns fresh user profile + new JWT.
+    """
+    user = crud_user.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    # ── Advance-payment guard (Active users only) ─────────────────────────────
+    if (
+        user.status == UserStatus.Active
+        and user.weekly_payment_status == WeeklyPaymentStatus.Paid
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "You've already paid for this week. "
+                "You can only deposit 1 instalment in advance — "
+                "your payment status resets to Unpaid after the Sunday draw."
+            ),
+        )
+
+    # ── Validate token ────────────────────────────────────────────────────────
+    code = body.deposit_token.strip().upper()
+    token = crud_token.get_token_by_code(db, code)
+    if not token:
+        raise HTTPException(status_code=400, detail="Deposit token not found.")
+    if token.type != TokenType.Deposit:
+        raise HTTPException(status_code=400, detail="Only Deposit tokens (DEP-...) are accepted.")
+    if token.status != TokenStatus.Active:
+        raise HTTPException(status_code=400, detail="This deposit token has already been used.")
+    if float(token.value_inr) != float(DEPOSIT_AMOUNT_INR):
+        raise HTTPException(status_code=400, detail=f"Token face value must be ₹{DEPOSIT_AMOUNT_INR}.")
+
+    # ── Burn the token ────────────────────────────────────────────────────────
+    now = datetime.now(timezone.utc)
+    token.user_id             = user.id
+    token.status              = TokenStatus.Burned
+    token.redeemed_at         = now
+    token.redeemed_by_user_id = user.id
+
+    # ── Mark user as Paid ─────────────────────────────────────────────────────
+    user.weekly_payment_status = WeeklyPaymentStatus.Paid
+    db.commit()
+    db.refresh(user)
+
+    # ── Background: fill vacancies + check for new pool threshold ─────────────
+    background_tasks.add_task(_background_waitlist_tasks, db)
+
+    return UserJWTResponse(
+        access_token=create_user_jwt(user.id),
+        user=_serialize_user(user),
+    )
+
+
+# ── Wallet History ─────────────────────────────────────────────────────────────
+
+class WalletTransaction(BaseModel):
+    id:         int
+    code:       str
+    type:       str             # "Deposit" | "Withdraw"
+    amount_inr: float
+    status:     str
+    pool_name:  Optional[str]  = None
+    date:       datetime
+
+
+class WalletHistoryResponse(BaseModel):
+    total_deposited_all_time: float
+    total_won_all_time:       float
+    transactions:             list[WalletTransaction]
+
+
+@users_me_router.get("/wallet-history", response_model=WalletHistoryResponse)
+def get_wallet_history(
+    user_id: int = Depends(require_user_jwt),
+    db: Session = Depends(get_db),
+):
+    """
+    Return a consolidated ledger of the authenticated user's financial activity:
+      - All Deposit tokens (DEP-) burned by this user  →  what they put in
+      - All Withdraw tokens (WIT-) issued to this user →  what they won
+
+    Each entry includes the Pool Name (for WIT tokens) and date.
+    Aggregated lifetime totals are also returned.
+    """
+    user = crud_user.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    # ── Fetch all relevant tokens in one query ────────────────────────────────
+    tokens: list[Token] = (
+        db.query(Token)
+        .filter(
+            Token.type.in_([TokenType.Deposit, TokenType.Withdraw]),
+            Token.user_id == user_id,
+        )
+        .order_by(Token.created_at.desc())
+        .all()
+    )
+
+    transactions: list[WalletTransaction] = []
+    total_deposited = 0.0
+    total_won       = 0.0
+
+    for t in tokens:
+        # Resolve pool name (WIT tokens have pool_id stamped at draw time)
+        pool_name: Optional[str] = None
+        if t.pool_id and t.pool:
+            pool_name = t.pool.name
+
+        entry_date = t.redeemed_at or t.created_at
+
+        transactions.append(
+            WalletTransaction(
+                id=t.id,
+                code=t.code,
+                type=t.type.value,
+                amount_inr=float(t.value_inr),
+                status=t.status.value,
+                pool_name=pool_name,
+                date=entry_date,
+            )
+        )
+
+        if t.type == TokenType.Deposit and t.status == TokenStatus.Burned:
+            total_deposited += float(t.value_inr)
+        elif t.type == TokenType.Withdraw:
+            total_won += float(t.value_inr)
+
+    return WalletHistoryResponse(
+        total_deposited_all_time=round(total_deposited, 2),
+        total_won_all_time=round(total_won, 2),
+        transactions=transactions,
+    )

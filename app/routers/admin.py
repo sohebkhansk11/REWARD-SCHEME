@@ -140,28 +140,41 @@ def trigger_waitlist_check(db: Session = Depends(get_db)):
     """
     Admin: manually trigger the waitlist auto-scaling check.
 
-    Creates a new pool and moves the top 12 paid Waitlist members into it
-    when paid Waitlist count reaches 24.
+    Step 1 — FIFO fill: assign paid Waitlist members to any existing pool
+              vacancies (pools sitting below 12 members).
+    Step 2 — Scale check: if ≥24 paid Waitlist members still remain after
+              vacancy fill, create a new pool of 12.
     """
+    from app.services.waitlist import fill_pool_vacancies
+
+    # Step 1 — fill existing vacancies first
+    fill_assignments = fill_pool_vacancies(db)
+
     paid_count: int = (
         db.query(User)
         .filter(User.status == UserStatus.Waitlist, User.weekly_payment_status == WeeklyPaymentStatus.Paid)
         .count()
     )
 
+    # Step 2 — scale check for new pool creation
     new_pool: Pool | None = svc_waitlist.check_and_scale_waitlist(db)
+
+    filled_msg = (
+        f" Also filled {len(fill_assignments)} existing pool vacancy(s)."
+        if fill_assignments else ""
+    )
 
     if new_pool:
         return WaitlistCheckResponse(
             paid_waitlist_count=paid_count,
             pool_created=PoolResponse.model_validate(new_pool),
-            message=f"New pool '{new_pool.name}' created with 12 members.",
+            message=f"New pool '{new_pool.name}' created with 12 members.{filled_msg}",
         )
 
     return WaitlistCheckResponse(
         paid_waitlist_count=paid_count,
         pool_created=None,
-        message=f"Waitlist has {paid_count} paid members; {24 - paid_count} more needed to trigger pool creation.",
+        message=f"Waitlist has {paid_count} paid members; {24 - paid_count} more needed to trigger pool creation.{filled_msg}",
     )
 
 
@@ -289,8 +302,16 @@ def eliminate_unpaid_members(db: Session = Depends(get_db)):
             "replaced_by": replacement.username if replacement else None,
         })
 
+    # FIFO fill: immediately reassign all vacancies created by eliminations
+    from app.services.waitlist import fill_pool_vacancies
+    fill_assignments = fill_pool_vacancies(db)
+
     return {
         "eliminated_count": len(eliminated),
-        "eliminated": eliminated,
-        "message": f"{len(eliminated)} unpaid member(s) eliminated. Slots forfeited.",
+        "eliminated":       eliminated,
+        "fifo_filled":      len(fill_assignments),
+        "message": (
+            f"{len(eliminated)} unpaid member(s) eliminated. "
+            f"{len(fill_assignments)} waitlist member(s) auto-assigned via FIFO fill."
+        ),
     }

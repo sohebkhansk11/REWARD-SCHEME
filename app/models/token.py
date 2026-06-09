@@ -31,9 +31,13 @@ class Token(Base):
     # Ownership — which user this token belongs to / was issued for
     user_id     = Column(Integer, ForeignKey("users.id"), nullable=True)
 
+    # Pool this token is associated with (set for WIT/Withdraw tokens at draw time)
+    pool_id = Column(Integer, ForeignKey("pools.id"), nullable=True)
+
     # Audit trail
     created_at          = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     redeemed_at         = Column(DateTime(timezone=True), nullable=True)   # set when status → Burned
     redeemed_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # who initiated the burn
 
     user = relationship("User", foreign_keys=[user_id], back_populates="tokens")
+    pool = relationship("Pool", foreign_keys=[pool_id])

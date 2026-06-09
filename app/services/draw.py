@@ -142,7 +142,7 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
     net_d   = Decimal(str(net))
     fee_d   = Decimal(str(PAYOUT_FEE_INR))
 
-    # Generate Withdraw token
+    # Generate Withdraw token — stamp pool_id for wallet history traceability
     code = _unique_token_code(db, "WIT-")
     crud_token.create_token(
         db,
@@ -151,6 +151,7 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
             type=TokenType.Withdraw,
             value_inr=net_d,
             user_id=winner.id,
+            pool_id=pool.id,
             status=TokenStatus.Active,
         ),
     )
@@ -287,6 +288,12 @@ def run_dual_draw(db: Session, pool_id: int) -> DrawResult:
         .count()
     )
     crud_pool.update_pool(db, pool_id, PoolUpdate(total_members=actual_count))
+
+    # FIFO fill: immediately assign waiting members to any vacancy created by this draw
+    # Local import avoids the circular dependency at module level
+    # (waitlist.py already imports from draw.py for _credit_referral_bonus)
+    from app.services.waitlist import fill_pool_vacancies
+    fill_pool_vacancies(db)
 
     return DrawResult(
         pool_id=pool.id,

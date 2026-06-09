@@ -11,7 +11,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ── 1. Financial & Liability Aggregation ─────────────────────────────────────
@@ -45,6 +45,34 @@ class FinancialStats(BaseModel):
     active_user_count:          int
     waitlist_count:             int
     eliminated_count:           int       # Eliminated + Eliminated_Won combined
+
+    # ── Liability-Adjusted Pure Profit (new) ─────────────────────────────────
+    # The organiser's exact net yield after all known obligations are satisfied.
+    #
+    # total_cash_inflow_inr     — identical to total_collected_inr; exposed under
+    #                             the canonical name used in financial analysis.
+    # total_cash_outflow_inr    — WIT Burned + Referral_Withdraw Burned only.
+    #                             Unlike total_distributed_inr which counts only WIT.
+    # current_active_liability_inr — principal the organiser would owe if every
+    #                             current participant claimed a refund right now.
+    #                             Formula (per user):
+    #                               Active Paid  L  → L × ₹1,000
+    #                               Active Unpaid L  → (L−1) × ₹1,000
+    #                               Waitlist         → ₹1,000
+    # pure_realized_profit_inr  — total_cash_inflow − total_cash_outflow
+    #                                               − current_active_liability
+    total_cash_inflow_inr:             Decimal
+    total_cash_outflow_inr:            Decimal
+    current_active_liability_inr:      Decimal
+    pure_realized_profit_inr:          Decimal
+
+    # ── Weekly Rolling Surplus (new) ─────────────────────────────────────────
+    # Measures the net cash position for the current ISO week (Mon 00:00 UTC → now).
+    # positive surplus = more cash collected than paid out this week.
+    week_start_date:             date
+    weekly_collections_inr:      Decimal   # DEP Burned this week
+    weekly_payouts_inr:          Decimal   # WIT Burned this week
+    weekly_rolling_surplus_inr:  Decimal   # collections − payouts
 
 
 # ── 2. Pool-Wise Micro Analytics ──────────────────────────────────────────────

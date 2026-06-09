@@ -18,7 +18,7 @@ from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.core.config import LEVEL_PAYOUTS, PAYOUT_FEE_INR, WAITLIST_TRIGGER
@@ -74,13 +74,28 @@ def get_financials(db: Session = Depends(get_db)):
     """
     Complete financial & liability snapshot.
 
-    Key metrics:
-    - total_collected_inr       — cash actually deposited (DEP burned)
-    - total_distributed_inr     — cash actually paid out (WIT burned)
-    - in_hand_liquidity_inr     — what's available in the bank right now
-    - maintenance_fees_total    — ₹500 × every draw winner ever
-    - total_liability_inr       — outstanding WIT + REF promises (un-burned)
-    - doomsday_liability_inr    — worst-case refund if all Active users exit today
+    Legacy metrics:
+    - total_collected_inr         — DEP burned (cash received)
+    - total_distributed_inr       — WIT burned (cash paid out)
+    - in_hand_liquidity_inr       — bank balance right now
+    - maintenance_fees_total_inr  — ₹500 × draw count
+    - total_liability_inr         — outstanding WIT + REF obligations
+    - doomsday_liability_inr      — total DEP invested by active users
+
+    New — Liability-Adjusted Profit:
+    - total_cash_inflow_inr          — same as total_collected_inr; canonical name
+    - total_cash_outflow_inr         — WIT burned + Referral_Withdraw burned
+    - current_active_liability_inr   — level-based principal owed to active/waitlist
+                                       Active Paid L  → L × ₹1,000
+                                       Active Unpaid L → (L−1) × ₹1,000
+                                       Waitlist       → ₹1,000
+    - pure_realized_profit_inr       — inflow − outflow − active_liability
+
+    New — Weekly Rolling Surplus (ISO week Mon 00:00 UTC → now):
+    - week_start_date
+    - weekly_collections_inr
+    - weekly_payouts_inr
+    - weekly_rolling_surplus_inr
     """
     # ── Deposit (DEP) ─────────────────────────────────────────────────────────
     dep_burned = _scalar_sum(db, TokenType.Deposit, TokenStatus.Burned)
@@ -96,16 +111,26 @@ def get_financials(db: Session = Depends(get_db)):
         .scalar() or 0
     )
 
-    # ── Referral (REF) ────────────────────────────────────────────────────────
+    # ── Referral (REF — legacy individual tokens) ─────────────────────────────
     ref_burned = _scalar_sum(db, TokenType.Referral, TokenStatus.Burned)
     ref_active = _scalar_sum(db, TokenType.Referral, TokenStatus.Active)
 
-    # ── Derived figures ───────────────────────────────────────────────────────
-    business_volume   = dep_burned + wit_burned + ref_burned   # gross money flow
+    # ── Referral_Withdraw (cumulative payout requests, Phase 5+) ─────────────
+    ref_withdraw_burned = _d(
+        db.query(func.sum(Token.value_inr))
+        .filter(
+            Token.type   == TokenType.Referral_Withdraw,
+            Token.status == TokenStatus.Burned,
+        )
+        .scalar()
+    )
+
+    # ── Derived legacy figures ────────────────────────────────────────────────
+    business_volume   = dep_burned + wit_burned + ref_burned
     liquidity         = dep_burned - wit_burned - ref_burned
     maintenance_total = Decimal(str(wit_all_count * PAYOUT_FEE_INR))
 
-    # ── Doomsday: SUM of DEP burned by ALL currently Active users (via subquery)
+    # ── Doomsday: SUM of DEP burned by ALL currently Active users ─────────────
     active_sq = db.query(User.id).filter(User.status == UserStatus.Active).subquery()
     doomsday  = _d(
         db.query(func.sum(Token.value_inr))
@@ -130,7 +155,86 @@ def get_financials(db: Session = Depends(get_db)):
         .scalar() or 0
     )
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # NEW ①  total_cash_outflow — WIT Burned + Referral_Withdraw Burned
+    # ─────────────────────────────────────────────────────────────────────────
+    # Note: legacy Referral (REF) tokens are intentionally excluded because they
+    # are micro-bonuses tracked separately; the spec explicitly calls out only
+    # Withdraw and Referral_Withdraw as "cash effectively paid out".
+    cash_outflow: Decimal = wit_burned + ref_withdraw_burned
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # NEW ②  current_active_liability — level-based principal owed to current
+    #         participants.  Computed as a single SQL aggregation:
+    #
+    #   Active Paid   Level L  →  L × 1000  (paid L instalments incl. this week)
+    #   Active Unpaid Level L  →  (L-1) × 1000  (paid L-1 instalments)
+    #   Waitlist               →  1000  (initial deposit only)
+    #
+    # This differs from doomsday_liability (which sums actual DEP tokens burned
+    # per user from the tokens table).  Here we derive the liability from game
+    # state so it works even when token records are sparse.
+    # ─────────────────────────────────────────────────────────────────────────
+    liability_expr = case(
+        (User.status == UserStatus.Waitlist, 1000),
+        (
+            (User.status == UserStatus.Active)
+            & (User.weekly_payment_status == WeeklyPaymentStatus.Paid),
+            User.current_level * 1000,
+        ),
+        (
+            (User.status == UserStatus.Active)
+            & (User.weekly_payment_status == WeeklyPaymentStatus.Unpaid),
+            (User.current_level - 1) * 1000,
+        ),
+        else_=0,
+    )
+    active_liability: Decimal = _d(
+        db.query(func.sum(liability_expr))
+        .filter(User.status.in_([UserStatus.Active, UserStatus.Waitlist]))
+        .scalar()
+    )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # NEW ③  pure_realized_profit
+    # ─────────────────────────────────────────────────────────────────────────
+    pure_profit: Decimal = dep_burned - cash_outflow - active_liability
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # NEW ④  weekly rolling surplus
+    #         Window: Monday 00:00:00 UTC of the current ISO week → now
+    # ─────────────────────────────────────────────────────────────────────────
+    now_utc   = datetime.now(timezone.utc)
+    week_start_dt = (
+        now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        - timedelta(days=now_utc.weekday())   # roll back to Monday
+    )
+    week_start_date = week_start_dt.date()
+
+    weekly_collections: Decimal = _d(
+        db.query(func.sum(Token.value_inr))
+        .filter(
+            Token.type       == TokenType.Deposit,
+            Token.status     == TokenStatus.Burned,
+            Token.redeemed_at >= week_start_dt,
+            Token.redeemed_at.isnot(None),
+        )
+        .scalar()
+    )
+    weekly_payouts: Decimal = _d(
+        db.query(func.sum(Token.value_inr))
+        .filter(
+            Token.type       == TokenType.Withdraw,
+            Token.status     == TokenStatus.Burned,
+            Token.redeemed_at >= week_start_dt,
+            Token.redeemed_at.isnot(None),
+        )
+        .scalar()
+    )
+    weekly_surplus: Decimal = weekly_collections - weekly_payouts
+
     return FinancialStats(
+        # ── Legacy fields (unchanged) ─────────────────────────────────────────
         total_collected_inr        = dep_burned,
         total_distributed_inr      = wit_burned,
         total_referrals_paid_inr   = ref_burned,
@@ -145,6 +249,16 @@ def get_financials(db: Session = Depends(get_db)):
         active_user_count          = active_count,
         waitlist_count             = waitlist_count,
         eliminated_count           = eliminated_count,
+        # ── New: Liability-Adjusted Profit ────────────────────────────────────
+        total_cash_inflow_inr          = dep_burned,      # canonical alias
+        total_cash_outflow_inr         = cash_outflow,
+        current_active_liability_inr   = active_liability,
+        pure_realized_profit_inr       = pure_profit,
+        # ── New: Weekly Rolling Surplus ───────────────────────────────────────
+        week_start_date              = week_start_date,
+        weekly_collections_inr       = weekly_collections,
+        weekly_payouts_inr           = weekly_payouts,
+        weekly_rolling_surplus_inr   = weekly_surplus,
     )
 
 

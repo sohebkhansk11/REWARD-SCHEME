@@ -4,6 +4,7 @@ import {
   IndianRupee, Users, Layers, Clock, Zap, AlertTriangle,
   CheckCircle2, XCircle, Shield, Target, Activity,
   ChevronDown, ChevronRight, CheckCheck, AlertCircle,
+  Calculator,
 } from 'lucide-react'
 import {
   ResponsiveContainer,
@@ -343,6 +344,15 @@ export default function Statistics() {
     ? fI(financials.active_user_count) + fI(financials.waitlist_count) + fI(financials.eliminated_count)
     : 0
 
+  // New liability-adjusted metrics
+  const pureProfit     = fP(financials?.pure_realized_profit_inr    ?? 0)
+  const cashInflow     = fP(financials?.total_cash_inflow_inr        ?? 0)
+  const cashOutflow    = fP(financials?.total_cash_outflow_inr       ?? 0)
+  const activeLiab     = fP(financials?.current_active_liability_inr ?? 0)
+  const weeklySurplus  = fP(financials?.weekly_rolling_surplus_inr   ?? 0)
+  const weeklyCol      = fP(financials?.weekly_collections_inr       ?? 0)
+  const weeklyPay      = fP(financials?.weekly_payouts_inr           ?? 0)
+
   // Prep chart points — convert all number strings to floats + add computed fields
   const chartPts = (chartData?.data ?? []).map(pt => ({
     label:            pt.period.length >= 10 ? pt.period.slice(5) : pt.period,
@@ -444,7 +454,190 @@ export default function Statistics() {
         />
       </div>
 
-      {/* ── 2. AI Forecast Panel ──────────────────────────────────────────── */}
+      {/* ── 2. Liability-Adjusted Profit Calculator ──────────────────────── */}
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+
+        {/* Header */}
+        <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-2"
+          style={{ background: 'linear-gradient(90deg, #f0fdf4 0%, #ffffff 60%)' }}>
+          <Calculator className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+          <h2 className="font-semibold text-slate-800">Liability-Adjusted Profit Calculator</h2>
+          <span className="ml-auto text-[10px] uppercase tracking-widest text-slate-400 font-semibold">
+            Pure Net Yield
+          </span>
+        </div>
+
+        <div className="p-6 space-y-5">
+
+          {mainLoading ? (
+            <div className="space-y-3">
+              <Skeleton className="h-24" />
+              <Skeleton className="h-16" />
+              <Skeleton className="h-20" />
+            </div>
+          ) : (
+            <>
+              {/* ── Equation row: Inflow − Outflow − Liability = Profit ─────── */}
+              <div className="flex items-stretch gap-2">
+
+                {/* Cash Inflow */}
+                <div className="flex-1 bg-emerald-50 border border-emerald-200 rounded-2xl p-4 text-center">
+                  <p className="text-[10px] font-semibold text-emerald-600 uppercase tracking-wider mb-1.5">
+                    Total Cash Inflow
+                  </p>
+                  <p className="text-xl font-black text-emerald-700 tabular-nums leading-none">
+                    {INR(financials?.total_cash_inflow_inr)}
+                  </p>
+                  <p className="text-[10px] text-emerald-500 mt-1.5">
+                    All DEP tokens redeemed
+                  </p>
+                </div>
+
+                <div className="flex items-center text-slate-300 font-bold text-xl px-1 flex-shrink-0">−</div>
+
+                {/* Cash Outflow */}
+                <div className="flex-1 bg-red-50 border border-red-200 rounded-2xl p-4 text-center">
+                  <p className="text-[10px] font-semibold text-red-600 uppercase tracking-wider mb-1.5">
+                    Total Cash Outflow
+                  </p>
+                  <p className="text-xl font-black text-red-700 tabular-nums leading-none">
+                    {INR(financials?.total_cash_outflow_inr)}
+                  </p>
+                  <p className="text-[10px] text-red-400 mt-1.5">
+                    WIT + Referral_Withdraw paid
+                  </p>
+                </div>
+
+                <div className="flex items-center text-slate-300 font-bold text-xl px-1 flex-shrink-0">−</div>
+
+                {/* Active Liability */}
+                <div className="flex-1 bg-amber-50 border border-amber-200 rounded-2xl p-4 text-center">
+                  <p className="text-[10px] font-semibold text-amber-600 uppercase tracking-wider mb-1.5">
+                    Active Liability
+                  </p>
+                  <p className="text-xl font-black text-amber-700 tabular-nums leading-none">
+                    {INR(financials?.current_active_liability_inr)}
+                  </p>
+                  <p className="text-[10px] text-amber-500 mt-1.5">
+                    Principal owed · Active + Waitlist
+                  </p>
+                </div>
+
+                <div className="flex items-center text-slate-300 font-bold text-xl px-1 flex-shrink-0">=</div>
+
+                {/* Pure Realized Profit — hero tile */}
+                <div
+                  className="flex-1 rounded-2xl p-4 text-center border-2"
+                  style={pureProfit >= 0 ? {
+                    background: '#059669',
+                    borderColor: '#047857',
+                  } : {
+                    background: '#dc2626',
+                    borderColor: '#b91c1c',
+                  }}
+                >
+                  <p className="text-[10px] font-semibold text-white/70 uppercase tracking-wider mb-1.5">
+                    Pure Realized Profit
+                  </p>
+                  <p className="text-xl font-black text-white tabular-nums leading-none">
+                    {INR(financials?.pure_realized_profit_inr)}
+                  </p>
+                  <p className="text-[10px] text-white/60 mt-1.5">
+                    {pureProfit >= 0 ? 'Net yield captured ✓' : 'Deficit — monitor closely ⚠'}
+                  </p>
+                </div>
+              </div>
+
+              {/* ── Formula explanation ─────────────────────────────────────── */}
+              <div className="bg-slate-50 rounded-xl px-4 py-3 border border-slate-100">
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  <span className="font-semibold text-slate-700">Active Liability</span> = exact principal
+                  the organiser owes if every current participant claims a refund today.
+                  Active <span className="font-mono text-amber-600">Paid</span> Level L →{' '}
+                  <span className="font-mono text-amber-600">L × ₹1,000</span>. &nbsp;
+                  Active <span className="font-mono text-red-500">Unpaid</span> Level L →{' '}
+                  <span className="font-mono text-amber-600">(L−1) × ₹1,000</span>. &nbsp;
+                  Waitlist → <span className="font-mono text-amber-600">₹1,000</span>.
+                  &nbsp;·&nbsp; Cash Outflow counts only{' '}
+                  <span className="font-mono text-slate-600">Withdraw</span> (WIT) and{' '}
+                  <span className="font-mono text-slate-600">Referral_Withdraw</span> tokens with
+                  status <span className="font-mono text-slate-600">Burned</span>.
+                </p>
+              </div>
+
+              {/* ── Weekly Rolling Surplus ──────────────────────────────────── */}
+              <div>
+                <div className="flex items-center gap-2 mb-3">
+                  <Clock className="w-3.5 h-3.5 text-violet-500 flex-shrink-0" />
+                  <p className="text-xs font-semibold text-slate-600 uppercase tracking-wider">
+                    Weekly Rolling Surplus
+                  </p>
+                  <span className="text-[10px] text-slate-400 font-mono">
+                    Since {financials?.week_start_date ?? '—'} (Mon 00:00 UTC)
+                  </span>
+                </div>
+
+                <div className="flex items-stretch gap-2">
+                  {/* This week collections */}
+                  <div className="flex-1 bg-blue-50 border border-blue-100 rounded-xl p-3 text-center">
+                    <p className="text-[10px] font-semibold text-blue-600 uppercase tracking-wider mb-1">
+                      This Week Collections
+                    </p>
+                    <p className="text-lg font-black text-blue-700 tabular-nums leading-none">
+                      {INR(financials?.weekly_collections_inr)}
+                    </p>
+                    <p className="text-[10px] text-blue-400 mt-1">DEP tokens redeemed</p>
+                  </div>
+
+                  <div className="flex items-center text-slate-300 font-bold text-lg px-1 flex-shrink-0">−</div>
+
+                  {/* This week payouts */}
+                  <div className="flex-1 bg-rose-50 border border-rose-100 rounded-xl p-3 text-center">
+                    <p className="text-[10px] font-semibold text-rose-600 uppercase tracking-wider mb-1">
+                      This Week Payouts
+                    </p>
+                    <p className="text-lg font-black text-rose-700 tabular-nums leading-none">
+                      {INR(financials?.weekly_payouts_inr)}
+                    </p>
+                    <p className="text-[10px] text-rose-400 mt-1">WIT tokens burned</p>
+                  </div>
+
+                  <div className="flex items-center text-slate-300 font-bold text-lg px-1 flex-shrink-0">=</div>
+
+                  {/* Weekly surplus */}
+                  <div
+                    className={`flex-1 rounded-xl p-3 text-center border ${
+                      weeklySurplus >= 0
+                        ? 'bg-violet-50 border-violet-200'
+                        : 'bg-red-50 border-red-200'
+                    }`}
+                  >
+                    <p className={`text-[10px] font-semibold uppercase tracking-wider mb-1 ${
+                      weeklySurplus >= 0 ? 'text-violet-600' : 'text-red-600'
+                    }`}>
+                      Rolling Surplus
+                    </p>
+                    <p className={`text-lg font-black tabular-nums leading-none ${
+                      weeklySurplus >= 0 ? 'text-violet-700' : 'text-red-700'
+                    }`}>
+                      {INR(financials?.weekly_rolling_surplus_inr)}
+                    </p>
+                    <p className={`text-[10px] mt-1 ${
+                      weeklySurplus >= 0 ? 'text-violet-400' : 'text-red-400'
+                    }`}>
+                      {weeklySurplus >= 0
+                        ? `+${INR_COMPACT(weeklySurplus)} surplus`
+                        : `${INR_COMPACT(weeklySurplus)} deficit`}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* ── 3. AI Forecast Panel ──────────────────────────────────────────── */}
       <div className="grid grid-cols-2 gap-5">
 
         {/* Waitlist Velocity */}
@@ -589,7 +782,7 @@ export default function Statistics() {
         </div>
       </div>
 
-      {/* ── 3. Charts ─────────────────────────────────────────────────────── */}
+      {/* ── 4. Charts ─────────────────────────────────────────────────────── */}
 
       {/* Period picker */}
       <div className="flex items-center justify-end gap-2">
@@ -718,7 +911,7 @@ export default function Statistics() {
         </div>
       </div>
 
-      {/* ── 4. Pool Analytics Table ───────────────────────────────────────── */}
+      {/* ── 5. Pool Analytics Table ───────────────────────────────────────── */}
       <SectionCard
         title="Pool Analytics"
         icon={Layers}
@@ -896,7 +1089,7 @@ export default function Statistics() {
         )}
       </SectionCard>
 
-      {/* ── 5. Pending Actions ────────────────────────────────────────────── */}
+      {/* ── 6. Pending Actions ────────────────────────────────────────────── */}
       <div className="grid grid-cols-2 gap-5">
 
         {/* WIT — Approve / Reject queue */}

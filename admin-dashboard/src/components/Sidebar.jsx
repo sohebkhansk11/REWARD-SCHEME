@@ -1,5 +1,5 @@
 import { NavLink, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, Key, Users, UserSearch, Shield, Dot, LogOut, Activity, BarChart3, Terminal } from 'lucide-react'
+import { LayoutDashboard, Key, Users, UserSearch, Shield, Dot, LogOut, Activity, BarChart3, Terminal, Gift } from 'lucide-react'
 import { BASE_URL } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 
@@ -13,6 +13,7 @@ const NAV = [
   { to: '/pools',       icon: Users,           label: 'Pool Oversight' },
   { to: '/users',       icon: UserSearch,      label: 'User Directory' },
   { to: '/statistics',  icon: BarChart3,       label: 'Statistics'     },
+  { to: '/referrals',   icon: Gift,            label: 'Referral Payouts' },
   { to: '/diagnostics', icon: Activity,        label: 'Diagnostics'    },
   // Conditionally append the Dev Tools entry — never shown in production builds
   ...(IS_DEV_MODE ? [{ to: '/dev-tools', icon: Terminal, label: 'Dev Tools', devOnly: true }] : []),

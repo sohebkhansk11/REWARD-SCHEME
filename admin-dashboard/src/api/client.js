@@ -121,6 +121,30 @@ export const getChartData = (days = 30, granularity = 'auto') =>
 export const updateTokenStatus = (tokenId, action, note = undefined) =>
   api.put(`/admin/tokens/${tokenId}/status`, { action, ...(note ? { note } : {}) })
 
+// ── Admin Deep User & Token Management (Phase 5) ──────────────────────────────
+
+/** PUT /admin/users/{id}/full-update — patch any user field */
+export const adminFullUpdateUser = (userId, data) =>
+  api.put(`/admin/users/${userId}/full-update`, data)
+
+/** DELETE /admin/users/{id} — permanently delete user + owned tokens */
+export const adminDeleteUser = (userId) =>
+  api.delete(`/admin/users/${userId}`)
+
+/** DELETE /admin/tokens/{id} — permanently delete token (admin password required) */
+export const adminDeleteToken = (tokenId, adminPassword) =>
+  api.delete(`/admin/tokens/${tokenId}`, { data: { admin_password: adminPassword } })
+
+// ── Referral Payout Queue (Phase 5) ───────────────────────────────────────────
+
+/** GET /admin/referrals/pending — list Pending_Approval Referral_Withdraw tokens */
+export const getPendingReferrals = () =>
+  api.get('/admin/referrals/pending')
+
+/** PUT /admin/referrals/{id}/status — approve or reject a referral payout */
+export const updateReferralStatus = (tokenId, action, note = undefined) =>
+  api.put(`/admin/referrals/${tokenId}/status`, { action, ...(note ? { note } : {}) })
+
 // ── Developer Mode — /dev/* endpoints (JWT + ENABLE_DEV_MODE=true required) ───
 // JWT is attached automatically by the request interceptor above.
 

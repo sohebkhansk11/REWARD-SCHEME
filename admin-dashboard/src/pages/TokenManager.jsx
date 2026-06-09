@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Copy, Check, Flame, Plus, Clock, AlertCircle, Download, RefreshCw, Filter } from 'lucide-react'
+import { Copy, Check, Flame, Plus, Clock, AlertCircle, Download, RefreshCw, Filter, Trash2, KeyRound } from 'lucide-react'
 import Spinner from '../components/Spinner'
 import StatusBadge from '../components/StatusBadge'
-import { generateToken, burnToken, getAdminTokens, downloadTokensCSV, triggerDownload } from '../api/client'
+import Modal from '../components/Modal'
+import { generateToken, burnToken, getAdminTokens, downloadTokensCSV, triggerDownload, adminDeleteToken } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
 function fmtDate(iso) {
@@ -63,6 +64,12 @@ export default function TokenManager() {
   const [statusFilter,    setStatusFilter]    = useState('')
   const [downloading,     setDownloading]     = useState(false)
 
+  // Delete token modal
+  const [delToken,     setDelToken]     = useState(null)   // token object
+  const [delAdminPw,   setDelAdminPw]   = useState('')
+  const [delLoading,   setDelLoading]   = useState(false)
+  const [pwVisible,    setPwVisible]    = useState(false)
+
   const loadTokens = useCallback(async (silent = false) => {
     if (!silent) setTokensLoading(true)
     else setTokensRefreshing(true)
@@ -122,6 +129,29 @@ export default function TokenManager() {
       toast(err.response?.data?.detail ?? 'Burn failed', 'error')
     } finally {
       setBurnLoading(false)
+    }
+  }
+
+  // ── Delete token handler ───────────────────────────────────────────────────
+  const openDeleteToken = token => {
+    setDelToken(token)
+    setDelAdminPw('')
+    setPwVisible(false)
+  }
+
+  const handleDeleteToken = async () => {
+    if (!delAdminPw.trim()) { toast('Enter your admin password', 'warning'); return }
+    setDelLoading(true)
+    try {
+      await adminDeleteToken(delToken.id, delAdminPw.trim())
+      toast(`Token ${delToken.code} permanently deleted`, 'success')
+      setTokens(t => t.filter(x => x.id !== delToken.id))
+      setDelToken(null)
+      setDelAdminPw('')
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Delete failed', 'error')
+    } finally {
+      setDelLoading(false)
     }
   }
 
@@ -263,6 +293,7 @@ export default function TokenManager() {
             <option value="Deposit">Deposit</option>
             <option value="Withdraw">Withdraw</option>
             <option value="Referral">Referral</option>
+            <option value="Referral_Withdraw">Referral Withdraw</option>
           </select>
 
           {/* Status filter */}
@@ -274,6 +305,8 @@ export default function TokenManager() {
             <option value="">All Statuses</option>
             <option value="Active">Active</option>
             <option value="Burned">Burned</option>
+            <option value="Rejected">Rejected</option>
+            <option value="Pending_Approval">Pending Approval</option>
           </select>
 
           {/* Refresh */}
@@ -306,14 +339,14 @@ export default function TokenManager() {
             <table className="w-full text-sm min-w-[920px]">
               <thead className="bg-slate-50 border-b border-slate-100">
                 <tr>
-                  {['Code', 'Type', 'Value', 'Status', 'Owner', 'Redeemed By', 'Created', 'Redeemed At'].map(h => (
+                  {['Code', 'Type', 'Value', 'Status', 'Owner', 'Redeemed By', 'Created', 'Redeemed At', ''].map(h => (
                     <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-50">
                 {tokens.map(t => (
-                  <tr key={t.id} className="hover:bg-slate-50/60 transition-colors">
+                  <tr key={t.id} className="hover:bg-slate-50/60 transition-colors group">
                     {/* Code */}
                     <td className="px-4 py-3 font-mono font-semibold text-slate-800 tracking-widest text-xs">
                       {t.code}
@@ -371,6 +404,18 @@ export default function TokenManager() {
                         : <span className="text-slate-300">Pending</span>
                       }
                     </td>
+
+                    {/* Delete action */}
+                    <td className="px-4 py-3">
+                      <button
+                        onClick={() => openDeleteToken(t)}
+                        className="opacity-0 group-hover:opacity-100 flex items-center gap-1 px-2 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-lg text-xs font-semibold transition-all"
+                        title="Delete token"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        Delete
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -378,6 +423,112 @@ export default function TokenManager() {
           </div>
         )}
       </div>
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          DELETE TOKEN MODAL  (requires admin password)
+      ══════════════════════════════════════════════════════════════════════ */}
+      <Modal
+        open={!!delToken}
+        onClose={() => !delLoading && (setDelToken(null), setDelAdminPw(''))}
+        title="Delete Token"
+        maxWidth="max-w-md"
+      >
+        {delToken && (
+          <div className="space-y-5">
+            {/* Warning */}
+            <div className="flex items-start gap-3 bg-red-50 border border-red-200 rounded-xl p-4">
+              <AlertCircle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold text-red-800 text-sm">Permanent deletion — cannot be undone</p>
+                <p className="text-xs text-red-600 mt-1">
+                  This token will be removed from the database entirely. Your admin password
+                  is required as a second-factor safety gate.
+                </p>
+              </div>
+            </div>
+
+            {/* Token summary */}
+            <div className="bg-slate-50 rounded-xl p-4 space-y-2 text-sm">
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">Token Code</span>
+                <span className="font-mono font-bold text-slate-800 tracking-widest">{delToken.code}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">Type</span>
+                <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                  delToken.type === 'Deposit'  ? 'bg-blue-100 text-blue-700' :
+                  delToken.type === 'Withdraw' ? 'bg-violet-100 text-violet-700' :
+                  'bg-teal-100 text-teal-700'
+                }`}>{delToken.type}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">Value</span>
+                <span className="font-bold text-slate-800">{INR(delToken.value_inr)}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">Status</span>
+                <StatusBadge status={delToken.status} />
+              </div>
+              {delToken.user_username && (
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500">Owner</span>
+                  <span className="text-xs font-mono text-slate-700">@{delToken.user_username}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Admin password */}
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
+                <KeyRound className="w-3.5 h-3.5" />
+                Admin Password
+              </label>
+              <div className="relative">
+                <input
+                  type={pwVisible ? 'text' : 'password'}
+                  value={delAdminPw}
+                  onChange={e => setDelAdminPw(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleDeleteToken()}
+                  placeholder="Your admin account password"
+                  autoComplete="current-password"
+                  className="w-full px-3 py-2 pr-20 border border-slate-200 rounded-xl text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-red-400 bg-white"
+                />
+                <button
+                  type="button"
+                  onClick={() => setPwVisible(v => !v)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400 hover:text-slate-600"
+                >
+                  {pwVisible ? 'Hide' : 'Show'}
+                </button>
+              </div>
+              <p className="mt-1.5 text-xs text-slate-400">
+                Verified against your stored bcrypt hash before deletion proceeds.
+              </p>
+            </div>
+
+            {/* Actions */}
+            <div className="flex items-center justify-end gap-3 pt-1">
+              <button
+                onClick={() => { setDelToken(null); setDelAdminPw('') }}
+                disabled={delLoading}
+                className="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteToken}
+                disabled={!delAdminPw.trim() || delLoading}
+                className="flex items-center gap-2 px-5 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                {delLoading
+                  ? <><Spinner className="w-4 h-4 text-white" />Deleting…</>
+                  : <><Trash2 className="w-4 h-4" />Delete Token</>}
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
     </div>
   )
 }

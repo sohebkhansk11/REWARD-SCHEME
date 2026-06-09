@@ -8,6 +8,7 @@ import TokenManager from './pages/TokenManager'
 import PoolOversight from './pages/PoolOversight'
 import UserDirectory from './pages/UserDirectory'
 import Statistics from './pages/Statistics'
+import ReferralQueue from './pages/ReferralQueue'
 import Diagnostics from './pages/Diagnostics'
 import DevTools from './pages/DevTools'
 
@@ -62,6 +63,7 @@ export default function App() {
               <Route path="pools"       element={<PoolOversight />} />
               <Route path="users"       element={<UserDirectory />} />
               <Route path="statistics"  element={<Statistics />} />
+              <Route path="referrals"   element={<ReferralQueue />} />
               <Route path="diagnostics" element={<Diagnostics />} />
               <Route path="dev-tools"   element={<DevModeRoute><DevTools /></DevModeRoute>} />
               <Route path="*"           element={<Navigate to="/" replace />} />

@@ -40,9 +40,10 @@ export const getUser            = (id)       => api.get(`/users/${id}`)
 export const getUsers           = (params)   => api.get('/users/', { params: { limit: 200, ...params } })
 
 // ── User profile (JWT required via interceptor) ───────────────────────────────
-export const updateProfile    = (data)                    => api.patch('/auth/profile', data)
-export const changePassword   = (oldPw, newPw)            => api.post('/auth/change-password', { old_password: oldPw, new_password: newPw })
-export const rejoinWaitlist   = (depositToken)            => api.post('/auth/rejoin', { deposit_token: depositToken })
+export const updateProfile         = (data)           => api.patch('/auth/profile', data)
+export const changePassword        = (oldPw, newPw)   => api.post('/auth/change-password', { old_password: oldPw, new_password: newPw })
+export const rejoinWaitlist        = (depositToken)   => api.post('/auth/rejoin', { deposit_token: depositToken })
+export const requestReferralPayout = ()               => api.post('/users/request-referral-payout')
 
 // ── Tokens ────────────────────────────────────────────────────────────────────
 export const redeemToken = (code, userId) =>

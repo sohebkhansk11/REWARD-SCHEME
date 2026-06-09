@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   User, Phone, Lock, Eye, EyeOff, CheckCircle2,
-  Clock, MapPin, Ticket, RefreshCw, AlertCircle,
+  Clock, MapPin, Ticket, RefreshCw, AlertCircle, Gift,
 } from 'lucide-react'
 import Background from '../components/Background'
 import GlassCard from '../components/GlassCard'
@@ -11,6 +11,7 @@ import BottomNav from '../components/BottomNav'
 import { useUser } from '../context/UserContext'
 import {
   getUsers, updateProfile, changePassword, rejoinWaitlist,
+  authMe, requestReferralPayout,
 } from '../api/client'
 
 // ─── IST date formatter ───────────────────────────────────────────────────────
@@ -87,7 +88,7 @@ function PwField({ label, value, onChange, autoComplete }) {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 export default function Profile() {
-  const { user, login, token } = useUser()
+  const { user, login, token, refresh } = useUser()
 
   // ── Waitlist position ──────────────────────────────────────────────────────
   const [waitlistPos,  setWaitlistPos]  = useState(null)
@@ -170,6 +171,50 @@ export default function Profile() {
     } catch (err) {
       setRejoinFb({ ok: false, msg: err.response?.data?.detail ?? 'Re-join failed.' })
     } finally { setRejoinLoading(false) }
+  }
+
+  // ── Referral program ──────────────────────────────────────────────────────
+  // Keep a locally-fresh copy of the user profile so referral counts/balance
+  // reflect the real-time server state rather than the (possibly stale) JWT payload.
+  const [refProfile,     setRefProfile]     = useState(user)
+  const [refLoading,     setRefLoading]     = useState(false)
+  const [payoutLoading,  setPayoutLoading]  = useState(false)
+  const [refFb,          setRefFb]          = useState({ ok: false, msg: '' })
+
+  const refreshRefProfile = useCallback(async () => {
+    setRefLoading(true)
+    try {
+      const res = await authMe()
+      setRefProfile(res.data)
+      refresh(res.data)          // keep localStorage in sync
+    } catch { /* silent – stale is better than broken */ }
+    finally { setRefLoading(false) }
+  }, [refresh])
+
+  useEffect(() => { refreshRefProfile() }, [refreshRefProfile])
+
+  // Coerce to plain number for comparisons and display
+  const refBalance = Number(refProfile?.accumulated_referral_bonus_inr ?? 0)
+
+  const handleRequestPayout = async () => {
+    setPayoutLoading(true)
+    setRefFb({ ok: false, msg: '' })
+    try {
+      const res = await requestReferralPayout()
+      setRefFb({
+        ok:  true,
+        msg: res.data.message ?? 'Request submitted — Pending Admin Approval.',
+      })
+      await refreshRefProfile()   // show updated (deducted) balance immediately
+    } catch (err) {
+      const status = err.response?.status
+      setRefFb({
+        ok:  false,
+        msg: status === 409
+          ? 'You already have a pending payout request. Wait for admin to approve it.'
+          : err.response?.data?.detail ?? 'Request failed. Please try again.',
+      })
+    } finally { setPayoutLoading(false) }
   }
 
   const status = user?.status ?? 'Waitlist'
@@ -354,6 +399,114 @@ export default function Profile() {
             </div>
           </motion.div>
         )}
+
+        {/* ══ REFERRAL PROGRAM ════════════════════════════════════ */}
+        <GlassCard animate className="p-5">
+          <SectionLabel>Referral Program</SectionLabel>
+
+          {refLoading ? (
+            /* Spinner while fetching fresh stats */
+            <div className="flex items-center justify-center py-6">
+              <motion.div
+                className="w-5 h-5 rounded-full"
+                style={{ border: '2px solid rgba(255,170,0,0.18)', borderTopColor: '#ffaa00' }}
+                animate={{ rotate: 360 }}
+                transition={{ duration: 0.8, repeat: Infinity, ease: 'linear' }}
+              />
+            </div>
+          ) : (
+            <>
+              {/* ── Stat row ──────────────────────────────────────── */}
+              <div className="flex gap-3 mb-4">
+                {/* Friends referred */}
+                <div
+                  className="flex-1 rounded-xl p-3 text-center"
+                  style={{
+                    background: 'rgba(255,170,0,0.06)',
+                    border:     '1px solid rgba(255,170,0,0.18)',
+                  }}
+                >
+                  <p className="text-2xl font-black tabular-nums" style={{ color: '#ffaa00' }}>
+                    {refProfile?.total_referrals_count ?? 0}
+                  </p>
+                  <p className="text-[10px] font-mono text-white/30 uppercase tracking-wider mt-0.5">
+                    Friends Referred
+                  </p>
+                </div>
+
+                {/* Accumulated pending bonus */}
+                <div
+                  className="flex-1 rounded-xl p-3 text-center"
+                  style={{
+                    background: refBalance >= 1000
+                      ? 'rgba(0,255,136,0.06)'
+                      : 'rgba(255,255,255,0.03)',
+                    border: refBalance >= 1000
+                      ? '1px solid rgba(0,255,136,0.22)'
+                      : '1px solid rgba(255,255,255,0.07)',
+                  }}
+                >
+                  <p
+                    className="text-2xl font-black tabular-nums"
+                    style={{ color: refBalance >= 1000 ? '#00ff88' : 'rgba(255,255,255,0.35)' }}
+                  >
+                    ₹{refBalance.toLocaleString('en-IN')}
+                  </p>
+                  <p className="text-[10px] font-mono text-white/30 uppercase tracking-wider mt-0.5">
+                    Pending Bonus
+                  </p>
+                </div>
+              </div>
+
+              {/* ── Rule hint ─────────────────────────────────────── */}
+              <div
+                className="rounded-xl px-3 py-2.5 mb-4"
+                style={{
+                  background: 'rgba(255,255,255,0.03)',
+                  border:     '1px solid rgba(255,255,255,0.06)',
+                }}
+              >
+                <p className="text-[10px] font-mono text-white/35 leading-relaxed">
+                  Earn a bonus for every friend you refer who joins the scheme.
+                  A minimum of{' '}
+                  <span style={{ color: 'rgba(255,170,0,0.80)' }}>₹1,000 accumulated bonus</span>{' '}
+                  is required to submit a payout request.
+                  Approved payouts are collected in cash from the admin.
+                </p>
+              </div>
+
+              {/* ── Feedback banner ───────────────────────────────── */}
+              <AnimatePresence>
+                {refFb.msg && <Feedback ok={refFb.ok} msg={refFb.msg} />}
+              </AnimatePresence>
+
+              {/* ── Request payout button ─────────────────────────── */}
+              <motion.button
+                onClick={handleRequestPayout}
+                disabled={payoutLoading || refBalance < 1000}
+                whileTap={payoutLoading || refBalance < 1000 ? {} : { scale: 0.97 }}
+                className="mt-3 w-full py-3 rounded-xl text-sm font-black tracking-widest font-mono flex items-center justify-center gap-2 transition-all"
+                style={{
+                  background: refBalance < 1000
+                    ? 'rgba(255,170,0,0.04)'
+                    : 'rgba(255,170,0,0.14)',
+                  border: `1px solid rgba(255,170,0,${refBalance < 1000 ? '0.12' : '0.42'})`,
+                  color:  refBalance < 1000 ? 'rgba(255,170,0,0.28)' : '#ffaa00',
+                  boxShadow: refBalance < 1000 ? 'none' : '0 0 18px rgba(255,170,0,0.15)',
+                  cursor: payoutLoading || refBalance < 1000 ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {payoutLoading ? (
+                  <><RefreshCw className="w-4 h-4 animate-spin" /> SUBMITTING…</>
+                ) : refBalance < 1000 ? (
+                  `🔒 ₹${(1000 - refBalance).toLocaleString('en-IN')} MORE TO UNLOCK`
+                ) : (
+                  <><Gift className="w-4 h-4" /> REQUEST BONUS PAYOUT</>
+                )}
+              </motion.button>
+            </>
+          )}
+        </GlassCard>
 
         {/* ══ PERSONAL DETAILS ════════════════════════════════════ */}
         <GlassCard animate className="p-5">

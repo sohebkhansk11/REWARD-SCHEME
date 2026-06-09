@@ -5,12 +5,14 @@ from typing import Optional
 # ── User registration & login ──────────────────────────────────────────────────
 
 class UserRegisterRequest(BaseModel):
-    name:              str
-    mobile:            str
-    username:          str
-    password:          str = Field(min_length=6)
-    deposit_token:     str = Field(description="Active DEP-XXXXXX token code")
-    referred_by_username: Optional[str] = None
+    name:          str
+    mobile:        str
+    username:      str
+    password:      str = Field(min_length=6)
+    deposit_token: str = Field(description="Active DEP-XXXXXX token code")
+    # 8-char referral code from an existing user's invite link.
+    # Blank / omitted = no referral.  Validated against users.referral_code column.
+    referred_by_code: Optional[str] = None
 
 
 class UserLoginRequest(BaseModel):

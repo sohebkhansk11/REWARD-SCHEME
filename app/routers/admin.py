@@ -178,6 +178,97 @@ def trigger_waitlist_check(db: Session = Depends(get_db)):
     )
 
 
+# ── Pool Settings (auto-creation toggle) ─────────────────────────────────────
+
+@router.get("/admin/pool-settings")
+def get_pool_settings():
+    """
+    Return the current state of the AUTO_POOL_CREATION_ENABLED toggle.
+    When disabled, the waitlist auto-scale (24 members → new pool) does NOT fire.
+    Use POST /admin/pools/manual-create to form pools manually.
+    """
+    from app.core.pool_settings import get_auto_pool_creation
+    enabled = get_auto_pool_creation()
+    return {
+        "auto_pool_creation_enabled": enabled,
+        "message": (
+            "Pools are created automatically when 24 paid Waitlist members accumulate."
+            if enabled else
+            "Auto pool creation is DISABLED. Use POST /admin/pools/manual-create."
+        ),
+    }
+
+
+@router.post("/admin/pool-settings/auto-creation")
+def set_pool_auto_creation(enabled: bool, db: Session = Depends(get_db)):
+    """
+    Toggle the AUTO_POOL_CREATION_ENABLED flag.
+
+    Pass `?enabled=true` or `?enabled=false` as a query parameter.
+
+    When switching back to enabled=True, immediately runs the scale check so
+    any backed-up waitlist members get pooled without a manual trigger.
+    """
+    from app.core.pool_settings import set_auto_pool_creation
+    set_auto_pool_creation(enabled)
+
+    bonus_msg = ""
+    if enabled:
+        new_pool = svc_waitlist.check_and_scale_waitlist(db)
+        if new_pool:
+            bonus_msg = f" Immediately created '{new_pool.name}' from backed-up waitlist."
+
+    return {
+        "auto_pool_creation_enabled": enabled,
+        "message": (
+            f"Auto pool creation {'ENABLED' if enabled else 'DISABLED'}.{bonus_msg}"
+        ),
+    }
+
+
+# ── Manual Pool Creation ──────────────────────────────────────────────────────
+
+@router.post("/admin/pools/manual-create")
+def manual_create_pool(db: Session = Depends(get_db)):
+    """
+    Admin: force-create a new Active pool from the oldest paid Waitlist members,
+    bypassing the AUTO_POOL_CREATION_ENABLED flag and the 24-member threshold.
+
+    Requires at least NEW_POOL_INTAKE (12) paid Waitlist members to be available.
+    After pool creation, also runs FIFO vacancy fill across all active pools.
+    """
+    from app.services.waitlist import manual_create_pool as svc_manual_create, fill_pool_vacancies
+
+    new_pool = svc_manual_create(db)
+    if not new_pool:
+        from app.core.config import NEW_POOL_INTAKE
+        paid_count = (
+            db.query(User)
+            .filter(User.status == UserStatus.Waitlist, User.weekly_payment_status == WeeklyPaymentStatus.Paid)
+            .count()
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Not enough paid Waitlist members to create a pool. "
+                f"Need {NEW_POOL_INTAKE}, have {paid_count}."
+            ),
+        )
+
+    fill_assignments = fill_pool_vacancies(db)
+
+    return {
+        "pool_id":      new_pool.id,
+        "pool_name":    new_pool.name,
+        "members_assigned": new_pool.total_members,
+        "fifo_filled_other_pools": len(fill_assignments),
+        "message": (
+            f"Pool '{new_pool.name}' manually created with {new_pool.total_members} members. "
+            f"FIFO fill also assigned {len(fill_assignments)} member(s) to other existing pools."
+        ),
+    }
+
+
 # ── Dual-Draw ─────────────────────────────────────────────────────────────────
 
 @router.post("/admin/pools/{pool_id}/draw", response_model=DrawResultResponse)

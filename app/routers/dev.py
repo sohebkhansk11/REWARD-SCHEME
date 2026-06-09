@@ -18,7 +18,9 @@ Endpoints:
 
 import random
 import secrets
+import string
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -58,11 +60,28 @@ class ForceDrawRequest(BaseModel):
         None,
         description="Target pool ID. Omit to auto-select the first active pool.",
     )
+    auto_pay_installments: bool = Field(
+        False,
+        description=(
+            "If True, simulate real token redemptions for every unpaid member before "
+            "the draw (creates Burned DEP tokens in the Tokens table so wallet history "
+            "and Cash Inflow statistics reflect accurate figures). "
+            "If False, payment status is set directly without creating token records."
+        ),
+    )
 
 
 class SimulateCycleRequest(BaseModel):
     n_cycles: int  = Field(3,    ge=1, le=12,     description="Number of weekly draws to simulate (1–12).")
     cleanup:  bool = Field(True,                  description="Delete all generated users, tokens, and the pool after the run.")
+    auto_pay_installments: bool = Field(
+        False,
+        description=(
+            "If True, simulate real token redemptions each cycle (creates Burned DEP "
+            "tokens per unpaid member so Cash Inflow statistics are accurate). "
+            "If False, payment status is toggled directly without token records."
+        ),
+    )
 
 
 class SimulateUsersRequest(BaseModel):
@@ -89,13 +108,14 @@ class DrawTrace(BaseModel):
 
 
 class SimulateResult(BaseModel):
-    n_requested:        int
-    n_executed:         int
-    users_created:      int
-    pool_id:            Optional[int]
-    draws:              list[DrawTrace]
-    total_paid_out_inr: float
-    cleanup_done:       bool
+    n_requested:             int
+    n_executed:              int
+    users_created:           int
+    pool_id:                 Optional[int]
+    draws:                   list[DrawTrace]
+    total_paid_out_inr:      float
+    simulated_tokens_created: int   # DEP tokens created by auto_pay_installments
+    cleanup_done:            bool
 
 
 class SimulateUsersResult(BaseModel):
@@ -117,6 +137,65 @@ class ResetDataResult(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Internal helper — simulate real token payments
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DEP_ALPHABET = string.ascii_uppercase + string.digits
+
+
+def _simulate_installment_payments(
+    db: Session,
+    members: list,
+    pool_id: int,
+) -> int:
+    """
+    For each unpaid Active member in `members`, create a Burned DEP token
+    that represents a real ₹1,000 deposit redemption.
+
+    This makes the Cash Inflow statistics accurate: the Tokens table will contain
+    the simulated deposit records just as if users had physically redeemed tokens.
+
+    Returns the number of tokens created.
+    """
+    now = datetime.now(timezone.utc)
+    tokens_created = 0
+
+    # Gather tokens already in DB to avoid code collisions cheaply
+    existing_codes: set[str] = set()
+
+    for member in members:
+        if member.weekly_payment_status == WeeklyPaymentStatus.Paid:
+            continue   # already paid — no token needed
+
+        # Generate a unique DEP code
+        while True:
+            code = "DEP-" + "".join(secrets.choice(_DEP_ALPHABET) for _ in range(6))
+            if code not in existing_codes:
+                # Quick DB check for absolute safety
+                if not db.query(Token).filter(Token.code == code).first():
+                    existing_codes.add(code)
+                    break
+
+        dep_token = Token(
+            code=code,
+            type=TokenType.Deposit,
+            value_inr=_DEPOSIT_DEC,
+            status=TokenStatus.Burned,
+            user_id=member.id,
+            redeemed_by_user_id=member.id,
+            redeemed_at=now,
+        )
+        db.add(dep_token)
+        member.weekly_payment_status = WeeklyPaymentStatus.Paid
+        tokens_created += 1
+
+    if tokens_created:
+        db.commit()
+
+    return tokens_created
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # POST /dev/force-draw
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -126,8 +205,12 @@ def force_draw(body: ForceDrawRequest, db: Session = Depends(get_db)):
     Execute the Sunday dual-draw immediately on the specified pool
     (or the first Active pool when pool_id is omitted).
 
-    Any unpaid members are automatically marked Paid before the draw so the
-    draw never fails due to payment status.
+    auto_pay_installments=False (default):
+      Unpaid members are marked Paid directly — no token records created.
+
+    auto_pay_installments=True:
+      A real Burned DEP token is created per unpaid member and logged in the
+      Tokens table.  This keeps Cash Inflow statistics accurate.
     """
     # ── Resolve target pool ───────────────────────────────────────────────────
     if body.pool_id:
@@ -139,7 +222,7 @@ def force_draw(body: ForceDrawRequest, db: Session = Depends(get_db)):
         if not pool:
             raise HTTPException(status_code=404, detail="No active pools found.")
 
-    # ── Auto-mark unpaid members as Paid ──────────────────────────────────────
+    # ── Pay unpaid members ────────────────────────────────────────────────────
     unpaid = (
         db.query(User)
         .filter(
@@ -149,11 +232,18 @@ def force_draw(body: ForceDrawRequest, db: Session = Depends(get_db)):
         )
         .all()
     )
-    auto_paid = len(unpaid)
-    for member in unpaid:
-        member.weekly_payment_status = WeeklyPaymentStatus.Paid
-    if unpaid:
-        db.commit()
+    auto_paid   = len(unpaid)
+    tokens_made = 0
+
+    if body.auto_pay_installments:
+        # Create real Burned DEP tokens so Tokens table reflects cash inflow
+        tokens_made = _simulate_installment_payments(db, unpaid, pool.id)
+    else:
+        # Fast-path: set payment flag directly without token records
+        for member in unpaid:
+            member.weekly_payment_status = WeeklyPaymentStatus.Paid
+        if unpaid:
+            db.commit()
 
     # ── Run draw ──────────────────────────────────────────────────────────────
     try:
@@ -163,9 +253,10 @@ def force_draw(body: ForceDrawRequest, db: Session = Depends(get_db)):
 
     w = result
     return {
-        "pool_id":         w.pool_id,
-        "pool_name":       w.pool_name,
-        "auto_paid_count": auto_paid,
+        "pool_id":                    w.pool_id,
+        "pool_name":                  w.pool_name,
+        "auto_paid_count":            auto_paid,
+        "simulated_tokens_created":   tokens_made,
         "winner_1": {
             "username":       w.winner_1.winner_username,
             "level":          w.winner_1.winner_level,
@@ -181,7 +272,11 @@ def force_draw(body: ForceDrawRequest, db: Session = Depends(get_db)):
             "replaced_by":    w.winner_2.replaced_by_username,
         },
         "edge_case_used": w.edge_case_used,
-        "dev_note": "Unpaid members were auto-marked Paid before the draw.",
+        "dev_note": (
+            "Real DEP tokens created for each unpaid member (auto_pay_installments=True)."
+            if body.auto_pay_installments else
+            "Payment status set directly without token records (auto_pay_installments=False)."
+        ),
     }
 
 
@@ -211,6 +306,15 @@ def simulate_cycle(body: SimulateCycleRequest, db: Session = Depends(get_db)):
     n_users = 24 + 2 * N
 
     # ── 1. Bulk-insert dummy users ────────────────────────────────────────────
+    # Generate unique referral codes for all sim users upfront
+    _sim_ref_codes: set[str] = set()
+    while len(_sim_ref_codes) < n_users:
+        _sim_ref_codes.update(
+            "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+            for _ in range(n_users - len(_sim_ref_codes))
+        )
+    _sim_ref_list = list(_sim_ref_codes)
+
     user_rows = [
         {
             "name":                  f"SimUser-{i + 1}",
@@ -219,6 +323,7 @@ def simulate_cycle(body: SimulateCycleRequest, db: Session = Depends(get_db)):
             "status":                UserStatus.Waitlist,
             "weekly_payment_status": WeeklyPaymentStatus.Paid,
             "current_level":         1,
+            "referral_code":         _sim_ref_list[i],
         }
         for i in range(n_users)
     ]
@@ -241,9 +346,10 @@ def simulate_cycle(body: SimulateCycleRequest, db: Session = Depends(get_db)):
     pool_id = new_pool.id
 
     # ── 3. Run N draw cycles ──────────────────────────────────────────────────
-    traces:     list[DrawTrace] = []
-    n_executed  = 0
-    total_paid  = 0.0
+    traces:           list[DrawTrace] = []
+    n_executed        = 0
+    total_paid        = 0.0
+    total_tokens_made = 0
 
     for cycle in range(1, N + 1):
         members = (
@@ -257,9 +363,16 @@ def simulate_cycle(body: SimulateCycleRequest, db: Session = Depends(get_db)):
         if not members:
             break  # pool exhausted early
 
-        for m in members:
-            m.weekly_payment_status = WeeklyPaymentStatus.Paid
-        db.commit()
+        if body.auto_pay_installments:
+            # Create real Burned DEP tokens for all unpaid members so Cash
+            # Inflow statistics in the Tokens table are accurate per cycle.
+            cycle_tokens = _simulate_installment_payments(db, members, pool_id)
+            total_tokens_made += cycle_tokens
+        else:
+            # Fast-path: flip payment flags directly
+            for m in members:
+                m.weekly_payment_status = WeeklyPaymentStatus.Paid
+            db.commit()
 
         try:
             result = run_dual_draw(db, pool_id)
@@ -295,6 +408,7 @@ def simulate_cycle(body: SimulateCycleRequest, db: Session = Depends(get_db)):
         pool_id=None if cleanup_done else pool_id,
         draws=traces,
         total_paid_out_inr=round(total_paid, 2),
+        simulated_tokens_created=total_tokens_made,
         cleanup_done=cleanup_done,
     )
 
@@ -338,6 +452,16 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
     code_list = list(codes)
 
     # ── Build user rows ───────────────────────────────────────────────────────
+    # Pre-generate unique referral codes for all dev users in Python to avoid
+    # individual DB round-trips inside the bulk insert.
+    _ref_codes: set[str] = set()
+    while len(_ref_codes) < count:
+        _ref_codes.update(
+            "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+            for _ in range(count - len(_ref_codes))
+        )
+    _ref_list = list(_ref_codes)
+
     user_rows = [
         {
             "name":                  f"DevUser-{i + 1}",
@@ -346,6 +470,7 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
             "status":                UserStatus.Waitlist,
             "weekly_payment_status": WeeklyPaymentStatus.Paid,
             "current_level":         1,
+            "referral_code":         _ref_list[i],
         }
         for i in range(count)
     ]

@@ -49,9 +49,11 @@ class UserUpdate(BaseModel):
 
 
 class UserResponse(UserBase):
-    id:       int
-    username: str
+    id:        int
+    username:  str
     join_date: datetime
+    # Unique invite code generated at registration — share to earn referral bonuses
+    referral_code: Optional[str] = None
     # Human-readable pool name populated via the User.current_pool_name property
     current_pool_name: Optional[str] = None
     # Cumulative referral fields (read-only — set by system)

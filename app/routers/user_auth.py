@@ -20,6 +20,8 @@ Registration atomically:
   6. Returns a 30-day User JWT.
 """
 
+import secrets
+import string
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -41,6 +43,20 @@ from app.services.auth import hash_password, verify_password, create_user_jwt
 from app.services.waitlist import check_and_scale_waitlist, fill_pool_vacancies
 from app.core.security import require_user_jwt
 from app.core.config import DEPOSIT_AMOUNT_INR
+
+# ── Referral code helpers ─────────────────────────────────────────────────────
+_REF_ALPHABET = string.ascii_uppercase + string.digits  # 36 chars → 36^8 ≈ 2.8T combos
+
+def _generate_referral_code() -> str:
+    """Return a random 8-char uppercase-alphanumeric string."""
+    return "".join(secrets.choice(_REF_ALPHABET) for _ in range(8))
+
+def _unique_referral_code(db: Session) -> str:
+    """Generate a referral code guaranteed not to collide with existing ones."""
+    while True:
+        code = _generate_referral_code()
+        if not crud_user.get_user_by_referral_code(db, code):
+            return code
 
 router = APIRouter(prefix="/auth", tags=["User Auth"])
 
@@ -97,12 +113,14 @@ def register(
     if crud_user.get_user_by_username(db, body.username):
         raise HTTPException(status_code=400, detail="Username already taken.")
 
-    # 3. Resolve referral
+    # 3. Resolve referral via unique referral_code (not username)
     referred_by_id: int | None = None
-    if body.referred_by_username:
-        referrer = crud_user.get_user_by_username(db, body.referred_by_username)
+    if body.referred_by_code and body.referred_by_code.strip():
+        referrer = crud_user.get_user_by_referral_code(db, body.referred_by_code)
         if not referrer:
-            raise HTTPException(status_code=400, detail="Referral username not found.")
+            raise HTTPException(status_code=400, detail="Referral code not found.")
+        if referrer.username == body.username:
+            raise HTTPException(status_code=400, detail="You cannot refer yourself.")
         referred_by_id = referrer.id
 
     # 4. Create user (Waitlist + Paid — the deposit token covers week 1)
@@ -115,6 +133,7 @@ def register(
         weekly_payment_status=WeeklyPaymentStatus.Paid,
         current_level=1,
         referred_by_user_id=referred_by_id,
+        referral_code=_unique_referral_code(db),   # unique invite code for sharing
     )
     db.add(new_user)
     db.commit()
@@ -184,6 +203,74 @@ def get_me(
     # Re-issue token so the 30-day window slides on active use
     access_token = create_user_jwt(user.id)
     return UserJWTResponse(access_token=access_token, user=_serialize_user(user))
+
+
+# ── Referral code validation ──────────────────────────────────────────────────
+
+@router.get("/validate-referral/{code}")
+def validate_referral(code: str, db: Session = Depends(get_db)):
+    """
+    Real-time referral code validation used by the registration form.
+
+    Rules:
+      - Blank / empty code  → 200  {"valid": True,  "message": "No referral code"}
+      - Valid 8-char code    → 200  {"valid": True,  "referrer_username": "..."}
+      - Unknown code         → 404  {"valid": False, "message": "Referral code not found"}
+
+    No authentication required — called before the user creates an account.
+    """
+    stripped = code.strip()
+
+    # Blank code is acceptable (user chose not to enter a referral)
+    if not stripped:
+        return {"valid": True, "message": "No referral code entered."}
+
+    referrer = crud_user.get_user_by_referral_code(db, stripped)
+    if not referrer:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Referral code '{stripped}' not found.",
+        )
+
+    return {
+        "valid":              True,
+        "referrer_username":  referrer.username,
+        "referrer_name":      referrer.name,
+        "message":            f"Valid — referred by @{referrer.username}",
+    }
+
+
+# ── Admin backfill: generate referral codes for legacy users ──────────────────
+
+@router.post("/admin/backfill-referral-codes")
+def backfill_referral_codes(
+    db: Session = Depends(get_db),
+    _: str = Depends(__import__("app.core.security", fromlist=["require_admin_jwt"]).require_admin_jwt),
+):
+    """
+    Admin-only: generate and persist referral_code for any user that was
+    registered before the referral_code column existed (i.e. referral_code IS NULL).
+
+    Safe to call multiple times — only touches rows where referral_code is NULL.
+    """
+    users_missing_code: list[User] = (
+        db.query(User)
+        .filter(User.referral_code == None)  # noqa: E711
+        .all()
+    )
+
+    updated = 0
+    for user in users_missing_code:
+        user.referral_code = _unique_referral_code(db)
+        updated += 1
+
+    if updated:
+        db.commit()
+
+    return {
+        "backfilled": updated,
+        "message": f"Referral codes generated for {updated} legacy user(s).",
+    }
 
 
 # ── Update profile (name + mobile only — username is immutable) ───────────────

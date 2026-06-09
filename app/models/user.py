@@ -1,5 +1,5 @@
 import enum
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, CheckConstraint, Numeric
+from sqlalchemy import Column, Index, Integer, String, DateTime, ForeignKey, Enum, CheckConstraint, Numeric
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
@@ -38,6 +38,10 @@ class User(Base):
     referred_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     hashed_password    = Column(String, nullable=True)   # nullable for users created before auth update
     telegram_chat_id   = Column(String, nullable=True)   # numeric Telegram user ID — used for broadcasts
+
+    # Unique referral code — generated on registration, used in invite links
+    # 8-char uppercase alphanumeric; unique constraint enforced at DB level
+    referral_code = Column(String(8), unique=True, nullable=True, index=True)
 
     # Cumulative referral tracking — replaces individual REF-token-per-referral model
     total_referrals_count          = Column(Integer,          default=0, server_default="0", nullable=False)

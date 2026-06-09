@@ -1,6 +1,7 @@
 import enum
-from sqlalchemy import Column, Integer, String, Enum
+from sqlalchemy import Column, Integer, String, DateTime, Enum
 from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
 from app.database import Base
 
 
@@ -17,5 +18,7 @@ class Pool(Base):
     name = Column(String, unique=True, nullable=False, index=True)
     status = Column(Enum(PoolStatus), default=PoolStatus.Waiting, nullable=False)
     total_members = Column(Integer, default=0, nullable=False)
+    # Timestamp used for FIFO pool-fill ordering (oldest pool gets vacancies filled first)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     members = relationship("User", back_populates="pool")

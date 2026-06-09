@@ -166,10 +166,19 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
     # Pull replacement from Waitlist
     replacement = _next_paid_waitlist_member(db)
     if replacement:
+        # State machine (Issue 2): entering pool → Level 1, Paid.
+        # Replacement already paid their deposit to join the waitlist, so they
+        # enter the Active pool with Paid status.  Their payment resets to Unpaid
+        # only AFTER the NEXT draw's level-advance loop — not immediately here.
         crud_user.update_user(
             db,
             replacement.id,
-            UserUpdate(status=UserStatus.Active, current_pool_id=pool.id, current_level=1),
+            UserUpdate(
+                status=UserStatus.Active,
+                current_pool_id=pool.id,
+                current_level=1,
+                weekly_payment_status=WeeklyPaymentStatus.Paid,
+            ),
         )
         db.refresh(replacement)
         # Rule 39: credit referral bonus when replacement ENTERS the active pool.
@@ -272,14 +281,10 @@ def run_dual_draw(db: Session, pool_id: int) -> DrawResult:
                 ),
             )
 
-    # Reset payment status for replacement members — new week begins after the draw
-    for rep_id in filter(None, [result_1.replaced_by_user_id, result_2.replaced_by_user_id]):
-        member = crud_user.get_user(db, rep_id)
-        if member and member.status == UserStatus.Active:
-            crud_user.update_user(
-                db, rep_id,
-                UserUpdate(weekly_payment_status=WeeklyPaymentStatus.Unpaid),
-            )
+    # NOTE (Issue 2): replacements are NOT reset to Unpaid here.
+    # They entered the pool with Paid status (deposit already collected) and their
+    # weekly_payment_status only resets to Unpaid in the NEXT draw's level-advance
+    # loop — same as every other surviving member.
 
     # Sync pool.total_members to actual active count (handles missing replacements cleanly)
     actual_count = (

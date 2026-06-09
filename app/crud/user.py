@@ -22,6 +22,11 @@ def get_user_by_mobile(db: Session, mobile: str) -> User | None:
     return db.query(User).filter(User.mobile == mobile).first()
 
 
+def get_user_by_referral_code(db: Session, code: str) -> User | None:
+    """Look up a user by their unique 8-char invite code (case-insensitive)."""
+    return db.query(User).filter(User.referral_code == code.strip().upper()).first()
+
+
 def get_users(db: Session, skip: int = 0, limit: int = 100) -> list[User]:
     return db.query(User).offset(skip).limit(limit).all()
 

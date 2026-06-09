@@ -1,0 +1,9 @@
+ADMIN_JWT_SECRET:3448d45a1cb18a38d88b8fdbc41b491a5f16d3457228ecba01825a57c2aaa324
+USER_JWT_SECRET:ad3eeff115e228d6eccb2fe8ca8a3a288730547e94384e9664b9aa0fe796e2d3
+ADMIN_SETUP_SECRET:MyApp@Sk@#2026RewardScheme
+
+{
+  "username": "admin",
+  "password": "YourStrongPassword123!",
+  "setup_secret": "MyApp@Sk@#2026RewardScheme"
+}

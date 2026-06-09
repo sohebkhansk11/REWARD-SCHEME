@@ -140,17 +140,14 @@ def _run_waitlist_check(db: Session):
 @router.post("/admin/waitlist/check", response_model=WaitlistCheckResponse)
 def trigger_waitlist_check(db: Session = Depends(get_db)):
     """
-    Admin: manually trigger the waitlist auto-scaling check.
+    Admin: manually trigger the Double-FIFO Auto-Refill Engine.
 
-    Step 1 — FIFO fill: assign paid Waitlist members to any existing pool
-              vacancies (pools sitting below 12 members).
-    Step 2 — Scale check: if ≥24 paid Waitlist members still remain after
-              vacancy fill, create a new pool of 12.
+    Phase 1 — FIFO fill existing vacancies (oldest pool first, oldest user first).
+    Phase 2 — Create a new pool if remaining waitlist >= pool_creation_threshold.
     """
-    from app.services.waitlist import fill_pool_vacancies
+    from app.services.waitlist import assign_waitlist_to_pools
 
-    # Step 1 — fill existing vacancies first
-    fill_assignments = fill_pool_vacancies(db)
+    result = assign_waitlist_to_pools(db)
 
     paid_count: int = (
         db.query(User)
@@ -158,25 +155,31 @@ def trigger_waitlist_check(db: Session = Depends(get_db)):
         .count()
     )
 
-    # Step 2 — scale check for new pool creation
-    new_pool: Pool | None = svc_waitlist.check_and_scale_waitlist(db)
+    p1 = result["phase1_assigned"]
+    p2 = result["phase2_pool_created"]
 
-    filled_msg = (
-        f" Also filled {len(fill_assignments)} existing pool vacancy(s)."
-        if fill_assignments else ""
+    new_pool: Pool | None = (
+        db.query(Pool).filter(Pool.name == p2).first() if p2 else None
     )
 
     if new_pool:
         return WaitlistCheckResponse(
             paid_waitlist_count=paid_count,
             pool_created=PoolResponse.model_validate(new_pool),
-            message=f"New pool '{new_pool.name}' created with 12 members.{filled_msg}",
+            message=(
+                f"New pool '{new_pool.name}' created with 12 members. "
+                f"Also filled {p1} vacancy slot(s) in existing pools."
+            ),
         )
 
     return WaitlistCheckResponse(
         paid_waitlist_count=paid_count,
         pool_created=None,
-        message=f"Waitlist has {paid_count} paid members; {24 - paid_count} more needed to trigger pool creation.{filled_msg}",
+        message=(
+            f"Phase 1: {p1} member(s) assigned to existing pools. "
+            f"Phase 2: {paid_count} paid Waitlist member(s) remain "
+            f"(threshold not met — no new pool created)."
+        ),
     )
 
 
@@ -511,16 +514,20 @@ def eliminate_unpaid_members(db: Session = Depends(get_db)):
             "replaced_by": replacement.username if replacement else None,
         })
 
-    # FIFO fill: immediately reassign all vacancies created by eliminations
-    from app.services.waitlist import fill_pool_vacancies
-    fill_assignments = fill_pool_vacancies(db)
+    # Double-FIFO refill: fill vacancies from eliminations AND check Phase 2 threshold
+    from app.services.waitlist import assign_waitlist_to_pools
+    refill = assign_waitlist_to_pools(db)
+    p1 = refill["phase1_assigned"]
+    p2 = refill["phase2_pool_created"]
 
     return {
         "eliminated_count": len(eliminated),
         "eliminated":       eliminated,
-        "fifo_filled":      len(fill_assignments),
+        "fifo_filled":      p1,
+        "new_pool_created": p2,
         "message": (
             f"{len(eliminated)} unpaid member(s) eliminated. "
-            f"{len(fill_assignments)} waitlist member(s) auto-assigned via FIFO fill."
+            f"Phase 1: {p1} waitlist member(s) assigned via FIFO fill."
+            + (f" Phase 2: new pool '{p2}' created." if p2 else "")
         ),
     }

@@ -41,7 +41,7 @@ from app.schemas.auth import (
 from app.schemas.user import UserResponse
 from app.crud import user as crud_user, token as crud_token
 from app.services.auth import hash_password, verify_password, create_user_jwt
-from app.services.waitlist import check_and_scale_waitlist, fill_pool_vacancies
+from app.services.waitlist import assign_waitlist_to_pools
 from app.core.security import require_user_jwt
 from app.core.config import DEPOSIT_AMOUNT_INR
 
@@ -74,12 +74,14 @@ def _serialize_user(user: User) -> dict:
 
 def _background_waitlist_tasks(db: Session) -> None:
     """
-    Run after every event that adds a user to the waitlist.
-    Step 1: Fill existing pool vacancies (FIFO).
-    Step 2: Create a new pool if ≥24 paid Waitlist members remain.
+    On-Join Instant Refill Trigger.
+
+    Called in the background after every registration, deposit redemption,
+    and re-join.  Runs the full Double-FIFO engine so that a pool sitting at
+    11/12 gets filled the moment the next user joins — without waiting for
+    the next scheduled Sunday draw.
     """
-    fill_pool_vacancies(db)
-    check_and_scale_waitlist(db)
+    assign_waitlist_to_pools(db)
 
 
 # ── Register ───────────────────────────────────────────────────────────────────

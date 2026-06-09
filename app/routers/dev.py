@@ -39,9 +39,9 @@ from app.models.token import Token, TokenType, TokenStatus
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.schemas.pool import PoolCreate
 from app.services.auth import hash_password as _hash_password
-from app.services.draw import run_dual_draw
+from app.services.draw import run_dual_draw, execute_weekly_draw
 from app.services.settings import get_pool_threshold
-from app.services.waitlist import fill_pool_vacancies, manual_create_pool
+from app.services.waitlist import assign_waitlist_to_pools, fill_pool_vacancies, manual_create_pool
 
 router = APIRouter(
     prefix="/dev",
@@ -220,52 +220,86 @@ def _simulate_installment_payments(
 @router.post("/force-draw")
 def force_draw(body: ForceDrawRequest, db: Session = Depends(get_db)):
     """
-    Execute the Sunday dual-draw immediately on the specified pool
-    (or the first Active pool when pool_id is omitted).
+    Execute the Sunday dual-draw.
 
-    auto_pay_installments=False (default):
-      Unpaid members are marked Paid directly — no token records created.
+    No pool_id supplied → GLOBAL MASS DRAW via execute_weekly_draw():
+      • Draws ALL active pools that currently have exactly 12 members.
+      • Each pool drops to 10 after the draw (no inline replacements).
+      • A single Double-FIFO assign_waitlist_to_pools() call refills all
+        vacancies and runs Phase 2 pool creation check.
 
-    auto_pay_installments=True:
-      A real Burned DEP token is created per unpaid member and logged in the
-      Tokens table.  This keeps Cash Inflow statistics accurate.
+    pool_id supplied → SINGLE-POOL DRAW on the specified pool only.
+      • The normal run_dual_draw() path: inline replacement + FIFO fill.
+
+    auto_pay_installments=True in either mode:
+      Creates real Burned DEP tokens per unpaid member so Cash Inflow
+      statistics in the Tokens table are accurate.
     """
-    # ── Resolve target pool ───────────────────────────────────────────────────
-    if body.pool_id:
-        pool = db.query(Pool).filter(Pool.id == body.pool_id).first()
-        if not pool:
-            raise HTTPException(status_code=404, detail=f"Pool {body.pool_id} not found.")
-    else:
-        # Auto-select: find the first Active pool that currently has exactly
-        # POOL_CAPACITY members.  A pool with fewer members causes run_dual_draw
-        # to raise ValueError, so we skip incomplete pools here and tell the
-        # admin to run FIFO fill first if none qualify.
-        pool = None
-        for _p in (
-            db.query(Pool)
-            .filter(Pool.status == PoolStatus.Active)
-            .order_by(Pool.id.asc())
-            .all()
-        ):
-            _actual = (
-                db.query(func.count(User.id))
-                .filter(User.current_pool_id == _p.id, User.status == UserStatus.Active)
-                .scalar() or 0
-            )
-            if _actual == POOL_CAPACITY:
-                pool = _p
-                break
-        if not pool:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    "No active pool with exactly 12 members found. "
-                    "Run 'Fill Pool Vacancies' (POST /admin/waitlist/check) first, "
-                    "then retry — or specify a pool_id explicitly."
-                ),
-            )
+    def _winner_dict(w) -> dict:
+        return {
+            "username":       w.winner_username,
+            "level":          w.winner_level,
+            "net_payout_inr": float(w.net_payout_inr),
+            "withdraw_token": w.withdraw_token_code,
+            "replaced_by":    w.replaced_by_username,
+        }
 
-    # ── Pay unpaid members ────────────────────────────────────────────────────
+    # ── GLOBAL MASS DRAW (no pool_id) ─────────────────────────────────────────
+    if not body.pool_id:
+        try:
+            mass = execute_weekly_draw(
+                db,
+                auto_pay_unpaid=True,   # always safe-pay before drawing in dev mode
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+        # Optionally create Burned DEP token records for unpaid members
+        tokens_made = 0
+        if body.auto_pay_installments:
+            # Gather all active members across drawn pools and create DEP tokens
+            # for those who were unpaid (auto_pay_unpaid already flipped flags)
+            for dr in mass.draw_results:
+                members = (
+                    db.query(User)
+                    .filter(User.current_pool_id == dr.pool_id, User.status == UserStatus.Active)
+                    .all()
+                )
+                tokens_made += _simulate_installment_payments(db, members, dr.pool_id)
+
+        return {
+            "mode":                   "mass_draw",
+            "pools_drawn":            mass.pools_drawn,
+            "skipped_pools":          mass.skipped_pools,
+            "total_auto_paid":        mass.total_auto_paid,
+            "simulated_tokens_created": tokens_made,
+            "draws": [
+                {
+                    "pool_id":       dr.pool_id,
+                    "pool_name":     dr.pool_name,
+                    "edge_case_used": dr.edge_case_used,
+                    "winner_1":      _winner_dict(dr.winner_1),
+                    "winner_2":      _winner_dict(dr.winner_2),
+                }
+                for dr in mass.draw_results
+            ],
+            "refill": {
+                "phase1_assigned":     mass.refill["phase1_assigned"],
+                "phase1_pool_changes": mass.refill["phase1_pool_changes"],
+                "phase2_pool_created": mass.refill["phase2_pool_created"],
+                "phase2_assigned":     mass.refill["phase2_assigned"],
+            },
+            "dev_note": (
+                "Global Mass Draw — all full pools drawn simultaneously; "
+                "Double-FIFO refill ran once after all draws."
+            ),
+        }
+
+    # ── SINGLE-POOL DRAW (pool_id specified) ──────────────────────────────────
+    pool = db.query(Pool).filter(Pool.id == body.pool_id).first()
+    if not pool:
+        raise HTTPException(status_code=404, detail=f"Pool {body.pool_id} not found.")
+
     unpaid = (
         db.query(User)
         .filter(
@@ -279,46 +313,31 @@ def force_draw(body: ForceDrawRequest, db: Session = Depends(get_db)):
     tokens_made = 0
 
     if body.auto_pay_installments:
-        # Create real Burned DEP tokens so Tokens table reflects cash inflow
         tokens_made = _simulate_installment_payments(db, unpaid, pool.id)
     else:
-        # Fast-path: set payment flag directly without token records
         for member in unpaid:
             member.weekly_payment_status = WeeklyPaymentStatus.Paid
         if unpaid:
             db.commit()
 
-    # ── Run draw ──────────────────────────────────────────────────────────────
     try:
         result = run_dual_draw(db, pool.id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    w = result
     return {
-        "pool_id":                    w.pool_id,
-        "pool_name":                  w.pool_name,
-        "auto_paid_count":            auto_paid,
-        "simulated_tokens_created":   tokens_made,
-        "winner_1": {
-            "username":       w.winner_1.winner_username,
-            "level":          w.winner_1.winner_level,
-            "net_payout_inr": float(w.winner_1.net_payout_inr),
-            "withdraw_token": w.winner_1.withdraw_token_code,
-            "replaced_by":    w.winner_1.replaced_by_username,
-        },
-        "winner_2": {
-            "username":       w.winner_2.winner_username,
-            "level":          w.winner_2.winner_level,
-            "net_payout_inr": float(w.winner_2.net_payout_inr),
-            "withdraw_token": w.winner_2.withdraw_token_code,
-            "replaced_by":    w.winner_2.replaced_by_username,
-        },
-        "edge_case_used": w.edge_case_used,
+        "mode":                   "single_draw",
+        "pool_id":                result.pool_id,
+        "pool_name":              result.pool_name,
+        "auto_paid_count":        auto_paid,
+        "simulated_tokens_created": tokens_made,
+        "winner_1":               _winner_dict(result.winner_1),
+        "winner_2":               _winner_dict(result.winner_2),
+        "edge_case_used":         result.edge_case_used,
         "dev_note": (
-            "Real DEP tokens created for each unpaid member (auto_pay_installments=True)."
+            "Real DEP tokens created for each unpaid member."
             if body.auto_pay_installments else
-            "Payment status set directly without token records (auto_pay_installments=False)."
+            "Payment status set directly without token records."
         ),
     }
 

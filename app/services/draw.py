@@ -21,11 +21,14 @@ Post-draw sequence (always):
   7. Sync pool.total_members to actual active count.
 """
 
+import logging
 import random
 import string
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from sqlalchemy.orm import Session
+
+_logger = logging.getLogger(__name__)
 
 from app.core.config import (
     POOL_CAPACITY, LEVEL_LOW, LEVEL_HIGH,
@@ -88,6 +91,16 @@ class DrawResult:
     edge_case_used: bool = False    # True when pool had no L4+ members (weeks 1-3)
 
 
+@dataclass
+class MassDrawResult:
+    """Return type of execute_weekly_draw()."""
+    pools_drawn:     int
+    draw_results:    list[DrawResult]
+    total_auto_paid: int
+    refill:          dict                    # assign_waitlist_to_pools() summary
+    skipped_pools:   list[str] = field(default_factory=list)  # pool names that errored
+
+
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 def _unique_token_code(db: Session, prefix: str) -> str:
@@ -128,14 +141,21 @@ def _issue_referral_token(db: Session, new_active_user: User) -> None:
     return  # intentional no-op — see docstring above
 
 
-def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
+def _process_winner(
+    db: Session,
+    winner: User,
+    pool: Pool,
+    *,
+    pull_replacement: bool = True,
+) -> WinnerResult:
     """
     For a single winner:
     1. Look up their level-based payout from LEVEL_PAYOUTS.
     2. Generate a WIT-XXXXXX Withdraw token for the net amount.
     3. Mark them Eliminated_Won and detach from the pool.
-    4. Pull the next paid Waitlist member as their replacement at Level 1.
-    5. Issue a referral token if the replacement was referred.
+    4. Optionally pull the next paid Waitlist member as a replacement (Level 1).
+       Set pull_replacement=False when running a mass draw; the caller will do
+       a single combined refill via assign_waitlist_to_pools() afterwards.
     """
     gross, net = LEVEL_PAYOUTS.get(winner.current_level, (2500, 2000))
     gross_d = Decimal(str(gross))
@@ -163,29 +183,26 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
         UserUpdate(status=UserStatus.Eliminated_Won, current_pool_id=None),
     )
 
-    # Pull replacement from Waitlist
-    replacement = _next_paid_waitlist_member(db)
-    if replacement:
-        # State machine (Issue 2): entering pool → Level 1, Paid.
-        # Replacement already paid their deposit to join the waitlist, so they
-        # enter the Active pool with Paid status.  Their payment resets to Unpaid
-        # only AFTER the NEXT draw's level-advance loop — not immediately here.
-        crud_user.update_user(
-            db,
-            replacement.id,
-            UserUpdate(
-                status=UserStatus.Active,
-                current_pool_id=pool.id,
-                current_level=1,
-                weekly_payment_status=WeeklyPaymentStatus.Paid,
-            ),
-        )
-        db.refresh(replacement)
-        # Rule 39: credit referral bonus when replacement ENTERS the active pool.
-        if replacement.referred_by_user_id:
-            _credit_referral_bonus(db, replacement.referred_by_user_id)
-    # If no replacement is available, pool.total_members is synced at the end of
-    # run_dual_draw — no partial update needed here.
+    # Pull replacement from Waitlist (skipped for mass draws — refill is batched)
+    replacement = None
+    if pull_replacement:
+        replacement = _next_paid_waitlist_member(db)
+        if replacement:
+            # State machine: entering pool → Level 1, Paid.
+            crud_user.update_user(
+                db,
+                replacement.id,
+                UserUpdate(
+                    status=UserStatus.Active,
+                    current_pool_id=pool.id,
+                    current_level=1,
+                    weekly_payment_status=WeeklyPaymentStatus.Paid,
+                ),
+            )
+            db.refresh(replacement)
+            # Rule 39: credit referral bonus when replacement ENTERS the active pool.
+            if replacement.referred_by_user_id:
+                _credit_referral_bonus(db, replacement.referred_by_user_id)
 
     return WinnerResult(
         winner_id=winner.id,
@@ -200,11 +217,23 @@ def _process_winner(db: Session, winner: User, pool: Pool) -> WinnerResult:
     )
 
 
-# ── Public draw entry-point ────────────────────────────────────────────────────
+# ── Single-pool draw ──────────────────────────────────────────────────────────
 
-def run_dual_draw(db: Session, pool_id: int) -> DrawResult:
+def run_dual_draw(
+    db: Session,
+    pool_id: int,
+    *,
+    skip_waitlist_fill: bool = False,
+) -> DrawResult:
     """
     Execute the Smart Pairing Dual-Draw for the given pool.
+
+    skip_waitlist_fill (default False):
+        If False — after the draw, immediately calls assign_waitlist_to_pools()
+        to fill the two vacancies and potentially create new pools.
+        If True  — inline replacement is also skipped; the pool drops to 10
+        members.  The caller (execute_weekly_draw) does a single combined
+        refill after ALL pools have been drawn.
 
     Raises ValueError with a human-readable message on any validation failure.
     """
@@ -260,10 +289,11 @@ def run_dual_draw(db: Session, pool_id: int) -> DrawResult:
     original_ids = {m.id for m in members}
     winner_ids   = {winner_1.id, winner_2.id}
 
-    # ── Process both winners (token generation + replacement) ─────────────────
-    result_1 = _process_winner(db, winner_1, pool)
+    # ── Process both winners (token generation + optional replacement) ────────
+    _pull = not skip_waitlist_fill   # inline replacement only for single draws
+    result_1 = _process_winner(db, winner_1, pool, pull_replacement=_pull)
     db.refresh(pool)
-    result_2 = _process_winner(db, winner_2, pool)
+    result_2 = _process_winner(db, winner_2, pool, pull_replacement=_pull)
 
     # ── Post-draw maintenance ──────────────────────────────────────────────────
     surviving_ids = original_ids - winner_ids
@@ -294,11 +324,14 @@ def run_dual_draw(db: Session, pool_id: int) -> DrawResult:
     )
     crud_pool.update_pool(db, pool_id, PoolUpdate(total_members=actual_count))
 
-    # FIFO fill: immediately assign waiting members to any vacancy created by this draw
-    # Local import avoids the circular dependency at module level
-    # (waitlist.py already imports from draw.py for _credit_referral_bonus)
-    from app.services.waitlist import fill_pool_vacancies
-    fill_pool_vacancies(db)
+    # After a single draw, immediately run the Double-FIFO refill so vacancies
+    # are filled and Phase 2 pool creation is considered.
+    # For mass draws (skip_waitlist_fill=True) the caller handles this once
+    # after ALL pools have been drawn — pools intentionally sit at 10 members
+    # until the combined refill runs.
+    if not skip_waitlist_fill:
+        from app.services.waitlist import assign_waitlist_to_pools
+        assign_waitlist_to_pools(db)
 
     return DrawResult(
         pool_id=pool.id,
@@ -306,4 +339,132 @@ def run_dual_draw(db: Session, pool_id: int) -> DrawResult:
         winner_1=result_1,
         winner_2=result_2,
         edge_case_used=edge_case,
+    )
+
+
+# ── Global Mass Draw ───────────────────────────────────────────────────────────
+
+def execute_weekly_draw(
+    db: Session,
+    *,
+    auto_pay_unpaid: bool = False,
+) -> MassDrawResult:
+    """
+    Global Mass Draw — the production Sunday-draw entry point.
+
+    Algorithm
+    ---------
+    1. Fetch ALL Active pools whose actual member count == POOL_CAPACITY (12).
+       Ordered by pool.id ASC for deterministic processing.
+    2. Optionally mark every unpaid member Paid before drawing
+       (used by the dev Force-Draw tool to avoid validation failures).
+    3. For each eligible pool run run_dual_draw(..., skip_waitlist_fill=True).
+       This removes 2 winners and does NOT pull inline replacements, so each
+       pool drops from 12 → 10 members.
+    4. After ALL pools have been drawn, call assign_waitlist_to_pools() ONCE:
+       Phase 1 — fills all 2×N vacancies across all pools (oldest pool first).
+       Phase 2 — creates new pools if remaining waitlist >= threshold.
+
+    Raises ValueError if no eligible full pools are found.
+    Returns MassDrawResult with per-pool draw traces + combined refill summary.
+    """
+    from app.services.waitlist import assign_waitlist_to_pools
+
+    # ── 1. Discover eligible pools ────────────────────────────────────────────
+    candidate_pools: list[Pool] = (
+        db.query(Pool)
+        .filter(Pool.status == PoolStatus.Active)
+        .order_by(Pool.id.asc())
+        .all()
+    )
+
+    eligible: list[Pool] = []
+    for pool in candidate_pools:
+        actual: int = (
+            db.query(User)
+            .filter(User.current_pool_id == pool.id, User.status == UserStatus.Active)
+            .count()
+        )
+        if actual == POOL_CAPACITY:
+            eligible.append(pool)
+
+    if not eligible:
+        raise ValueError(
+            "No active pools with exactly 12 members found. "
+            "Run 'Fill Pool Vacancies' (POST /admin/waitlist/check) first, "
+            "then retry the draw."
+        )
+
+    _logger.info(
+        "execute_weekly_draw: %d eligible full pool(s): %s",
+        len(eligible),
+        ", ".join(p.name for p in eligible),
+    )
+
+    # ── 2. Auto-pay unpaid members if requested ───────────────────────────────
+    total_auto_paid = 0
+    if auto_pay_unpaid:
+        for pool in eligible:
+            unpaid: list[User] = (
+                db.query(User)
+                .filter(
+                    User.current_pool_id == pool.id,
+                    User.status == UserStatus.Active,
+                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
+                )
+                .all()
+            )
+            for member in unpaid:
+                member.weekly_payment_status = WeeklyPaymentStatus.Paid
+                total_auto_paid += 1
+        if total_auto_paid:
+            db.commit()
+            _logger.info(
+                "execute_weekly_draw: auto-paid %d unpaid member(s) across %d pool(s).",
+                total_auto_paid, len(eligible),
+            )
+
+    # ── 3. Draw every eligible pool — no inline replacement, no intermediate fill
+    draw_results: list[DrawResult] = []
+    skipped:      list[str]        = []
+
+    for pool in eligible:
+        try:
+            result = run_dual_draw(db, pool.id, skip_waitlist_fill=True)
+            draw_results.append(result)
+            _logger.info(
+                "execute_weekly_draw: ✓ %s — W1=@%s (L%d %s), W2=@%s (L%d %s)",
+                pool.name,
+                result.winner_1.winner_username, result.winner_1.winner_level,
+                "edge" if result.edge_case_used else "norm",
+                result.winner_2.winner_username, result.winner_2.winner_level,
+                "edge" if result.edge_case_used else "norm",
+            )
+        except ValueError as exc:
+            _logger.warning("execute_weekly_draw: ✗ %s skipped — %s", pool.name, exc)
+            skipped.append(pool.name)
+
+    _logger.info(
+        "execute_weekly_draw: %d pool(s) drawn, %d skipped. "
+        "Triggering Double-FIFO refill...",
+        len(draw_results), len(skipped),
+    )
+
+    # ── 4. Single combined FIFO refill after ALL draws ────────────────────────
+    refill = assign_waitlist_to_pools(db)
+
+    _logger.info(
+        "execute_weekly_draw COMPLETE — "
+        "pools_drawn=%d  P1_assigned=%d  P2_created=%s",
+        len(draw_results),
+        refill["phase1_assigned"],
+        refill["phase2_pool_created"] or "none",
+    )
+
+    return MassDrawResult(
+        pools_drawn=len(draw_results),
+        draw_results=draw_results,
+        total_auto_paid=total_auto_paid,
+        refill=refill,
+        skipped_pools=skipped,
     )

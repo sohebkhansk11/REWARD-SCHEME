@@ -153,47 +153,154 @@ function WinnerCard({ slot, winner }) {
   )
 }
 
-function ForceDrawResult({ r }) {
+function SingleDrawBadges({ r }) {
   return (
-    <>
-      {/* Status badges row */}
-      <div className="flex flex-wrap gap-2 mb-4">
-        <span className="bg-slate-800 text-slate-300 text-xs font-medium px-3 py-1.5 rounded-lg border border-slate-700">
-          🏊&nbsp; {r.pool_name}&nbsp; <span className="text-slate-500">#{r.pool_id}</span>
+    <div className="flex flex-wrap gap-2 mb-4">
+      <span className="bg-slate-800 text-slate-300 text-xs font-medium px-3 py-1.5 rounded-lg border border-slate-700">
+        🏊&nbsp; {r.pool_name}&nbsp; <span className="text-slate-500">#{r.pool_id}</span>
+      </span>
+      {(r.auto_paid_count ?? 0) > 0 ? (
+        <span className="bg-amber-950 border border-amber-800 text-amber-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+          <AlertTriangle className="w-3 h-3" />{r.auto_paid_count} unpaid auto-marked Paid
         </span>
+      ) : (
+        <span className="bg-slate-800 border border-slate-700 text-slate-400 text-xs px-3 py-1.5 rounded-lg">
+          All members were already Paid
+        </span>
+      )}
+      {(r.simulated_tokens_created ?? 0) > 0 && (
+        <span className="bg-emerald-950 border border-emerald-800 text-emerald-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+          <IndianRupee className="w-3 h-3" />
+          {r.simulated_tokens_created} cash inflow token{r.simulated_tokens_created !== 1 ? 's' : ''} created
+        </span>
+      )}
+      {r.edge_case_used ? (
+        <span className="bg-blue-950 border border-blue-800 text-blue-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+          <Info className="w-3 h-3" />Edge Case — No L4+ yet
+        </span>
+      ) : (
+        <span className="bg-emerald-950 border border-emerald-800 text-emerald-300 text-xs font-semibold px-3 py-1.5 rounded-lg">
+          ✓ Normal Draw (L1–3 vs L4–6)
+        </span>
+      )}
+    </div>
+  )
+}
 
-        {r.auto_paid_count > 0 ? (
-          <span className="bg-amber-950 border border-amber-800 text-amber-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
-            <AlertTriangle className="w-3 h-3" />
-            {r.auto_paid_count} unpaid auto-marked Paid
-          </span>
-        ) : (
-          <span className="bg-slate-800 border border-slate-700 text-slate-400 text-xs px-3 py-1.5 rounded-lg">
-            All members were already Paid
-          </span>
-        )}
-
-        {/* Cash inflow simulation indicator */}
-        {r.simulated_tokens_created > 0 && (
-          <span className="bg-emerald-950 border border-emerald-800 text-emerald-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
-            <IndianRupee className="w-3 h-3" />
-            {r.simulated_tokens_created} cash inflow token{r.simulated_tokens_created !== 1 ? 's' : ''} created — stats updated
-          </span>
-        )}
-
-        {r.edge_case_used ? (
-          <span className="bg-blue-950 border border-blue-800 text-blue-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
-            <Info className="w-3 h-3" />
-            Edge Case — No L4+ yet (early pool)
-          </span>
-        ) : (
-          <span className="bg-emerald-950 border border-emerald-800 text-emerald-300 text-xs font-semibold px-3 py-1.5 rounded-lg">
-            ✓ Normal Draw (L1–3 vs L4–6)
-          </span>
+function RefillSummary({ refill }) {
+  if (!refill) return null
+  return (
+    <div className="mt-4 bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 space-y-1.5">
+      <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest mb-2">
+        Double-FIFO Refill Summary
+      </p>
+      <div className="flex flex-wrap gap-2">
+        <StatPill label="P1 Assigned" value={refill.phase1_assigned} accent="blue" />
+        <StatPill
+          label="P2 New Pool"
+          value={refill.phase2_pool_created ?? 'none'}
+          accent={refill.phase2_pool_created ? 'emerald' : 'slate'}
+        />
+        {refill.phase2_assigned > 0 && (
+          <StatPill label="P2 Members" value={refill.phase2_assigned} accent="purple" />
         )}
       </div>
+      {refill.phase1_pool_changes?.length > 0 && (
+        <div className="pt-2 space-y-1">
+          {refill.phase1_pool_changes.map(c => (
+            <p key={c.pool_id} className="text-[10px] font-mono text-slate-500">
+              {c.pool_name}&nbsp;←&nbsp;
+              <span className="text-sky-400">+{c.filled}</span>
+              &nbsp;member{c.filled !== 1 ? 's' : ''}
+              &nbsp;(now <span className="text-emerald-400">{c.total_after}/12</span>)
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
 
-      {/* Winners side-by-side */}
+function ForceDrawResult({ r }) {
+  // ── Mass draw ──────────────────────────────────────────────────────────────
+  if (r.mode === 'mass_draw') {
+    return (
+      <>
+        {/* Summary badges */}
+        <div className="flex flex-wrap gap-2 mb-4">
+          <span className="bg-purple-950 border border-purple-800 text-purple-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+            <Zap className="w-3 h-3" />
+            Global Mass Draw — {r.pools_drawn} pool{r.pools_drawn !== 1 ? 's' : ''} drawn
+          </span>
+          {r.total_auto_paid > 0 && (
+            <span className="bg-amber-950 border border-amber-800 text-amber-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+              <AlertTriangle className="w-3 h-3" />{r.total_auto_paid} unpaid auto-marked Paid
+            </span>
+          )}
+          {(r.simulated_tokens_created ?? 0) > 0 && (
+            <span className="bg-emerald-950 border border-emerald-800 text-emerald-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+              <IndianRupee className="w-3 h-3" />{r.simulated_tokens_created} DEP tokens created
+            </span>
+          )}
+          {r.skipped_pools?.length > 0 && (
+            <span className="bg-red-950 border border-red-800 text-red-300 text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+              <AlertTriangle className="w-3 h-3" />
+              Skipped: {r.skipped_pools.join(', ')}
+            </span>
+          )}
+        </div>
+
+        {/* Per-pool draw results (collapsible table) */}
+        {r.draws?.length > 0 && (
+          <div className="overflow-x-auto rounded-xl border border-slate-700/60 mb-4">
+            <table className="w-full text-xs whitespace-nowrap">
+              <thead className="bg-slate-800/80">
+                <tr>
+                  {['Pool', 'Winner 1', 'Lvl', 'Payout', 'Winner 2', 'Lvl', 'Payout', 'Mode'].map(h => (
+                    <th key={h} className="text-left py-2.5 px-3 text-slate-400 font-semibold uppercase tracking-wider text-[10px]">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {r.draws.map(d => (
+                  <tr key={d.pool_id} className="border-b border-slate-800/60 hover:bg-slate-800/30">
+                    <td className="py-2.5 px-3 font-bold text-slate-300">{d.pool_name}</td>
+                    <td className="py-2.5 px-3 font-mono text-slate-300 max-w-[120px]">
+                      <span className="block truncate">{d.winner_1.username}</span>
+                    </td>
+                    <td className="py-2.5 px-3">
+                      <span className="bg-purple-900/60 border border-purple-700/50 text-purple-300 px-1.5 py-0.5 rounded-full font-bold">L{d.winner_1.level}</span>
+                    </td>
+                    <td className="py-2.5 px-3 text-emerald-400 font-bold tabular-nums">{INR(d.winner_1.net_payout_inr)}</td>
+                    <td className="py-2.5 px-3 font-mono text-slate-300 max-w-[120px]">
+                      <span className="block truncate">{d.winner_2.username}</span>
+                    </td>
+                    <td className="py-2.5 px-3">
+                      <span className="bg-purple-900/60 border border-purple-700/50 text-purple-300 px-1.5 py-0.5 rounded-full font-bold">L{d.winner_2.level}</span>
+                    </td>
+                    <td className="py-2.5 px-3 text-emerald-400 font-bold tabular-nums">{INR(d.winner_2.net_payout_inr)}</td>
+                    <td className="py-2.5 px-3">
+                      {d.edge_case_used
+                        ? <span className="bg-amber-900/50 border border-amber-700/60 text-amber-300 px-2 py-0.5 rounded-full text-[10px] font-semibold">⚡ Early</span>
+                        : <span className="bg-emerald-900/50 border border-emerald-700/60 text-emerald-300 px-2 py-0.5 rounded-full text-[10px] font-semibold">✓ Normal</span>
+                      }
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <RefillSummary refill={r.refill} />
+      </>
+    )
+  }
+
+  // ── Single draw (legacy + explicit pool_id) ────────────────────────────────
+  return (
+    <>
+      <SingleDrawBadges r={r} />
       <div className="grid grid-cols-2 gap-3">
         <WinnerCard slot="Winner 1 — Low Tier (L1–3)" winner={r.winner_1} />
         <WinnerCard slot="Winner 2 — High Tier (L4–6)" winner={r.winner_2} />
@@ -432,7 +539,10 @@ export default function DevTools() {
       const pid = drawPoolId.trim() ? parseInt(drawPoolId.trim(), 10) : undefined
       const res = await forceDrawDev(pid, drawAutoPayInstallments)
       setDrawResult(res.data)
-      toast(`Draw complete — ${res.data.pool_name}`, 'success')
+      const msg = res.data.mode === 'mass_draw'
+        ? `Mass draw complete — ${res.data.pools_drawn} pool(s) drawn`
+        : `Draw complete — ${res.data.pool_name}`
+      toast(msg, 'success')
     } catch (err) {
       handleErr(err, 'Force draw failed')
     } finally {
@@ -490,7 +600,9 @@ export default function DevTools() {
   // Render
   // ─────────────────────────────────────────────────────────────────────────
 
-  const fakesForSim = 24 + 2 * simCycles
+  // Informational hint: simulate_cycle creates max(threshold, 12) + 2×N users.
+  // Threshold is fetched dynamically; default hint assumes 24.
+  const fakesForSim = `≥${12 + 2 * simCycles} (threshold + 2×cycles)`
 
   return (
     <div className="min-h-full bg-slate-950">

@@ -201,7 +201,7 @@ export const resetDataDev = () =>
  */
 export const advancedSimulationDev = (params) =>
   api.post('/dev/advanced-simulation', params, {
-    timeout: 300_000,   // 5-minute timeout for 1000-cycle runs
+    timeout: 120_000,   // 120 s — sufficient for 1000-cycle in-memory run
   })
 
 // ── System Settings ───────────────────────────────────────────────────────────

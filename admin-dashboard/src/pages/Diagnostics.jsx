@@ -90,56 +90,59 @@ export default function Diagnostics() {
     setApiStatus('checking')
     setDbStatus('checking')
 
-    // 1. API health — hit the public root
-    const apiStart = performance.now()
     try {
-      await api.get('/')
-      setApiStatus('ok')
-      setApiLatency(Math.round(performance.now() - apiStart))
-      setApiDetail(null)
-    } catch (err) {
-      setApiStatus('error')
-      setApiLatency(null)
-      setApiDetail(err.message ?? 'Cannot reach API')
-    }
+      // 1. API health — hit the public root
+      const apiStart = performance.now()
+      try {
+        await api.get('/')
+        setApiStatus('ok')
+        setApiLatency(Math.round(performance.now() - apiStart))
+        setApiDetail(null)
+      } catch (err) {
+        setApiStatus('error')
+        setApiLatency(null)
+        setApiDetail(err.message ?? 'Cannot reach API')
+      }
 
-    // 2. DB health — hit /admin/stats (authenticated, touches DB)
-    const dbStart = performance.now()
-    try {
-      const res = await getStats()
-      setDbStatus('ok')
-      setDbLatency(Math.round(performance.now() - dbStart))
-      setDbDetail(null)
-      setStats(res.data)
-    } catch (err) {
-      setDbStatus('error')
-      setDbLatency(null)
-      setDbDetail(err.response?.data?.detail ?? err.message ?? 'DB query failed')
-      setStats(null)
-    }
+      // 2. DB health — hit /admin/stats (authenticated, touches DB)
+      const dbStart = performance.now()
+      try {
+        const res = await getStats()
+        setDbStatus('ok')
+        setDbLatency(Math.round(performance.now() - dbStart))
+        setDbDetail(null)
+        setStats(res.data)
+      } catch (err) {
+        setDbStatus('error')
+        setDbLatency(null)
+        setDbDetail(err.response?.data?.detail ?? err.message ?? 'DB query failed')
+        setStats(null)
+      }
 
-    // 3. Token liability — active Withdraw + Referral tokens
-    try {
-      const [witRes, refRes, depRes] = await Promise.all([
-        getAdminTokens({ type: 'Withdraw', status: 'Active', limit: 1000 }),
-        getAdminTokens({ type: 'Referral', status: 'Active', limit: 1000 }),
-        getAdminTokens({ type: 'Deposit',  status: 'Active', limit: 1000 }),
-      ])
-      const sum = arr => arr.reduce((s, t) => s + parseFloat(t.value_inr ?? 0), 0)
-      setLiability({
-        witTotal:   sum(witRes.data),
-        witCount:   witRes.data.length,
-        refTotal:   sum(refRes.data),
-        refCount:   refRes.data.length,
-        depPending: depRes.data.length,
-      })
-    } catch {
-      setLiability(null)
+      // 3. Token liability — active Withdraw + Referral tokens
+      try {
+        const [witRes, refRes, depRes] = await Promise.all([
+          getAdminTokens({ type: 'Withdraw', status: 'Active', limit: 1000 }),
+          getAdminTokens({ type: 'Referral', status: 'Active', limit: 1000 }),
+          getAdminTokens({ type: 'Deposit',  status: 'Active', limit: 1000 }),
+        ])
+        const sum = arr => arr.reduce((s, t) => s + parseFloat(t.value_inr ?? 0), 0)
+        setLiability({
+          witTotal:   sum(witRes.data),
+          witCount:   witRes.data.length,
+          refTotal:   sum(refRes.data),
+          refCount:   refRes.data.length,
+          depPending: depRes.data.length,
+        })
+      } catch {
+        setLiability(null)
+      }
+    } finally {
+      // Guaranteed to run even if an unexpected error escapes the inner try-catch blocks.
+      setLoading(false)
+      setLastChecked(new Date())
+      setCountdown(REFRESH_INTERVAL)
     }
-
-    setLoading(false)
-    setLastChecked(new Date())
-    setCountdown(REFRESH_INTERVAL)
   }, [])
 
   // Initial + auto-refresh

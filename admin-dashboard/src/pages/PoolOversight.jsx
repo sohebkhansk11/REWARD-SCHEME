@@ -275,7 +275,11 @@ export default function PoolOversight() {
       toast(`Pool '${res.data.pool_name}' created with ${res.data.members_assigned} members`, 'success')
       fetchAll(true)
     } catch (err) {
-      toast(err.response?.data?.detail ?? 'Manual pool creation failed', 'error')
+      if (err.code === 'ECONNABORTED' || err.message?.toLowerCase().includes('timeout')) {
+        toast('Data processing timeout. The server is handling a large queue.', 'error')
+      } else {
+        toast(err.response?.data?.detail ?? 'Manual pool creation failed', 'error')
+      }
     } finally {
       setManualCreateLoading(false)
     }
@@ -292,7 +296,11 @@ export default function PoolOversight() {
       toast(msg, 'success')
       fetchAll(true)
     } catch (err) {
-      toast(err.response?.data?.detail ?? 'Vacancy fill failed', 'error')
+      if (err.code === 'ECONNABORTED' || err.message?.toLowerCase().includes('timeout')) {
+        toast('Data processing timeout. The server is handling a large queue.', 'error')
+      } else {
+        toast(err.response?.data?.detail ?? 'Vacancy fill failed', 'error')
+      }
     } finally {
       setFillVacanciesLoading(false)
     }

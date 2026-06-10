@@ -49,7 +49,8 @@ export const burnToken = (code) =>
 export const triggerDraw = (poolId) => api.post(`/admin/pools/${poolId}/draw`)
 
 // ── Waitlist ─────────────────────────────────────────────────────────────────
-export const checkWaitlist = () => api.post('/admin/waitlist/check')
+export const checkWaitlist = () =>
+  api.post('/admin/waitlist/check', undefined, { timeout: 120_000 })
 
 // ── Pool Creation Settings ────────────────────────────────────────────────────
 /** GET  /admin/pool-settings — returns { auto_pool_creation_enabled, message } */
@@ -59,7 +60,8 @@ export const setAutoPoolCreation = (enabled) => api.post(`/admin/pool-settings/a
 /** POST /admin/pools/manual-create — force-create pool from oldest paid waitlist members */
 export const manualCreatePool       = ()        => api.post('/admin/pools/manual-create')
 /** POST /admin/waitlist/check — fill existing pool vacancies then auto-scale */
-export const fillPoolVacancies      = ()        => api.post('/admin/waitlist/check')
+export const fillPoolVacancies      = ()        =>
+  api.post('/admin/waitlist/check', undefined, { timeout: 120_000 })
 /** POST /admin/pools/sync-member-counts — recompute + fix stale pool.total_members */
 export const syncPoolMemberCounts   = ()        => api.post('/admin/pools/sync-member-counts')
 

@@ -48,7 +48,11 @@ export default function Dashboard() {
       toast(res.data.message, res.data.pool_created ? 'success' : 'info')
       fetchAll(true)
     } catch (err) {
-      toast(err.response?.data?.detail ?? 'Waitlist check failed', 'error')
+      if (err.code === 'ECONNABORTED' || err.message?.toLowerCase().includes('timeout')) {
+        toast('Data processing timeout. The server is handling a large queue.', 'error')
+      } else {
+        toast(err.response?.data?.detail ?? 'Waitlist check failed', 'error')
+      }
     } finally {
       setWaitlistLoading(false)
     }

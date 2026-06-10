@@ -1081,15 +1081,32 @@ class _AdvSimEngine:
             self._late += fee_each
         return len(late_sel)
 
-    # ── Step C — Auto Billing ─────────────────────────────────────────────────
+    # ── Step C — Auto Billing + Weekly Installment Collection ────────────────
 
     def step_c(self):
-        """Mark non-late active members Paid; clear late markers for next cycle."""
+        """
+        Mark non-late active members Paid; clear late markers; collect weekly
+        installments from ALL active pool members.
+
+        The recurring ₹1,000/week installment that every pool member pays is
+        the primary revenue stream that funds draw payouts.  Without tracking it,
+        the liquidity float goes massively negative as pools accumulate.
+
+        Note: initial join deposits are tracked in step_a (_dep += _S_DEP per new user).
+        This step adds the RECURRING installment on top of those initial deposits.
+        """
+        active_in_pools = 0
         for u in self._users.values():
-            if u.alive and u.pool_sid is not None and not u.late:
-                u.paid = True
+            if u.alive and u.pool_sid is not None:
+                if not u.late:
+                    u.paid = True
+                active_in_pools += 1          # count ALL active members, late or not
         for u in self._users.values():
             u.late = False
+
+        # Weekly installment collection: every active pool member pays ₹1,000 this week.
+        # This is tracked in _dep (total system inflow = initial deposits + installments).
+        self._dep += _S_DEP * active_in_pools
 
     # ── Step D — Double-FIFO Refill + Condensation ────────────────────────────
 
@@ -1255,8 +1272,14 @@ class _AdvSimEngine:
 
     def summary(self) -> dict:
         """
-        final_virtual_liquidity_float = (total deposits + total late fees)
+        final_virtual_liquidity_float = (total initial deposits
+                                         + total weekly installments
+                                         + total late fees)
                                          − total winner payouts
+
+        _dep accumulates BOTH initial join deposits (step_a) AND weekly
+        installments from all active pool members (step_c).  This ensures the
+        float stays positive — payouts are funded by ongoing installment revenue.
         """
         return {
             "total_cycles_run":              len(self.logs),

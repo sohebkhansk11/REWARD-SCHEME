@@ -1,8 +1,27 @@
+import logging
 import os
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exception_handlers import http_exception_handler
+from starlette.middleware.base import BaseHTTPMiddleware
+
+_logger = logging.getLogger(__name__)
+
+# 5 MB hard ceiling on request bodies — protects against DoS via large payloads
+# while still allowing realistic CSV imports (typical 10k-user CSV ≈ 800 KB).
+_MAX_BODY_BYTES = 5 * 1024 * 1024
+
+class _BodySizeMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        cl = request.headers.get("content-length")
+        if cl and int(cl) > _MAX_BODY_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Request body exceeds the 5 MB limit."},
+            )
+        return await call_next(request)
 from app.database import engine, Base
 import app.models  # noqa: F401 — registers all ORM models with SQLAlchemy metadata
 from app.routers import users, pools, tokens
@@ -10,6 +29,7 @@ from app.routers import admin
 from app.routers import admin_data
 from app.routers import admin_comms
 from app.routers import admin_analytics
+from app.routers.admin_analytics import _public_router as draw_schedule_router
 from app.routers import admin_user_mgmt
 from app.routers import referrals as referrals_router
 from app.routers import dev as dev_router
@@ -18,10 +38,63 @@ from app.routers import user_auth as user_auth_router
 
 Base.metadata.create_all(bind=engine)
 
+_IS_DEV_MODE        = os.getenv("ENABLE_DEV_MODE")   == "true"
+_SCHEDULER_ENABLED  = os.getenv("SCHEDULER_ENABLED", "false").lower() == "true"
+
+
+# ── FastAPI lifespan — scheduler start / stop ─────────────────────────────────
+# The scheduler fires the Sunday draw lifecycle automatically:
+#   T-2H  → start_draw_preparation()   (LPI snapshot, SDE pre-processing)
+#   T+0   → execute_weekly_draw()      (global mass draw)
+#   T+5m  → post_draw_cleanup()        (reset flags, release lock)
+#   every 5min → admin override watchdog (BUG 4 auto-select)
+#
+# Set SCHEDULER_ENABLED=true in your Render / production env vars to activate.
+# Leave unset (or false) for local dev — trigger jobs manually via admin API.
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup ───────────────────────────────────────────────────────────────
+    if _SCHEDULER_ENABLED:
+        try:
+            from app.services.scheduler import start_scheduler
+            start_scheduler()
+            _logger.info(
+                "APScheduler ACTIVE — Sunday draw lifecycle is running autonomously."
+            )
+        except Exception as exc:
+            # Scheduler failure must never prevent the API from starting.
+            _logger.error(
+                "APScheduler failed to start — API will run WITHOUT scheduler. "
+                "Error: %s: %s",
+                type(exc).__name__, exc,
+                exc_info=True,
+            )
+    else:
+        _logger.info(
+            "APScheduler DISABLED (SCHEDULER_ENABLED != 'true'). "
+            "Trigger draw jobs manually via POST /admin/draw/prepare and "
+            "POST /admin/draw/execute."
+        )
+
+    yield   # app is running
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
+    if _SCHEDULER_ENABLED:
+        try:
+            from app.services.scheduler import stop_scheduler
+            stop_scheduler()
+        except Exception:
+            pass   # already logged inside stop_scheduler
+
+
 app = FastAPI(
     title="Reward Scheme API",
     description="Pools, Users, Tokens — with Dual-Draw and Waitlist Auto-Scaling",
     version="1.0.0",
+    docs_url="/docs" if _IS_DEV_MODE else None,
+    redoc_url="/redoc" if _IS_DEV_MODE else None,
+    lifespan=lifespan,
 )
 
 
@@ -47,6 +120,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 _raw = os.getenv("ALLOWED_ORIGINS", "*")
 _origins: list[str] = [o.strip() for o in _raw.split(",")] if _raw != "*" else ["*"]
 
+if _raw == "*":
+    _logger.warning(
+        "CORS is using wildcard origin (*). Set ALLOWED_ORIGINS in your Render "
+        "environment variables to restrict access in production."
+    )
+
+app.add_middleware(_BodySizeMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
@@ -65,7 +145,8 @@ app.include_router(tokens.router)
 app.include_router(admin.router)        # /admin/*              — core admin ops (JWT required)
 app.include_router(admin_data.router)   # /admin/users|tokens|export|import  — data engine (JWT required)
 app.include_router(admin_comms.router)      # /admin/broadcast         — communications (JWT required)
-app.include_router(admin_analytics.router)    # /admin/stats/*                — analytics & ERP (JWT required)
+app.include_router(admin_analytics.router)    # /admin/stats/* + /admin/draw/* — analytics & ERP (JWT required)
+app.include_router(draw_schedule_router)      # /draw/countdown               — public draw timer
 app.include_router(admin_user_mgmt.router)    # /admin/users|tokens (destroy) — deep management (JWT required)
 app.include_router(referrals_router.router)   # /users/request-referral-payout + /admin/referrals/* (JWT required)
 app.include_router(dev_router.router)         # /dev/*                        — DEV MODE ONLY (JWT + ENABLE_DEV_MODE=true)
@@ -85,3 +166,9 @@ def server_time():
     """
     from datetime import datetime, timezone
     return {"epoch_ms": int(datetime.now(timezone.utc).timestamp() * 1000)}
+
+
+@app.get("/health", tags=["Health"])
+def health_check():
+    """Render health-check probe. Returns 200 when the process is alive."""
+    return {"status": "healthy"}

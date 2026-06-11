@@ -855,3 +855,501 @@ def get_chart_data(
         to_date     = now.date(),
         data        = points,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  GET /admin/winners/history  — Winning Ledger
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/winners/history")
+def get_winners_history(
+    level:        Optional[int] = Query(None, ge=1, le=6, description="Filter by winning level"),
+    journey_type: Optional[str] = Query(None, description="Filter by journey type: 'direct' or 'merged'"),
+    limit:        int           = Query(100, ge=1, le=500),
+    offset:       int           = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """
+    Paginated winner history for the Winning Ledger tab.
+
+    Each draw produces two winner records (winner_1 and winner_2) which are
+    returned as individual rows. Includes full journey provenance: level won,
+    pool exited from, total deposited, merges + pauses experienced, and
+    whether the journey was direct or went through dynamic condensation.
+    """
+    from app.models.draw_history import DrawHistory
+    from app.models.pool import Pool
+
+    # Pull draw history with pool names — no ORM relationship needed
+    raw = (
+        db.query(DrawHistory, Pool.name.label("pool_name"))
+        .outerjoin(Pool, DrawHistory.pool_id == Pool.id)
+        .order_by(DrawHistory.draw_timestamp.desc())
+        .all()
+    )
+
+    rows = []
+    for dh, pool_name in raw:
+        for slot in (1, 2):
+            uid    = dh.winner_1_user_id            if slot == 1 else dh.winner_2_user_id
+            lvl    = dh.winner_1_level              if slot == 1 else dh.winner_2_level
+            net    = dh.winner_1_net_payout         if slot == 1 else dh.winner_2_net_payout
+            dep    = dh.winner_1_total_deposited    if slot == 1 else dh.winner_2_total_deposited
+            merges = dh.winner_1_merges_experienced if slot == 1 else dh.winner_2_merges_experienced
+            pauses = dh.winner_1_pauses_experienced if slot == 1 else dh.winner_2_pauses_experienced
+            jtype  = dh.winner_1_journey_type       if slot == 1 else dh.winner_2_journey_type
+
+            # Apply filters before any DB lookup
+            if level        is not None and lvl   != level:        continue
+            if journey_type is not None and jtype != journey_type: continue
+
+            user: User | None = (
+                db.query(User).filter(User.id == uid).first() if uid else None
+            )
+            net_f  = float(net or 0)
+            dep_i  = dep or 1000
+            gross  = net_f + 500   # net = gross − ₹500 platform fee
+
+            rows.append({
+                "draw_id":              dh.id,
+                "pool_id":              dh.pool_id,
+                "pool_name":            pool_name or f"Pool #{dh.pool_id}",
+                "draw_timestamp":       dh.draw_timestamp.isoformat() if dh.draw_timestamp else None,
+                "edge_case":            dh.edge_case_triggered,
+                "user_id":              uid,
+                "username":             user.username  if user else None,
+                "user_name":            user.name      if user else None,
+                "level_won":            lvl,
+                "gross_payout_inr":     round(gross, 2),
+                "net_payout_inr":       round(net_f, 2),
+                "total_deposited_inr":  dep_i,
+                "net_profit_inr":       round(net_f - dep_i, 2),
+                "merges_experienced":   merges or 0,
+                "pauses_experienced":   pauses or 0,
+                "journey_type":         jtype  or "direct",
+                "is_referred":          bool(user.referred_by_user_id) if user else False,
+            })
+
+    total = len(rows)
+    return {
+        "total":  total,
+        "limit":  limit,
+        "offset": offset,
+        "items":  rows[offset : offset + limit],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  GET /admin/stats/level-breakdown  — Winner stats aggregated by level
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/stats/level-breakdown")
+def get_level_breakdown(db: Session = Depends(get_db)):
+    """
+    Aggregate draw_history winner records by winning level (L1–L6).
+
+    Returns collected (total deposited by winners) and distributed (net payout)
+    for each level so the Statistics tab can render a side-by-side BarChart.
+    Counts both winner_1 and winner_2 slots per draw record.
+    """
+    from app.models.draw_history import DrawHistory
+
+    all_draws = db.query(DrawHistory).all()
+
+    stats: dict[int, dict] = {
+        l: {"winners": 0, "collected": 0, "distributed": 0.0}
+        for l in range(1, 7)
+    }
+
+    for dh in all_draws:
+        for lvl, dep, pay in (
+            (dh.winner_1_level, dh.winner_1_total_deposited, dh.winner_1_net_payout),
+            (dh.winner_2_level, dh.winner_2_total_deposited, dh.winner_2_net_payout),
+        ):
+            if lvl and 1 <= lvl <= 6:
+                stats[lvl]["winners"]     += 1
+                stats[lvl]["collected"]   += dep or 1000
+                stats[lvl]["distributed"] += float(pay or 0)
+
+    levels = []
+    for l in range(1, 7):
+        s = stats[l]
+        levels.append({
+            "level":                 l,
+            "winners_count":         s["winners"],
+            "total_collected_inr":   s["collected"],
+            "total_distributed_inr": round(s["distributed"], 2),
+            "avg_payout_inr":        round(s["distributed"] / s["winners"], 2)
+                                     if s["winners"] else 0.0,
+        })
+
+    return {"levels": levels}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  GET /admin/stats/ai-snapshot  — Quant Engine live state
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/stats/ai-snapshot")
+def get_ai_snapshot(db: Session = Depends(get_db)):
+    """
+    Live snapshot of all AI Quant Engine signals: velocity, momentum, RDR,
+    active scenario, and dynamic reserve calculation.  Used by the admin
+    dashboard header and DevTools AI status indicator.
+
+    v2: now includes Brain 5 LPI, forward signal, cliff signal,
+    blended velocity, and level distribution.
+    """
+    from app.services.ai_quant_engine import get_system_snapshot
+    return get_system_snapshot(db)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9.  GET /admin/stats/brain5-lpi  — Brain 5 LPI live state
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/stats/brain5-lpi")
+def get_brain5_lpi(db: Session = Depends(get_db)):
+    """
+    Brain 5 Level Pressure Index — live snapshot.
+
+    Returns:
+      lpi:               float (0–100)
+      level_distribution: counts per level (L1–L6)
+      pool_type_decision: routing decision for the upcoming draw cycle
+      sde_demand:        SDE resource requirements
+      forward_signal_l3: projected new L3 members next week
+      elevated_risk:     True if any L5/L6 members exist (should be False normally)
+    """
+    from app.services.brain5_lpi_engine import (
+        calculate_lpi, get_level_distribution, decide_pool_types,
+        get_sde_demand, get_forward_signal, has_elevated_risk_members,
+    )
+
+    lpi      = calculate_lpi(db)
+    dist     = get_level_distribution(db)
+    decision = decide_pool_types(db)
+    demand   = get_sde_demand(db)
+    fwd      = get_forward_signal(db)
+    elev     = has_elevated_risk_members(db)
+
+    return {
+        "lpi":                round(lpi, 2),
+        "level_distribution": dist.as_dict(),
+        "total_active":       dist.total,
+        "pool_type_decision": {
+            "p1_sde_active":      decision.p1_sde_active,
+            "p1_sde_reason":      decision.p1_sde_reason,
+            "p2_type_a_active":   decision.p2_type_a_active,
+            "p3_regular_active":  decision.p3_regular_active,
+            "p4_type_b_active":   decision.p4_type_b_active,
+            "l4_flagged_count":   decision.l4_flagged_count,
+            "sde_threshold_met":  decision.sde_threshold_met,
+            "l1l2_exhausted":     decision.l1l2_exhausted,
+            "summary":            decision.summary(),
+        },
+        "sde_demand": {
+            "l4_count":               demand.l4_count,
+            "sessions_needed":        demand.sessions_needed,
+            "l1l2_threshold":         demand.l1l2_threshold,
+            "l1l2_available":         demand.l1l2_available,
+            "clearable_count":        demand.clearable_count,
+            "overflow_count":         demand.overflow_count,
+            "overflow_requires_admin": demand.overflow_requires_admin,
+        },
+        "forward_signal_l3":  round(fwd, 2),
+        "elevated_risk":      elev,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10.  GET /draw/countdown  — Two-flag countdown (public endpoint)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Note: this is intentionally NOT under /admin/ — it is shown to users too.
+# The router is `admin_analytics` but we register a public path here.
+# FastAPI does not restrict path prefixes per router; the auth dependency
+# is only on the router-level for /admin/* paths.  This endpoint has NO
+# auth so users can poll it freely.
+from fastapi import APIRouter as _APIRouter
+_public_router = _APIRouter(tags=["Draw Schedule"])
+
+@_public_router.get("/draw/countdown")
+def get_draw_countdown_public(db: Session = Depends(get_db)):
+    """
+    Two-flag countdown endpoint.
+
+    Returns countdown data ONLY when preparation_valid=True AND
+    countdown_active=True.  Otherwise returns a placeholder message.
+
+    Clients MUST check `countdown_active` before displaying the timer.
+    """
+    from app.services.draw_preparation import get_draw_countdown
+    return get_draw_countdown(db)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11.  GET  /admin/draw/state            — Current WeeklyDrawState
+#      POST /admin/draw/prepare          — Trigger T-2H preparation (manual)
+#      POST /admin/draw/cleanup          — Trigger post-draw cleanup (manual)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/draw/state")
+def get_draw_state(db: Session = Depends(get_db)):
+    """
+    Return the current WeeklyDrawState for admin monitoring.
+    Shows preparation status, SDE sessions, float projection, etc.
+    """
+    from datetime import datetime, timezone
+    from app.models.weekly_draw_state import WeeklyDrawState
+
+    now = datetime.now(timezone.utc)
+    iso = now.isocalendar()
+    week_id = f"{iso.year}-W{iso.week:02d}"
+
+    state = (
+        db.query(WeeklyDrawState)
+        .filter(WeeklyDrawState.week_id == week_id)
+        .first()
+    )
+
+    if not state:
+        return {
+            "week_id":            week_id,
+            "status":             "not_prepared",
+            "preparation_valid":  False,
+            "countdown_active":   False,
+            "draw_executed":      False,
+            "message":            "No preparation state found for this week.",
+        }
+
+    return {
+        "week_id":                   state.week_id,
+        "preparation_valid":         state.preparation_valid,
+        "countdown_active":          state.countdown_active,
+        "draw_time_utc":             state.draw_time_utc.isoformat() if state.draw_time_utc else None,
+        "preparation_started_at":    state.preparation_started_at.isoformat() if state.preparation_started_at else None,
+        "preparation_completed_at":  state.preparation_completed_at.isoformat() if state.preparation_completed_at else None,
+        "lpi_snapshot":              float(state.lpi_snapshot or 0),
+        "total_l4_count":            state.total_l4_count,
+        "total_l3_count":            state.total_l3_count,
+        "sde_sessions_planned":      state.sde_sessions_planned,
+        "sde_sessions_completed":    state.sde_sessions_completed,
+        "sde_overflow_count":        state.sde_overflow_count,
+        "admin_override_required":   state.admin_override_required,
+        "admin_override_deadline":   state.admin_override_deadline.isoformat() if state.admin_override_deadline else None,
+        "admin_override_choice":     state.admin_override_choice,
+        "float_projection_inr":      state.float_projection_inr,
+        "draw_executed":             state.draw_executed,
+        "consecutive_type_b_weeks":  state.consecutive_type_b_weeks,
+    }
+
+
+@router.post("/admin/draw/prepare")
+def trigger_draw_preparation(
+    draw_time_utc_iso: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Manually trigger T-2H draw preparation.
+
+    draw_time_utc_iso: ISO 8601 UTC datetime of the draw.
+    Example: "2026-06-14T13:30:00Z"
+
+    Idempotent: safe to call multiple times.  Returns existing state
+    if preparation is already complete for this week.
+    """
+    from datetime import datetime, timezone
+    from app.services.draw_preparation import start_draw_preparation
+
+    try:
+        dt = datetime.fromisoformat(draw_time_utc_iso.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid ISO datetime: '{draw_time_utc_iso}'. "
+                   "Use format: '2026-06-14T13:30:00Z'",
+        )
+
+    try:
+        state = start_draw_preparation(db, dt)
+        return {
+            "status":             "prepared",
+            "week_id":            state.week_id,
+            "preparation_valid":  state.preparation_valid,
+            "countdown_active":   state.countdown_active,
+            "sde_sessions":       state.sde_sessions_planned,
+            "admin_override_req": state.admin_override_required,
+            "float_projection":   state.float_projection_inr,
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/admin/draw/cleanup")
+def trigger_post_draw_cleanup(db: Session = Depends(get_db)):
+    """
+    Manually trigger post-draw cleanup (T+0H:05).
+
+    Resets draw_completed_this_week flags, clears SDE flags on exited members,
+    releases the draw engine lock.  Idempotent.
+    """
+    from app.services.draw import post_draw_cleanup
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    iso = now.isocalendar()
+    week_id = f"{iso.year}-W{iso.week:02d}"
+
+    result = post_draw_cleanup(db)
+    return {"status": "cleanup_complete", "week_id": week_id, **result}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12.  GET  /admin/draw/override-dashboard
+#      POST /admin/draw/override-decision
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/draw/override-dashboard")
+def get_override_dashboard(
+    week_id: Optional[str] = Query(
+        None, description="ISO week key (e.g. '2026-W24'). Defaults to current week."
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    Admin override dashboard for L4 overflow resolution.
+
+    Shows financial risk comparison for both options with real-time expected costs.
+    Returns null if no override is required for the specified week.
+    """
+    from app.services.admin_override import get_override_dashboard as _get_dashboard
+    from datetime import datetime, timezone
+
+    if not week_id:
+        now = datetime.now(timezone.utc)
+        iso = now.isocalendar()
+        week_id = f"{iso.year}-W{iso.week:02d}"
+
+    dashboard = _get_dashboard(db, week_id)
+    if dashboard is None:
+        return {
+            "admin_override_required": False,
+            "week_id": week_id,
+            "message": "No admin override required for this week.",
+        }
+    return dashboard
+
+
+@router.post("/admin/draw/override-decision")
+def submit_override_decision(
+    choice: str,
+    week_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Submit admin override decision: 'option_a' or 'option_b'.
+
+    option_a: Let overflow L4 members draw normally (probabilistic L5 risk).
+    option_b: Promote overflow L4 → L5, clear them next week via SDE.
+    """
+    from app.services.admin_override import apply_override_decision
+    from datetime import datetime, timezone
+
+    if not week_id:
+        now = datetime.now(timezone.utc)
+        iso = now.isocalendar()
+        week_id = f"{iso.year}-W{iso.week:02d}"
+
+    try:
+        result = apply_override_decision(db, week_id, choice, applied_by="admin_api")
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13.  GET  /admin/draw/scheduler-status  — APScheduler live state
+#      POST /admin/draw/execute           — Manual draw trigger (dev / recovery)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/draw/scheduler-status")
+def get_scheduler_status():
+    """
+    Return APScheduler running state and next-run times for all 4 draw jobs.
+
+    Fields:
+      running   — True if the scheduler process is alive
+      enabled   — True if SCHEDULER_ENABLED=true was set at startup
+      jobs      — list of { id, name, next_run } for each registered job
+      schedule  — configured UTC trigger times for draw / prep / cleanup
+
+    Use this to verify:
+      • The scheduler started correctly on Render / production.
+      • Next Sunday's jobs are queued at the expected times.
+      • No jobs are silently missing (e.g. after a crash + restart).
+    """
+    from app.services.scheduler import get_scheduler_status as _get_status
+    return _get_status()
+
+
+@router.post("/admin/draw/execute")
+def manual_execute_draw(db: Session = Depends(get_db)):
+    """
+    Manually execute the weekly draw.
+
+    Intended for:
+      • Recovery draws when SCHEDULER_ENABLED=false (local dev, staging).
+      • Emergency re-run if the scheduler missed the Sunday trigger.
+
+    Sequence mirrors the scheduler job exactly:
+      1. Auto-select override if deadline has passed.
+      2. execute_weekly_draw() — draws all eligible full pools.
+      3. Marks WeeklyDrawState.draw_executed=True + countdown_active=False.
+
+    Returns full draw result including per-pool outcomes and waitlist refill.
+
+    Note: This is NOT idempotent by itself — use only after confirming no draw
+    has already run this week (check GET /admin/draw/state first).
+    """
+    from app.services.draw             import execute_weekly_draw
+    from app.services.admin_override   import auto_select_on_timeout
+    from app.models.weekly_draw_state  import WeeklyDrawState
+    from datetime import datetime, timezone
+    from dataclasses import asdict
+
+    now     = datetime.now(timezone.utc)
+    iso     = now.isocalendar()
+    week_id = f"{iso.year}-W{iso.week:02d}"
+
+    # Belt-and-suspenders: resolve any pending override before drawing
+    late_choice = auto_select_on_timeout(db, week_id)
+
+    try:
+        result = execute_weekly_draw(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    # Mark WeeklyDrawState.draw_executed
+    state = (
+        db.query(WeeklyDrawState)
+        .filter(WeeklyDrawState.week_id == week_id)
+        .first()
+    )
+    if state:
+        state.draw_executed    = True
+        state.draw_executed_at = now
+        state.countdown_active = False
+        db.commit()
+
+    return {
+        "status":              "draw_complete",
+        "week_id":             week_id,
+        "pools_drawn":         result.pools_drawn,
+        "sde_pre_drawn":       result.sde_pre_drawn,
+        "skipped_pools":       result.skipped_pools,
+        "paused_pools":        result.paused_pools,
+        "total_auto_paid":     result.total_auto_paid,
+        "refill":              result.refill,
+        "late_override_choice": late_choice,
+    }

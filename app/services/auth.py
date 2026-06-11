@@ -136,7 +136,8 @@ def _admin_jwt_secret() -> str:
 def create_jwt(admin_username: str) -> str:
     payload = {
         "sub":  admin_username,
-        "type": "admin_access",
+        "type": "admin_access",   # internal type guard — validated in decode_jwt
+        "role": "admin",          # spec-compliant field (#149)
         "exp":  datetime.now(timezone.utc) + timedelta(hours=_JWT_EXPIRE_H),
     }
     return jwt.encode(payload, _admin_jwt_secret(), algorithm=_ALGORITHM)

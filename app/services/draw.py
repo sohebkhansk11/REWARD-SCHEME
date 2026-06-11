@@ -1,15 +1,14 @@
 """
 Smart Pairing Dual-Draw Service
 ================================
-Implements the exact algorithm from the V1.0 architecture document.
+Implements the exact algorithm from the V1.0 architecture document,
+updated for the SDE anti-maturity architecture (Phase 1+).
 
-Normal draw (pool has matured, week 4+):
-  Winner 1 — random from Level 1-3
-  Winner 2 — random from Level 4-6
-
-Edge case (early weeks 1-3, no L4+ members yet):
-  Both winners drawn randomly from the available low-tier pool.
-  Two DISTINCT members are selected via random.sample() — never the same person.
+Pool-type routing (draw_type parameter):
+  'regular'  — L1-3 lower / L4-6 upper  (legacy / low-LPI pools)
+  'type_a'   — L1-2 lower / L3-4 upper  (Execution Pool Type A)
+  'sde'      — handled by sde_engine.py; run_dual_draw not used
+  'type_b'   — L3 lower / L4 upper       (Type B fallback)
 
 Post-draw sequence (always):
   1. Generate level-based Withdraw token for each winner.
@@ -17,24 +16,40 @@ Post-draw sequence (always):
   3. Pull top-2 paid Waitlist members as replacements at Level 1.
   4. Issue ₹250 REF token to any replacement's referrer.
   5. Advance surviving original members by +1 level (hard cap: L6).
-  6. Reset weekly_payment_status = Unpaid for ALL pool members.
-  7. Sync pool.total_members to actual active count.
+     ↳ ATOMIC: if new_level == 4, set sde_required=True + flag the pool.
+  6. Set draw_completed_this_week = True on the pool (double-draw guard).
+  7. Reset weekly_payment_status = Unpaid for ALL pool members.
+  8. Sync pool.total_members to actual active count.
 """
 
+import hashlib
 import logging
+import os
 import random
+import secrets
 import string
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from sqlalchemy.orm import Session
+
+# _draw_rng: SystemRandom (os.urandom-backed) used ONLY for
+# guaranteed-distinct 2-sample draws (no stdlib secrets.sample).
+# All single picks use secrets.choice() directly.
+_draw_rng = random.SystemRandom()
 
 _logger = logging.getLogger(__name__)
 
 from app.core.config import (
-    POOL_CAPACITY, LEVEL_LOW, LEVEL_HIGH,
+    POOL_CAPACITY,
+    LEVEL_LOW, LEVEL_HIGH,              # regular pool tier split
+    EXEC_LEVEL_LOW, EXEC_LEVEL_HIGH,    # type_a tier split
+    TYPE_B_LEVEL_LOW, TYPE_B_LEVEL_HIGH,# type_b tier split
+    POOL_DRAW_REGULAR, POOL_DRAW_TYPE_A, POOL_DRAW_TYPE_B, POOL_DRAW_SDE,
     LEVEL_PAYOUTS, PAYOUT_FEE_INR, REFERRAL_REWARD_INR,
 )
 from app.crud import token as crud_token, user as crud_user, pool as crud_pool
+from app.models.draw_history import DrawHistory
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.models.pool import Pool, PoolStatus
 from app.models.token import TokenType, TokenStatus
@@ -86,9 +101,10 @@ class WinnerResult:
 class DrawResult:
     pool_id: int
     pool_name: str
-    winner_1: WinnerResult          # Low-tier winner (L1-L3), or fallback
-    winner_2: WinnerResult          # High-tier winner (L4-L6), or fallback
-    edge_case_used: bool = False    # True when pool had no L4+ members (weeks 1-3)
+    winner_1: WinnerResult          # Low-tier winner, or fallback
+    winner_2: WinnerResult          # High-tier winner, or fallback
+    edge_case_used: bool = False    # True when pool had no upper-tier members
+    draw_type: str = POOL_DRAW_REGULAR  # routing bucket used
 
 
 @dataclass
@@ -97,17 +113,32 @@ class MassDrawResult:
     pools_drawn:     int
     draw_results:    list[DrawResult]
     total_auto_paid: int
-    refill:          dict                    # assign_waitlist_to_pools() summary
-    skipped_pools:   list[str] = field(default_factory=list)  # pool names that errored mid-draw
-    paused_pools:    list[str] = field(default_factory=list)  # Active pools with < 12 — paused pre-draw
+    refill:          dict                     # assign_waitlist_to_pools() summary
+    skipped_pools:   list[str] = field(default_factory=list)   # errored mid-draw
+    paused_pools:    list[str] = field(default_factory=list)   # Active pools with < 12 — paused
+    sde_pre_drawn:   list[str] = field(default_factory=list)   # pools drawn by SDE pre-draw
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
+def _current_week_id() -> str:
+    """Return the ISO week key for the current UTC date.  Format: 'YYYY-Www'."""
+    now = datetime.now(timezone.utc)
+    iso = now.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
 def _unique_token_code(db: Session, prefix: str) -> str:
-    """Generate a collision-free token code with the given prefix."""
+    """
+    Generate a collision-free token code using cryptographic randomness.
+
+    Uses secrets.choice() (backed by os.urandom) — replaces the former
+    random.choices() call which used the MT19937 PRNG (predictable after
+    sufficient observation).
+    """
+    alphabet = string.ascii_uppercase + string.digits
     while True:
-        code = prefix + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        code = prefix + "".join(secrets.choice(alphabet) for _ in range(6))
         if not crud_token.get_token_by_code(db, code):
             return code
 
@@ -220,24 +251,52 @@ def _process_winner(
 
 # ── Single-pool draw ──────────────────────────────────────────────────────────
 
+def _resolve_tier_bounds(draw_type: str) -> tuple[tuple[int, int], tuple[int, int]]:
+    """
+    Return (low_bounds, high_bounds) for the given draw_type.
+
+    BUG 1 FIX: tier rules are now pool-type-specific.
+      regular → L1-3 lower / L4-6 upper (legacy behaviour)
+      type_a  → L1-2 lower / L3-4 upper (Execution Pool)
+      type_b  → L3   lower / L4   upper (Type B Fallback)
+      sde     → not handled here (sde_engine.py owns SDE tier logic)
+    """
+    if draw_type == POOL_DRAW_TYPE_A:
+        return EXEC_LEVEL_LOW, EXEC_LEVEL_HIGH
+    if draw_type == POOL_DRAW_TYPE_B:
+        return TYPE_B_LEVEL_LOW, TYPE_B_LEVEL_HIGH
+    # default / 'regular'
+    return LEVEL_LOW, LEVEL_HIGH
+
+
 def run_dual_draw(
     db: Session,
     pool_id: int,
     *,
     skip_waitlist_fill: bool = False,
+    draw_type: str = POOL_DRAW_REGULAR,
 ) -> DrawResult:
     """
     Execute the Smart Pairing Dual-Draw for the given pool.
 
+    draw_type controls tier bounds (BUG 1 FIX):
+      'regular' (default) — L1-3 lower / L4-6 upper
+      'type_a'            — L1-2 lower / L3-4 upper
+      'type_b'            — L3   lower / L4   upper
+      'sde'               — never routed here; use sde_engine.run_sde_sub_draw()
+
     skip_waitlist_fill (default False):
-        If False — after the draw, immediately calls assign_waitlist_to_pools()
-        to fill the two vacancies and potentially create new pools.
-        If True  — inline replacement is also skipped; the pool drops to 10
-        members.  The caller (execute_weekly_draw) does a single combined
-        refill after ALL pools have been drawn.
+        If True — no inline replacement; pool drops to 10 members.
+        Caller (execute_weekly_draw) does one combined refill after all draws.
 
     Raises ValueError with a human-readable message on any validation failure.
     """
+    if draw_type == POOL_DRAW_SDE:
+        raise ValueError(
+            "draw_type='sde' must not be routed through run_dual_draw(). "
+            "Use sde_engine.run_sde_sub_draw() instead."
+        )
+
     # ── Validate pool ──────────────────────────────────────────────────────────
     pool: Pool | None = crud_pool.get_pool(db, pool_id)
     if not pool:
@@ -245,6 +304,13 @@ def run_dual_draw(
     if pool.status != PoolStatus.Active:
         raise ValueError(
             f"Pool '{pool.name}' is not Active (current status: {pool.status.value})."
+        )
+
+    # BUG 7 FIX: double-draw guard — refuse if this pool already drew this week
+    if pool.draw_completed_this_week:
+        raise ValueError(
+            f"Pool '{pool.name}' already completed its draw this week "
+            f"(draw_completed_this_week=True).  Prevent duplicate execution."
         )
 
     members: list[User] = (
@@ -259,36 +325,44 @@ def run_dual_draw(
             f"exactly {POOL_CAPACITY} are required to run the draw."
         )
 
-    # ── Split by tier ──────────────────────────────────────────────────────────
-    low_pool  = [m for m in members if LEVEL_LOW[0]  <= m.current_level <= LEVEL_LOW[1]]
-    high_pool = [m for m in members if LEVEL_HIGH[0] <= m.current_level <= LEVEL_HIGH[1]]
+    # ── Split by tier (pool-type-specific bounds) ─────────────────────────────
+    low_bounds, high_bounds = _resolve_tier_bounds(draw_type)
+    low_pool  = [m for m in members if low_bounds[0]  <= m.current_level <= low_bounds[1]]
+    high_pool = [m for m in members if high_bounds[0] <= m.current_level <= high_bounds[1]]
 
     edge_case = (len(high_pool) == 0)
 
     if edge_case:
-        # ── Edge case: weeks 1–3, pool has not yet matured to L4 ──────────────
-        # Per spec: "simply select 2 random winners from the available lower
-        # levels until the pool matures."
-        # We need at least 2 distinct members in the low pool.
+        # ── Edge case: pool has not yet matured — no upper-tier members ────────
+        # Per spec: "select 2 random winners from the available lower tier
+        # until the pool matures."  Requires ≥ 2 distinct candidates.
         if len(low_pool) < 2:
             raise ValueError(
                 f"Pool '{pool.name}' has fewer than 2 eligible members for the "
                 f"early-pool edge-case draw (low_pool size: {len(low_pool)})."
             )
-        winner_1, winner_2 = random.sample(low_pool, 2)  # guaranteed distinct
+        winner_1, winner_2 = _draw_rng.sample(low_pool, 2)  # guaranteed distinct
     else:
         # ── Normal draw: one winner from each tier ─────────────────────────────
         if not low_pool:
             raise ValueError(
                 f"Pool '{pool.name}' has no members at Level "
-                f"{LEVEL_LOW[0]}–{LEVEL_LOW[1]} for the low-tier draw."
+                f"{low_bounds[0]}–{low_bounds[1]} for the low-tier draw."
             )
-        winner_1 = random.choice(low_pool)
-        winner_2 = random.choice(high_pool)
+        winner_1 = secrets.choice(low_pool)
+        winner_2 = secrets.choice(high_pool)
 
     # ── Snapshot IDs before any mutations ─────────────────────────────────────
     original_ids = {m.id for m in members}
     winner_ids   = {winner_1.id, winner_2.id}
+
+    # Snapshot winner journey fields BEFORE _process_winner mutates their status
+    _w1_dep    = winner_1.total_deposited_inr        or 1000
+    _w1_merges = winner_1.dynamic_merges_experienced or 0
+    _w1_pauses = winner_1.pauses_experienced         or 0
+    _w2_dep    = winner_2.total_deposited_inr        or 1000
+    _w2_merges = winner_2.dynamic_merges_experienced or 0
+    _w2_pauses = winner_2.pauses_experienced         or 0
 
     # ── Process both winners (token generation + optional replacement) ────────
     _pull = not skip_waitlist_fill   # inline replacement only for single draws
@@ -298,32 +372,85 @@ def run_dual_draw(
 
     # ── Post-draw maintenance ──────────────────────────────────────────────────
     surviving_ids = original_ids - winner_ids
+    week_id = _current_week_id()
+    new_l4_flagged = False  # tracks whether any survivor just became L4
 
     for member_id in surviving_ids:
         member = crud_user.get_user(db, member_id)
         if member and member.status == UserStatus.Active and member.current_pool_id == pool_id:
-            # Advance level — hard cap at L6 (per spec: L7 is mathematically impossible)
+            new_level = min(member.current_level + 1, 6)
+
+            # ANTI-MATURITY PROTOCOL — ATOMIC L4 FLAG (BUG 1 / REAL-TIME FLAGGING):
+            # If this member just advanced to L4, set sde_required=True in the
+            # SAME database write as the level change.  This is a hard guarantee —
+            # there is no window between "member is L4" and "member is flagged".
+            reaching_l4 = (new_level == 4)
+            if reaching_l4:
+                new_l4_flagged = True
+                _logger.info(
+                    "Anti-Maturity: member %d (%s) advanced to L4 — "
+                    "sde_required=True flagged atomically (week %s).",
+                    member.id, member.username, week_id,
+                )
+
             crud_user.update_user(
                 db,
                 member_id,
                 UserUpdate(
-                    current_level=min(member.current_level + 1, 6),
+                    current_level=new_level,
                     weekly_payment_status=WeeklyPaymentStatus.Unpaid,
+                    # Atomically set SDE flag if this member just hit L4
+                    sde_required=(True if reaching_l4 else None),
+                    sde_flagged_week=(week_id if reaching_l4 else None),
                 ),
             )
+
+    # If any survivor reached L4, mark the pool as containing a flagged L4 member.
+    # This sets contains_flagged_l4=True in the SAME transaction as the flag itself.
+    if new_l4_flagged:
+        pool.contains_flagged_l4 = True
 
     # NOTE (Issue 2): replacements are NOT reset to Unpaid here.
     # They entered the pool with Paid status (deposit already collected) and their
     # weekly_payment_status only resets to Unpaid in the NEXT draw's level-advance
     # loop — same as every other surviving member.
 
-    # Sync pool.total_members to actual active count (handles missing replacements cleanly)
+    # BUG 7 FIX: mark pool as drawn this week — prevents double-draw in same cycle
+    pool.draw_completed_this_week = True
+    pool.pool_draw_type           = draw_type
+
+    # Sync pool.total_members to actual active count
     actual_count = (
         db.query(User)
         .filter(User.current_pool_id == pool_id, User.status == UserStatus.Active)
         .count()
     )
     crud_pool.update_pool(db, pool_id, PoolUpdate(total_members=actual_count))
+
+    # Immutable draw audit record — one row per completed draw, never updated
+    db.add(DrawHistory(
+        pool_id             = pool.id,
+        edge_case_triggered = edge_case,
+        draw_type           = draw_type,           # NEW: draw classification
+        targeted_early_exit = False,               # only SDE upper winners get True
+        # Winner 1
+        winner_1_user_id            = result_1.winner_id,
+        winner_1_level              = result_1.winner_level,
+        winner_1_net_payout         = result_1.net_payout_inr,
+        winner_1_total_deposited    = _w1_dep,
+        winner_1_merges_experienced = _w1_merges,
+        winner_1_pauses_experienced = _w1_pauses,
+        winner_1_journey_type       = "merged" if _w1_merges > 0 else "direct",
+        # Winner 2
+        winner_2_user_id            = result_2.winner_id,
+        winner_2_level              = result_2.winner_level,
+        winner_2_net_payout         = result_2.net_payout_inr,
+        winner_2_total_deposited    = _w2_dep,
+        winner_2_merges_experienced = _w2_merges,
+        winner_2_pauses_experienced = _w2_pauses,
+        winner_2_journey_type       = "merged" if _w2_merges > 0 else "direct",
+    ))
+    db.commit()
 
     # After a single draw, immediately run the Double-FIFO refill so vacancies
     # are filled and Phase 2 pool creation is considered.
@@ -403,6 +530,14 @@ def execute_weekly_draw(
             # Draw protection: Active pool with < 12 members — pause it
             pool.status = PoolStatus.Paused_Awaiting_Members
             paused_now.append(pool.name)
+            # Record the pause in every active member's journey counter
+            db.query(User).filter(
+                User.current_pool_id == pool.id,
+                User.status == UserStatus.Active,
+            ).update(
+                {"pauses_experienced": User.pauses_experienced + 1},
+                synchronize_session=False,
+            )
             _logger.warning(
                 "execute_weekly_draw: ⏸  %s has %d/%d members — "
                 "marking Paused_Awaiting_Members (DRAW SKIPPED for this pool).",
@@ -457,20 +592,41 @@ def execute_weekly_draw(
     # ── 3. Draw every eligible pool — no inline replacement, no intermediate fill
     draw_results: list[DrawResult] = []
     skipped:      list[str]        = []
+    sde_skipped:  list[str]        = []   # pools already handled by SDE pre-draw
 
     for pool in eligible:
+        # BUG 7 FIX: skip any pool that SDE (or a previous draw attempt) already
+        # processed this week.  draw_completed_this_week=True is the authoritative
+        # single source of truth for "already drawn".
+        if pool.draw_completed_this_week:
+            sde_skipped.append(pool.name)
+            _logger.info(
+                "execute_weekly_draw: ⟳ %s already drawn this week (SDE or prior run) — skipping.",
+                pool.name,
+            )
+            continue
+
         try:
-            result = run_dual_draw(db, pool.id, skip_waitlist_fill=True)
+            # Route to correct draw type based on pool_draw_type set at T-2H prep.
+            # If prep hasn't run (pool_draw_type is None), default to 'regular'.
+            effective_draw_type = pool.pool_draw_type or POOL_DRAW_REGULAR
+
+            result = run_dual_draw(
+                db, pool.id,
+                skip_waitlist_fill=True,
+                draw_type=effective_draw_type,
+            )
             draw_results.append(result)
             _logger.info(
-                "execute_weekly_draw: ✓ %s — W1=@%s (L%d %s), W2=@%s (L%d %s)",
-                pool.name,
+                "execute_weekly_draw: ✓ %s [%s] — W1=@%s (L%d %s), W2=@%s (L%d %s)",
+                pool.name, effective_draw_type,
                 result.winner_1.winner_username, result.winner_1.winner_level,
                 "edge" if result.edge_case_used else "norm",
                 result.winner_2.winner_username, result.winner_2.winner_level,
                 "edge" if result.edge_case_used else "norm",
             )
         except ValueError as exc:
+            db.rollback()
             _logger.warning("execute_weekly_draw: ✗ %s skipped — %s", pool.name, exc)
             skipped.append(pool.name)
 
@@ -498,4 +654,87 @@ def execute_weekly_draw(
         refill=refill,
         skipped_pools=skipped,
         paused_pools=paused_now,
+        sde_pre_drawn=sde_skipped,
     )
+
+
+# ── Post-draw cleanup (T+0H:05) ────────────────────────────────────────────────
+
+def post_draw_cleanup(db: Session) -> dict:
+    """
+    Post-draw cleanup job.  Run at T+0H:05 after all draws complete.
+
+    Actions:
+      1. Reset draw_completed_this_week=False on all non-dissolved pools.
+         (Enables next week's draw.)
+      2. Reset pool_draw_type=None on all non-dissolved pools.
+         (Next week's prep will re-assign types at T-2H.)
+      3. Clear contains_flagged_l4=False on pools whose L4 members exited.
+      4. Clear sde_required=False on any Eliminated_Won member who still
+         has the flag set (defensive cleanup — SDE should have cleared it,
+         but this catches any edge-case survivors).
+      5. Release the draw engine system lock.
+
+    Returns a summary dict for logging / admin API response.
+    """
+    non_dissolved = [
+        PoolStatus.Active,
+        PoolStatus.Waiting,
+        PoolStatus.Paused_Awaiting_Members,
+        PoolStatus.Full,
+    ]
+
+    # 1+2: reset weekly draw flags
+    pools_reset: int = (
+        db.query(Pool)
+        .filter(Pool.status.in_(non_dissolved))
+        .update(
+            {"draw_completed_this_week": False, "pool_draw_type": None},
+            synchronize_session=False,
+        )
+    )
+
+    # 3: clear L4 flag on pools that no longer have any sde_required members
+    #    (sub-query: pool IDs that still have at least one sde_required=True active member)
+    pools_still_flagged = (
+        db.query(User.current_pool_id)
+        .filter(User.sde_required == True, User.status == UserStatus.Active)  # noqa: E712
+        .distinct()
+        .subquery()
+    )
+    pools_cleared: int = (
+        db.query(Pool)
+        .filter(
+            Pool.contains_flagged_l4 == True,  # noqa: E712
+            ~Pool.id.in_(pools_still_flagged),
+        )
+        .update({"contains_flagged_l4": False}, synchronize_session=False)
+    )
+
+    # 4: defensive sde_required cleanup for exited members
+    orphan_flags_cleared: int = (
+        db.query(User)
+        .filter(
+            User.sde_required == True,   # noqa: E712
+            User.status.in_([UserStatus.Eliminated_Won, UserStatus.Eliminated]),
+        )
+        .update(
+            {"sde_required": False, "sde_flagged_week": None},
+            synchronize_session=False,
+        )
+    )
+
+    # 5: release draw engine lock
+    from app.models.system_lock import SystemLock
+    db.query(SystemLock).filter(SystemLock.lock_name == "draw_engine").delete()
+
+    db.commit()
+
+    summary = {
+        "pools_draw_flag_reset": pools_reset,
+        "pools_l4_flag_cleared": pools_cleared,
+        "orphan_sde_flags_cleared": orphan_flags_cleared,
+        "draw_lock_released": True,
+    }
+    _logger.info("post_draw_cleanup complete: %s", summary)
+    return summary

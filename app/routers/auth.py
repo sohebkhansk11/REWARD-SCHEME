@@ -13,9 +13,55 @@ beyond ADMIN_JWT_SECRET and ADMIN_SETUP_SECRET.
 """
 
 import os
+import time
+from collections import defaultdict
+from threading import Lock
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
+
+# ── In-memory brute-force protection ─────────────────────────────────────────
+# Tracks per-IP failed attempt timestamps. State lives in the process — resets
+# on server restart, which is acceptable for single-process deployments.
+# Replace with Redis if horizontal scaling is ever needed.
+_RATE_WINDOW_S = 900   # 15-minute sliding window
+_RATE_MAX_FAILS = 5    # max failed attempts before lockout
+
+_failed_attempts: dict[str, list[float]] = defaultdict(list)
+_rl_lock = Lock()
+
+
+def _get_client_ip(request: Request) -> str:
+    """Extract real IP — respects X-Forwarded-For from Render's proxy."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _check_rate_limit(ip: str) -> None:
+    """Raise 429 if this IP has hit the failed-attempt ceiling."""
+    now = time.time()
+    with _rl_lock:
+        _failed_attempts[ip] = [t for t in _failed_attempts[ip] if now - t < _RATE_WINDOW_S]
+        if len(_failed_attempts[ip]) >= _RATE_MAX_FAILS:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Too many failed login attempts from this IP. "
+                    f"Try again in {_RATE_WINDOW_S // 60} minutes."
+                ),
+            )
+
+
+def _record_failure(ip: str) -> None:
+    with _rl_lock:
+        _failed_attempts[ip].append(time.time())
+
+
+def _clear_failures(ip: str) -> None:
+    with _rl_lock:
+        _failed_attempts.pop(ip, None)
 
 from app.database import get_db
 from app.models.admin import Admin
@@ -100,12 +146,17 @@ def setup_admin(body: AdminSetupRequest, db: Session = Depends(get_db)):
 # ── Step 1: Password → session token ──────────────────────────────────────────
 
 @router.post("/login", response_model=AdminLoginResponse)
-def login(body: AdminLoginRequest, db: Session = Depends(get_db)):
+def login(request: Request, body: AdminLoginRequest, db: Session = Depends(get_db)):
     """
     Verify username + password.
     On success, return a short-lived `temp_token` valid for 5 minutes.
     No external calls — the admin will supply the TOTP code from their app.
+
+    Rate limited to 5 failed attempts per IP per 15-minute window.
     """
+    ip = _get_client_ip(request)
+    _check_rate_limit(ip)
+
     admin: Admin | None = (
         db.query(Admin)
         .filter(Admin.username == body.username, Admin.is_active == True)   # noqa: E712
@@ -118,8 +169,10 @@ def login(body: AdminLoginRequest, db: Session = Depends(get_db)):
     password_ok = verify_password(body.password, stored_hash)
 
     if not admin or not password_ok:
+        _record_failure(ip)
         raise HTTPException(status_code=401, detail="Invalid username or password.")
 
+    _clear_failures(ip)
     temp_token = create_login_session(admin.id, admin.username)
 
     return AdminLoginResponse(

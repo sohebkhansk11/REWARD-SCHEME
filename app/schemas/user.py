@@ -39,6 +39,11 @@ class UserUpdate(BaseModel):
     late_fees_inr: Optional[Decimal] = None
     referred_by_user_id: Optional[int] = None
     telegram_chat_id: Optional[str] = None
+    # ── Anti-Maturity Protocol — SDE flags ────────────────────────────────────
+    # Service layer sets these atomically alongside level advancement.
+    # Never exposed via user-facing API endpoints — internal use only.
+    sde_required:     Optional[bool] = None
+    sde_flagged_week: Optional[str]  = None
 
     @field_validator("current_level")
     @classmethod

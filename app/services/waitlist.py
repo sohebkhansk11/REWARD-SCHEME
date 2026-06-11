@@ -44,6 +44,7 @@ from sqlalchemy import func, insert as sa_insert
 from sqlalchemy.orm import Session
 
 from app.core.config import WAITLIST_TRIGGER, NEW_POOL_INTAKE, POOL_CAPACITY  # noqa: F401
+from app.services.ai_quant_engine import determine_reserve_multiplier
 from app.core.pool_settings import get_auto_pool_creation
 from app.crud import user as crud_user, pool as crud_pool
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
@@ -322,10 +323,39 @@ def assign_waitlist_to_pools(db: Session) -> dict:
             remaining, threshold,
         )
 
-        if remaining >= threshold:
-            # Create as many FULL pools as the current waitlist can fill.
-            # pools_to_make * POOL_CAPACITY <= remaining, so every pool will be full.
-            pools_to_make = remaining // POOL_CAPACITY
+        # ── AI Quant Engine gate ──────────────────────────────────────────────
+        # The admin threshold is the FLOOR.  The AI multiplier scales the
+        # dynamic reserve needed before any of the waitlist is "available"
+        # for spawning.  This prevents the system from exhausting the waitlist
+        # during a Dry Phase or Flash Flood.
+        _ai_multiplier, _ai_scenario = determine_reserve_multiplier(db)
+        # Burn rate counts Active-only (paused pools don't exit members).
+        # Reserve capacity must protect ALL operational pools (Active + Paused)
+        # because paused pools still hold members that need replacement coverage.
+        _active_pool_count = (
+            db.query(func.count(Pool.id))
+            .filter(Pool.status == PoolStatus.Active)
+            .scalar()
+        ) or 0
+        _operational_pool_count = (
+            db.query(func.count(Pool.id))
+            .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
+            .scalar()
+        ) or 0
+        _dynamic_reserve     = int(_operational_pool_count * POOL_CAPACITY * _ai_multiplier)
+        _available_to_spawn  = max(0, remaining - _dynamic_reserve)
+        _logger.info(
+            "Phase 2 AI: scenario=%-20s  multiplier=%.2f  "
+            "active_pools=%d  operational_pools=%d  dynamic_reserve=%d  "
+            "waitlist=%d  available_to_spawn=%d  admin_floor=%d",
+            _ai_scenario, _ai_multiplier, _active_pool_count, _operational_pool_count,
+            _dynamic_reserve, remaining, _available_to_spawn, threshold,
+        )
+
+        if _available_to_spawn >= threshold:
+            # Create as many FULL pools as the AI-available portion allows.
+            # pools_to_make * POOL_CAPACITY <= _available_to_spawn (every pool is full).
+            pools_to_make = _available_to_spawn // POOL_CAPACITY
 
             if pools_to_make > 0:
                 base_count = db.query(Pool).count()   # current total pool count
@@ -435,17 +465,20 @@ def assign_waitlist_to_pools(db: Session) -> dict:
     # Phase 3 — Dynamic Inter-Pool Condensation Engine
     # ─────────────────────────────────────────────────────────────────────────
     #
-    # SAFEGUARD: Phase 3 ONLY runs when:
-    #   (a) The paid Waitlist is fully exhausted (wl_remaining == 0), AND
+    # SAFEGUARDS — Phase 3 ONLY runs when ALL of the following hold:
+    #   (a) The paid Waitlist is fully exhausted (wl_remaining == 0).
     #   (b) At least one pool still has < POOL_CAPACITY members.
+    #   (c) The draw engine lock is NOT active (T-2H through T+0H:10 window).
+    #       Dissolving pools during preparation or draw execution would corrupt
+    #       the SDE session plan and pool routing tables.
     #
-    # If the waitlist is not empty, Phase 1/2 should have handled the remaining
-    # assignments.  Running condensation while users are still waiting would
-    # incorrectly dissolve pools that could have been filled normally.
+    # Per-pool guard (inside the source-pool loop):
+    #   Any source pool whose contains_flagged_l4=True is IMMUNE to condensation.
+    #   An L4-flagged pool must remain intact until SDE processes it this week.
     #
     # Mechanism when triggered:
     #   Target pools  — under-capacity Active/Paused pools, created_at ASC
-    #   Source pools  — full Active pools NOT in target set, created_at DESC
+    #   Source pools  — full Active pools NOT in target set AND not L4-flagged, created_at DESC
     #   Transfer      — FIFO within source (oldest member transferred first)
     #   Preservation  — current_level, weekly_payment_status, join_date NEVER altered
 
@@ -453,7 +486,38 @@ def assign_waitlist_to_pools(db: Session) -> dict:
     phase3_events:    list[dict] = []
     phase3_dissolved: list[str]  = []
 
-    # ── Safeguard: check paid waitlist count ──────────────────────────────────
+    # ── Safeguard (c): draw window lock check (BUG 9 FIX) ────────────────────
+    # Defer the import to avoid circular dependency at module load time.
+    from app.models.system_lock import SystemLock
+    from datetime import datetime, timezone as _tz
+    draw_lock = (
+        db.query(SystemLock)
+        .filter(
+            SystemLock.lock_name == "draw_engine",
+            SystemLock.expires_at > datetime.now(_tz.utc),
+        )
+        .first()
+    )
+    if draw_lock:
+        _logger.info(
+            "Phase 3: SKIPPED — draw engine lock active (held by '%s', expires %s). "
+            "Condensation is blocked during the T-2H → T+0H:10 draw window.",
+            draw_lock.held_by,
+            draw_lock.expires_at.isoformat(),
+        )
+        # Return early — Phase 1/2 results preserved, Phase 3 zeros out
+        return {
+            "phase1_assigned":     phase1_assigned,
+            "phase1_pool_changes": phase1_pool_changes,
+            "phase2_pool_created": phase2_pool_name,
+            "phase2_pools_count":  phase2_pools_count,
+            "phase2_assigned":     phase2_assigned,
+            "phase3_transfers":    0,
+            "phase3_events":       [],
+            "phase3_dissolved":    [],
+        }
+
+    # ── Safeguard (a): check paid waitlist count ──────────────────────────────
     wl_remaining: int = (
         db.query(User)
         .filter(
@@ -495,12 +559,18 @@ def assign_waitlist_to_pools(db: Session) -> dict:
         else:
             target_ids: set[int] = {pool.id for pool, _ in p3_targets}
 
-            # Source pools: Active pools NOT in target set, ordered newest first
+            # Source pools: Active pools NOT in target set AND not L4-flagged.
+            # SDE IMMUNITY (BUG 2 / CONDENSATION GUARD):
+            #   Any pool with contains_flagged_l4=True must not be used as a
+            #   condensation source.  Dissolving such a pool would scatter the
+            #   L4 member(s) into random pools, breaking the SDE session plan
+            #   that was built at T-2H.
             source_pools: list[Pool] = (
                 db.query(Pool)
                 .filter(
                     Pool.status == PoolStatus.Active,
                     Pool.id.notin_(target_ids),
+                    Pool.contains_flagged_l4 == False,   # noqa: E712
                 )
                 .order_by(Pool.created_at.desc())
                 .all()
@@ -533,12 +603,15 @@ def assign_waitlist_to_pools(db: Session) -> dict:
                     ),
                 )
 
-                src_idx = 0   # rolling pointer into source_pools list
+                _MAX_P3_ITERS = 10_000   # explicit safety ceiling (#189)
+                src_idx  = 0             # rolling pointer into source_pools list
+                _p3_iter = 0             # iteration guard counter
 
                 for target_pool, target_actual in p3_targets:
                     vacancies = POOL_CAPACITY - target_actual
 
-                    while vacancies > 0 and src_idx < len(source_pools):
+                    while vacancies > 0 and src_idx < len(source_pools) and _p3_iter < _MAX_P3_ITERS:
+                        _p3_iter += 1
                         source_pool = source_pools[src_idx]
 
                         if src_counts[source_pool.id] == 0:
@@ -561,9 +634,12 @@ def assign_waitlist_to_pools(db: Session) -> dict:
 
                         for member in transfer_batch:
                             # ── LEVEL & STATE PRESERVATION (CRITICAL) ──────────
-                            # Only pool_id changes.
+                            # Only pool_id and journey counter change.
                             # current_level, weekly_payment_status, join_date: NEVER touched.
-                            member.current_pool_id = target_pool.id
+                            member.current_pool_id           = target_pool.id
+                            member.dynamic_merges_experienced = (
+                                (member.dynamic_merges_experienced or 0) + 1
+                            )
                             _logger.info(
                                 "[P3-XFER]  @%-20s  (id=%5d  L%d  %s)  %s → %s",
                                 member.username,
@@ -607,6 +683,13 @@ def assign_waitlist_to_pools(db: Session) -> dict:
                             "[P3] %s still needs %d member(s) — all source pools exhausted.",
                             target_pool.name, vacancies,
                         )
+
+                if _p3_iter >= _MAX_P3_ITERS:
+                    _logger.error(
+                        "Phase 3: safety limit reached (%d iterations) — "
+                        "condensation halted early to prevent runaway loop.",
+                        _MAX_P3_ITERS,
+                    )
 
                 # ── Persist + sync all affected pools ──────────────────────────
                 if phase3_transfers:

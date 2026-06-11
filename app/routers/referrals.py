@@ -299,3 +299,60 @@ def update_referral_status(
                 "User not found — balance not restored."
             ),
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUT /admin/referrals/{token_id}/settle
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.put(
+    "/admin/referrals/{token_id}/settle",
+    dependencies=[Depends(require_admin_jwt)],
+)
+def settle_referral_payout(
+    token_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Confirm physical cash payment and close the referral payout lifecycle.
+
+    Lifecycle: Pending_Approval → (approve) → Active → (settle) → Burned
+
+    The approve step (PUT /admin/referrals/{id}/status) marks the token Active,
+    meaning the admin has authorised the payout.  This settle step marks it
+    Burned, confirming the cash has been physically handed to the user.
+
+    Only tokens in Active status can be settled — Pending and already-Burned
+    tokens are rejected with 404 to prevent double-settlement.
+    """
+    token: Token | None = (
+        db.query(Token)
+        .filter(
+            Token.id     == token_id,
+            Token.type   == TokenType.Referral_Withdraw,
+            Token.status == TokenStatus.Active,
+        )
+        .first()
+    )
+    if not token:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Token {token_id} not found, is not a Referral_Withdraw token, "
+                "or is not in Active (approved) status. "
+                "Only approved tokens can be settled."
+            ),
+        )
+
+    token.status      = TokenStatus.Burned
+    token.redeemed_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {
+        "message":    f"Referral payout {token.code} settled.",
+        "token_id":   token_id,
+        "token_code": token.code,
+        "amount_inr": float(token.value_inr),
+        "new_status": TokenStatus.Burned,
+        "note":       "Cash confirmed paid out. Token lifecycle complete.",
+    }

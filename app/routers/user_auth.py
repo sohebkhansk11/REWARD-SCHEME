@@ -128,7 +128,7 @@ def register(
 
     # 4. Create user (Waitlist + Paid — the deposit token covers week 1)
     new_user = User(
-        name=body.name,
+        name=body.name.strip(),
         mobile=body.mobile,
         username=body.username,
         hashed_password=hash_password(body.password),
@@ -444,8 +444,9 @@ def redeem_deposit(
     token.redeemed_at         = now
     token.redeemed_by_user_id = user.id
 
-    # ── Mark user as Paid ─────────────────────────────────────────────────────
+    # ── Mark user as Paid + accumulate deposit total ──────────────────────────
     user.weekly_payment_status = WeeklyPaymentStatus.Paid
+    user.total_deposited_inr   = (user.total_deposited_inr or 0) + DEPOSIT_AMOUNT_INR
     db.commit()
     db.refresh(user)
 

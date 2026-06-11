@@ -13,6 +13,8 @@ pool_creation_threshold   — minimum paid Waitlist members needed before
                             Default: WAITLIST_TRIGGER (24) from config.py.
 """
 
+import time
+
 from sqlalchemy.orm import Session
 
 from app.core.config import WAITLIST_TRIGGER
@@ -21,6 +23,13 @@ from app.models.system_settings import SystemSettings
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _KEY_THRESHOLD = "pool_creation_threshold"
+
+# Process-local cache — avoids a DB round-trip on every waitlist trigger call.
+# TTL of 60 seconds means threshold changes take effect within one minute.
+# Thread-safe in CPython: dict reads/writes on simple scalar values are atomic
+# under the GIL; no explicit lock needed for this single-writer pattern.
+_THRESHOLD_CACHE: dict = {"value": None, "expires": 0.0}
+_CACHE_TTL_S = 60
 
 
 # ── Internal helper ───────────────────────────────────────────────────────────
@@ -48,18 +57,23 @@ def get_pool_threshold(db: Session) -> int:
     """
     Return the current pool-creation threshold.
 
-    If the row does not exist yet (fresh deployment or before first explicit
-    SET), returns the compiled-in default (WAITLIST_TRIGGER = 24) without
-    writing anything to the DB.  This keeps GET endpoints read-only.
+    Served from a 60-second process-local cache to avoid a DB hit on every
+    waitlist trigger call.  Falls back to the compiled-in WAITLIST_TRIGGER (24)
+    when the row does not exist, keeping GET paths read-only.
     """
+    now = time.monotonic()
+    if _THRESHOLD_CACHE["value"] is not None and now < _THRESHOLD_CACHE["expires"]:
+        return _THRESHOLD_CACHE["value"]
+
     row: SystemSettings | None = (
         db.query(SystemSettings)
         .filter(SystemSettings.key == _KEY_THRESHOLD)
         .first()
     )
-    if row is None or row.value_int is None:
-        return WAITLIST_TRIGGER   # compiled-in fallback
-    return row.value_int
+    result = row.value_int if (row is not None and row.value_int is not None) else WAITLIST_TRIGGER
+    _THRESHOLD_CACHE["value"]   = result
+    _THRESHOLD_CACHE["expires"] = now + _CACHE_TTL_S
+    return result
 
 
 def set_pool_threshold(db: Session, new_threshold: int) -> int:
@@ -76,4 +90,6 @@ def set_pool_threshold(db: Session, new_threshold: int) -> int:
     row.value_int = new_threshold
     db.commit()
     db.refresh(row)
+    # Invalidate cache so next call reads the new value immediately
+    _THRESHOLD_CACHE["value"] = None
     return row.value_int

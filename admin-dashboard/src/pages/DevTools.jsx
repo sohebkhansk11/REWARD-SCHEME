@@ -676,8 +676,7 @@ function InjectionTab({ toast }) {
         <DevCard icon={UserPlus} iconBg="bg-emerald-900/40 border border-emerald-700/50" iconColor="text-emerald-400" title="Mass User Injection" subtitle="Bulk-create users via SQLAlchemy Core batch inserts">
           <div className="space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
-              <div className="sm:col-span-2"><DevInput label="Number of Users" hint="(1–100000)" type="number" min={1} max={100_000} value={count} onChange={e=>setCount(Math.min(100_000,Math.max(1,parseInt(e.target.value,10)||1))}/></div>
-              <div><p className="text-xs text-slate-400 font-medium mb-1.5">Auto-Form Pools</p>
+              <div className="sm:col-span-2"><DevInput label="Number of Users" hint="(1–100,000)" type="number" min={1} max={100_000} value={count} onChange={e=>setCount(Math.min(100_000,Math.max(1,parseInt(e.target.value,10)||1)))} /></div><div><p className="text-xs text-slate-400 font-medium mb-1.5">Auto-Form Pools</p>
                 <div className="flex items-center gap-3 h-10"><Toggle checked={autoPool} onChange={setAutoPool} label="Auto-pool"/><span className="text-xs text-slate-300">{autoPool?'Yes':'No'}</span></div>
               </div>
             </div>

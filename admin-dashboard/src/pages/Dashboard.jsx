@@ -46,10 +46,18 @@ export default function Dashboard() {
     try {
       const res = await checkWaitlist()
       toast(res.data.message, res.data.pool_created ? 'success' : 'info')
+      // Surface Phase 3 condensation events to the browser console (#203)
+      if ((res.data.phase3_transfers ?? 0) > 0) {
+        console.warn('[Phase 3 Condensation]', {
+          transfers: res.data.phase3_transfers,
+          events:    res.data.phase3_events,
+          dissolved: res.data.phase3_dissolved,
+        })
+      }
       fetchAll(true)
     } catch (err) {
       if (err.code === 'ECONNABORTED' || err.message?.toLowerCase().includes('timeout')) {
-        toast('Data processing timeout. The server is handling a large queue.', 'error')
+        toast('Server is processing heavy load. Please wait or refresh.', 'error')
       } else {
         toast(err.response?.data?.detail ?? 'Waitlist check failed', 'error')
       }

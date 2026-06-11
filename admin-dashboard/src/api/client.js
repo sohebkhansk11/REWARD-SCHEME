@@ -15,16 +15,25 @@ api.interceptors.request.use(config => {
   return config
 })
 
-// On 401, clear stored credentials and redirect to /login
+// Global response interceptor:
+//  401 → clear auth state and redirect to /login
+//  500/502/503/504 → attach a user-friendly message so catch blocks
+//                    can display err.userMessage without parsing raw JSON
 api.interceptors.response.use(
   res => res,
   err => {
-    if (err.response?.status === 401) {
+    const status = err.response?.status
+    if (status === 401) {
       localStorage.removeItem('rs_admin_jwt')
       localStorage.removeItem('rs_admin_name')
       if (!window.location.pathname.startsWith('/login')) {
         window.location.href = '/login'
       }
+    }
+    if ([500, 502, 503, 504].includes(status)) {
+      err.userMessage =
+        err.response?.data?.detail ||
+        'The server encountered an error. Please try again or contact support.'
     }
     return Promise.reject(err)
   }
@@ -159,6 +168,10 @@ export const getPendingReferrals = () =>
 export const updateReferralStatus = (tokenId, action, note = undefined) =>
   api.put(`/admin/referrals/${tokenId}/status`, { action, ...(note ? { note } : {}) })
 
+/** PUT /admin/referrals/{id}/settle — mark approved payout as Burned after cash paid */
+export const settleReferralPayout = (tokenId) =>
+  api.put(`/admin/referrals/${tokenId}/settle`)
+
 // ── Developer Mode — /dev/* endpoints (JWT + ENABLE_DEV_MODE=true required) ───
 // JWT is attached automatically by the request interceptor above.
 
@@ -205,6 +218,99 @@ export const advancedSimulationDev = (params) =>
   api.post('/dev/advanced-simulation', params, {
     timeout: 120_000,   // 120 s — sufficient for 1000-cycle in-memory run
   })
+
+// ── Winners History & AI Snapshot ────────────────────────────────────────────
+
+/**
+ * GET /admin/winners/history — paginated winner ledger with full journey data
+ * @param {Object} params  { limit, offset, level, journey_type }
+ */
+export const getWinnersHistory = (params = {}) =>
+  api.get('/admin/winners/history', { params })
+
+/**
+ * GET /admin/stats/level-breakdown — L1–L6 aggregate: winners, collected, distributed
+ * Used by Statistics tab Level-Wise Financial Distribution BarChart.
+ */
+export const getLevelBreakdown = () =>
+  api.get('/admin/stats/level-breakdown')
+
+/**
+ * GET /admin/stats/ai-snapshot — live AI quant engine system snapshot
+ * Returns velocity, burn_rate, momentum, rdr, scenario, multiplier, etc.
+ */
+export const getAiSnapshot = () =>
+  api.get('/admin/stats/ai-snapshot')
+
+// ── Draw Engine — scheduler + manual execution ───────────────────────────────
+
+/** GET /admin/draw/scheduler-status — APScheduler running state + next-run times */
+export const getSchedulerStatus = () =>
+  api.get('/admin/draw/scheduler-status')
+
+/** POST /admin/draw/execute — Manually run the weekly draw (recovery / dev) */
+export const manualExecuteDraw = () =>
+  api.post('/admin/draw/execute')
+
+/** GET /admin/draw/state — Current WeeklyDrawState */
+export const getDrawState = () =>
+  api.get('/admin/draw/state')
+
+/** POST /admin/draw/prepare — Manually trigger T-2H preparation */
+export const prepareWeeklyDraw = (drawTimeUtcIso) =>
+  api.post('/admin/draw/prepare', null, { params: { draw_time_utc_iso: drawTimeUtcIso } })
+
+/** POST /admin/draw/cleanup — Manually trigger post-draw cleanup */
+export const triggerPostDrawCleanup = () =>
+  api.post('/admin/draw/cleanup')
+
+/** GET /admin/draw/override-dashboard — Admin override option A/B dashboard */
+export const getOverrideDashboard = (weekId) =>
+  api.get('/admin/draw/override-dashboard', { params: weekId ? { week_id: weekId } : {} })
+
+/** POST /admin/draw/override-decision — Submit admin override choice */
+export const submitOverrideDecision = (choice, weekId) =>
+  api.post('/admin/draw/override-decision', null, {
+    params: { choice, ...(weekId ? { week_id: weekId } : {}) }
+  })
+
+/** GET /draw/countdown — Two-flag authoritative countdown (public) */
+export const getDrawCountdown = () =>
+  api.get('/draw/countdown')
+
+/** GET /admin/stats/brain5-lpi — Brain 5 LPI live snapshot */
+export const getBrain5Lpi = () =>
+  api.get('/admin/stats/brain5-lpi')
+
+// ── Developer Mode — new analytics endpoints ──────────────────────────────────
+
+/** GET /dev/live-stats — Combined real-time statistics for dev panel */
+export const devLiveStats = () =>
+  api.get('/dev/live-stats')
+
+/** GET /dev/level-map — All pools with member level breakdown */
+export const devLevelMap = () =>
+  api.get('/dev/level-map')
+
+/** GET /dev/winners-analytics — Level-wise winner analysis */
+export const devWinnersAnalytics = () =>
+  api.get('/dev/winners-analytics')
+
+/** GET /dev/projection — Next draw projection engine */
+export const devProjection = () =>
+  api.get('/dev/projection')
+
+/** POST /dev/inject-timed — Inject users with custom date/time distribution */
+export const devInjectTimed = (params) =>
+  api.post('/dev/inject-timed', params, { timeout: 60_000 })
+
+/** POST /dev/mark-all-paid — Master paid toggle for all active pool members */
+export const devMarkAllPaid = () =>
+  api.post('/dev/mark-all-paid')
+
+/** POST /dev/set-payment-scenario — Set paid/late/elimination percentages */
+export const devSetPaymentScenario = (params) =>
+  api.post('/dev/set-payment-scenario', params)
 
 // ── System Settings ───────────────────────────────────────────────────────────
 

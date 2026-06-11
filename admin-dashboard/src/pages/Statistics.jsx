@@ -4,7 +4,7 @@ import {
   IndianRupee, Users, Layers, Clock, Zap, AlertTriangle,
   CheckCircle2, XCircle, Shield, Target, Activity,
   ChevronDown, ChevronRight, CheckCheck, AlertCircle,
-  Calculator, Info,
+  Calculator, Info, Cpu,
 } from 'lucide-react'
 import {
   ResponsiveContainer,
@@ -16,8 +16,9 @@ import Spinner from '../components/Spinner'
 import StatusBadge from '../components/StatusBadge'
 import {
   getFinancials, getPoolStats, getTokenStats,
-  getAiForecast, getChartData,
+  getAiForecast, getChartData, getLevelBreakdown,
   getAdminTokens, updateTokenStatus, burnToken,
+  getBrain5Lpi,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -225,6 +226,58 @@ function InlineError({ message }) {
   )
 }
 
+// ── Brain 5 LPI Semicircle Gauge ─────────────────────────────────────────────
+// Renders a top-semicircle arc (9 o'clock → 12 o'clock → 3 o'clock) filled
+// proportionally to `lpi`.  SVG arc: M 10 60 A 50 50 0 0 0 110 60
+// sweep=0 → counter-clockwise from left → traces OVER the top ✓
+function LpiGauge({ lpi = 0 }) {
+  const r    = 50
+  const half = Math.PI * r                    // ≈ 157.08 — total path length
+  const fill = half * Math.min(100, Math.max(0, lpi)) / 100
+
+  const color = lpi < 14 ? '#10b981'
+              : lpi < 25 ? '#f59e0b'
+              : lpi < 50 ? '#f97316'
+              :             '#ef4444'
+  const zone  = lpi < 14 ? 'Healthy'
+              : lpi < 25 ? 'Caution'
+              : lpi < 50 ? 'Elevated'
+              :             'Critical'
+
+  return (
+    <div className="flex flex-col items-center">
+      <svg viewBox="0 0 120 68" className="w-44 select-none">
+        {/* Background track */}
+        <path d="M 10 60 A 50 50 0 0 0 110 60"
+              fill="none" stroke="#e2e8f0" strokeWidth="10" strokeLinecap="round" />
+        {/* Filled arc — proportion = lpi / 100 */}
+        <path d="M 10 60 A 50 50 0 0 0 110 60"
+              fill="none" stroke={color} strokeWidth="10" strokeLinecap="round"
+              strokeDasharray={`${fill} ${half}`}
+              style={{ transition: 'stroke-dasharray 0.9s cubic-bezier(0.25,1,0.5,1)' }}
+        />
+        {/* LPI value */}
+        <text x="60" y="52" textAnchor="middle" fontSize="17" fontWeight="800"
+              fill={color} fontFamily="ui-monospace,monospace">
+          {lpi.toFixed(1)}%
+        </text>
+        {/* Sub-label */}
+        <text x="60" y="64" textAnchor="middle" fontSize="7.5" fill="#94a3b8" letterSpacing="1.2">
+          PRESSURE INDEX
+        </text>
+      </svg>
+      <span className={`text-[11px] font-bold -mt-1 ${
+        lpi < 14 ? 'text-emerald-600'
+      : lpi < 25 ? 'text-amber-600'
+      : lpi < 50 ? 'text-orange-600'
+      :             'text-red-600'
+      }`}>
+        {zone}
+      </span>
+    </div>
+  )
+}
+
 // Token row (shared by both WIT and REF action panels)
 function PendingTokenRow({ token, children }) {
   return (
@@ -252,12 +305,14 @@ export default function Statistics() {
   const toast = useToast()
 
   // ── Data ──────────────────────────────────────────────────────────────────
-  const [financials, setFinancials] = useState(null)
-  const [poolStats,  setPoolStats]  = useState(null)
-  const [forecast,   setForecast]   = useState(null)
-  const [chartData,  setChartData]  = useState(null)
-  const [witTokens,  setWitTokens]  = useState([])
-  const [refTokens,  setRefTokens]  = useState([])
+  const [financials,      setFinancials]      = useState(null)
+  const [poolStats,       setPoolStats]       = useState(null)
+  const [forecast,        setForecast]        = useState(null)
+  const [chartData,       setChartData]       = useState(null)
+  const [levelBreakdown,  setLevelBreakdown]  = useState(null)
+  const [lpiData,         setLpiData]         = useState(null)
+  const [witTokens,       setWitTokens]       = useState([])
+  const [refTokens,       setRefTokens]       = useState([])
 
   // ── Loading / error ───────────────────────────────────────────────────────
   const [loading, setLoading] = useState({ main: true, charts: true, actions: true })
@@ -278,10 +333,12 @@ export default function Statistics() {
     silent ? setRefreshing(true) : setLoading(l => ({ ...l, main: true }))
     setErrors(e => ({ ...e, financials: null, pools: null, forecast: null }))
 
-    const [finR, poolR, foreR] = await Promise.allSettled([
+    const [finR, poolR, foreR, lvlR, lpiR] = await Promise.allSettled([
       getFinancials(),
       getPoolStats(),
       getAiForecast(),
+      getLevelBreakdown(),
+      getBrain5Lpi(),
     ])
 
     if (finR.status  === 'fulfilled') setFinancials(finR.value.data)
@@ -292,6 +349,10 @@ export default function Statistics() {
 
     if (foreR.status === 'fulfilled') setForecast(foreR.value.data)
     else setErrors(e => ({ ...e, forecast: foreR.reason?.response?.data?.detail ?? 'Load failed' }))
+
+    if (lvlR.status  === 'fulfilled') setLevelBreakdown(lvlR.value.data)
+    // level breakdown + lpi failures are non-fatal — sections show empty state
+    if (lpiR.status  === 'fulfilled') setLpiData(lpiR.value.data)
 
     setLoading(l => ({ ...l, main: false }))
     setRefreshing(false)
@@ -984,7 +1045,129 @@ export default function Statistics() {
         </div>
       </div>
 
-      {/* ── 4. Charts ─────────────────────────────────────────────────────── */}
+      {/* ══ 4. SDE / BRAIN 5 ENGINE STATUS ══════════════════════════════════ */}
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+
+        {/* ── A. LPI Gauge panel ────────────────────────────────────────────── */}
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
+          <div className="flex items-center gap-2 mb-4">
+            <Cpu className="w-4 h-4 text-violet-500" />
+            <h2 className="font-semibold text-slate-800">Brain 5 — LPI Engine</h2>
+            <span className="ml-auto text-[10px] text-emerald-600 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full font-bold uppercase tracking-widest">
+              Live
+            </span>
+          </div>
+
+          {mainLoading || !lpiData ? (
+            <div className="space-y-4">
+              <Skeleton className="h-28 w-40 mx-auto rounded-xl" />
+              <div className="grid grid-cols-2 gap-2">
+                <Skeleton className="h-14" /><Skeleton className="h-14" />
+                <Skeleton className="h-14 col-span-2" />
+              </div>
+            </div>
+          ) : (
+            <>
+              <LpiGauge lpi={fP(lpiData.lpi)} />
+
+              <div className="mt-4 grid grid-cols-2 gap-2.5">
+                <div className="bg-violet-50 rounded-xl p-3 text-center border border-violet-100">
+                  <p className="text-[10px] text-violet-400 uppercase tracking-wide mb-1">L4 Flagged</p>
+                  <p className="text-xl font-black text-violet-700 tabular-nums">
+                    {fI(lpiData.l4_flagged_count)}
+                  </p>
+                </div>
+                <div className="bg-slate-50 rounded-xl p-3 text-center border border-slate-100">
+                  <p className="text-[10px] text-slate-400 uppercase tracking-wide mb-1">Total Active</p>
+                  <p className="text-xl font-black text-slate-700 tabular-nums">
+                    {fI(lpiData.total_active)}
+                  </p>
+                </div>
+                <div className="col-span-2 rounded-xl p-3 text-center border border-slate-100 bg-slate-50">
+                  <p className="text-[10px] text-slate-400 uppercase tracking-wide mb-1">SDE Demand</p>
+                  <p className={`text-xl font-black tabular-nums ${
+                    fP(lpiData.sde_demand_pct) > 50 ? 'text-red-600'
+                  : fP(lpiData.sde_demand_pct) > 20 ? 'text-amber-600'
+                  :                                    'text-emerald-600'
+                  }`}>
+                    {fP(lpiData.sde_demand_pct).toFixed(1)}%
+                  </p>
+                  <p className="text-[9px] text-slate-400 mt-0.5">
+                    {fI(lpiData.l3_count ?? 0)} L3 members pushing toward L4
+                  </p>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* ── B. Pool Type Routing ──────────────────────────────────────────── */}
+        <div className="xl:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
+          <div className="flex items-center gap-2 mb-5">
+            <Layers className="w-4 h-4 text-blue-500" />
+            <h2 className="font-semibold text-slate-800">Pool Type Routing</h2>
+            <span className="ml-auto text-[10px] text-slate-400 font-semibold uppercase tracking-widest">
+              Anti-Maturity Protocol
+            </span>
+          </div>
+
+          {mainLoading || !lpiData ? (
+            <div className="grid grid-cols-2 gap-3">
+              {[1,2,3,4].map(i => <Skeleton key={i} className="h-24" />)}
+            </div>
+          ) : (() => {
+            const dec = lpiData.pool_type_decision ?? {}
+            const TYPES = [
+              { key: 'p1', label: 'P1 — Standard',   desc: 'Regular L1 → L6 dual-winner draw',    active: dec.p1?.active ?? false },
+              { key: 'p2', label: 'P2 — Balanced',   desc: 'Constrained payout-range draw',         active: dec.p2?.active ?? false },
+              { key: 'p3', label: 'P3 — SDE Active', desc: 'Sequential Dynamic Eviction engaged',   active: dec.p3?.active ?? false },
+              { key: 'p4', label: 'P4 — Emergency',  desc: 'Emergency pool condensation mode',      active: dec.p4?.active ?? false },
+            ]
+            const sdeOn = dec.sde_active ?? TYPES[2].active
+            return (
+              <>
+                {sdeOn && (
+                  <div className="mb-4 flex items-center gap-2 px-4 py-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-semibold">
+                    <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                    SDE Protocol Active — pools with L4-flagged members will route to P3/P4
+                  </div>
+                )}
+                <div className="grid grid-cols-2 gap-3">
+                  {TYPES.map(({ key, label, desc, active }) => (
+                    <div key={key} className={`rounded-xl p-4 border-2 transition-all ${
+                      active
+                        ? 'bg-blue-50 border-blue-300 shadow-sm shadow-blue-100'
+                        : 'bg-slate-50/50 border-slate-100'
+                    }`}>
+                      <div className="flex items-center gap-2 mb-1.5">
+                        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${active ? 'bg-blue-500 animate-pulse' : 'bg-slate-200'}`} />
+                        <p className={`text-sm font-bold leading-none ${active ? 'text-blue-800' : 'text-slate-400'}`}>
+                          {label}
+                        </p>
+                        {active && (
+                          <span className="ml-auto text-[8px] font-black bg-blue-600 text-white px-1.5 py-0.5 rounded-full uppercase tracking-widest flex-shrink-0">
+                            ON
+                          </span>
+                        )}
+                      </div>
+                      <p className={`text-xs leading-snug ${active ? 'text-blue-600' : 'text-slate-400'}`}>
+                        {desc}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+                {dec.recommended_types?.length > 0 && (
+                  <p className="mt-3 text-[11px] text-slate-400 text-right">
+                    Recommended: {dec.recommended_types.join(', ')}
+                  </p>
+                )}
+              </>
+            )
+          })()}
+        </div>
+      </div>
+
+      {/* ── 5. Charts ─────────────────────────────────────────────────────── */}
 
       {/* Period picker */}
       <div className="flex items-center justify-end gap-2">
@@ -1113,7 +1296,119 @@ export default function Statistics() {
         </div>
       </div>
 
-      {/* ── 5. Pool Analytics Table ───────────────────────────────────────── */}
+      {/* ── 5. Level-Wise Financial Distribution ────────────────────────── */}
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-100">
+        <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-2">
+          <BarChart3 className="w-4 h-4 text-violet-500" />
+          <h2 className="font-semibold text-slate-800">Level-Wise Financial Distribution</h2>
+          <span className="ml-auto text-xs text-slate-400">Total Collected vs Distributed (₹)</span>
+        </div>
+        {mainLoading ? (
+          <div className="p-6"><Skeleton className="h-56" /></div>
+        ) : !levelBreakdown?.levels?.length ? (
+          <p className="px-6 py-16 text-center text-sm text-slate-400">
+            No draw history yet — run draws to populate level-wise data
+          </p>
+        ) : (
+          <div className="px-4 pt-4 pb-6">
+            <ResponsiveContainer width="100%" height={240}>
+              <ComposedChart
+                data={levelBreakdown.levels.map(l => ({
+                  name:        `L${l.level}`,
+                  collected:   l.total_collected_inr,
+                  distributed: l.total_distributed_inr,
+                  winners:     l.winners_count,
+                  avg:         l.avg_payout_inr,
+                }))}
+                margin={{ top: 4, right: 4, bottom: 0, left: -8 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
+                <XAxis
+                  dataKey="name"
+                  tick={{ fontSize: 11, fill: '#64748b', fontWeight: 600 }}
+                  tickLine={false} axisLine={false}
+                />
+                <YAxis
+                  tick={{ fontSize: 10, fill: '#94a3b8' }}
+                  tickLine={false} axisLine={false}
+                  tickFormatter={v => v >= 1000 ? `₹${(v / 1000).toFixed(0)}K` : `₹${v}`}
+                />
+                <Tooltip
+                  content={({ active, payload, label }) => {
+                    if (!active || !payload?.length) return null
+                    return (
+                      <div className="bg-white border border-slate-200 rounded-lg shadow-lg px-3 py-2 text-xs">
+                        <p className="font-bold text-slate-700 mb-1">{label}</p>
+                        {payload.map(p => (
+                          <p key={p.dataKey} style={{ color: p.fill || p.stroke }}>
+                            {p.name}: ₹{Number(p.value).toLocaleString('en-IN')}
+                          </p>
+                        ))}
+                        {payload[0]?.payload?.winners > 0 && (
+                          <p className="text-slate-400 mt-1 pt-1 border-t border-slate-100">
+                            {payload[0].payload.winners} winner{payload[0].payload.winners !== 1 ? 's' : ''}
+                            {' · '}avg ₹{Number(payload[0].payload.avg).toLocaleString('en-IN')}
+                          </p>
+                        )}
+                      </div>
+                    )
+                  }}
+                />
+                <Legend iconType="square" iconSize={8} wrapperStyle={{ fontSize: 11, paddingTop: 10 }} />
+                <Bar dataKey="collected"   name="Collected From"   fill={C.blue}    radius={[3, 3, 0, 0]} maxBarSize={28} />
+                <Bar dataKey="distributed" name="Distributed To"   fill={C.rose}    radius={[3, 3, 0, 0]} maxBarSize={28} />
+              </ComposedChart>
+            </ResponsiveContainer>
+
+            {/* Dense summary table below chart */}
+            <div className="mt-4 overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-slate-100">
+                    <th className="text-left py-2 px-3 font-semibold text-slate-500 uppercase tracking-wide text-[10px]">Level</th>
+                    <th className="text-right py-2 px-3 font-semibold text-slate-500 uppercase tracking-wide text-[10px]">Winners</th>
+                    <th className="text-right py-2 px-3 font-semibold text-slate-500 uppercase tracking-wide text-[10px]">Collected</th>
+                    <th className="text-right py-2 px-3 font-semibold text-slate-500 uppercase tracking-wide text-[10px]">Distributed</th>
+                    <th className="text-right py-2 px-3 font-semibold text-slate-500 uppercase tracking-wide text-[10px]">Avg Payout</th>
+                    <th className="text-right py-2 px-3 font-semibold text-slate-500 uppercase tracking-wide text-[10px]">Net Margin</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {levelBreakdown.levels.map(l => {
+                    const margin = l.total_collected_inr > 0
+                      ? ((l.total_collected_inr - l.total_distributed_inr) / l.total_collected_inr * 100)
+                      : 0
+                    return (
+                      <tr key={l.level} className="border-b border-slate-50 hover:bg-slate-50 transition-colors">
+                        <td className="py-2 px-3">
+                          <LevelBadge level={l.level} />
+                        </td>
+                        <td className="py-2 px-3 text-right tabular-nums text-slate-700 font-medium">
+                          {l.winners_count.toLocaleString()}
+                        </td>
+                        <td className="py-2 px-3 text-right tabular-nums text-blue-600">
+                          {INR(l.total_collected_inr)}
+                        </td>
+                        <td className="py-2 px-3 text-right tabular-nums text-rose-500">
+                          {INR(l.total_distributed_inr)}
+                        </td>
+                        <td className="py-2 px-3 text-right tabular-nums text-slate-500">
+                          {INR(l.avg_payout_inr)}
+                        </td>
+                        <td className={`py-2 px-3 text-right tabular-nums font-semibold ${margin >= 0 ? 'text-emerald-600' : 'text-rose-500'}`}>
+                          {margin >= 0 ? '+' : ''}{margin.toFixed(1)}%
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── 6. Pool Analytics Table ───────────────────────────────────────── */}
       <SectionCard
         title="Pool Analytics"
         icon={Layers}
@@ -1162,6 +1457,9 @@ export default function Statistics() {
                   <th className="text-right px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">Deposited</th>
                   <th className="text-right px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">This Week</th>
                   <th className="text-right pr-6 px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">Max Liability</th>
+                  <th className="text-center px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">Draw Type</th>
+                  <th className="text-center px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">L4 Flag</th>
+                  <th className="text-center px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">Week Done</th>
                 </tr>
               </thead>
               <tbody>
@@ -1211,12 +1509,38 @@ export default function Statistics() {
                       <td className="px-4 pr-6 py-3.5 text-right font-mono text-amber-600 tabular-nums">
                         {INR(pool.potential_payout_liability_inr)}
                       </td>
+
+                      {/* Draw Type */}
+                      <td className="px-4 py-3.5 text-center">
+                        {pool.pool_draw_type ? (
+                          <span className="inline-flex px-2 py-0.5 rounded text-[10px] font-bold bg-violet-50 text-violet-700 border border-violet-200">
+                            {pool.pool_draw_type}
+                          </span>
+                        ) : <span className="text-slate-300 text-xs">—</span>}
+                      </td>
+
+                      {/* L4 Flagged */}
+                      <td className="px-4 py-3.5 text-center">
+                        {pool.contains_flagged_l4 ? (
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-red-50 text-red-700 border border-red-200">
+                            <AlertTriangle className="w-3 h-3" />L4
+                          </span>
+                        ) : <span className="text-slate-300 text-xs">—</span>}
+                      </td>
+
+                      {/* Draw completed this week */}
+                      <td className="px-4 py-3.5 text-center">
+                        {pool.draw_completed_this_week
+                          ? <CheckCircle2 className="w-4 h-4 text-emerald-500 mx-auto" />
+                          : <span className="text-slate-300 text-xs">—</span>
+                        }
+                      </td>
                     </tr>
 
                     {/* Expanded member sub-table */}
                     {expandedPools.has(pool.pool_id) && (
                       <tr className="bg-blue-50/10">
-                        <td colSpan={7} className="px-6 py-4">
+                        <td colSpan={10} className="px-6 py-4">
                           {pool.members?.length > 0 ? (
                             <div className="rounded-xl border border-blue-100 bg-white overflow-hidden shadow-sm">
                               <div className="px-4 py-2.5 bg-blue-50/70 border-b border-blue-100 flex items-center justify-between">

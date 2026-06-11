@@ -39,6 +39,92 @@ const LEVEL_COLOR = {
   6: 'bg-rose-100 text-rose-700',
 }
 
+// ─── Module 4: 12-Seat Hex Grid ──────────────────────────────────────────────
+const _hexPts = (cx, cy, r) =>
+  Array.from({ length: 6 }, (_, i) => {
+    const a = (Math.PI / 3) * i - Math.PI / 2
+    return `${(cx + r * Math.cos(a)).toFixed(1)},${(cy + r * Math.sin(a)).toFixed(1)}`
+  }).join(' ')
+
+const _LEVEL_COLOR = {
+  1: '#94a3b8', 2: '#06b6d4', 3: '#f97316',
+  4: '#f43f5e', 5: '#f59e0b', 6: '#ef4444',
+}
+
+// Seat positions: 4-col × 3-row grid with alternating row offsets
+const _HEX_SEATS = [
+  {x:40, y:36}, {x:90, y:36}, {x:140, y:36}, {x:190, y:36},
+  {x:65, y:79}, {x:115,y:79}, {x:165,y:79},  {x:215,y:79},
+  {x:40, y:122},{x:90, y:122},{x:140,y:122},  {x:190,y:122},
+]
+
+function PoolHexGrid({ members }) {
+  const [tip, setTip] = useState(null)
+  const r = 21, ringR = 27
+
+  return (
+    <div>
+      <svg viewBox="0 0 255 150" className="w-full" style={{ maxWidth: 340 }}>
+        {_HEX_SEATS.map((pos, i) => {
+          const m = members[i]
+          if (!m) {
+            return (
+              <polygon key={i} points={_hexPts(pos.x, pos.y, r)}
+                       fill="#f8fafc" stroke="#e2e8f0" strokeWidth="1.5"/>
+            )
+          }
+          const lvl        = m.current_level ?? 1
+          const hexColor   = _LEVEL_COLOR[lvl] ?? '#94a3b8'
+          const isPaid     = m.weekly_payment_status === 'Paid'
+          const isLate     = m.weekly_payment_status === 'Late'
+          const ringColor  = isPaid ? '#10b981' : isLate ? '#f59e0b' : '#ef4444'
+          const ringDash   = isLate ? '4 2' : undefined
+
+          return (
+            <g key={i} onMouseEnter={() => setTip({ m, pos })} onMouseLeave={() => setTip(null)}
+               className="cursor-pointer">
+              <circle cx={pos.x} cy={pos.y} r={ringR} fill="none"
+                      stroke={ringColor} strokeWidth="2.5" strokeDasharray={ringDash}
+                      opacity={isPaid ? 1 : 0.6}/>
+              <polygon points={_hexPts(pos.x, pos.y, r)}
+                       fill={hexColor} fillOpacity="0.15"
+                       stroke={hexColor} strokeWidth="1.5"
+                       className={lvl === 4 ? 'animate-pulse' : ''}/>
+              <text x={pos.x} y={pos.y + 4} textAnchor="middle"
+                    fontSize="9" fontWeight="800" fill={hexColor} fontFamily="ui-monospace,monospace">
+                L{lvl}
+              </text>
+            </g>
+          )
+        })}
+      </svg>
+
+      {/* Inline tooltip */}
+      {tip && (
+        <div className="text-xs bg-slate-800 text-white rounded-lg px-2.5 py-1.5 inline-block mt-1 ml-2">
+          @{tip.m.username} · L{tip.m.current_level} ·{' '}
+          <span className={tip.m.weekly_payment_status==='Paid' ? 'text-emerald-400' : 'text-amber-400'}>
+            {tip.m.weekly_payment_status}
+          </span>
+          {Number(tip.m.late_fees_inr) > 0 &&
+            <span className="text-amber-400 ml-1">₹{Number(tip.m.late_fees_inr).toLocaleString()} fee</span>}
+        </div>
+      )}
+
+      <div className="flex items-center gap-3 mt-2 flex-wrap text-[9px] text-slate-400">
+        <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-0.5 bg-emerald-400 rounded"/>Paid</span>
+        <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-0.5 bg-amber-400 rounded" style={{borderTop:'1px dashed #f59e0b'}}/>Late fee</span>
+        <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-0.5 bg-red-400 rounded opacity-60"/>Unpaid</span>
+        {[1,2,3,4,5,6].map(l=>(
+          <span key={l} className="flex items-center gap-1">
+            <span className="inline-block w-2 h-2 rounded-full" style={{background:_LEVEL_COLOR[l]}}/>L{l}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function DrawResult({ result }) {
   const INR = v => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(v)
   return (
@@ -86,9 +172,10 @@ function DrawResult({ result }) {
 }
 
 function PoolRow({ pool, members, onDraw }) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded,    setExpanded]   = useState(false)
+  const [hexView,     setHexView]    = useState(false)
   const [drawLoading, setDrawLoading] = useState(false)
-  const [drawResult, setDrawResult] = useState(null)
+  const [drawResult,  setDrawResult]  = useState(null)
   const toast = useToast()
 
   const canDraw = pool.status === 'Active' && members.length === 12
@@ -142,14 +229,58 @@ function PoolRow({ pool, members, onDraw }) {
             Trigger Draw
           </button>
         </td>
+
+        {/* ── SDE / Brain5 metadata ───────────────────────── */}
+        <td className="px-5 py-4 text-center">
+          {pool.pool_draw_type ? (
+            <span className="inline-flex px-2 py-0.5 rounded text-[10px] font-bold bg-violet-50 text-violet-700 border border-violet-200">
+              {pool.pool_draw_type}
+            </span>
+          ) : <span className="text-slate-300 text-xs">—</span>}
+        </td>
+        <td className="px-5 py-4 text-center">
+          {pool.contains_flagged_l4
+            ? <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-red-50 text-red-700 border border-red-200"><AlertTriangle className="w-3 h-3" />L4</span>
+            : <span className="text-slate-300 text-xs">—</span>
+          }
+        </td>
+        <td className="px-5 py-4 text-center">
+          {pool.draw_completed_this_week
+            ? <Shield className="w-4 h-4 text-emerald-500 mx-auto" />
+            : <span className="text-slate-300 text-xs">—</span>
+          }
+        </td>
       </tr>
 
       {expanded && (
         <tr className="bg-slate-50/60 border-b border-slate-200">
-          <td colSpan={4} className="px-5 pb-5 pt-2">
+          <td colSpan={7} className="px-5 pb-5 pt-2">
             {drawResult && <DrawResult result={drawResult} />}
 
-            {members.length === 0 ? (
+            {/* View toggle */}
+            {members.length > 0 && (
+              <div className="flex items-center gap-2 mt-3 mb-2">
+                <button
+                  onClick={() => setHexView(false)}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold transition ${!hexView ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                >
+                  ☰ Table
+                </button>
+                <button
+                  onClick={() => setHexView(true)}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold transition ${hexView ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                >
+                  ⬡ Hex Grid
+                </button>
+                <span className="text-[10px] text-slate-400 ml-1">
+                  {members.filter(m=>m.weekly_payment_status==='Paid').length}/{members.length} paid
+                </span>
+              </div>
+            )}
+
+            {hexView && members.length > 0 ? (
+              <PoolHexGrid members={members} />
+            ) : members.length === 0 ? (
               <p className="text-sm text-slate-400 py-4 text-center">No members in this pool</p>
             ) : (
               <table className="w-full text-sm mt-3 bg-white rounded-xl overflow-hidden shadow-sm border border-slate-100">
@@ -276,7 +407,7 @@ export default function PoolOversight() {
       fetchAll(true)
     } catch (err) {
       if (err.code === 'ECONNABORTED' || err.message?.toLowerCase().includes('timeout')) {
-        toast('Data processing timeout. The server is handling a large queue.', 'error')
+        toast('Server is processing heavy load. Please wait or refresh.', 'error')
       } else {
         toast(err.response?.data?.detail ?? 'Manual pool creation failed', 'error')
       }
@@ -297,7 +428,7 @@ export default function PoolOversight() {
       fetchAll(true)
     } catch (err) {
       if (err.code === 'ECONNABORTED' || err.message?.toLowerCase().includes('timeout')) {
-        toast('Data processing timeout. The server is handling a large queue.', 'error')
+        toast('Server is processing heavy load. Please wait or refresh.', 'error')
       } else {
         toast(err.response?.data?.detail ?? 'Vacancy fill failed', 'error')
       }
@@ -679,6 +810,9 @@ export default function PoolOversight() {
                 <th className="text-left px-5 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">Status</th>
                 <th className="text-center px-5 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">Members</th>
                 <th className="text-right px-5 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">Action</th>
+                <th className="text-center px-5 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">Draw Type</th>
+                <th className="text-center px-5 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">L4 Flag</th>
+                <th className="text-center px-5 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">Week Done</th>
               </tr>
             </thead>
             <tbody>

@@ -29,18 +29,16 @@ function JourneyBadge({ type }) {
   )
 }
 
-// ── Draw type badge ────────────────────────────────────────────────────────────
+// ── Draw type badge — handles all 4 pool draw types ──────────────────────────
 function DrawTypeBadge({ drawType }) {
-  const isSde = drawType && String(drawType).toLowerCase().includes('sde')
-  return isSde ? (
-    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold tracking-wide bg-rose-900/60 text-rose-300 border border-rose-700/40">
-      SDE Exit
-    </span>
-  ) : (
-    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold tracking-wide bg-blue-900/60 text-blue-300 border border-blue-700/40">
-      Regular
-    </span>
-  )
+  const dt = String(drawType ?? '').toLowerCase()
+  if (dt.includes('sde'))
+    return <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold tracking-wide bg-rose-900/60 text-rose-300 border border-rose-700/40">SDE Exit</span>
+  if (dt === 'type_a')
+    return <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold tracking-wide bg-cyan-900/60 text-cyan-300 border border-cyan-700/40">Type A</span>
+  if (dt === 'type_b')
+    return <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold tracking-wide bg-orange-900/60 text-orange-300 border border-orange-700/40">Type B</span>
+  return <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold tracking-wide bg-blue-900/60 text-blue-300 border border-blue-700/40">Regular</span>
 }
 
 // ── SDE targeted-exit badge ───────────────────────────────────────────────────
@@ -163,7 +161,7 @@ function WinnerAutopsyModal({ winner, onClose }) {
             { l: 'Net Payout', v: `₹${Number(winner.net_payout_inr ?? 0).toLocaleString('en-IN')}`,  c: 'text-emerald-400' },
             { l: 'Net Profit', v: (netProfit >= 0 ? '+' : '') + `₹${netProfit.toLocaleString('en-IN')}`, c: netProfit >= 0 ? 'text-emerald-400' : 'text-red-400' },
             { l: 'Pool',       v: winner.pool_name ?? `#${winner.pool_id ?? '?'}`,   c: 'text-slate-300' },
-            { l: 'Draw Type',  v: isSde ? 'SDE Exit' : 'Regular',                    c: isSde ? 'text-rose-400' : 'text-blue-400' },
+            { l: 'Draw Type',  v: (() => { const d = (winner.draw_type ?? '').toLowerCase(); return d.includes('sde') ? 'SDE Exit' : d === 'type_a' ? 'Type A' : d === 'type_b' ? 'Type B' : 'Regular' })(), c: isSde ? 'text-rose-400' : (winner.draw_type === 'type_a' ? 'text-cyan-400' : winner.draw_type === 'type_b' ? 'text-orange-400' : 'text-blue-400') },
             { l: 'Entry',      v: isMerged ? 'Merge' : 'Direct',                     c: isMerged ? 'text-violet-400' : 'text-slate-400' },
           ].map(({ l, v, c }) => (
             <div key={l} className="bg-slate-800/80 rounded-xl p-2.5 text-center">
@@ -386,6 +384,8 @@ export default function WinningLedger() {
             <option value="">All Draw Types</option>
             <option value="regular">Regular Draw</option>
             <option value="sde">SDE Exit</option>
+            <option value="type_a">Type A Execution</option>
+            <option value="type_b">Type B Fallback</option>
           </select>
 
           <span className="ml-auto text-xs text-slate-500">

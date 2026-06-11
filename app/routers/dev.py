@@ -901,7 +901,8 @@ class _SU:
     late:         bool = False
     pool_sid:     int | None = None   # which _SP this user belongs to
     alive:        bool = True         # False = Eliminated_Won
-    deposits_paid: int = 1            # entry deposit counted as first payment
+    deposits_paid:  int  = 1            # entry deposit counted as first payment
+    sde_required:   bool = False        # True when member reaches L4 → guaranteed SDE exit
 
 
 @_dc
@@ -995,6 +996,12 @@ class _AdvSimEngine:
         self.level_wise_payouts:  dict[int, Decimal] = {l: Decimal("0") for l in range(1, 7)}
         self._inflow_history:     list[int]       = []   # new users per cycle (velocity calc)
 
+        # SDE / draw-type metrics (architecture-accurate — matches Brain 5 routing)
+        self.n_sde_flags:    int = 0   # total L4 flaggings (sde_required = True events)
+        self.n_sde_exits:    int = 0   # SDE-guaranteed exits executed
+        self.n_type_a_draws: int = 0   # Type A draw executions (LPI 14-25%)
+        self.n_type_b_draws: int = 0   # Type B draw executions (L1/L2 shortage)
+
         self.logs: list[dict] = []
         self._ins:  list[dict] = []   # pending DB-insert buffer
 
@@ -1004,6 +1011,21 @@ class _AdvSimEngine:
         """Live active members of pool psid."""
         return [u for u in self._users.values()
                 if u.pool_sid == psid and u.alive]
+
+    def _calc_lpi(self) -> float:
+        """
+        Level Pressure Index = (L3+L4+L5+L6 active members) / Total Active × 100.
+        Mirrors Brain 5 LPI calculation. Drives draw type routing.
+          0–14%  → Regular draw
+          14–25% → Type A (if L3/L4 present)
+          25%+   → SDE (if sde_required members exist)
+        """
+        active = [u for u in self._users.values()
+                  if u.alive and u.pool_sid is not None]
+        if not active:
+            return 0.0
+        pressure = sum(1 for u in active if u.level >= 3)
+        return pressure / len(active) * 100.0
 
     def _letter(self) -> str:
         """Sequence: A, B, …, Z, AA, AB, … (based on n_scaled at call time)."""
@@ -1045,6 +1067,7 @@ class _AdvSimEngine:
             "dynamic_merges_experienced":     0,
             "pauses_experienced":             0,
             "total_deposited_inr":            1000,
+            "sde_required":                   False,
         }
 
     # ── Step A — FIFO Sequential Inflow ───────────────────────────────────────
@@ -1246,12 +1269,19 @@ class _AdvSimEngine:
 
     def step_e(self) -> tuple[int, int]:
         """
-        For each Active pool:
-          12 members → Smart Pairing draw (L1-3 vs L4-6; edge-case L1-3 only).
-          < 12 members → status = Paused_Awaiting_Members; SKIP draw to
-                         protect the L1-L3 / L4-L6 financial mathematics.
+        Architecture-accurate draw router — mirrors Brain 5 production logic.
+
+        For each Active pool with exactly 12 members, the draw type is chosen:
+          1. SDE draw  : pool has sde_required members → oldest L4 exits guaranteed
+          2. Type A    : LPI 14–25% + L3/L4 present + L1/L2 available
+          3. Type B    : LPI ≥ 14% + L3/L4 present + NO L1/L2 (shortage)
+          4. Regular   : default — L1-3 lower / L4-6 upper; edge-case L1-3 only
+
+        After each draw: survivors advance +1 level; new L4 arrivals are
+        flagged sde_required=True to guarantee their exit in a future draw.
         """
         draws = new_pauses = 0
+        lpi   = self._calc_lpi()
 
         for pool in sorted(
             [p for p in self._pools.values() if not p.dissolved and not p.paused],
@@ -1266,29 +1296,81 @@ class _AdvSimEngine:
                 self.n_paused += 1
                 continue
 
-            low  = [m for m in members if 1 <= m.level <= 3]
-            high = [m for m in members if 4 <= m.level <= 6]
+            # ── Classify members ──────────────────────────────────────────────
+            sde_mbrs = [m for m in members if m.sde_required]
+            l1_l2    = [m for m in members if 1 <= m.level <= 2]
+            l3       = [m for m in members if m.level == 3]
+            l4       = [m for m in members if m.level == 4]
+            l1_l3    = [m for m in members if 1 <= m.level <= 3]
+            l4_l6    = [m for m in members if 4 <= m.level <= 6]
 
-            if not high:                           # early-pool edge case (weeks 1-3)
-                if len(low) < 2:
-                    pool.paused = True; new_pauses += 1; self.n_paused += 1
-                    continue
-                w1, w2 = random.sample(low, 2)
-            else:                                  # normal draw (pool has matured)
-                if not low:
-                    pool.paused = True; new_pauses += 1; self.n_paused += 1
-                    continue
-                w1 = random.choice(low)
-                w2 = random.choice(high)
+            w1 = w2 = None
 
-            # Issue payouts, eliminate winners — track level-wise financials
+            if sde_mbrs:
+                # ── SDE Draw: oldest sde_required member guaranteed exit ───────
+                # Upper winner = first (oldest) SDE-flagged L4 member
+                # Lower winner = L1/L2 preferred, fall through to L1-3 or any non-SDE
+                upper  = sde_mbrs[0]
+                lowers = [m for m in l1_l2 if m.sid != upper.sid]
+                if not lowers:
+                    lowers = [m for m in l1_l3 if m.sid != upper.sid]
+                if not lowers:
+                    lowers = [m for m in members if m.sid != upper.sid]
+                if not lowers:
+                    pool.paused = True; new_pauses += 1; self.n_paused += 1; continue
+                w1 = random.choice(lowers)
+                w2 = upper
+                self.n_sde_exits += 1
+
+            elif lpi >= 14.0 and (l3 or l4):
+                if l1_l2:
+                    # ── Type A: L1/L2 lower, L3/L4 upper ─────────────────────
+                    upper_pool = l3 + l4
+                    w2   = random.choice(upper_pool)
+                    avail = [m for m in l1_l2 if m.sid != w2.sid]
+                    w1   = random.choice(avail) if avail else random.choice(l1_l2)
+                    self.n_type_a_draws += 1
+                elif l3 and l4:
+                    # ── Type B: L3 lower, L4 upper (L1/L2 shortage) ───────────
+                    w1 = random.choice(l3)
+                    w2 = random.choice(l4)
+                    self.n_type_b_draws += 1
+                else:
+                    # Degenerate: not enough tiered members — regular fallback
+                    if not l4_l6:
+                        if len(l1_l3) < 2:
+                            pool.paused = True; new_pauses += 1; self.n_paused += 1; continue
+                        w1, w2 = random.sample(l1_l3, 2)
+                    else:
+                        if not l1_l3:
+                            pool.paused = True; new_pauses += 1; self.n_paused += 1; continue
+                        w1 = random.choice(l1_l3)
+                        w2 = random.choice(l4_l6)
+
+            else:
+                # ── Regular Draw: L1-3 lower / L4-6 upper ────────────────────
+                if not l4_l6:                      # early-pool edge case (weeks 1-3)
+                    if len(l1_l3) < 2:
+                        pool.paused = True; new_pauses += 1; self.n_paused += 1; continue
+                    w1, w2 = random.sample(l1_l3, 2)
+                else:
+                    if not l1_l3:
+                        pool.paused = True; new_pauses += 1; self.n_paused += 1; continue
+                    w1 = random.choice(l1_l3)
+                    w2 = random.choice(l4_l6)
+
+            # Safety check (should not reach here, but defensive)
+            if w1 is None or w2 is None:
+                pool.paused = True; new_pauses += 1; self.n_paused += 1; continue
+
+            # ── Issue payouts, eliminate winners ──────────────────────────────
             for w in (w1, w2):
                 _, net = LEVEL_PAYOUTS.get(w.level, (2500, 2000))
                 net_d = Decimal(str(net))
-                self._pay                    += net_d
-                self.level_wise_winners[w.level]   = self.level_wise_winners.get(w.level,   0)             + 1
-                self.level_wise_payouts[w.level]   = self.level_wise_payouts.get(w.level,   Decimal("0")) + net_d
-                self.level_wise_deposits[w.level]  = (
+                self._pay                          += net_d
+                self.level_wise_winners[w.level]    = self.level_wise_winners.get(w.level,   0)             + 1
+                self.level_wise_payouts[w.level]    = self.level_wise_payouts.get(w.level,   Decimal("0")) + net_d
+                self.level_wise_deposits[w.level]   = (
                     self.level_wise_deposits.get(w.level, Decimal("0"))
                     + Decimal(str(w.deposits_paid)) * _S_DEP
                 )
@@ -1296,12 +1378,17 @@ class _AdvSimEngine:
                 w.pool_sid = None
                 self.n_winners += 1
 
-            # Advance all survivors +1 level (hard-capped at 6); reset payment flag
+            # ── Advance survivors +1 level; flag new L4 arrivals for SDE ──────
             winner_sids = {w1.sid, w2.sid}
             for m in members:
                 if m.alive and m.sid not in winner_sids:
-                    m.level = min(m.level + 1, 6)
-                    m.paid  = False                # cleared for the next installment week
+                    old_level = m.level
+                    m.level   = min(m.level + 1, 6)
+                    m.paid    = False               # reset for next installment week
+                    # Anti-Maturity Protocol: flag L4 arrivals for guaranteed exit
+                    if old_level == 3 and m.level == 4 and not m.sde_required:
+                        m.sde_required  = True
+                        self.n_sde_flags += 1
 
             draws += 1
 
@@ -1346,7 +1433,11 @@ class _AdvSimEngine:
             "scenario":       scenario,
             "phase":          phase,
             "burn_rate":      burn_rate,
-            "velocity":       round(velocity, 2),
+            "velocity":           round(velocity, 2),
+            "lpi":                round(self._calc_lpi(), 1),
+            "sde_exits_total":    self.n_sde_exits,
+            "type_a_draws_total": self.n_type_a_draws,
+            "type_b_draws_total": self.n_type_b_draws,
         })
 
     # ── Response helpers ──────────────────────────────────────────────────────
@@ -1415,6 +1506,14 @@ class _AdvSimEngine:
             "total_direct_pool_assignments": self.direct_assignments,
             "total_dynamic_merges":          self.n_condensed,
             "total_draw_pauses_triggered":   self.n_paused,
+            # SDE / draw-type analytics (architecture-accurate simulation)
+            "total_l4_sde_flaggings":       self.n_sde_flags,
+            "total_sde_exits":              self.n_sde_exits,
+            "total_type_a_draws":           self.n_type_a_draws,
+            "total_type_b_draws":           self.n_type_b_draws,
+            "sde_exit_rate_pct": round(
+                self.n_sde_exits / max(self.n_winners, 1) * 100, 1
+            ),
         }
 
         return {

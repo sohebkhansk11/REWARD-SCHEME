@@ -1,13 +1,31 @@
 import { useState, useEffect, useCallback } from 'react'
 import { IndianRupee, Users, LayoutGrid, Clock, RefreshCw, Zap, AlertCircle } from 'lucide-react'
+import { motion } from 'framer-motion'
 import MetricCard from '../components/MetricCard'
 import StatusBadge from '../components/StatusBadge'
 import Spinner from '../components/Spinner'
-import { getStats, getPools, checkWaitlist, BASE_URL } from '../api/client'
+import { getStats, getPools, checkWaitlist, getBrain5Lpi, BASE_URL } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
 const INR = v =>
   new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(v)
+
+// ── Brain 5 LPI Health Chip ───────────────────────────────────────────────────
+function LpiChip({ lpi }) {
+  if (lpi == null) return null
+  const v = parseFloat(lpi)
+  const cfg =
+    v < 14 ? { label: `LPI ${v.toFixed(1)}% · Healthy`,  cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' } :
+    v < 25 ? { label: `LPI ${v.toFixed(1)}% · Caution`,  cls: 'bg-amber-50   text-amber-700   border-amber-200'   } :
+    v < 50 ? { label: `LPI ${v.toFixed(1)}% · Elevated`, cls: 'bg-orange-50  text-orange-700  border-orange-200'  } :
+             { label: `LPI ${v.toFixed(1)}% · Critical`, cls: 'bg-red-50     text-red-700     border-red-200'     }
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold border ${cfg.cls}`}>
+      <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+      {cfg.label}
+    </span>
+  )
+}
 
 export default function Dashboard() {
   const toast = useToast()
@@ -17,16 +35,28 @@ export default function Dashboard() {
   const [refreshing, setRefreshing] = useState(false)
   const [waitlistLoading, setWaitlistLoading] = useState(false)
   const [lastUpdated, setLastUpdated] = useState(null)
-  const [error, setError] = useState(null)
+  const [error,   setError]   = useState(null)
+  const [lpiData, setLpiData] = useState(null)
+  const [clock,   setClock]   = useState(new Date())
 
   const fetchAll = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     else setRefreshing(true)
     setError(null)
     try {
-      const [statsRes, poolsRes] = await Promise.all([getStats(), getPools()])
-      setStats(statsRes.data)
-      setPools(poolsRes.data)
+      const [statsRes, poolsRes, lpiRes] = await Promise.allSettled([
+        getStats(), getPools(), getBrain5Lpi(),
+      ])
+      if (statsRes.status === 'fulfilled') setStats(statsRes.value.data)
+      if (poolsRes.status === 'fulfilled') setPools(poolsRes.value.data)
+      if (lpiRes.status  === 'fulfilled') setLpiData(lpiRes.value.data)
+      if (statsRes.status === 'rejected') {
+        const err = statsRes.reason
+        const msg = err.code === 'ERR_NETWORK'
+          ? `Cannot reach API at ${BASE_URL} — is the backend running?`
+          : err.response?.data?.detail ?? 'Failed to load dashboard data'
+        setError(msg)
+      }
       setLastUpdated(new Date())
     } catch (err) {
       const msg = err.code === 'ERR_NETWORK'
@@ -40,6 +70,18 @@ export default function Dashboard() {
   }, [])
 
   useEffect(() => { fetchAll() }, [fetchAll])
+
+  // Live clock — ticks every second
+  useEffect(() => {
+    const id = setInterval(() => setClock(new Date()), 1000)
+    return () => clearInterval(id)
+  }, [])
+
+  // Auto-refresh every 30 s (silent — no loading spinner)
+  useEffect(() => {
+    const id = setInterval(() => fetchAll(true), 30_000)
+    return () => clearInterval(id)
+  }, [fetchAll])
 
   const handleWaitlistCheck = async () => {
     setWaitlistLoading(true)
@@ -77,21 +119,37 @@ export default function Dashboard() {
   return (
     <div className="p-8 space-y-8">
       {/* Header */}
-      <div className="flex items-start justify-between">
+      <div className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-900">Dashboard</h1>
-          <p className="text-sm text-slate-400 mt-0.5">
-            {lastUpdated ? `Last updated ${lastUpdated.toLocaleTimeString()}` : 'Loading…'}
-          </p>
+          <div className="flex items-center gap-2.5 mt-1 flex-wrap">
+            <p className="text-sm text-slate-400">
+              {lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString()}` : 'Loading…'}
+            </p>
+            <LpiChip lpi={lpiData?.lpi} />
+          </div>
         </div>
-        <button
-          onClick={() => fetchAll(true)}
-          disabled={refreshing}
-          className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50 shadow-sm disabled:opacity-50 transition"
-        >
-          <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
-          Refresh
-        </button>
+        <div className="flex items-center gap-2.5 flex-shrink-0">
+          {/* Live clock */}
+          <motion.div
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="hidden sm:flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2"
+          >
+            <Clock className="w-3.5 h-3.5 text-slate-400" />
+            <span className="font-mono text-sm font-semibold text-slate-700 tabular-nums">
+              {clock.toLocaleTimeString('en-IN', { hour12: false })}
+            </span>
+          </motion.div>
+          <button
+            onClick={() => fetchAll(true)}
+            disabled={refreshing}
+            className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50 shadow-sm disabled:opacity-50 transition"
+          >
+            <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {/* Error banner */}
@@ -163,7 +221,15 @@ export default function Dashboard() {
                   <tr key={pool.id} className={i % 2 === 0 ? 'bg-white' : 'bg-slate-50/50'}>
                     <td className="px-6 py-3 font-semibold text-slate-800">{pool.name}</td>
                     <td className="px-6 py-3"><StatusBadge status={pool.status} /></td>
-                    <td className="px-6 py-3 text-center font-mono text-slate-700">{pool.total_members}/12</td>
+                    <td className="px-6 py-3 text-center">
+                      <span className={`font-mono font-semibold tabular-nums ${
+                        (pool.total_members ?? 0) >= 12 ? 'text-emerald-600' :
+                        (pool.total_members ?? 0) >= 8  ? 'text-amber-600'  :
+                        'text-red-500'
+                      }`}>
+                        {pool.total_members ?? 0}/12
+                      </span>
+                    </td>
                   </tr>
                 ))}
               </tbody>

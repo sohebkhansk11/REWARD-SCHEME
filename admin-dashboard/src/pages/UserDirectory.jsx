@@ -16,6 +16,52 @@ import { useToast } from '../context/ToastContext'
 const INR = v =>
   new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(v)
 
+// ── Level Distribution Bar ────────────────────────────────────────────────────
+const LVL_COLORS  = ['bg-slate-400','bg-blue-500','bg-violet-500','bg-amber-500','bg-orange-500','bg-rose-500']
+const LVL_TEXT    = ['text-slate-600','text-blue-700','text-violet-700','text-amber-700','text-orange-700','text-rose-700']
+const LVL_BG      = ['bg-slate-50','bg-blue-50','bg-violet-50','bg-amber-50','bg-orange-50','bg-rose-50']
+
+function LevelDistBar({ users }) {
+  const active = users.filter(u => u.status === 'Active')
+  if (!active.length) return null
+  const total = active.length
+  const byLevel = [1,2,3,4,5,6].map((l, i) => ({
+    level: l, i,
+    count: active.filter(u => u.current_level === l).length,
+  }))
+  return (
+    <div className="bg-white rounded-2xl shadow-sm border border-slate-100 px-5 py-4">
+      <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
+        Active Member Level Distribution ({total} active)
+      </p>
+      <div className="flex items-center gap-1.5 flex-wrap mb-3">
+        {byLevel.map(({ level, i, count }) => count > 0 && (
+          <div key={level} className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border ${LVL_BG[i]} border-slate-100`}>
+            <span className={`text-xs font-bold ${LVL_TEXT[i]}`}>L{level}</span>
+            <span className="text-xs font-semibold text-slate-700">{count}</span>
+            <span className="text-[10px] text-slate-400">{((count / total) * 100).toFixed(0)}%</span>
+          </div>
+        ))}
+        {byLevel.filter(d => d.count > 0 && d.level >= 4).length > 0 && (
+          <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-50 border border-rose-200 ml-auto">
+            <span className="text-[10px] font-bold text-rose-700">
+              {byLevel.filter(d => d.level >= 4).reduce((s, d) => s + d.count, 0)} SDE-pressure members (L4+)
+            </span>
+          </div>
+        )}
+      </div>
+      {/* Stacked progress bar */}
+      <div className="flex w-full h-2 rounded-full overflow-hidden gap-px">
+        {byLevel.map(({ level, i, count }) => count > 0 && (
+          <div key={level} className={`${LVL_COLORS[i]} h-full`}
+               style={{ width: `${(count / total) * 100}%`, transition: 'width 0.6s ease' }}
+               title={`L${level}: ${count} (${((count / total) * 100).toFixed(1)}%)`} />
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function fmtDate(iso) {
   if (!iso) return '—'
   return new Date(iso).toLocaleString('en-IN', {
@@ -114,7 +160,9 @@ export default function UserDirectory() {
   const [loading,      setLoading]      = useState(true)
   const [refreshing,   setRefreshing]   = useState(false)
   const [statusFilter, setStatusFilter] = useState('')
-  const [search,       setSearch]       = useState('')
+  const [rawSearch,    setRawSearch]    = useState('')   // immediate display value
+  const [search,       setSearch]       = useState('')   // debounced filter value
+  const debounceRef = useRef(null)
   const [sortBy,       setSortBy]       = useState('join_date')
   const [sortDir,      setSortDir]      = useState('desc')
   const [importing,    setImporting]    = useState(false)
@@ -310,6 +358,9 @@ export default function UserDirectory() {
 
       <ImportBanner result={importResult} onClose={() => setImportResult(null)} />
 
+      {/* Level distribution bar */}
+      {!loading && users.length > 0 && <LevelDistBar users={users} />}
+
       {/* CSV hint */}
       <div className="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs text-slate-500 font-mono">
         CSV format — required: <span className="text-slate-700 font-semibold">name, mobile</span>
@@ -321,7 +372,12 @@ export default function UserDirectory() {
         <div className="relative flex-1 max-w-xs">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
           <input type="text" placeholder="Search name, username, mobile…"
-            value={search} onChange={e => setSearch(e.target.value)}
+            value={rawSearch}
+            onChange={e => {
+              setRawSearch(e.target.value)
+              clearTimeout(debounceRef.current)
+              debounceRef.current = setTimeout(() => setSearch(e.target.value), 300)
+            }}
             className="w-full pl-9 pr-4 py-2 border border-slate-200 rounded-xl text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white" />
         </div>
         <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
@@ -357,7 +413,7 @@ export default function UserDirectory() {
               </thead>
               <tbody className="divide-y divide-slate-50">
                 {displayed.map((u, i) => (
-                  <tr key={u.id} className="hover:bg-slate-50/60 transition-colors group">
+                  <tr key={u.id} className={`hover:bg-slate-50/60 transition-colors group ${u.sde_required ? 'bg-rose-50/50' : ''}`}>
                     <td className="px-4 py-3 text-xs text-slate-400 tabular-nums">{i + 1}</td>
 
                     {/* Name + username */}
@@ -372,11 +428,24 @@ export default function UserDirectory() {
                     {/* Status */}
                     <td className="px-4 py-3"><StatusBadge status={u.status} /></td>
 
-                    {/* Level */}
+                    {/* Level + SDE badge */}
                     <td className="px-4 py-3">
-                      {u.status === 'Active'
-                        ? <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-blue-100 text-blue-700 text-xs font-bold">L{u.current_level}</span>
-                        : <span className="text-slate-300 text-xs">—</span>}
+                      {u.status === 'Active' ? (
+                        <div className="flex items-center gap-1.5">
+                          <span className={`inline-flex items-center justify-center w-7 h-7 rounded-full text-xs font-bold ${
+                            u.sde_required ? 'bg-rose-100 text-rose-700 ring-2 ring-rose-300' : 'bg-blue-100 text-blue-700'
+                          }`}>
+                            L{u.current_level}
+                          </span>
+                          {u.sde_required && (
+                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-bold bg-rose-100 text-rose-700 border border-rose-200 leading-none">
+                              SDE
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-slate-300 text-xs">—</span>
+                      )}
                     </td>
 
                     {/* Payment */}

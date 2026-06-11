@@ -9,8 +9,10 @@ import {
 import {
   ResponsiveContainer,
   AreaChart, Area,
+  BarChart,
   ComposedChart, Bar, Line,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine,
+  Cell,
 } from 'recharts'
 import Spinner from '../components/Spinner'
 import StatusBadge from '../components/StatusBadge'
@@ -19,6 +21,7 @@ import {
   getAiForecast, getChartData, getLevelBreakdown,
   getAdminTokens, updateTokenStatus, burnToken,
   getBrain5Lpi,
+  devLiveStats, devLevelMap, devWinnersAnalytics, devProjection,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -278,6 +281,426 @@ function LpiGauge({ lpi = 0 }) {
   )
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Statistics sub-tab panel helpers (light theme, always accessible)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LVL_PILL_COLORS = ['#94a3b8','#3b82f6','#8b5cf6','#f59e0b','#f97316','#ef4444']
+
+function AnalyticsCard({ title, icon: Icon, iconColor = 'text-violet-500', children, className = '' }) {
+  return (
+    <div className={`bg-white rounded-2xl shadow-sm border border-slate-100 ${className}`}>
+      <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-2">
+        {Icon && <Icon className={`w-4 h-4 flex-shrink-0 ${iconColor}`} />}
+        <h3 className="font-semibold text-slate-800 text-sm">{title}</h3>
+      </div>
+      <div className="p-5">{children}</div>
+    </div>
+  )
+}
+
+function ARow({ label, value, color = 'text-slate-900' }) {
+  return (
+    <div className="flex items-center justify-between py-1.5 border-b border-slate-50 last:border-0">
+      <span className="text-sm text-slate-500">{label}</span>
+      <span className={`text-sm font-bold tabular-nums ${color}`}>{value}</span>
+    </div>
+  )
+}
+
+// ── Live Stats panel ─────────────────────────────────────────────────────────
+function LiveStatsPanel({ toast }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [lastUp,  setLastUp]  = useState(null)
+  const fetch_ = useCallback(async () => {
+    try { const r = await devLiveStats(); setData(r.data); setLastUp(new Date()) }
+    catch  { toast('Failed to load live stats', 'error') }
+    finally { setLoading(false) }
+  }, [toast])
+  useEffect(() => { fetch_() }, [fetch_])
+  useEffect(() => { const id = setInterval(fetch_, 30_000); return () => clearInterval(id) }, [fetch_])
+
+  if (loading) return <div className="flex items-center justify-center h-48"><Spinner className="w-8 h-8 text-violet-500" /></div>
+  if (!data)   return null
+
+  const lvlData = Object.entries(data.levels).map(([k, v]) => ({ level: k, count: v }))
+  const INR_    = n => `₹${Number(n ?? 0).toLocaleString('en-IN')}`
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-slate-400">
+          {lastUp ? `Updated ${lastUp.toLocaleTimeString()} · auto-refresh 30 s` : ''}
+        </p>
+        <button onClick={fetch_} className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-xs text-slate-500 hover:bg-slate-50 transition">
+          <RefreshCw className="w-3.5 h-3.5"/>Refresh
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+        <AnalyticsCard title="User Distribution" icon={Users}>
+          <ARow label="Active in Pools" value={data.users.active}  color="text-emerald-600" />
+          <ARow label="Waitlist"        value={data.users.waitlist} color="text-blue-600"    />
+          <ARow label="Winners"         value={data.users.won}     color="text-violet-600"  />
+          <ARow label="Eliminated"      value={data.users.unpaid}  color="text-red-500"     />
+          <ARow label="Total"           value={data.users.total}                             />
+        </AnalyticsCard>
+
+        <AnalyticsCard title="Pool Overview" icon={Layers}>
+          <ARow label="Active Pools" value={data.pools.active}  color="text-emerald-600" />
+          <ARow label="Paused"       value={data.pools.paused}  color="text-amber-600"   />
+          <ARow label="Waiting"      value={data.pools.waiting} color="text-blue-600"    />
+          <ARow label="Total Pools"  value={data.pools.total}                            />
+        </AnalyticsCard>
+
+        <AnalyticsCard title="Brain 5 — SDE / LPI" icon={Cpu}>
+          <ARow label="LPI" value={`${data.sde.lpi}%`}
+            color={data.sde.lpi >= 25 ? 'text-red-600' : data.sde.lpi >= 14 ? 'text-amber-600' : 'text-emerald-600'} />
+          <ARow label="L4 Flagged"  value={data.sde.l4_flagged} color={data.sde.l4_flagged > 0 ? 'text-red-600' : 'text-slate-400'} />
+          <ARow label="AI Scenario" value={data.ai.scenario.replace(/_/g,' ')} color="text-violet-700" />
+          <ARow label="Velocity"    value={`${data.ai.velocity}/wk`}           color="text-blue-600"   />
+        </AnalyticsCard>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        <AnalyticsCard title="Level Distribution (Active Members)" icon={BarChart3}>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={lvlData} margin={{top:4,right:4,left:-20,bottom:4}}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+              <XAxis dataKey="level" tick={{fill:'#64748b',fontSize:11,fontWeight:700}} tickLine={false} axisLine={false}/>
+              <YAxis tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} axisLine={false}/>
+              <Tooltip contentStyle={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:8,fontSize:11}}/>
+              <Bar dataKey="count" name="Members" radius={[4,4,0,0]} maxBarSize={40}>
+                {lvlData.map((e,i) => <Cell key={i} fill={LVL_PILL_COLORS[i % 6]}/>)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </AnalyticsCard>
+
+        <AnalyticsCard title="Financial Snapshot" icon={IndianRupee}>
+          <ARow label="Total Collected" value={INR_(data.financials.total_collected_inr)} color="text-emerald-600" />
+          <ARow label="Total Paid Out"  value={INR_(data.financials.total_paid_out_inr)}  color="text-rose-500"   />
+          <ARow label="Net Float"       value={INR_(data.financials.net_float_inr)}
+            color={data.financials.net_float_inr >= 0 ? 'text-blue-600' : 'text-red-600'} />
+          {(data.payments?.paid_in_pools != null) && (
+            <>
+              <div className="mt-3 pt-3 border-t border-slate-100">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs text-slate-500">Weekly payment rate</span>
+                  <span className="text-xs font-bold text-emerald-600">{data.payments.paid_pct}%</span>
+                </div>
+                <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                  <div className="h-full rounded-full bg-emerald-400 transition-all"
+                       style={{width:`${data.payments.paid_pct}%`}}/>
+                </div>
+              </div>
+            </>
+          )}
+        </AnalyticsCard>
+      </div>
+    </div>
+  )
+}
+
+// ── Level Map panel ──────────────────────────────────────────────────────────
+function LevelMapPanel({ toast }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [filter,  setFilter]  = useState('all')
+  const [expanded, setExpanded] = useState(new Set())
+  const fetch_ = useCallback(async () => {
+    setLoading(true)
+    try { const r = await devLevelMap(); setData(r.data) }
+    catch { toast('Failed to load level map', 'error') }
+    finally { setLoading(false) }
+  }, [toast])
+  useEffect(() => { fetch_() }, [fetch_])
+
+  if (loading) return <div className="flex items-center justify-center h-48"><Spinner className="w-8 h-8 text-violet-500"/></div>
+  if (!data)   return null
+
+  const LEVEL_PILL_CLS = [
+    'bg-slate-100 text-slate-600', 'bg-blue-50 text-blue-700',
+    'bg-violet-50 text-violet-700', 'bg-amber-50 text-amber-700',
+    'bg-orange-50 text-orange-700', 'bg-rose-50 text-rose-700',
+  ]
+  const lks = ['L1','L2','L3','L4','L5','L6']
+  const s   = data.summary
+  const filtered = data.pools.filter(p => {
+    if (filter === 'all') return true
+    return (p.level_counts[filter.toUpperCase()] ?? 0) > 0
+  })
+
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-7 gap-2">
+        {lks.map((lk, i) => (
+          <div key={lk} className={`${LEVEL_PILL_CLS[i]} rounded-xl p-3 text-center border border-slate-100`}>
+            <p className="text-[10px] uppercase tracking-wide mb-1 font-semibold opacity-70">{lk}</p>
+            <p className="text-xl font-black">{(s.by_level[lk] ?? 0).toLocaleString('en-IN')}</p>
+          </div>
+        ))}
+        <div className="bg-slate-50 rounded-xl p-3 text-center border border-slate-100">
+          <p className="text-[10px] uppercase tracking-wide mb-1 font-semibold text-slate-400">Active</p>
+          <p className="text-xl font-black text-slate-700">{s.total_active_members.toLocaleString('en-IN')}</p>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        {['all','L1','L2','L3','L4'].map(f => (
+          <button key={f} onClick={() => setFilter(f.toLowerCase())}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition border ${
+              filter === f.toLowerCase()
+                ? 'bg-violet-600 text-white border-violet-600'
+                : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'
+            }`}>
+            {f === 'all' ? 'All Pools' : `${f} Members`}
+          </button>
+        ))}
+        <button onClick={fetch_} className="ml-auto px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs text-slate-500 hover:bg-slate-50 transition flex items-center gap-1.5">
+          <RefreshCw className="w-3 h-3"/>Refresh
+        </button>
+      </div>
+
+      <p className="text-xs text-slate-400">{filtered.length} of {data.pools.length} pools</p>
+
+      <div className="space-y-2">
+        {filtered.map(pool => (
+          <div key={pool.id} className="bg-white rounded-xl border border-slate-100 shadow-sm overflow-hidden">
+            <div className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-slate-50 transition"
+                 onClick={() => setExpanded(prev => { const n = new Set(prev); n.has(pool.id) ? n.delete(pool.id) : n.add(pool.id); return n })}>
+              <ChevronRight className={`w-4 h-4 text-slate-400 flex-shrink-0 transition-transform ${expanded.has(pool.id) ? 'rotate-90' : ''}`}/>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <p className="font-semibold text-slate-800 text-sm">{pool.name}</p>
+                  <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border ${
+                    pool.status === 'Active' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-amber-50 text-amber-700 border-amber-200'
+                  }`}>{pool.status}</span>
+                  {pool.contains_l4 && <span className="text-[10px] px-2 py-0.5 rounded-full font-semibold bg-red-50 text-red-700 border border-red-200">⚠ L4</span>}
+                </div>
+                <p className="text-[11px] text-slate-400 mt-0.5">{pool.member_count}/12 members · {pool.pool_draw_type}</p>
+              </div>
+              <div className="flex items-center gap-1 flex-shrink-0">
+                {lks.map((lk, i) => {
+                  const cnt = pool.level_counts[lk] ?? 0
+                  if (!cnt) return null
+                  return (
+                    <span key={lk} className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${LEVEL_PILL_CLS[i]}`}>
+                      {lk}:{cnt}
+                    </span>
+                  )
+                })}
+              </div>
+            </div>
+            {expanded.has(pool.id) && (
+              <div className="border-t border-slate-100 px-4 pb-3 pt-2">
+                {lks.map((lk, i) => {
+                  const mbrs = pool.members_by_level[lk] ?? []
+                  if (!mbrs.length) return null
+                  return (
+                    <div key={lk} className="flex items-start gap-2 py-1.5 border-b border-slate-50 last:border-0">
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded flex-shrink-0 mt-0.5 ${LEVEL_PILL_CLS[i]}`}>{lk}</span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {mbrs.map(m => (
+                          <span key={m.id} className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                            m.sde_required ? 'bg-rose-50 border-rose-200 text-rose-700' :
+                            m.paid ? 'bg-emerald-50 border-emerald-200 text-emerald-700' :
+                            'bg-slate-50 border-slate-200 text-slate-500'
+                          }`}>
+                            @{m.username}{m.sde_required ? ' SDE' : ''}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ── Winners Analytics panel ──────────────────────────────────────────────────
+function WinnersPanel({ toast }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+  useEffect(() => {
+    devWinnersAnalytics()
+      .then(r => setData(r.data))
+      .catch(() => toast('Failed to load winners', 'error'))
+      .finally(() => setLoading(false))
+  }, [toast])
+
+  if (loading) return <div className="flex items-center justify-center h-48"><Spinner className="w-8 h-8 text-violet-500"/></div>
+  if (!data)   return null
+
+  const barData = data.by_level.map((d, i) => ({
+    level: `L${d.level}`, winners: d.winners,
+    payout: d.total_payout_inr / 1000, avg: d.avg_payout_inr / 1000,
+    fill: LVL_PILL_COLORS[i],
+  }))
+  const INR_ = n => `₹${Number(n ?? 0).toLocaleString('en-IN')}`
+
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {[
+          { label: 'Total Winners',  value: data.summary.total_winners,                          color: 'text-violet-700' },
+          { label: 'Total Paid Out', value: INR_(data.summary.total_payout_inr),                  color: 'text-rose-600'   },
+          { label: 'Avg Payout',     value: INR_(data.summary.avg_payout_inr),                   color: 'text-slate-700'  },
+          { label: 'SDE Exits',      value: data.summary.sde_exits, color: data.summary.sde_exits > 0 ? 'text-cyan-600' : 'text-slate-400' },
+        ].map(({ label, value, color }) => (
+          <div key={label} className="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 text-center">
+            <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1">{label}</p>
+            <p className={`text-xl font-black ${color}`}>{value}</p>
+          </div>
+        ))}
+      </div>
+
+      <AnalyticsCard title="Winners per Level" icon={Target}>
+        <ResponsiveContainer width="100%" height={200}>
+          <BarChart data={barData} margin={{top:4,right:4,left:-20,bottom:4}}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+            <XAxis dataKey="level" tick={{fill:'#64748b',fontSize:11,fontWeight:700}} tickLine={false} axisLine={false}/>
+            <YAxis tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} axisLine={false}/>
+            <Tooltip contentStyle={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:8,fontSize:11}}/>
+            <Bar dataKey="winners" name="Winners" radius={[4,4,0,0]} maxBarSize={40}>
+              {barData.map((e,i) => <Cell key={i} fill={e.fill}/>)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </AnalyticsCard>
+
+      <AnalyticsCard title="Level-Wise Distribution" icon={BarChart3}>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead><tr className="border-b border-slate-100">
+              {['Level','Winners','Total Payout','Avg Payout','SDE %','% of Total'].map(h => (
+                <th key={h} className="text-left px-3 py-2.5 text-xs font-semibold text-slate-400 uppercase tracking-wider">{h}</th>
+              ))}
+            </tr></thead>
+            <tbody>
+              {data.by_level.map((d, i) => (
+                <tr key={d.level} className="border-b border-slate-50 hover:bg-slate-50 transition-colors">
+                  <td className="px-3 py-2.5"><LevelBadge level={d.level}/></td>
+                  <td className="px-3 py-2.5 font-semibold text-slate-700 tabular-nums">{d.winners.toLocaleString('en-IN')}</td>
+                  <td className="px-3 py-2.5 text-rose-600 tabular-nums">{INR_(d.total_payout_inr)}</td>
+                  <td className="px-3 py-2.5 text-slate-500 tabular-nums">{INR_(d.avg_payout_inr)}</td>
+                  <td className="px-3 py-2.5 tabular-nums text-slate-500">{d.sde_pct}%</td>
+                  <td className="px-3 py-2.5 font-semibold text-violet-700 tabular-nums">{d.pct_of_total}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </AnalyticsCard>
+    </div>
+  )
+}
+
+// ── Projections panel ────────────────────────────────────────────────────────
+function ProjectionsPanel({ toast }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+  const fetch_ = useCallback(async () => {
+    setLoading(true)
+    try { const r = await devProjection(); setData(r.data) }
+    catch { toast('Failed to load projections', 'error') }
+    finally { setLoading(false) }
+  }, [toast])
+  useEffect(() => { fetch_() }, [fetch_])
+
+  if (loading) return <div className="flex items-center justify-center h-48"><Spinner className="w-8 h-8 text-violet-500"/></div>
+  if (!data)   return null
+
+  const t    = data.totals
+  const INR_ = n => `₹${Number(n ?? 0).toLocaleString('en-IN')}`
+
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+        {[
+          { label: 'Eligible Pools',    value: data.eligible_pools,               color: 'text-blue-600'  },
+          { label: 'Proj. Collection',  value: INR_(t.projected_collection_inr),  color: 'text-emerald-600' },
+          { label: 'Proj. Payout',      value: INR_(t.projected_payout_inr),      color: 'text-rose-600'  },
+          { label: 'Proj. Profit',      value: INR_(t.projected_profit_inr),      color: t.projected_profit_inr >= 0 ? 'text-violet-700' : 'text-red-600' },
+          { label: 'Fee Income',        value: INR_(t.fee_income_inr),            color: 'text-slate-700' },
+        ].map(({ label, value, color }) => (
+          <div key={label} className="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 text-center">
+            <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1">{label}</p>
+            <p className={`text-lg font-black ${color}`}>{value}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        <AnalyticsCard title="LPI Projection (Post-Draw)" icon={Cpu}>
+          <ARow label="Current LPI"     value={`${data.post_draw_lpi.current_lpi}%`}
+            color={data.post_draw_lpi.current_lpi >= 25 ? 'text-red-600' : 'text-emerald-600'} />
+          <ARow label="Est. Post-Draw"  value={`${data.post_draw_lpi.estimated_lpi}%`}
+            color={data.post_draw_lpi.estimated_lpi >= 25 ? 'text-amber-600' : 'text-emerald-600'} />
+          <ARow label="Current L4"      value={data.post_draw_lpi.current_l4}      color="text-amber-600" />
+          <ARow label="New L4 After"    value={data.post_draw_lpi.total_new_l4_after}
+            color={data.post_draw_lpi.total_new_l4_after > 0 ? 'text-red-600' : 'text-slate-400'} />
+        </AnalyticsCard>
+
+        <AnalyticsCard title="Waitlist Pool Formation" icon={Layers}>
+          <ARow label="Current Waitlist" value={data.waitlist_projection.current_waitlist}  color="text-blue-600"    />
+          <ARow label="Threshold"         value={data.waitlist_projection.threshold}         />
+          <ARow label="Pools Can Form"    value={data.waitlist_projection.pools_can_form}
+            color={data.waitlist_projection.pools_can_form > 0 ? 'text-emerald-600' : 'text-slate-400'} />
+          <ARow label="Remaining After"   value={data.waitlist_projection.waitlist_remaining} />
+        </AnalyticsCard>
+      </div>
+
+      {data.pool_projections?.length > 0 && (
+        <AnalyticsCard title={`Per-Pool Projections (${data.eligible_pools} eligible)`} icon={Target}>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm min-w-[700px]">
+              <thead><tr className="border-b border-slate-100">
+                {['Pool','Draw Type','Members','Lower Win','Upper Win','Proj. Payout','Profit','New L4+'].map(h => (
+                  <th key={h} className="text-left px-3 py-2.5 text-xs font-semibold text-slate-400 uppercase tracking-wider">{h}</th>
+                ))}
+              </tr></thead>
+              <tbody>
+                {data.pool_projections.map((p, i) => (
+                  <tr key={p.pool_id} className={`border-b border-slate-50 ${i%2===0?'':'bg-slate-50/30'}`}>
+                    <td className="px-3 py-2.5 font-semibold text-slate-800">{p.pool_name}</td>
+                    <td className="px-3 py-2.5"><span className="text-[10px] bg-violet-50 text-violet-700 border border-violet-200 px-1.5 py-0.5 rounded font-semibold">{p.draw_type}</span></td>
+                    <td className="px-3 py-2.5 text-slate-500">{p.member_count}/12</td>
+                    <td className="px-3 py-2.5"><span className="bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded text-[10px] font-bold">L{p.proj_lower_level}</span> <span className="text-[10px] text-slate-400">{INR_(p.proj_lower_payout)}</span></td>
+                    <td className="px-3 py-2.5"><span className="bg-amber-50 text-amber-700 px-1.5 py-0.5 rounded text-[10px] font-bold">L{p.proj_upper_level}</span> <span className="text-[10px] text-slate-400">{INR_(p.proj_upper_payout)}</span></td>
+                    <td className="px-3 py-2.5 text-rose-600 font-semibold tabular-nums">{INR_(p.proj_total_payout)}</td>
+                    <td className={`px-3 py-2.5 font-semibold tabular-nums ${p.proj_profit >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>{INR_(p.proj_profit)}</td>
+                    <td className="px-3 py-2.5">{p.new_l4_after_draw > 0 ? <span className="text-red-600 font-bold">+{p.new_l4_after_draw}</span> : <span className="text-slate-300">—</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </AnalyticsCard>
+      )}
+
+      {data.eligible_pools === 0 && (
+        <div className="flex items-start gap-3 bg-blue-50 border border-blue-200 rounded-xl p-4">
+          <AlertCircle className="w-4 h-4 text-blue-500 flex-shrink-0 mt-0.5"/>
+          <p className="text-sm text-blue-700">No eligible pools found. Pools need exactly 12 active members to be draw-eligible.</p>
+        </div>
+      )}
+
+      <div className="flex justify-end">
+        <button onClick={fetch_} className="flex items-center gap-2 px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-xs text-slate-500 hover:bg-slate-50 transition">
+          <RefreshCw className="w-3 h-3"/>Refresh Projections
+        </button>
+      </div>
+    </div>
+  )
+}
+
 // Token row (shared by both WIT and REF action panels)
 function PendingTokenRow({ token, children }) {
   return (
@@ -324,6 +747,7 @@ export default function Statistics() {
   const [chartDays,     setChartDays]     = useState(30)
   const [expandedPools, setExpandedPools] = useState(new Set())
   const [actioning,     setActioning]     = useState(new Set())  // token IDs in-flight
+  const [subTab,        setSubTab]        = useState('overview') // sub-tab navigation
 
   // ─────────────────────────────────────────────────────────────────────────
   // Fetch helpers
@@ -462,8 +886,53 @@ export default function Statistics() {
 
   const mainLoading = loading.main
 
+  // ── Sub-tab navigation ────────────────────────────────────────────────────
+  const SUB_TABS = [
+    { id: 'overview',    label: 'Overview',          icon: BarChart3 },
+    { id: 'live_stats',  label: 'Live Stats',         icon: Activity  },
+    { id: 'level_map',   label: 'Level Map',          icon: Layers    },
+    { id: 'winners',     label: 'Winners Analytics',  icon: Target    },
+    { id: 'projections', label: 'Projections',        icon: TrendingUp },
+  ]
+
+  // ── Early-return for analytics sub-tabs ───────────────────────────────────
+  if (subTab !== 'overview') {
+    return (
+      <div className="p-8 space-y-6">
+        {/* Header */}
+        <div className="flex items-start justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
+              <BarChart3 className="w-6 h-6 text-violet-600" />
+              Statistics &amp; Analytics
+            </h1>
+          </div>
+        </div>
+        {/* Sub-tab nav */}
+        <div className="flex gap-0.5 border-b border-slate-200 overflow-x-auto pb-px">
+          {SUB_TABS.map(t => (
+            <button key={t.id} onClick={() => setSubTab(t.id)}
+              className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-semibold border-b-2 transition whitespace-nowrap ${
+                subTab === t.id
+                  ? 'border-violet-600 text-violet-700 -mb-px'
+                  : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'
+              }`}>
+              <t.icon className="w-3.5 h-3.5" />
+              {t.label}
+            </button>
+          ))}
+        </div>
+        {/* Panel content */}
+        {subTab === 'live_stats'   && <LiveStatsPanel   toast={toast} />}
+        {subTab === 'level_map'    && <LevelMapPanel    toast={toast} />}
+        {subTab === 'winners'      && <WinnersPanel     toast={toast} />}
+        {subTab === 'projections'  && <ProjectionsPanel toast={toast} />}
+      </div>
+    )
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
-  // Render
+  // Overview tab (original Statistics content)
   // ─────────────────────────────────────────────────────────────────────────
 
   return (
@@ -488,6 +957,21 @@ export default function Statistics() {
           <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
           Refresh All
         </button>
+      </div>
+
+      {/* Sub-tab nav (Overview tab active) */}
+      <div className="flex gap-0.5 border-b border-slate-200 overflow-x-auto pb-px">
+        {SUB_TABS.map(t => (
+          <button key={t.id} onClick={() => setSubTab(t.id)}
+            className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-semibold border-b-2 transition whitespace-nowrap ${
+              subTab === t.id
+                ? 'border-violet-600 text-violet-700 -mb-px'
+                : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'
+            }`}>
+            <t.icon className="w-3.5 h-3.5" />
+            {t.label}
+          </button>
+        ))}
       </div>
 
       {/* ══ 1. SYSTEM LIQUIDITY  ·  ORGANIZER REVENUE ═══════════════════════ */}

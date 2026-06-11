@@ -215,7 +215,11 @@ function PoolRow({ pool, members, onDraw }) {
         </td>
         <td className="px-5 py-4"><StatusBadge status={pool.status} /></td>
         <td className="px-5 py-4 text-center">
-          <span className={`font-mono font-semibold ${members.length === 12 ? 'text-emerald-600' : 'text-amber-600'}`}>
+          <span className={`font-mono font-semibold tabular-nums ${
+            members.length >= 12 ? 'text-emerald-600' :
+            members.length >= 8  ? 'text-amber-600'  :
+            'text-red-500'
+          }`}>
             {members.length}/12
           </span>
         </td>
@@ -379,6 +383,12 @@ export default function PoolOversight() {
   }, [])
 
   useEffect(() => { fetchAll(); fetchPoolSettings() }, [fetchAll, fetchPoolSettings])
+
+  // Auto-refresh every 30 s (silent)
+  useEffect(() => {
+    const id = setInterval(() => fetchAll(true), 30_000)
+    return () => clearInterval(id)
+  }, [fetchAll])
 
   // ── Toggle auto pool creation ─────────────────────────────────────────────
   const handleToggleAutoPool = async (newValue) => {
@@ -545,6 +555,26 @@ export default function PoolOversight() {
           </div>
         ))}
       </div>
+
+      {/* ── Type B Danger Banner ─────────────────────────────────────────────── */}
+      {pools.filter(p => p.pool_draw_type === 'type_b' && (p.status ?? p.pool_status) === 'Active').length >= 1 && (
+        <div className="flex items-start gap-3 bg-amber-50 border-2 border-amber-300 rounded-xl p-4">
+          <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="font-bold text-amber-800 text-sm">
+              ⚠ Type B Fallback Draw Active
+              <span className="ml-2 font-normal text-xs text-amber-700">
+                ({pools.filter(p => p.pool_draw_type === 'type_b' && (p.status ?? p.pool_status) === 'Active').length} pool{pools.filter(p => p.pool_draw_type === 'type_b' && (p.status ?? p.pool_status) === 'Active').length !== 1 ? 's' : ''})
+              </span>
+            </p>
+            <p className="text-xs text-amber-700 mt-0.5 leading-relaxed">
+              Type B indicates L1/L2 member shortage — L3/L4 filling both winner slots.
+              Anti-Maturity Protocol risk if this persists across consecutive weeks.
+              Increase waitlist injection or run Fill Vacancies below.
+            </p>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="flex items-center gap-3 bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">

@@ -203,9 +203,14 @@ function SimStatsGrid({ s }) {
   const cond   = s.total_condensation_events
   const pauses = s.total_draw_pauses_triggered
   const liq    = s.final_virtual_liquidity_float
+  const sh     = s.system_health ?? {}
+  const sdeEx  = sh.total_sde_exits    ?? 0
+  const typeA  = sh.total_type_a_draws ?? 0
+  const typeB  = sh.total_type_b_draws ?? 0
+  const sdeFlg = sh.total_l4_sde_flaggings ?? 0
   return (
-    <div className="mt-6">
-      <p className="text-[10px] font-bold text-violet-400 uppercase tracking-widest flex items-center gap-2 mb-3"><Database className="w-3.5 h-3.5" />Simulation Audit Ledger</p>
+    <div className="mt-6 space-y-4">
+      <p className="text-[10px] font-bold text-violet-400 uppercase tracking-widest flex items-center gap-2"><Database className="w-3.5 h-3.5" />Simulation Audit Ledger</p>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {[
           { icon: Users,      label:'Users Created',     value:s.total_simulated_users_created.toLocaleString('en-IN'), badge:'👥', dyn:false },
@@ -224,6 +229,27 @@ function SimStatsGrid({ s }) {
             <p className="text-[11px] text-slate-400 font-semibold uppercase tracking-wider">{c.label}</p>
           </div>
         ))}
+      </div>
+
+      {/* SDE / Draw Type metrics row */}
+      <div>
+        <p className="text-[10px] font-bold text-cyan-400 uppercase tracking-widest flex items-center gap-2 mb-3"><Cpu className="w-3.5 h-3.5" />Brain 5 SDE &amp; Draw Type Analytics</p>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          {[
+            { label:'L4 SDE Flaggings', value:sdeFlg, accent:'amber',  desc:'Members reaching L4' },
+            { label:'SDE Exits',        value:sdeEx,  accent:'rose',   desc:'Guaranteed L4 eliminations' },
+            { label:'Type A Draws',     value:typeA,  accent:'cyan',   desc:'LPI 14-25% routing' },
+            { label:'Type B Draws',     value:typeB,  accent:'orange', desc:'L1/L2 shortage fallback' },
+          ].map((c, i) => (
+            <div key={i} className="border border-slate-700/60 bg-slate-800/40 rounded-xl p-3">
+              <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider">{c.label}</p>
+              <p className={`text-xl font-black tabular-nums mt-1 ${
+                c.accent==='amber'?'text-amber-400':c.accent==='rose'?'text-rose-400':c.accent==='cyan'?'text-cyan-400':'text-orange-400'
+              }`}>{c.value}</p>
+              <p className="text-[9px] text-slate-600 mt-0.5">{c.desc}</p>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   )
@@ -373,6 +399,7 @@ function StressTestTab({ toast }) {
   const [rdr, setRdr] = useState(40.0)
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState(null)
+  const [showSetup, setShowSetup] = useState(false)
 
   const run = async () => {
     setRunning(true); setResult(null)
@@ -456,6 +483,28 @@ function StressTestTab({ toast }) {
             <span className={rdr>70?'text-amber-400':''}>{rdr>70?'⚡ Flash Flood':rdr<30?'🌊 Sustainable Wave':'⚖️ Mixed'}</span>
             <span>Referral</span>
           </div>
+        </div>
+
+        {/* ── Pre-Test Setup (collapsible) ─────────────────────────────────── */}
+        <div className={`border rounded-xl overflow-hidden transition-colors ${showSetup ? 'border-slate-600' : 'border-slate-700/40'}`}>
+          <button
+            type="button"
+            onClick={() => setShowSetup(v => !v)}
+            disabled={running}
+            className={`w-full flex items-center justify-between px-5 py-3.5 transition-colors text-left ${showSetup ? 'bg-slate-800' : 'bg-slate-800/30 hover:bg-slate-800/60'} disabled:opacity-40`}
+          >
+            <div className="flex items-center gap-2.5">
+              <Settings className="w-4 h-4 text-slate-500 flex-shrink-0" />
+              <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">Pre-Test Setup</span>
+              <span className="hidden sm:inline text-[10px] text-slate-600 ml-1">Set DB payment state before launching</span>
+            </div>
+            <ChevronRight className={`w-4 h-4 text-slate-500 flex-shrink-0 transition-transform duration-200 ${showSetup ? 'rotate-90' : ''}`} />
+          </button>
+          {showSetup && (
+            <div className="border-t border-slate-700/60">
+              <ControlsTab toast={toast} />
+            </div>
+          )}
         </div>
 
         <button onClick={run} disabled={running}
@@ -1446,15 +1495,10 @@ function DangerTab({ toast }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const TABS = [
-  { id:0, icon:FlaskConical,  label:'Stress Test',  short:'Stress'    },
-  { id:1, icon:Zap,           label:'Draw Control', short:'Draw'      },
-  { id:2, icon:UserPlus,      label:'Injection',    short:'Inject'    },
-  { id:3, icon:Activity,      label:'Live Stats',   short:'Stats'     },
-  { id:4, icon:Layers,        label:'Level Map',    short:'Map'       },
-  { id:5, icon:Trophy,        label:'Winners',      short:'Winners'   },
-  { id:6, icon:Target,        label:'Projections',  short:'Projections'},
-  { id:7, icon:Settings,      label:'Controls',     short:'Controls'  },
-  { id:8, icon:Skull,         label:'Danger Zone',  short:'Danger',   danger:true },
+  { id:0, icon:FlaskConical, label:'Stress Test',  short:'Stress'  },
+  { id:1, icon:Zap,          label:'Draw Control', short:'Draw'    },
+  { id:2, icon:UserPlus,     label:'Injection',    short:'Inject'  },
+  { id:3, icon:Skull,        label:'Danger Zone',  short:'Danger', danger:true },
 ]
 
 function TabNav({ active, setActive }) {
@@ -1536,12 +1580,7 @@ export default function DevTools() {
           {tab===0&&<StressTestTab  toast={toast}/>}
           {tab===1&&<DrawControlTab toast={toast}/>}
           {tab===2&&<InjectionTab   toast={toast}/>}
-          {tab===3&&<LiveStatsTab   toast={toast}/>}
-          {tab===4&&<LevelMapTab    toast={toast}/>}
-          {tab===5&&<WinnersTab     toast={toast}/>}
-          {tab===6&&<ProjectionsTab toast={toast}/>}
-          {tab===7&&<ControlsTab    toast={toast}/>}
-          {tab===8&&<DangerTab      toast={toast}/>}
+          {tab===3&&<DangerTab      toast={toast}/>}
         </div>
 
         <div className="h-8"/>

@@ -85,6 +85,12 @@ export default function TokenManager() {
 
   useEffect(() => { loadTokens() }, [loadTokens])
 
+  // Auto-refresh every 60 s
+  useEffect(() => {
+    const id = setInterval(() => loadTokens(true), 60_000)
+    return () => clearInterval(id)
+  }, [loadTokens])
+
   const handleDownloadTokens = async () => {
     setDownloading(true)
     try {
@@ -283,18 +289,28 @@ export default function TokenManager() {
             <span className="text-xs text-slate-400">{tokens.length} tokens</span>
           </div>
 
-          {/* Type filter */}
-          <select
-            value={typeFilter}
-            onChange={e => setTypeFilter(e.target.value)}
-            className="px-3 py-1.5 border border-slate-200 rounded-lg text-xs text-slate-700 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="">All Types</option>
-            <option value="Deposit">Deposit</option>
-            <option value="Withdraw">Withdraw</option>
-            <option value="Referral">Referral</option>
-            <option value="Referral_Withdraw">Referral Withdraw</option>
-          </select>
+          {/* Type filter — chip buttons */}
+          <div className="flex items-center gap-1 flex-wrap">
+            {[
+              { value: '',                   label: 'All'     },
+              { value: 'Deposit',            label: 'DEP'     },
+              { value: 'Withdraw',           label: 'WIT'     },
+              { value: 'Referral',           label: 'REF'     },
+              { value: 'Referral_Withdraw',  label: 'REF-WIT' },
+            ].map(({ value, label }) => (
+              <button
+                key={value}
+                onClick={() => setTypeFilter(value)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors ${
+                  typeFilter === value
+                    ? 'bg-blue-600 text-white border-blue-600'
+                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
 
           {/* Status filter */}
           <select
@@ -346,7 +362,13 @@ export default function TokenManager() {
               </thead>
               <tbody className="divide-y divide-slate-50">
                 {tokens.map(t => (
-                  <tr key={t.id} className="hover:bg-slate-50/60 transition-colors group">
+                  <tr key={t.id} className={`transition-colors group hover:brightness-95 ${
+                    t.status === 'Burned'           ? 'bg-emerald-50/40' :
+                    t.status === 'Active'           ? 'bg-blue-50/30'    :
+                    t.status === 'Rejected'         ? 'bg-red-50/30'     :
+                    t.status === 'Pending_Approval' ? 'bg-amber-50/30'   :
+                    'hover:bg-slate-50/60'
+                  }`}>
                     {/* Code */}
                     <td className="px-4 py-3 font-mono font-semibold text-slate-800 tracking-widest text-xs">
                       {t.code}

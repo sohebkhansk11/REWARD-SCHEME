@@ -212,6 +212,15 @@ export default function Dashboard() {
     if (user?.status === 'Waitlist') fetchRank()
   }, [location.key])  // eslint-disable-line
 
+  // Auto-refresh every 30 s — keeps level, payment status, and pool info live
+  useEffect(() => {
+    const id = setInterval(() => {
+      fetchFresh(true)
+      if (user?.status === 'Waitlist') fetchRank()
+    }, 30_000)
+    return () => clearInterval(id)
+  }, [user?.status])  // eslint-disable-line
+
   const handleLogout = () => { logout(); nav('/', { replace: true }) }
 
   const status = user?.status ?? 'Waitlist'

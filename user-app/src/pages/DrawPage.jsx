@@ -262,6 +262,12 @@ export default function DrawPage() {
 
   useEffect(() => { fetchWinners() }, [fetchWinners])
 
+  // Auto-refresh winners every 60 s — picks up new draws without page reload
+  useEffect(() => {
+    const id = setInterval(fetchWinners, 60_000)
+    return () => clearInterval(id)
+  }, [fetchWinners])
+
   const currentPayout = PAYOUT_TABLE.find(r => r.level === userLevel)
 
   return (

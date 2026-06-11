@@ -1341,6 +1341,70 @@ export default function Statistics() {
         </div>
       </div>
 
+      {/* ══ Financial Waterfall ══════════════════════════════════════════════ */}
+      {!mainLoading && financials && (() => {
+        const inflow     = fP(financials.total_cash_inflow_inr ?? 0)
+        const outflow    = fP(financials.total_cash_outflow_inr ?? 0)
+        const maintFees  = fP(financials.maintenance_fees_total_inr ?? 0)
+        const netFloat   = fP(financials.in_hand_liquidity_inr ?? 0)
+        const total      = Math.max(inflow + maintFees, 0.01)   // denominator guard
+
+        const segments = [
+          { label: 'Gross Collected', value: inflow,    pct: inflow / total * 100,        bg: 'bg-emerald-500', text: 'text-emerald-700' },
+          { label: 'Maint. Fees',     value: maintFees, pct: maintFees / total * 100,     bg: 'bg-violet-500',  text: 'text-violet-700'  },
+          { label: 'Paid Out',        value: outflow,   pct: outflow / total * 100,        bg: 'bg-rose-400',    text: 'text-rose-700'    },
+          { label: 'Net Float',       value: netFloat,  pct: Math.max(0, netFloat / total * 100), bg: netFloat >= 0 ? 'bg-blue-500' : 'bg-red-400', text: netFloat >= 0 ? 'text-blue-700' : 'text-red-600' },
+        ]
+        return (
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+            <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-3"
+                 style={{ background: 'linear-gradient(90deg, #f5f3ff 0%, #fff 65%)' }}>
+              <div className="w-7 h-7 rounded-xl bg-violet-100 flex items-center justify-center flex-shrink-0">
+                <IndianRupee className="w-3.5 h-3.5 text-violet-600" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[9px] font-semibold text-violet-500 uppercase tracking-widest leading-none">All-Time</p>
+                <h2 className="text-sm font-bold text-slate-800 leading-none mt-0.5">Financial Waterfall</h2>
+              </div>
+              <span className="ml-auto text-[10px] font-mono text-slate-400 flex-shrink-0">Gross → Fees → Payouts → Float</span>
+            </div>
+            <div className="p-6 space-y-5">
+              {/* Stacked flow bar */}
+              <div className="flex h-7 rounded-full overflow-hidden gap-0.5">
+                {segments.filter(s => s.pct > 0).map((s, i) => (
+                  <div key={i} className={`${s.bg} flex items-center justify-center`}
+                       style={{ width: `${Math.max(s.pct, 1)}%`, minWidth: 2, transition: 'width 0.9s ease' }}
+                       title={`${s.label}: ${INR(s.value)}`} />
+                ))}
+              </div>
+              {/* Legend + amounts */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                {segments.map((s, i) => (
+                  <div key={i} className="bg-slate-50 rounded-xl p-3.5 border border-slate-100">
+                    <div className={`w-3 h-3 rounded-full ${s.bg} mb-2`} />
+                    <p className="text-[10px] text-slate-400 uppercase tracking-wide mb-0.5">{s.label}</p>
+                    <p className={`text-base font-black tabular-nums ${s.text}`}>{INR(s.value)}</p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">{s.pct.toFixed(1)}% of total</p>
+                  </div>
+                ))}
+              </div>
+              {/* Arrow flow annotation */}
+              <div className="flex items-center gap-2 flex-wrap text-[10px] text-slate-400 font-mono">
+                <span className="bg-emerald-50 text-emerald-700 border border-emerald-200 px-2 py-0.5 rounded font-semibold">{INR(inflow)} In</span>
+                <span>+</span>
+                <span className="bg-violet-50 text-violet-700 border border-violet-200 px-2 py-0.5 rounded font-semibold">{INR(maintFees)} Fees</span>
+                <span>−</span>
+                <span className="bg-rose-50 text-rose-700 border border-rose-200 px-2 py-0.5 rounded font-semibold">{INR(outflow)} Out</span>
+                <span>=</span>
+                <span className={`border px-2 py-0.5 rounded font-bold ${netFloat >= 0 ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-red-50 text-red-700 border-red-200'}`}>
+                  {INR(netFloat)} Float
+                </span>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
       {/* ══ 3. QUICK REFERENCE METRICS ════════════════════════════════════════ */}
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
         <KPICard

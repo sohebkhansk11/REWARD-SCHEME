@@ -79,7 +79,7 @@ function WinnerAutopsyModal({ winner, onClose }) {
   const isMerged = winner.journey_type === 'merged'
   const isRef    = winner.is_referred ?? false
   const exitDate = winner.draw_timestamp
-    ? new Date(winner.draw_timestamp).toLocaleDateString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })
+    ? new Date(winner.draw_timestamp).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })
     : '—'
 
   const netProfit = (winner.net_payout_inr ?? 0) - (winner.total_deposited_inr ?? 0)
@@ -300,7 +300,7 @@ export default function WinningLedger() {
   useEffect(() => { load(1) }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Derived KPIs from visible page data ────────────────────────────────────
-  const totalPaid    = items.reduce((s, w) => s + (w.net_winning_inr ?? 0), 0)
+  const totalPaid    = items.reduce((s, w) => s + (w.net_payout_inr ?? w.net_winning_inr ?? 0), 0)
   const totalDep     = items.reduce((s, w) => s + (w.total_deposited_inr ?? 0), 0)
   const avgNet       = items.length ? (totalPaid / items.length) : 0
   const mergedCount  = items.filter(w => w.journey_type === 'merged').length

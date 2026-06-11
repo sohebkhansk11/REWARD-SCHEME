@@ -19,7 +19,7 @@ import { useState, useEffect, useCallback } from 'react'
 import {
   Cpu, Activity, Target, AlertTriangle, TrendingUp, TrendingDown,
   RefreshCw, Zap, Shield, Users, IndianRupee, Terminal,
-  Crosshair, Radio, Network, Layers, BarChart3, Clock,
+  Crosshair, Radio, Network, Layers, BarChart3, Clock, Waves,
 } from 'lucide-react'
 import {
   ResponsiveContainer, ComposedChart, Area, Line,
@@ -680,7 +680,7 @@ export default function CommandCenter() {
         {/* Breathing Chart — center */}
         <div className="col-span-6">
           <DarkCard title="Velocity vs Burn Rate — The Breathing Chart"
-            icon={Waves ?? Activity} iconColor="text-blue-400"
+            icon={Waves} iconColor="text-blue-400"
             badge={burnRate > 0 ? {
               label: `Burn: ${burnRate}/wk`,
               cls: 'bg-red-950/60 text-red-400 border border-red-800/50'
@@ -733,7 +733,7 @@ export default function CommandCenter() {
 
       {/* ══ MODULE 2-A: BRAIN 1 & 4 TOPOLOGY MAP ════════════════════════════ */}
       <DarkCard title="Brain 1 & 4 — Hydraulic Topology Map"
-        icon={Network ?? Layers} iconColor="text-blue-400"
+        icon={Network} iconColor="text-blue-400"
         badge={condensationActive ? { label: 'CONDENSATION', cls: 'bg-red-950/60 text-red-400 border border-red-800/50 animate-pulse' } : null}
       >
         <div className="px-4 py-3">

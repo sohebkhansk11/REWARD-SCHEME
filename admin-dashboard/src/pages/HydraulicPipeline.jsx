@@ -97,7 +97,7 @@ function MemberTag({ member, dimmed, highlighted, onHover, onLeave, onClick }) {
             : 'hover:bg-slate-800/40'
       }`}
       style={{ height: ITEM_H }}
-      onMouseEnter={onHover}
+      onMouseEnter={e => onHover(member, e)}
       onMouseLeave={onLeave}
       onClick={onClick}
     >
@@ -158,7 +158,7 @@ function LayerThreePanel({ members, loading, searchHighlight, searchDimAll, onHo
             member={m}
             dimmed={searchDimAll && m.id !== searchHighlight?.id}
             highlighted={searchHighlight && m.id === searchHighlight.id}
-            onHover={() => onHoverMember(m)}
+            onHover={onHoverMember}
             onLeave={onLeaveMember}
             onClick={() => onClickMember(m)}
           />
@@ -181,7 +181,7 @@ function LayerThreePanel({ members, loading, searchHighlight, searchDimAll, onHo
             member={m}
             dimmed={searchDimAll && m.id !== searchHighlight?.id}
             highlighted={searchHighlight && m.id === searchHighlight.id}
-            onHover={() => onHoverMember(m)}
+            onHover={onHoverMember}
             onLeave={onLeaveMember}
             onClick={() => onClickMember(m)}
           />
@@ -527,8 +527,8 @@ export default function HydraulicPipeline() {
   const multiplier  = fP(aiData?.multiplier ?? 1.0)
   const paidWaitlist = waitlist.filter(u => u.deposit_token_status === 'Burned' || u.has_paid).length
   const targetBuffer = 24
-  const activePools  = pools.filter(p => p.status === 'Active')
-  const poolsWithVacancy = activePools.filter(p => (p.total_members ?? 0) < 12)
+  const activePools  = pools.filter(p => (p.status ?? p.pool_status) === 'Active')
+  const poolsWithVacancy = activePools.filter(p => (p.total_members ?? p.current_member_count ?? 0) < 12)
 
   // All members across all layers for entity search
   const allMembers = useMemo(() => [...waitlist, ...activeUsers], [waitlist, activeUsers])
@@ -617,7 +617,7 @@ export default function HydraulicPipeline() {
             loading={loading}
             searchHighlight={highlightedMember}
             searchDimAll={dimAll}
-            onHoverMember={(m) => setHoveredMember(m)}
+            onHoverMember={(m, e) => { setHoveredMember(m); if (e) setHoverPos({ x: e.clientX, y: e.clientY }) }}
             onLeaveMember={() => setHoveredMember(null)}
             onClickMember={m => setHighlightedMember(prev => prev?.id === m.id ? null : m)}
             viewMode={viewMode}
@@ -671,7 +671,7 @@ export default function HydraulicPipeline() {
                     dimmed={dimAll}
                   />
                 ))}
-                {pools.filter(p => p.status !== 'Active').slice(0, 4).map(p => (
+                {pools.filter(p => (p.status ?? p.pool_status) !== 'Active').slice(0, 4).map(p => (
                   <PoolMiniCard
                     key={p.id ?? p.pool_id}
                     pool={p}

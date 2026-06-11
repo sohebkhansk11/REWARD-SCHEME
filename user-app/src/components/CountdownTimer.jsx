@@ -1,38 +1,11 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'https://reward-scheme-api.onrender.com'
 
-/**
- * Returns the epoch-ms of the next Sunday at 19:00:00 IST (UTC+5:30)
- * relative to a given `nowMs` value so the calculation is testable.
- */
-function nextSundayDraw(nowMs) {
-  // IST = UTC + 5h 30m = UTC + 19800 s
-  const IST_OFFSET_MS = 5.5 * 3600 * 1000
-  const nowIST = nowMs + IST_OFFSET_MS                        // ms in IST epoch
-  const d = new Date(nowIST)
-
-  const day  = d.getUTCDay()   // 0=Sun … 6=Sat (in IST space)
-  const hour = d.getUTCHours()
-  const min  = d.getUTCMinutes()
-  const sec  = d.getUTCSeconds()
-
-  // Days until next Sunday
-  let daysUntil = (7 - day) % 7
-  // If it is already Sunday but before 19:00 IST, use today
-  if (day === 0 && (hour < 19 || (hour === 19 && min === 0 && sec === 0))) {
-    daysUntil = 0
-  } else if (daysUntil === 0) {
-    daysUntil = 7  // already past 19:00 on Sunday — next week
-  }
-
-  // Build target in IST epoch, then convert back to UTC epoch
-  const target = new Date(nowIST)
-  target.setUTCDate(d.getUTCDate() + daysUntil)
-  target.setUTCHours(19, 0, 0, 0)
-  return target.getTime() - IST_OFFSET_MS   // UTC epoch ms
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function decompose(diffMs) {
   const d = Math.max(0, diffMs)
@@ -44,6 +17,7 @@ function decompose(diffMs) {
   }
 }
 
+// Animated flip digit
 function Digit({ value }) {
   const str = String(value).padStart(2, '0')
   return (
@@ -64,52 +38,77 @@ function Digit({ value }) {
   )
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CountdownTimer
+//
+// Two-flag rule (from backend):
+//   preparation_valid = true   →  T-2H preparation job has run
+//   countdown_active  = true   →  admin hasn't paused the countdown
+//
+// ONLY when BOTH flags are true does the live countdown show.
+// Otherwise a static "Next draw: Sunday 7 PM IST" message is rendered.
+// This prevents a client-side computed timer from ticking away when the
+// draw hasn't actually been prepared yet.
+// ─────────────────────────────────────────────────────────────────────────────
 export default function CountdownTimer() {
-  // clockOffset: server_epoch_ms - client_epoch_ms
-  // Allows us to correct for client clock drift.
-  const offsetRef = useRef(0)
-  const [synced, setSynced] = useState(false)
+  const [countdownActive, setCountdownActive] = useState(false)
+  const [drawTimeMs,      setDrawTimeMs]      = useState(null)   // epoch ms
+  const [t, setT] = useState({ d: 0, h: 0, m: 0, s: 0 })
 
-  // Fetch server time once on mount and calculate offset
-  useEffect(() => {
-    let cancelled = false
-    const fetchServerTime = async () => {
-      try {
-        const clientBefore = Date.now()
-        const res = await fetch(`${BASE_URL}/time`)
-        const clientAfter = Date.now()
-        if (cancelled) return
+  // ── Poll /draw/countdown every 30 s ───────────────────────────────────────
+  // Uses the authoritative two-flag response from the backend.
+  const pollCountdown = useCallback(async () => {
+    try {
+      const res  = await fetch(`${BASE_URL}/draw/countdown`)
+      if (!res.ok) return
+      const data = await res.json()
 
-        const { epoch_ms } = await res.json()
-        // Mid-point correction to account for network latency
-        const rtt = clientAfter - clientBefore
-        const clientMid = clientBefore + rtt / 2
-        offsetRef.current = epoch_ms - clientMid
-      } catch {
-        // If the fetch fails, fall back to local clock (offset stays 0)
-      } finally {
-        if (!cancelled) setSynced(true)
-      }
+      // Both flags must be true to activate the countdown display
+      const active = !!(data.countdown_active && data.preparation_valid)
+      setCountdownActive(active)
+      setDrawTimeMs(
+        active && data.draw_time_utc
+          ? new Date(data.draw_time_utc).getTime()
+          : null
+      )
+    } catch {
+      // Network error — keep existing display state, don't flash the UI
     }
-    fetchServerTime()
-    return () => { cancelled = true }
   }, [])
 
-  const nowCorrected = () => Date.now() + offsetRef.current
-
-  const [t, setT] = useState(() => {
-    const now = nowCorrected()
-    return decompose(nextSundayDraw(now) - now)
-  })
-
   useEffect(() => {
-    const id = setInterval(() => {
-      const now = nowCorrected()
-      setT(decompose(nextSundayDraw(now) - now))
-    }, 1000)
+    pollCountdown()                               // immediate on mount
+    const id = setInterval(pollCountdown, 30_000) // then every 30 s
     return () => clearInterval(id)
-  }, [synced]) // restart after sync so first tick uses corrected offset
+  }, [pollCountdown])
 
+  // ── Tick every second while countdown is active ───────────────────────────
+  useEffect(() => {
+    if (!countdownActive || drawTimeMs == null) return
+    const update = () => setT(decompose(drawTimeMs - Date.now()))
+    update()                                // immediate so no 1-s flicker
+    const id = setInterval(update, 1000)
+    return () => clearInterval(id)
+  }, [countdownActive, drawTimeMs])
+
+  // ── Not active ────────────────────────────────────────────────────────────
+  if (!countdownActive || drawTimeMs == null) {
+    return (
+      <div className="text-center space-y-1.5">
+        <p className="text-neon-cyan/60 text-xs font-mono tracking-[0.2em] uppercase">
+          Next Draw
+        </p>
+        <p className="text-white/70 text-lg font-bold">
+          Sunday &middot; 7:00 PM IST
+        </p>
+        <p className="text-white/25 text-[10px] font-mono tracking-wide">
+          Countdown starts 2 h before draw
+        </p>
+      </div>
+    )
+  }
+
+  // ── Active: live animated countdown ──────────────────────────────────────
   const units = [
     { label: 'DAYS', val: t.d },
     { label: 'HRS',  val: t.h },

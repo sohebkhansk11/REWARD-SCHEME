@@ -1,4 +1,6 @@
 # Pinned from pip freeze — Python 3.12+
+# Scheduler
+APScheduler==3.10.4
 # Auth / security
 bcrypt==4.2.1
 httpx==0.28.1

@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, insert as sa_insert, text
 from sqlalchemy.orm import Session
 
-from app.core.config import DEPOSIT_AMOUNT_INR, NEW_POOL_INTAKE, POOL_CAPACITY
+from app.core.config import DEPOSIT_AMOUNT_INR, LEVEL_PAYOUTS, NEW_POOL_INTAKE, POOL_CAPACITY
 from app.core.dev_guard import require_dev_mode
 from app.database import get_db
 from app.crud import pool as crud_pool
@@ -852,14 +852,6 @@ _S_CAP      = 12           # pool capacity
 _S_THR      = 12           # waitlist threshold for auto-scaling a new pool
 _S_DEP      = Decimal("1000")
 
-_S_PAY: dict[int, tuple[Decimal, Decimal]] = {
-    1: (Decimal("2500"), Decimal("2000")),
-    2: (Decimal("2500"), Decimal("2000")),
-    3: (Decimal("2500"), Decimal("2000")),
-    4: (Decimal("5000"), Decimal("4000")),
-    5: (Decimal("5000"), Decimal("4000")),
-    6: (Decimal("10000"), Decimal("8000")),
-}
 
 
 # ── Request schema (strict validation) ───────────────────────────────────────
@@ -885,6 +877,14 @@ class AdvancedSimRequest(BaseModel):
         100, ge=5,
         description="Upper bound for random weekly user injection (volatility mode only)",
     )
+    avg_rdr_pct: float = Field(
+        40.0, ge=0.0, le=100.0,
+        description=(
+            "Simulated average Referral Density Ratio % "
+            "(0 = all organic, 100 = all referral). "
+            "Gaussian noise (σ=8) is added per cycle to model real-world variance."
+        ),
+    )
 
 
 # ── Lightweight in-memory state objects ──────────────────────────────────────
@@ -892,15 +892,16 @@ class AdvancedSimRequest(BaseModel):
 @_dc
 class _SU:
     """In-memory simulation user — never a SQLAlchemy ORM object."""
-    sid:      int
-    uname:    str
-    mobile:   str
-    joined:   datetime
-    level:    int  = 1
-    paid:     bool = False
-    late:     bool = False
-    pool_sid: int | None = None   # which _SP this user belongs to
-    alive:    bool = True         # False = Eliminated_Won
+    sid:          int
+    uname:        str
+    mobile:       str
+    joined:       datetime
+    level:        int  = 1
+    paid:         bool = False
+    late:         bool = False
+    pool_sid:     int | None = None   # which _SP this user belongs to
+    alive:        bool = True         # False = Eliminated_Won
+    deposits_paid: int = 1            # entry deposit counted as first payment
 
 
 @_dc
@@ -987,6 +988,13 @@ class _AdvSimEngine:
         self._pay  = Decimal("0")
         self._late = Decimal("0")
 
+        # God Mode — journey & level-wise tracking
+        self.direct_assignments:  int            = 0
+        self.level_wise_winners:  dict[int, int]     = {l: 0 for l in range(1, 7)}
+        self.level_wise_deposits: dict[int, Decimal] = {l: Decimal("0") for l in range(1, 7)}
+        self.level_wise_payouts:  dict[int, Decimal] = {l: Decimal("0") for l in range(1, 7)}
+        self._inflow_history:     list[int]       = []   # new users per cycle (velocity calc)
+
         self.logs: list[dict] = []
         self._ins:  list[dict] = []   # pending DB-insert buffer
 
@@ -1031,9 +1039,12 @@ class _AdvSimEngine:
             "current_pool_id":               None,
             "referred_by_user_id":           None,
             "referral_code":                 None,   # NULL OK: unique constraint allows multi-NULL
-            "total_referrals_count":         0,
+            "total_referrals_count":          0,
             "accumulated_referral_bonus_inr": Decimal("0"),
-            "late_fees_inr":                 Decimal("0"),
+            "late_fees_inr":                  Decimal("0"),
+            "dynamic_merges_experienced":     0,
+            "pauses_experienced":             0,
+            "total_deposited_inr":            1000,
         }
 
     # ── Step A — FIFO Sequential Inflow ───────────────────────────────────────
@@ -1060,6 +1071,7 @@ class _AdvSimEngine:
             self.n_created += 1
             self._ins.append(self._mkrow(sid, uname, joined, mobile, hpw))
 
+        self._inflow_history.append(n)  # record for velocity calculations
         return n
 
     # ── Step B — Ratio Penalty Application ────────────────────────────────────
@@ -1101,6 +1113,7 @@ class _AdvSimEngine:
                 if not u.late:
                     u.paid = True
                 active_in_pools += 1          # count ALL active members, late or not
+                u.deposits_paid += 1          # accumulate installment count per user
         for u in self._users.values():
             u.late = False
 
@@ -1108,9 +1121,35 @@ class _AdvSimEngine:
         # This is tracked in _dep (total system inflow = initial deposits + installments).
         self._dep += _S_DEP * active_in_pools
 
+    # ── AI helpers ────────────────────────────────────────────────────────────
+
+    def _recent_velocity(self) -> float:
+        """Average weekly inflow over the last 3 cycles (slow velocity proxy)."""
+        hist = self._inflow_history[-3:] if len(self._inflow_history) >= 1 else []
+        return (sum(hist) / len(hist)) if hist else 12.0
+
+    def _determine_sim_multiplier(
+        self, velocity: float, burn_rate: float, rdr_pct: float
+    ) -> tuple[float, str, str]:
+        """
+        Simulation-local mirror of the production AI decision matrix.
+        Returns (multiplier, scenario, phase).
+        """
+        if velocity > burn_rate:
+            if rdr_pct < 30.0:
+                return 0.50, "SUSTAINABLE_WAVE",  "BOOM"
+            elif rdr_pct > 70.0:
+                return 1.50, "FLASH_FLOOD",        "BOOM"   # cautious — volatile referral hype
+            else:
+                return 0.75, "BOOM_GOLDEN_CROSS",  "BOOM"
+        else:
+            if rdr_pct > 60.0:
+                return 2.00, "REFERRAL_LIFELINE",  "LIQUIDITY_PROTECTION"
+            return 2.00,     "DRY_PHASE",          "DRY"
+
     # ── Step D — Double-FIFO Refill + Condensation ────────────────────────────
 
-    def step_d(self, ts: datetime) -> tuple[int, int]:
+    def step_d(self, ts: datetime, rdr_pct: float = 40.0) -> tuple[int, int]:
         """
         Phase 1: Fill vacancies from Waitlist (oldest pool first, oldest user first).
         Phase 2: Auto-scale new pool when waitlist >= threshold.
@@ -1125,17 +1164,29 @@ class _AdvSimEngine:
         for pool in p1:
             vac = _S_CAP - len(self._mbrs(pool.sid))
             while vac > 0 and self._wl:
-                uid       = self._wl.pop(0)         # oldest waitlist user (FIFO)
+                uid       = self._wl.pop(0)
                 u         = self._users[uid]
                 u.pool_sid = pool.sid
                 u.paid    = True
                 u.level   = 1
                 vac      -= 1
+                self.direct_assignments += 1
             if pool.paused and len(self._mbrs(pool.sid)) >= _S_CAP:
-                pool.paused = False                  # restore Active if now full
+                pool.paused = False
 
-        # ── Phase 2 ───────────────────────────────────────────────────────────
-        while len(self._wl) >= _S_THR:
+        # ── Phase 2 (AI-governed spawning) ───────────────────────────────────
+        # Burn rate = Active-only (paused pools don't exit members this cycle).
+        # Reserve = ALL operational pools (Active + Paused) because paused pools
+        # still hold members and need replacement coverage to eventually resume.
+        _active_ct   = sum(1 for p in self._pools.values() if not p.dissolved and not p.paused)
+        _ops_ct      = sum(1 for p in self._pools.values() if not p.dissolved)  # active + paused
+        _burn        = float(_active_ct * 2)
+        _velocity    = self._recent_velocity()
+        _multiplier, _, _ = self._determine_sim_multiplier(_velocity, _burn, rdr_pct)
+        _dyn_reserve = int(_ops_ct * _S_CAP * _multiplier)      # reserve covers ALL ops pools
+        _available   = max(0, len(self._wl) - _dyn_reserve)
+
+        while _available >= _S_THR:
             pool = self._mkpool(ts)
             for _ in range(_S_CAP):
                 if not self._wl:
@@ -1145,6 +1196,8 @@ class _AdvSimEngine:
                 u.pool_sid = pool.sid
                 u.paid    = True
                 u.level   = 1
+                self.direct_assignments += 1
+            _available -= _S_CAP
 
         # ── Phase 3: Dynamic Inter-Pool Condensation ──────────────────────────
         p3_tgts = sorted(
@@ -1228,12 +1281,19 @@ class _AdvSimEngine:
                 w1 = random.choice(low)
                 w2 = random.choice(high)
 
-            # Issue payouts, eliminate winners
+            # Issue payouts, eliminate winners — track level-wise financials
             for w in (w1, w2):
-                _, net  = _S_PAY.get(w.level, (Decimal("2500"), Decimal("2000")))
-                self._pay   += net
-                w.alive      = False
-                w.pool_sid   = None
+                _, net = LEVEL_PAYOUTS.get(w.level, (2500, 2000))
+                net_d = Decimal(str(net))
+                self._pay                    += net_d
+                self.level_wise_winners[w.level]   = self.level_wise_winners.get(w.level,   0)             + 1
+                self.level_wise_payouts[w.level]   = self.level_wise_payouts.get(w.level,   Decimal("0")) + net_d
+                self.level_wise_deposits[w.level]  = (
+                    self.level_wise_deposits.get(w.level, Decimal("0"))
+                    + Decimal(str(w.deposits_paid)) * _S_DEP
+                )
+                w.alive    = False
+                w.pool_sid = None
                 self.n_winners += 1
 
             # Advance all survivors +1 level (hard-capped at 6); reset payment flag
@@ -1252,46 +1312,133 @@ class _AdvSimEngine:
     def run_cycle(self, cycle: int, req: AdvancedSimRequest,
                   base: datetime, hpw: str):
         ts = base + timedelta(weeks=cycle - 1)
+
+        # ── Pre-cycle AI snapshot (uses history BEFORE this cycle's inflow) ──
+        velocity   = self._recent_velocity()
+        active_pre = sum(1 for p in self._pools.values() if not p.dissolved and not p.paused)
+        burn_rate  = float(active_pre * 2)
+        # Gaussian noise ± 8% around the configured avg RDR
+        rdr_pct    = max(0.0, min(100.0, req.avg_rdr_pct + random.gauss(0, 8.0)))
+        _, scenario, phase = self._determine_sim_multiplier(velocity, burn_rate, rdr_pct)
+        # Momentum = current cycle velocity vs previous-cycle velocity
+        prev_vel   = (
+            (sum(self._inflow_history[-4:-1]) / len(self._inflow_history[-4:-1]))
+            if len(self._inflow_history) >= 2 else velocity
+        )
+        momentum   = velocity - prev_vel
+
+        # ── Execute cycle ────────────────────────────────────────────────────
         self.step_a(cycle, req.volatility_mode, req.volatility_max_inflow, base, hpw)
         self.step_b(req.late_fee_pct, req.late_users_ratio_pct)
         self.step_c()
-        _, merges  = self.step_d(ts)
-        _, pauses  = self.step_e()
+        _, merges = self.step_d(ts, rdr_pct)
+        _, pauses = self.step_e()
 
-        active_n = sum(1 for p in self._pools.values()
-                       if not p.dissolved and not p.paused)
+        active_n = sum(1 for p in self._pools.values() if not p.dissolved and not p.paused)
         self.logs.append({
             "week":           cycle,
             "active_pools":   active_n,
             "waitlist_count": len(self._wl),
             "pauses":         pauses,
             "merges":         merges,
+            "momentum_value": round(momentum, 3),
+            "rdr_value":      round(rdr_pct,  1),
+            "scenario":       scenario,
+            "phase":          phase,
+            "burn_rate":      burn_rate,
+            "velocity":       round(velocity, 2),
         })
 
     # ── Response helpers ──────────────────────────────────────────────────────
 
     def summary(self) -> dict:
         """
-        final_virtual_liquidity_float = (total initial deposits
-                                         + total weekly installments
-                                         + total late fees)
-                                         − total winner payouts
+        Full God Mode simulation summary.
+
+        Backward-compatible: the original 8 top-level keys are preserved so
+        existing frontend code continues to work without changes.
+
+        New sections added:
+          financial_metrics   — detailed INR cash-flow breakdown
+          level_wise_metrics  — per-level winner / collected / distributed data
+          system_health       — assignment-method counters for journey analysis
 
         _dep accumulates BOTH initial join deposits (step_a) AND weekly
-        installments from all active pool members (step_c).  This ensures the
-        float stays positive — payouts are funded by ongoing installment revenue.
+        installments from all active pool members (step_c).  The liquidity
+        float stays positive because ongoing installment revenue funds payouts.
         """
+        # ── Core financial figures ─────────────────────────────────────────────
+        total_collected  = float(self._dep)
+        total_distributed = float(self._pay)
+        late_fees        = float(self._late)
+        net_profit       = float(self._dep + self._late - self._pay)
+
+        # Maintenance fee = gross − net for each payout issued, summed by level
+        maintenance_fees = float(sum(
+            self.level_wise_winners.get(l, 0) * (
+                Decimal(str(LEVEL_PAYOUTS[l][0])) - Decimal(str(LEVEL_PAYOUTS[l][1]))
+            )
+            for l in range(1, 7)
+            if LEVEL_PAYOUTS.get(l)
+        ))
+
+        # Projected ultimate liability: every active pool member wins at the
+        # maximum level (L6).  This is the worst-case future obligation.
+        _l6_net = Decimal(str(LEVEL_PAYOUTS.get(6, (0, 80000))[1]))
+        _active_in_pools = sum(
+            1 for u in self._users.values() if u.alive and u.pool_sid is not None
+        )
+        projected_ultimate_liability = float(_l6_net * _active_in_pools)
+
+        # ── Level-wise breakdown (L1 – L6) ────────────────────────────────────
+        level_wise_metrics: dict = {}
+        for l in range(1, 7):
+            w_count    = self.level_wise_winners.get(l, 0)
+            collected  = float(self.level_wise_deposits.get(l, Decimal("0")))
+            distributed = float(self.level_wise_payouts.get(l, Decimal("0")))
+            avg_payout  = (distributed / w_count) if w_count else 0.0
+            roi_pct     = (
+                ((distributed - collected) / collected * 100.0)
+                if collected else 0.0
+            )
+            level_wise_metrics[f"L{l}"] = {
+                "winners_count":             w_count,
+                "total_collected_from_them": round(collected,  2),
+                "total_distributed_to_them": round(distributed, 2),
+                "avg_payout":                round(avg_payout, 2),
+                "level_roi_pct":             round(roi_pct,    2),
+            }
+
+        # ── System health counters ─────────────────────────────────────────────
+        system_health = {
+            "total_members_injected":        self.n_created,
+            "total_direct_pool_assignments": self.direct_assignments,
+            "total_dynamic_merges":          self.n_condensed,
+            "total_draw_pauses_triggered":   self.n_paused,
+        }
+
         return {
+            # ── Backward-compatible original 8 keys ───────────────────────────
             "total_cycles_run":              len(self.logs),
             "total_simulated_users_created": self.n_created,
             "total_winners_drawn":           self.n_winners,
             "total_pools_auto_scaled":       self.n_scaled,
             "total_condensation_events":     self.n_condensed,
             "total_draw_pauses_triggered":   self.n_paused,
-            "total_late_fees_collected_inr": float(self._late),
-            "final_virtual_liquidity_float": float(
-                self._dep + self._late - self._pay
-            ),
+            "total_late_fees_collected_inr": late_fees,
+            "final_virtual_liquidity_float": net_profit,
+            # ── God Mode extended sections ────────────────────────────────────
+            "financial_metrics": {
+                "total_collected_inr":            total_collected,
+                "total_distributed_inr":          total_distributed,
+                "total_maintenance_fees_inr":     maintenance_fees,
+                "total_late_fees_inr":            late_fees,
+                "net_organizer_profit_inr":       net_profit,
+                "master_liquidity_float_inr":     net_profit,
+                "projected_ultimate_liability":   projected_ultimate_liability,
+            },
+            "level_wise_metrics": level_wise_metrics,
+            "system_health":      system_health,
         }
 
 
@@ -1374,6 +1521,804 @@ def advanced_simulation(
             "cycle_logs":         engine.logs,
         }
 
+    except Exception:
+        # Roll back any uncommitted inserts before the finally-block cleanup
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
+
     finally:
         # GUARANTEED cleanup — executes even on unhandled exceptions / timeouts
         _sim_cleanup(db, upfx)
+
+
+# =============================================================================
+# DEV ANALYTICS ENDPOINTS — God Mode production mirror
+# =============================================================================
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dev/live-stats
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/live-stats")
+def dev_live_stats(db: Session = Depends(get_db)):
+    """
+    Combined real-time statistics snapshot — mirrors all production dashboards
+    in a single API call for the Developer Mode Live Stats panel.
+
+    Returns: user counts, pool counts, payment status, level distribution,
+    SDE/LPI state, financial snapshot, draw history summary, AI scenario.
+    """
+    from datetime import timedelta
+    from app.models.draw_history import DrawHistory
+
+    now        = datetime.now(timezone.utc)
+    week_start = now - timedelta(days=(now.weekday() + 1) % 7)
+
+    # ── User counts ───────────────────────────────────────────────────────────
+    active_count   = db.query(func.count(User.id)).filter(User.status == UserStatus.Active).scalar()   or 0
+    waitlist_count = db.query(func.count(User.id)).filter(User.status == UserStatus.Waitlist).scalar() or 0
+    won_count      = db.query(func.count(User.id)).filter(User.status == "Eliminated_Won").scalar()    or 0
+    unpaid_count   = db.query(func.count(User.id)).filter(User.status == "Eliminated_Unpaid").scalar() or 0
+
+    # ── Pool counts ───────────────────────────────────────────────────────────
+    active_pools  = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Active).scalar()                      or 0
+    paused_pools  = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Paused_Awaiting_Members).scalar()     or 0
+    waiting_pools = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Waiting).scalar()                     or 0
+    total_pools   = db.query(func.count(Pool.id)).scalar() or 0
+
+    # ── Payment status (active members only) ──────────────────────────────────
+    paid_active   = db.query(func.count(User.id)).filter(
+        User.status == UserStatus.Active,
+        User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+    ).scalar() or 0
+    unpaid_active = active_count - paid_active
+
+    # ── Level distribution ────────────────────────────────────────────────────
+    level_dist: dict[str, int] = {}
+    for lvl in range(1, 7):
+        cnt = db.query(func.count(User.id)).filter(
+            User.status        == UserStatus.Active,
+            User.current_level == lvl,
+        ).scalar() or 0
+        level_dist[f"L{lvl}"] = cnt
+
+    # ── SDE state ─────────────────────────────────────────────────────────────
+    sde_flagged = db.query(func.count(User.id)).filter(
+        User.sde_required == True,    # noqa: E712
+        User.status       == UserStatus.Active,
+    ).scalar() or 0
+
+    lpi = 0.0
+    try:
+        from app.services.brain5_lpi_engine import calculate_lpi
+        lpi = calculate_lpi(db)
+    except Exception:
+        pass
+
+    # ── Financial snapshot ────────────────────────────────────────────────────
+    total_dep = db.query(func.sum(Token.value_inr)).filter(
+        Token.type   == TokenType.Deposit,
+        Token.status == TokenStatus.Burned,
+    ).scalar() or Decimal("0")
+
+    total_wit = db.query(func.sum(Token.value_inr)).filter(
+        Token.type   == TokenType.Withdraw,
+        Token.status == TokenStatus.Burned,
+    ).scalar() or Decimal("0")
+
+    total_ref_paid = db.query(func.sum(Token.value_inr)).filter(
+        Token.type   == TokenType.Referral,
+        Token.status == TokenStatus.Burned,
+    ).scalar() or Decimal("0")
+
+    # ── Draw history summary ──────────────────────────────────────────────────
+    total_draws    = db.query(func.count(DrawHistory.id)).scalar() or 0
+    draws_this_wk  = db.query(func.count(DrawHistory.id)).filter(
+        DrawHistory.draw_timestamp >= week_start,
+    ).scalar() or 0
+
+    # ── Recent draws (last 6) ─────────────────────────────────────────────────
+    recent_draws_raw = (
+        db.query(DrawHistory)
+        .order_by(DrawHistory.draw_timestamp.desc())
+        .limit(6)
+        .all()
+    )
+    recent_draws = []
+    for dh in recent_draws_raw:
+        recent_draws.append({
+            "id":             dh.id,
+            "pool_id":        dh.pool_id,
+            "draw_type":      dh.draw_type or "regular",
+            "w1_level":       dh.winner_1_level,
+            "w1_payout":      float(dh.winner_1_net_payout or 0),
+            "w2_level":       dh.winner_2_level,
+            "w2_payout":      float(dh.winner_2_net_payout or 0),
+            "timestamp":      dh.draw_timestamp.isoformat() if dh.draw_timestamp else None,
+            "sde":            bool(dh.targeted_early_exit),
+        })
+
+    # ── AI snapshot ───────────────────────────────────────────────────────────
+    scenario = "NEUTRAL"
+    velocity = 0.0
+    try:
+        from app.services.ai_quant_engine import get_system_snapshot
+        snap     = get_system_snapshot(db)
+        scenario = snap.get("scenario", "NEUTRAL")
+        velocity = float(snap.get("velocity", 0.0))
+    except Exception:
+        pass
+
+    return {
+        "users": {
+            "active":   active_count,
+            "waitlist": waitlist_count,
+            "won":      won_count,
+            "unpaid":   unpaid_count,
+            "total":    active_count + waitlist_count + won_count + unpaid_count,
+        },
+        "pools": {
+            "active":  active_pools,
+            "paused":  paused_pools,
+            "waiting": waiting_pools,
+            "total":   total_pools,
+        },
+        "payments": {
+            "paid_in_pools":   paid_active,
+            "unpaid_in_pools": unpaid_active,
+            "paid_pct":        round(paid_active / active_count * 100, 1) if active_count else 0.0,
+        },
+        "levels":  level_dist,
+        "sde": {
+            "l4_flagged": sde_flagged,
+            "lpi":        round(lpi, 2),
+        },
+        "financials": {
+            "total_collected_inr":   float(total_dep),
+            "total_paid_out_inr":    float(total_wit + total_ref_paid),
+            "net_float_inr":         float(total_dep - total_wit - total_ref_paid),
+        },
+        "draws": {
+            "total":     total_draws,
+            "this_week": draws_this_wk,
+            "recent":    recent_draws,
+        },
+        "ai": {
+            "scenario": scenario,
+            "velocity": round(velocity, 2),
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dev/level-map
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/level-map")
+def dev_level_map(db: Session = Depends(get_db)):
+    """
+    Visual distribution of all active members by level across all pools.
+
+    Returns each pool with its members broken down by level — feeds the
+    Developer Mode Level Map visualizer and the L1/L2/L3 member viewer.
+    """
+    pools = (
+        db.query(Pool)
+        .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
+        .order_by(Pool.id.asc())
+        .all()
+    )
+
+    result_pools = []
+    global_by_level: dict[int, int] = {l: 0 for l in range(1, 7)}
+
+    for pool in pools:
+        members = (
+            db.query(User)
+            .filter(
+                User.current_pool_id == pool.id,
+                User.status          == UserStatus.Active,
+            )
+            .order_by(User.current_level.asc(), User.join_date.asc())
+            .all()
+        )
+
+        by_level: dict[str, list] = {f"L{l}": [] for l in range(1, 7)}
+        level_counts: dict[str, int] = {f"L{l}": 0 for l in range(1, 7)}
+
+        for m in members:
+            lvl = m.current_level
+            key = f"L{lvl}"
+            by_level[key].append({
+                "id":           m.id,
+                "username":     m.username,
+                "name":         m.name or "",
+                "paid":         m.weekly_payment_status == WeeklyPaymentStatus.Paid,
+                "sde_required": bool(m.sde_required),
+                "join_date":    m.join_date.isoformat() if m.join_date else None,
+            })
+            level_counts[key] = level_counts[key] + 1
+            global_by_level[lvl] = global_by_level.get(lvl, 0) + 1
+
+        result_pools.append({
+            "id":               pool.id,
+            "name":             pool.name,
+            "status":           pool.status.value,
+            "member_count":     len(members),
+            "draw_completed":   bool(pool.draw_completed_this_week),
+            "pool_draw_type":   pool.pool_draw_type or "regular",
+            "contains_l4":      bool(pool.contains_flagged_l4),
+            "members_by_level": by_level,
+            "level_counts":     level_counts,
+        })
+
+    return {
+        "pools":   result_pools,
+        "summary": {
+            "total_active_members": sum(global_by_level.values()),
+            "by_level": {f"L{l}": global_by_level[l] for l in range(1, 7)},
+            "pool_count": len(result_pools),
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dev/winners-analytics
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/winners-analytics")
+def dev_winners_analytics(db: Session = Depends(get_db)):
+    """
+    Level-wise winner analysis with amounts and temporal distribution.
+
+    Returns aggregate stats from draw_history for the Winners tab.
+    """
+    from app.models.draw_history import DrawHistory
+
+    all_draws = db.query(DrawHistory).order_by(DrawHistory.draw_timestamp.desc()).all()
+
+    # ── Level-wise aggregation ─────────────────────────────────────────────────
+    by_level: dict[int, dict] = {
+        l: {"winners": 0, "total_payout_inr": 0.0, "sde_winners": 0}
+        for l in range(1, 7)
+    }
+    total_winners   = 0
+    total_payout    = 0.0
+    sde_total       = 0
+
+    # Recent winners with full detail (last 20)
+    recent: list[dict] = []
+
+    for dh in all_draws:
+        is_sde = bool(dh.targeted_early_exit)
+        for slot in (1, 2):
+            lvl  = (dh.winner_1_level if slot == 1 else dh.winner_2_level) or 1
+            pay  = float(dh.winner_1_net_payout if slot == 1 else dh.winner_2_net_payout or 0)
+            uid  = dh.winner_1_user_id if slot == 1 else dh.winner_2_user_id
+
+            if 1 <= lvl <= 6:
+                by_level[lvl]["winners"]       += 1
+                by_level[lvl]["total_payout_inr"] += pay
+                if is_sde:
+                    by_level[lvl]["sde_winners"] += 1
+                    sde_total += 1
+
+            total_winners += 1
+            total_payout  += pay
+
+            if len(recent) < 20:
+                user = db.query(User).filter(User.id == uid).first() if uid else None
+                recent.append({
+                    "draw_id":    dh.id,
+                    "pool_id":    dh.pool_id,
+                    "draw_type":  dh.draw_type or "regular",
+                    "sde":        is_sde,
+                    "level":      lvl,
+                    "payout_inr": pay,
+                    "username":   user.username if user else None,
+                    "timestamp":  dh.draw_timestamp.isoformat() if dh.draw_timestamp else None,
+                })
+
+    # ── Compute averages ──────────────────────────────────────────────────────
+    level_stats = []
+    for l in range(1, 7):
+        d   = by_level[l]
+        w   = d["winners"]
+        pay = d["total_payout_inr"]
+        level_stats.append({
+            "level":            l,
+            "winners":          w,
+            "total_payout_inr": round(pay, 2),
+            "avg_payout_inr":   round(pay / w, 2) if w else 0.0,
+            "sde_winners":      d["sde_winners"],
+            "sde_pct":          round(d["sde_winners"] / w * 100, 1) if w else 0.0,
+            "pct_of_total":     round(w / total_winners * 100, 1) if total_winners else 0.0,
+        })
+
+    return {
+        "summary": {
+            "total_winners":   total_winners,
+            "total_payout_inr": round(total_payout, 2),
+            "avg_payout_inr":  round(total_payout / total_winners, 2) if total_winners else 0.0,
+            "total_draws":     len(all_draws),
+            "sde_exits":       sde_total,
+        },
+        "by_level":      level_stats,
+        "recent_winners": recent,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dev/projection
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/projection")
+def dev_projection(db: Session = Depends(get_db)):
+    """
+    Next draw projection engine.
+
+    For each eligible full pool (12 members), projects:
+      • Draw type based on current pool_draw_type assignment
+      • Expected upper/lower winner levels and payouts
+      • Projected collection vs payout vs profit
+      • Post-draw level advancement analysis (who will reach L4 next)
+
+    Also projects waitlist → pool formation events.
+    """
+    from app.core.config import (
+        POOL_CAPACITY, LEVEL_PAYOUTS, PAYOUT_FEE_INR,
+        EXEC_LEVEL_LOW, EXEC_LEVEL_HIGH,
+        LEVEL_LOW, LEVEL_HIGH,
+        TYPE_B_LEVEL_LOW, TYPE_B_LEVEL_HIGH,
+        POOL_DRAW_TYPE_A, POOL_DRAW_REGULAR, POOL_DRAW_TYPE_B,
+    )
+
+    # ── Eligible full pools ───────────────────────────────────────────────────
+    candidate_pools = (
+        db.query(Pool)
+        .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
+        .order_by(Pool.id.asc())
+        .all()
+    )
+
+    pool_projections = []
+    total_collection = 0
+    total_payout     = 0
+    total_fee_income = 0
+    eligible_count   = 0
+
+    for pool in candidate_pools:
+        actual = (
+            db.query(func.count(User.id))
+            .filter(User.current_pool_id == pool.id, User.status == UserStatus.Active)
+            .scalar() or 0
+        )
+        if actual != POOL_CAPACITY:
+            continue
+
+        eligible_count += 1
+        draw_type = pool.pool_draw_type or POOL_DRAW_REGULAR
+
+        # Determine tier bounds
+        if draw_type == POOL_DRAW_TYPE_A:
+            lo_bounds, hi_bounds = EXEC_LEVEL_LOW,    EXEC_LEVEL_HIGH
+        elif draw_type == POOL_DRAW_TYPE_B:
+            lo_bounds, hi_bounds = TYPE_B_LEVEL_LOW,  TYPE_B_LEVEL_HIGH
+        else:
+            lo_bounds, hi_bounds = LEVEL_LOW,          LEVEL_HIGH
+
+        members = (
+            db.query(User)
+            .filter(User.current_pool_id == pool.id, User.status == UserStatus.Active)
+            .all()
+        )
+
+        lower_tier = [m for m in members if lo_bounds[0] <= m.current_level <= lo_bounds[1]]
+        upper_tier = [m for m in members if hi_bounds[0] <= m.current_level <= hi_bounds[1]]
+
+        # Projected winner: highest level in each tier (worst-case payout)
+        if upper_tier:
+            proj_upper_lvl = max(m.current_level for m in upper_tier)
+        else:
+            proj_upper_lvl = max(m.current_level for m in members) if members else 1
+
+        if lower_tier:
+            proj_lower_lvl = min(m.current_level for m in lower_tier)
+        else:
+            proj_lower_lvl = 1
+
+        upper_gross, upper_net = LEVEL_PAYOUTS.get(proj_upper_lvl, (2500, 2000))
+        lower_gross, lower_net = LEVEL_PAYOUTS.get(proj_lower_lvl, (2500, 2000))
+
+        pool_collection = POOL_CAPACITY * 1000
+        pool_payout     = upper_net + lower_net
+        pool_fee        = PAYOUT_FEE_INR * 2   # ₹500 per winner × 2
+        pool_profit     = pool_collection - pool_payout
+
+        total_collection += pool_collection
+        total_payout     += pool_payout
+        total_fee_income += pool_fee
+
+        # Post-draw level advancement: survivors get +1 level
+        # Who will reach L4 next?
+        surviving = [m for m in members]   # conservative — don't know who wins
+        new_l4_after = sum(
+            1 for m in surviving
+            if m.current_level == 3   # they'll advance to L4 after surviving the draw
+        )
+
+        level_counts = {}
+        for l in range(1, 7):
+            cnt = sum(1 for m in members if m.current_level == l)
+            if cnt:
+                level_counts[f"L{l}"] = cnt
+
+        pool_projections.append({
+            "pool_id":            pool.id,
+            "pool_name":          pool.name,
+            "member_count":       actual,
+            "draw_type":          draw_type,
+            "lower_tier_count":   len(lower_tier),
+            "upper_tier_count":   len(upper_tier),
+            "proj_lower_level":   proj_lower_lvl,
+            "proj_upper_level":   proj_upper_lvl,
+            "proj_lower_payout":  lower_net,
+            "proj_upper_payout":  upper_net,
+            "proj_total_payout":  pool_payout,
+            "proj_collection":    pool_collection,
+            "proj_profit":        pool_profit,
+            "fee_income":         pool_fee,
+            "new_l4_after_draw":  new_l4_after,
+            "level_distribution": level_counts,
+        })
+
+    # ── Waitlist projection ───────────────────────────────────────────────────
+    wl_count   = db.query(func.count(User.id)).filter(User.status == UserStatus.Waitlist).scalar() or 0
+    threshold  = get_pool_threshold(db)
+    can_form   = wl_count // threshold
+    wl_remain  = wl_count - can_form * threshold
+
+    # ── Post-draw LPI estimate ─────────────────────────────────────────────────
+    current_active = db.query(func.count(User.id)).filter(User.status == UserStatus.Active).scalar() or 1
+    current_l4     = db.query(func.count(User.id)).filter(User.status == UserStatus.Active, User.current_level == 4).scalar() or 0
+    current_l3     = db.query(func.count(User.id)).filter(User.status == UserStatus.Active, User.current_level == 3).scalar() or 0
+
+    # After draw: 2 × eligible_count winners exit; current_l3 members advance → some become L4
+    total_new_l4 = sum(p["new_l4_after_draw"] for p in pool_projections)
+    post_draw_l4 = max(0, current_l4 - eligible_count * 0.5 + total_new_l4)   # rough estimate
+    post_draw_active = max(1, current_active - eligible_count)
+    post_draw_lpi = round((post_draw_l4 / post_draw_active) * 100, 2)
+
+    return {
+        "eligible_pools":   eligible_count,
+        "ineligible_pools": len(candidate_pools) - eligible_count,
+        "pool_projections": pool_projections,
+        "totals": {
+            "projected_collection_inr": total_collection,
+            "projected_payout_inr":     total_payout,
+            "projected_profit_inr":     total_collection - total_payout,
+            "fee_income_inr":           total_fee_income,
+            "total_new_l4_members":     total_new_l4,
+        },
+        "post_draw_lpi": {
+            "estimated_lpi":        post_draw_lpi,
+            "current_lpi":          round((current_l4 / current_active) * 100, 2) if current_active else 0.0,
+            "total_new_l4_after":   total_new_l4,
+            "current_l4":           current_l4,
+        },
+        "waitlist_projection": {
+            "current_waitlist":   wl_count,
+            "threshold":          threshold,
+            "pools_can_form":     can_form,
+            "waitlist_remaining": wl_remain,
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /dev/inject-timed
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TimedInjectRequest(BaseModel):
+    count:              int   = Field(..., ge=1, le=100_000, description="Number of users to create.")
+    base_date_iso:      str | None = Field(None, description="ISO datetime to use as injection anchor.  Null = now.")
+    spread_days:        int   = Field(7,   ge=0, le=365,    description="Spread injection across the last N days.  0 = all at base_date.")
+    randomize_dates:    bool  = Field(True,                  description="Randomise individual join_dates within the spread window.")
+    daily_count:        int | None = Field(None, ge=1,       description="If set, inject this many users per day over spread_days.")
+    auto_pool:          bool  = Field(True,                  description="Auto-trigger pool formation after creation.")
+
+
+@router.post("/inject-timed")
+def dev_inject_timed(body: TimedInjectRequest, db: Session = Depends(get_db)):
+    """
+    Inject users with fully-customizable date/time distribution.
+
+    Supports three modes:
+      • Single burst: all users at base_date (spread_days=0)
+      • Random spread: each user gets a random date within the last N days
+      • Daily cadence: daily_count users per day for spread_days days
+
+    This lets you simulate realistic historical member growth with accurate
+    temporal spacing so FIFO ordering is meaningful.
+    """
+    import time as _time
+
+    t0       = time.perf_counter()
+    ts_epoch = int(_time.time())
+    nonce    = random.randint(100_000, 999_999)
+    prefix   = f"dev_timed_{ts_epoch}_{nonce}_"
+    count    = body.count
+
+    # ── Resolve anchor datetime ───────────────────────────────────────────────
+    if body.base_date_iso:
+        try:
+            anchor = datetime.fromisoformat(body.base_date_iso.replace("Z", "+00:00"))
+            if anchor.tzinfo is None:
+                anchor = anchor.replace(tzinfo=timezone.utc)
+        except ValueError:
+            anchor = datetime.now(timezone.utc)
+    else:
+        anchor = datetime.now(timezone.utc)
+
+    # ── Build join_date list ──────────────────────────────────────────────────
+    join_dates: list[datetime] = []
+
+    if body.spread_days == 0:
+        # All users at the anchor datetime, sequential minutes apart
+        for i in range(count):
+            join_dates.append(anchor + timedelta(minutes=i))
+
+    elif body.daily_count and body.spread_days > 0:
+        # Daily cadence: daily_count per day for spread_days days
+        for day in range(body.spread_days):
+            day_base = anchor - timedelta(days=(body.spread_days - 1 - day))
+            for j in range(body.daily_count):
+                if len(join_dates) >= count:
+                    break
+                minute_offset = random.randint(0, 1439) if body.randomize_dates else j
+                join_dates.append(day_base + timedelta(minutes=minute_offset))
+            if len(join_dates) >= count:
+                break
+        # Pad to count if daily_count * spread_days < count
+        while len(join_dates) < count:
+            join_dates.append(anchor - timedelta(minutes=random.randint(0, body.spread_days * 1440)))
+
+    elif body.randomize_dates:
+        # Random scatter within the spread window
+        spread_minutes = body.spread_days * 24 * 60
+        for i in range(count):
+            offset = random.randint(0, max(1, spread_minutes))
+            join_dates.append(anchor - timedelta(minutes=offset) + timedelta(seconds=i))
+
+    else:
+        # Linear spread: evenly spaced across the window
+        if count == 1 or body.spread_days == 0:
+            join_dates = [anchor + timedelta(minutes=i) for i in range(count)]
+        else:
+            interval = (body.spread_days * 24 * 60) / (count - 1)
+            for i in range(count):
+                join_dates.append(anchor - timedelta(minutes=interval * (count - 1 - i)))
+
+    join_dates = sorted(join_dates)[:count]   # FIFO order guaranteed
+
+    # ── Build user rows ───────────────────────────────────────────────────────
+    hashed_pw = _get_dev_pw_hash()
+
+    _ref_set: set[str] = set()
+    while len(_ref_set) < count:
+        _ref_set.update(
+            "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+            for _ in range(count - len(_ref_set))
+        )
+    _ref_list = list(_ref_set)
+
+    user_rows = [
+        {
+            "name":                  f"TimedUser-{i + 1}",
+            "mobile":                f"+99{ts_epoch % 10_000_000_000:010d}{nonce:06d}{i:05d}",
+            "username":              f"{prefix}{secrets.token_hex(6)}",
+            "hashed_password":       hashed_pw,
+            "join_date":             join_dates[i],
+            "status":                UserStatus.Waitlist,
+            "weekly_payment_status": WeeklyPaymentStatus.Paid,
+            "current_level":         1,
+            "referral_code":         _ref_list[i],
+        }
+        for i in range(count)
+    ]
+
+    for start in range(0, count, _BULK_BATCH):
+        db.execute(sa_insert(User), user_rows[start:start + _BULK_BATCH])
+    db.flush()
+
+    # ── Create DEP tokens ─────────────────────────────────────────────────────
+    user_ids = [
+        r[0] for r in db.execute(
+            text("SELECT id FROM users WHERE username LIKE :p ORDER BY join_date"),
+            {"p": f"{prefix}%"},
+        ).fetchall()
+    ]
+
+    codes: set[str] = set()
+    while len(codes) < len(user_ids):
+        codes.update(f"DEP-{secrets.token_hex(4).upper()}" for _ in range(len(user_ids) - len(codes)))
+    code_list = list(codes)
+
+    token_rows = [
+        {
+            "code":                code_list[i],
+            "type":                TokenType.Deposit,
+            "value_inr":           _DEPOSIT_DEC,
+            "status":              TokenStatus.Burned,
+            "user_id":             user_ids[i],
+            "redeemed_by_user_id": user_ids[i],
+        }
+        for i in range(len(user_ids))
+    ]
+    for start in range(0, len(token_rows), _BULK_BATCH):
+        db.execute(sa_insert(Token), token_rows[start:start + _BULK_BATCH])
+    db.commit()
+
+    # ── Auto-pool formation ───────────────────────────────────────────────────
+    pools_formed = 0
+    if body.auto_pool:
+        fill_pool_vacancies(db)
+        while True:
+            new_pool = manual_create_pool(db)
+            if not new_pool:
+                break
+            pools_formed += 1
+
+    wl_remaining = db.query(func.count(User.id)).filter(User.status == UserStatus.Waitlist).scalar() or 0
+    elapsed_ms   = int((time.perf_counter() - t0) * 1000)
+
+    # Date range summary
+    date_from = join_dates[0].isoformat() if join_dates else None
+    date_to   = join_dates[-1].isoformat() if join_dates else None
+
+    return {
+        "users_created":    len(user_ids),
+        "dep_tokens_created": len(user_ids),
+        "pools_formed":     pools_formed,
+        "waitlist_remaining": wl_remaining,
+        "elapsed_ms":       elapsed_ms,
+        "date_from":        date_from,
+        "date_to":          date_to,
+        "spread_days":      body.spread_days,
+        "randomized":       body.randomize_dates,
+        "daily_cadence":    body.daily_count,
+        "prefix":           prefix,
+        "note": (
+            f"{len(user_ids)} timed users created — "
+            f"join dates from {date_from} to {date_to}.  "
+            f"{pools_formed} pool(s) formed.  {wl_remaining} on waitlist."
+        ),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /dev/mark-all-paid
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/mark-all-paid")
+def dev_mark_all_paid(db: Session = Depends(get_db)):
+    """
+    Master paid toggle — marks ALL active pool members as Paid.
+    Used to instantly clear unpaid state before running a draw.
+    Returns count of members whose status was changed.
+    """
+    result = (
+        db.query(User)
+        .filter(
+            User.status               == UserStatus.Active,
+            User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
+        )
+        .update(
+            {"weekly_payment_status": WeeklyPaymentStatus.Paid},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+
+    total_active = db.query(func.count(User.id)).filter(User.status == UserStatus.Active).scalar() or 0
+
+    return {
+        "marked_paid":    result,
+        "total_active":   total_active,
+        "all_paid_now":   True,
+        "message":        f"Marked {result} member(s) as Paid. All {total_active} active members are now Paid.",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /dev/set-payment-scenario
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PaymentScenarioRequest(BaseModel):
+    paid_pct:            float = Field(100.0, ge=0.0, le=100.0,
+                                       description="% of active pool members to mark Paid (rest become Unpaid).")
+    apply_late_fee:      bool  = Field(False,
+                                       description="If True, create Burned Late Fee tokens for unpaid members.")
+    late_fee_inr:        float = Field(50.0, ge=0.0,
+                                       description="Late fee amount in INR per unpaid member.")
+    eliminate_unpaid_pct: float = Field(0.0, ge=0.0, le=100.0,
+                                        description="% of unpaid members to eliminate (Eliminated_Unpaid status).")
+
+
+@router.post("/set-payment-scenario")
+def dev_set_payment_scenario(body: PaymentScenarioRequest, db: Session = Depends(get_db)):
+    """
+    Configurable payment scenario for testing.
+
+    Sets the payment distribution across all active pool members:
+      • paid_pct = 80 → 80% of members marked Paid, 20% Unpaid
+      • apply_late_fee = True → creates Late Fee tokens for unpaid members
+      • eliminate_unpaid_pct = 50 → eliminates 50% of unpaid members
+
+    Returns counts of affected members in each category.
+    """
+    all_active: list[User] = (
+        db.query(User)
+        .filter(User.status == UserStatus.Active)
+        .all()
+    )
+
+    if not all_active:
+        return {"marked_paid": 0, "marked_unpaid": 0, "eliminated": 0, "late_fees_created": 0}
+
+    total  = len(all_active)
+    random.shuffle(all_active)
+    n_paid = int(total * body.paid_pct / 100.0)
+
+    paid_members   = all_active[:n_paid]
+    unpaid_members = all_active[n_paid:]
+
+    for m in paid_members:
+        m.weekly_payment_status = WeeklyPaymentStatus.Paid
+    for m in unpaid_members:
+        m.weekly_payment_status = WeeklyPaymentStatus.Unpaid
+
+    db.flush()
+
+    # ── Late fees ─────────────────────────────────────────────────────────────
+    late_tokens = 0
+    if body.apply_late_fee and unpaid_members and body.late_fee_inr > 0:
+        fee_dec = Decimal(str(body.late_fee_inr))
+        for m in unpaid_members:
+            code = "LF-" + secrets.token_hex(4).upper()
+            db.add(Token(
+                code       = code,
+                type       = TokenType.Withdraw,     # treated as outflow
+                value_inr  = fee_dec,
+                status     = TokenStatus.Burned,
+                user_id    = m.id,
+            ))
+            late_tokens += 1
+
+    # ── Elimination ───────────────────────────────────────────────────────────
+    eliminated = 0
+    if body.eliminate_unpaid_pct > 0 and unpaid_members:
+        n_elim = max(1, int(len(unpaid_members) * body.eliminate_unpaid_pct / 100.0))
+        for m in unpaid_members[:n_elim]:
+            m.status          = "Eliminated_Unpaid"
+            m.current_pool_id = None
+            eliminated       += 1
+
+    db.commit()
+
+    return {
+        "total_active":     total,
+        "marked_paid":      len(paid_members),
+        "marked_unpaid":    len(unpaid_members),
+        "eliminated":       eliminated,
+        "late_fees_created": late_tokens,
+        "paid_pct_actual":  round(len(paid_members) / total * 100, 1),
+        "message": (
+            f"Scenario applied: {len(paid_members)} Paid, {len(unpaid_members)} Unpaid "
+            f"({eliminated} eliminated, {late_tokens} late-fee tokens)."
+        ),
+    }

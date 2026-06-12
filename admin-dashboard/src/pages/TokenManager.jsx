@@ -366,8 +366,16 @@ export default function TokenManager() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-50">
-                {tokens.map(t => (
-                  <tr key={t.id} className={`transition-colors group hover:brightness-95 ${
+                <AnimatePresence initial={false}>
+                {tokens.map((t, _ti) => (
+                  <motion.tr
+                    key={t.id}
+                    layout
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, height: 0, overflow: 'hidden' }}
+                    transition={{ duration: 0.18, ease: [0.25, 1, 0.5, 1], delay: Math.min(_ti * 0.02, 0.2) }}
+                    className={`group hover:brightness-95 ${
                     t.status === 'Burned'           ? 'bg-emerald-50/40' :
                     t.status === 'Active'           ? 'bg-blue-50/30'    :
                     t.status === 'Rejected'         ? 'bg-red-50/30'     :
@@ -443,8 +451,9 @@ export default function TokenManager() {
                         Delete
                       </button>
                     </td>
-                  </tr>
+                  </motion.tr>
                 ))}
+                </AnimatePresence>
               </tbody>
             </table>
           </div>

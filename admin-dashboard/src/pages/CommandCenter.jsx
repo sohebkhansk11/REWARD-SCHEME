@@ -97,13 +97,16 @@ function LpiThermometer({ lpi = 0 }) {
         <rect x="27" y={tubeTop} width="16" height={tubeH}
               rx="8" fill="none" stroke="#1e293b" strokeWidth="1.5"/>
 
-        {/* Fill bar */}
-        <rect
-          x="29.5" y={fillY} width="11" height={Math.max(fillH, 2)}
+        {/* Fill bar — framer-motion spring animation on LPI change */}
+        <motion.rect
+          x="29.5"
+          width="11"
           rx={fillH > 12 ? 5 : 2}
           fill={color}
-          style={{ filter: glow, transition: 'y 0.9s ease, height 0.9s ease' }}
-          className={lpi >= 50 ? 'animate-pulse' : lpi >= 25 ? '' : ''}
+          style={{ filter: glow }}
+          animate={{ y: fillY, height: Math.max(fillH, 2), fill: color }}
+          transition={{ type: 'spring', stiffness: 60, damping: 18, mass: 1.2 }}
+          className={lpi >= 50 ? 'animate-pulse' : ''}
         />
 
         {/* Bulb */}
@@ -489,10 +492,19 @@ function AntiMaturityGrid({ users = [] }) {
               </td>
             </tr>
           )}
+          <AnimatePresence initial={false}>
           {rows.map((u, i) => {
             const isTarget = u.current_level === 4
             return (
-              <tr key={u.id ?? i} className={`border-b border-slate-800/50 ${isTarget ? 'bg-red-950/15' : ''}`}>
+              <motion.tr
+                key={u.id ?? i}
+                layout
+                initial={{ opacity: 0, x: -12 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 12, height: 0 }}
+                transition={{ duration: 0.22, ease: [0.25, 1, 0.5, 1] }}
+                className={`border-b border-slate-800/50 ${isTarget ? 'bg-red-950/15' : ''}`}
+              >
                 <td className="px-3 py-2.5">
                   <span className={`font-medium text-xs ${isTarget ? 'text-white' : 'text-slate-300'}`}>
                     @{u.username ?? u.user_username ?? '—'}
@@ -515,9 +527,13 @@ function AntiMaturityGrid({ users = [] }) {
                 </td>
                 <td className="px-3 py-2.5 text-center">
                   {isTarget ? (
-                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-black bg-rose-950/60 text-rose-300 border border-rose-800/50">
+                    <motion.span
+                      animate={{ opacity: [1, 0.5, 1] }}
+                      transition={{ duration: 1.6, repeat: Infinity }}
+                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-black bg-rose-950/60 text-rose-300 border border-rose-800/50"
+                    >
                       <Crosshair className="w-2.5 h-2.5"/>TARGET LOCKED
-                    </span>
+                    </motion.span>
                   ) : (
                     <span className="text-[10px] text-amber-500/70">Candidate</span>
                   )}
@@ -527,9 +543,10 @@ function AntiMaturityGrid({ users = [] }) {
                     {isTarget ? 'Next Sunday' : '~1–2 draws'}
                   </span>
                 </td>
-              </tr>
+              </motion.tr>
             )
           })}
+          </AnimatePresence>
         </tbody>
       </table>
 

@@ -1493,16 +1493,24 @@ class _AdvSimEngine:
 
     def step_e(self) -> tuple[int, int]:
         """
-        Architecture-accurate draw router — mirrors Brain 5 production logic.
+        Architecture-accurate draw router — mirrors ALL Brain 5 production logic.
 
-        For each Active pool with exactly 12 members, the draw type is chosen:
-          1. SDE draw  : pool has sde_required members → oldest L4 exits guaranteed
-          2. Type A    : LPI 14–25% + L3/L4 present + L1/L2 available
-          3. Type B    : LPI ≥ 14% + L3/L4 present + NO L1/L2 (shortage)
-          4. Regular   : default — L1-3 lower / L4-6 upper; edge-case L1-3 only
+        Faithfully implements the FULL decision tree (same rules/thresholds as production):
+          0. SDE Ext-III: L6 member found → both winners from L6 tier (upper) + L1-L5 (lower)
+             → guaranteed L6 forced exit; runs BEFORE any other draw type
+          1. SDE Ext-II:  L5 member found → both winners: upper=L5, lower=L1-L4
+             → guaranteed L5 forced exit; runs after Ext-III check
+          2. SDE draw:    sde_required (L4) → oldest L4 exits guaranteed; lower=L1-L2 preferred
+          3. Accelerated dissolution: ≥60% L4+ → both winners from L4+; dissolve if <8 remain
+          4. Type A draw: LPI 14–25% + L3/L4 + L1/L2 available
+          5. Type B draw: LPI ≥ 14% + L3/L4 + NO L1/L2 (shortage)
+          6. Regular draw: L1-3 lower / L4-6 upper (default)
 
-        After each draw: survivors advance +1 level; new L4 arrivals are
-        flagged sde_required=True to guarantee their exit in a future draw.
+        L5/L6 escalation tracking (A-1: WHY members reach L5/L6):
+          Members reach L5/L6 when SDE is unable to process them due to:
+            - Pool being paused (insufficient members)
+            - Insufficient lower-tier members to match with the L4 for SDE
+          The simulation now runs Ext-II/III to catch these cases BEFORE they accumulate.
         """
         draws = new_pauses = 0
         lpi   = self._calc_lpi()
@@ -1514,7 +1522,12 @@ class _AdvSimEngine:
             members = self._mbrs(pool.sid)
 
             # ── Safestop ──────────────────────────────────────────────────────
-            if len(members) != _S_CAP:
+            if len(members) < 8:     # below minimum viable pool size
+                pool.paused = True
+                new_pauses += 1
+                self.n_paused += 1
+                continue
+            if len(members) != _S_CAP and len(members) < 8:
                 pool.paused = True
                 new_pauses += 1
                 self.n_paused += 1
@@ -1525,16 +1538,66 @@ class _AdvSimEngine:
             l1_l2    = [m for m in members if 1 <= m.level <= 2]
             l3       = [m for m in members if m.level == 3]
             l4       = [m for m in members if m.level == 4]
+            l5       = [m for m in members if m.level == 5]
+            l6       = [m for m in members if m.level == 6]
             l1_l3    = [m for m in members if 1 <= m.level <= 3]
+            l1_l4    = [m for m in members if 1 <= m.level <= 4]
+            l1_l5    = [m for m in members if 1 <= m.level <= 5]
             l4_l6    = [m for m in members if 4 <= m.level <= 6]
+            l4_plus_ratio = len(l4_l6) / max(len(members), 1)
 
             w1 = w2 = None
+            draw_tag = "regular"
 
-            if sde_mbrs:
-                # ── SDE Draw: oldest sde_required member guaranteed exit ───────
-                # Upper winner = first (oldest) SDE-flagged L4 member
-                # Lower winner = L1/L2 preferred, fall through to L1-3 or any non-SDE
-                upper  = sde_mbrs[0]
+            # ── SDE Ext-III: L6 found — both winners from L6 (upper) + L1-L5 (lower) ──
+            if l6:
+                upper = random.choice(l6)
+                lowers = [m for m in l1_l5 if m.sid != upper.sid]
+                if not lowers:
+                    lowers = [m for m in members if m.sid != upper.sid]
+                if lowers:
+                    w2 = upper
+                    w1 = random.choice(lowers)
+                    draw_tag = "sde"
+                    self.n_sde_exits += 1
+                    # Track L6 escalation event
+                    if not hasattr(self, '_l6_escalation_events'):
+                        self._l6_escalation_events = 0
+                    self._l6_escalation_events += 1
+
+            # ── SDE Ext-II: L5 found — both winners: upper=L5, lower=L1-L4 ──────────
+            elif l5:
+                upper = random.choice(l5)
+                lowers = [m for m in l1_l4 if m.sid != upper.sid]
+                if not lowers:
+                    lowers = [m for m in l1_l3 if m.sid != upper.sid]
+                if not lowers:
+                    lowers = [m for m in members if m.sid != upper.sid]
+                if lowers:
+                    w2 = upper
+                    w1 = random.choice(lowers)
+                    draw_tag = "sde"
+                    self.n_sde_exits += 1
+                    if not hasattr(self, '_l5_escalation_events'):
+                        self._l5_escalation_events = 0
+                    self._l5_escalation_events += 1
+
+            # ── Accelerated Dissolution: ≥60% L4+ → both winners from L4+ ─────────
+            elif l4_plus_ratio >= 0.60 and len(l4_l6) >= 2:
+                w1 = random.choice(l4_l6)
+                l4_l6_remaining = [m for m in l4_l6 if m.sid != w1.sid]
+                if l4_l6_remaining:
+                    w2 = random.choice(l4_l6_remaining)
+                    draw_tag = "sde"
+                    self.n_sde_exits += 1
+                    # Mark pool for dissolution check after draw (< 8 members)
+                    if not hasattr(self, '_accel_diss_events'):
+                        self._accel_diss_events = 0
+                    self._accel_diss_events += 1
+
+            # ── SDE Draw: sde_required L4 member guaranteed exit ─────────────────────
+            elif sde_mbrs:
+                upper  = sde_mbrs[0]      # oldest SDE-flagged L4 member
                 lowers = [m for m in l1_l2 if m.sid != upper.sid]
                 if not lowers:
                     lowers = [m for m in l1_l3 if m.sid != upper.sid]
@@ -1544,6 +1607,7 @@ class _AdvSimEngine:
                     pool.paused = True; new_pauses += 1; self.n_paused += 1; continue
                 w1 = random.choice(lowers)
                 w2 = upper
+                draw_tag = "sde"
                 self.n_sde_exits += 1
 
             elif lpi >= 14.0 and (l3 or l4):
@@ -1553,11 +1617,13 @@ class _AdvSimEngine:
                     w2   = random.choice(upper_pool)
                     avail = [m for m in l1_l2 if m.sid != w2.sid]
                     w1   = random.choice(avail) if avail else random.choice(l1_l2)
+                    draw_tag = "type_a"
                     self.n_type_a_draws += 1
                 elif l3 and l4:
                     # ── Type B: L3 lower, L4 upper (L1/L2 shortage) ───────────
                     w1 = random.choice(l3)
                     w2 = random.choice(l4)
+                    draw_tag = "type_b"
                     self.n_type_b_draws += 1
                 else:
                     # Degenerate: not enough tiered members — regular fallback
@@ -1837,6 +1903,10 @@ class _AdvSimEngine:
         # Pool pause timeline (used by Pool Activity tab)
         pauses_by_week = [log.get("pauses", 0) for log in self.logs]
 
+        l5_escalation_events = getattr(self, '_l5_escalation_events', 0)
+        l6_escalation_events = getattr(self, '_l6_escalation_events', 0)
+        accel_diss_events    = getattr(self, '_accel_diss_events',    0)
+
         system_health = {
             "total_members_injected":        self.n_created,
             "total_direct_pool_assignments": self.direct_assignments,
@@ -1850,13 +1920,28 @@ class _AdvSimEngine:
             "sde_exit_rate_pct": round(
                 self.n_sde_exits / max(self.n_winners, 1) * 100, 1
             ),
-            # Anti-Maturity pressure metrics (Phase 2-A)
+            # Anti-Maturity pressure metrics (Phase 2-A / A-1)
             "max_l5_count":                 self._max_l5,
             "max_l6_count":                 self._max_l6,
             "max_high_lpi_streak_weeks":    self._max_high_lpi_streak,
             "l5_peak_by_week":              l5_by_week,
             "l6_peak_by_week":              l6_by_week,
             "pauses_by_week":               pauses_by_week,
+            # SDE Extension events (Ext-II = L5 forced exit, Ext-III = L6 forced exit)
+            "total_l5_ext2_forced_exits":   l5_escalation_events,
+            "total_l6_ext3_forced_exits":   l6_escalation_events,
+            "total_accel_dissolution_events": accel_diss_events,
+            # A-1: WHY members reach L5/L6 explanation
+            "l5_l6_escalation_explanation": (
+                f"L5 members appeared {l5_escalation_events} times (Ext-II draws executed). "
+                f"L6 members appeared {l6_escalation_events} times (Ext-III draws executed). "
+                + (
+                    "Root cause: SDE failed to clear L4 before advancement when pools were paused "
+                    f"or under-capacity. {self.n_paused} pool pauses prevented timely SDE processing."
+                    if (l5_escalation_events + l6_escalation_events) > 0
+                    else "No L5/L6 escalation — SDE cleared all L4 members in time."
+                )
+            ),
         }
 
         return {

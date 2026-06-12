@@ -327,31 +327,40 @@ function PoolMiniCard({ pool, dimmed }) {
   const members = pool.total_members ?? pool.current_member_count ?? 0
   const status  = pool.status ?? pool.pool_status
   const hasVacancy = members < 12 && status === 'Active'
+  const fillPct = (members / 12) * 100
+  const fillColor = members >= 12 ? '#10b981' : members >= 8 ? '#3b82f6' : members >= 4 ? '#f59e0b' : '#ef4444'
 
   return (
-    <div className={`rounded-xl border p-3 transition-all ${
-      dimmed ? 'opacity-20' : ''
-    } ${
-      hasVacancy
-        ? 'border-red-700/50 bg-red-950/15'
-        : 'border-slate-700/50 bg-slate-800/50'
-    }`}>
+    <motion.div
+      layout
+      initial={{ opacity: 0, scale: 0.88 }}
+      animate={{ opacity: dimmed ? 0.2 : 1, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.85 }}
+      transition={{ duration: 0.28, ease: [0.25, 1, 0.5, 1] }}
+      className={`rounded-xl border p-3 ${
+        hasVacancy
+          ? 'border-red-700/50 bg-red-950/15'
+          : 'border-slate-700/50 bg-slate-800/50'
+      }`}
+    >
       <div className="flex items-center justify-between mb-2">
         <span className="text-xs font-bold text-slate-200 truncate">{name}</span>
         {hasVacancy && (
-          <span className="text-[8px] font-black text-red-400 border border-red-800/50 px-1 py-0.5 rounded-full ml-1 flex-shrink-0 animate-pulse">
+          <motion.span
+            animate={{ opacity: [1, 0.4, 1] }}
+            transition={{ duration: 1.4, repeat: Infinity }}
+            className="text-[8px] font-black text-red-400 border border-red-800/50 px-1 py-0.5 rounded-full ml-1 flex-shrink-0"
+          >
             VACANCY
-          </span>
+          </motion.span>
         )}
       </div>
-      {/* Fill progress */}
+      {/* Fill progress — motion.div animated on member count change */}
       <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden mb-1.5">
-        <div
-          className="h-full rounded-full transition-all duration-500"
-          style={{
-            width: `${(members / 12) * 100}%`,
-            background: members >= 12 ? '#10b981' : members >= 8 ? '#3b82f6' : members >= 4 ? '#f59e0b' : '#ef4444',
-          }}
+        <motion.div
+          className="h-full rounded-full"
+          animate={{ width: `${fillPct}%`, backgroundColor: fillColor }}
+          transition={{ duration: 0.7, ease: 'easeOut' }}
         />
       </div>
       <div className="flex items-center justify-between text-[9px]">
@@ -365,7 +374,7 @@ function PoolMiniCard({ pool, dimmed }) {
           <span className="text-slate-600">✓ done</span>
         )}
       </div>
-    </div>
+    </motion.div>
   )
 }
 
@@ -672,6 +681,7 @@ export default function HydraulicPipeline() {
               <p className="text-xs text-slate-600 text-center py-8">No active pools</p>
             ) : (
               <div className="grid grid-cols-2 gap-2">
+                <AnimatePresence mode="popLayout" initial={false}>
                 {activePools.map(p => (
                   <PoolMiniCard
                     key={p.id ?? p.pool_id}
@@ -686,6 +696,7 @@ export default function HydraulicPipeline() {
                     dimmed={true}
                   />
                 ))}
+                </AnimatePresence>
               </div>
             )}
           </div>

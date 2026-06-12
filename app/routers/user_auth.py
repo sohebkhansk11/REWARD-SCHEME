@@ -497,6 +497,7 @@ def get_waitlist_rank(
     if user.status != UserStatus.Waitlist:
         return {
             "rank":          None,
+            "wl_number":     None,
             "total_waiting": None,
             "status":        user.status.value,
             "message":       f"Your account status is '{user.status.value}' — not currently on the Waitlist.",
@@ -529,17 +530,22 @@ def get_waitlist_rank(
         # Rare edge: user is Waitlist but somehow not in the window (shouldn't happen)
         return {
             "rank":          None,
+            "wl_number":     None,
             "total_waiting": total_waiting,
             "status":        user.status.value,
             "message":       "Could not determine rank — please try again.",
         }
 
+    wl_number = f"WL-{int(rank):02d}"   # e.g. WL-01, WL-68, WL-142
+
     return {
         "rank":          int(rank),
+        "wl_number":     wl_number,
         "total_waiting": total_waiting,
         "status":        user.status.value,
         "message":       (
-            f"You are #{rank} in the waitlist queue out of {total_waiting} members. "
+            f"You are {wl_number} in the queue "
+            f"({int(rank)} of {total_waiting} waiting). "
             f"The next pool forms when the queue reaches the configured threshold."
         ),
     }
@@ -625,3 +631,171 @@ def get_wallet_history(
         total_won_all_time=round(total_won, 2),
         transactions=transactions,
     )
+
+
+# ── In-App Flash Notifications ────────────────────────────────────────────────
+#
+# Polled by the user-app Dashboard every 60 seconds.
+# Returns an array of active notice objects so the FlashBanner component
+# can display payment warnings, grace period alerts, and draw countdowns.
+#
+# Notification priority (highest shown first):
+#   1. grace_period_active  — LAST CHANCE before elimination
+#   2. elimination_risk     — payment overdue, elimination imminent
+#   3. payment_overdue      — unpaid but not yet flagged (early warning)
+#   4. draw_approaching     — draw in < 2h (informational)
+#
+# The frontend FlashBanner renders these in order with the appropriate
+# urgency styling (red > amber > yellow > blue).
+
+_NOTIF_TEMPLATES = {
+    "grace_period_active": {
+        "type":            "danger",
+        "title":           "🚨 LAST CHANCE — Grace Period Active",
+        "persistent":      True,   # stays until dismissed
+        "action_required": True,
+    },
+    "elimination_risk": {
+        "type":            "warning",
+        "title":           "🔴 Elimination Risk — Payment Overdue",
+        "persistent":      True,
+        "action_required": True,
+    },
+    "payment_overdue": {
+        "type":            "warning",
+        "title":           "⚠️ Weekly Payment Due",
+        "persistent":      False,
+        "action_required": True,
+    },
+    "draw_approaching": {
+        "type":            "info",
+        "title":           "🎯 Draw Starting Soon",
+        "persistent":      False,
+        "action_required": False,
+    },
+}
+
+
+@router.get("/my-notifications")
+def get_my_notifications(
+    user_id: int = Depends(require_user_jwt),
+    db: Session = Depends(get_db),
+):
+    """
+    Return all active in-app notifications for the authenticated user.
+
+    Polled by the user-app Dashboard every 60 seconds.  Each notification
+    has a type (danger | warning | info | success), a message, and whether
+    it requires user action.
+
+    No notifications are stored in DB — they are computed on-the-fly from
+    the user's current state, which is always consistent with the backend.
+    """
+    from app.models.system_settings import SystemSettings as _SS
+
+    user = crud_user.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    notifications: list[dict] = []
+    now = datetime.now(timezone.utc)
+
+    # ── Helper: get elimination config setting ────────────────────────────────
+    def _cfg(key: str, default: int) -> int:
+        row = db.query(_SS).filter(_SS.key == key).first()
+        return (row.value_int or default) if row and row.value_int is not None else default
+
+    grace_fee = _cfg("grace_seat_save_fee_inr", 500)
+    late_fees  = float(user.late_fees_inr or 0)
+
+    # ── 1. Grace period active ────────────────────────────────────────────────
+    if user.grace_active and not user.grace_fee_paid:
+        expires_str = ""
+        remaining_hours = None
+        if user.grace_expires_at:
+            remaining = (user.grace_expires_at - now).total_seconds()
+            remaining_hours = max(0, remaining / 3600)
+            expires_str = (
+                f" by {user.grace_expires_at.strftime('%d %b %H:%M UTC')}"
+                f" ({remaining_hours:.1f}h remaining)"
+            )
+        total_due = grace_fee + late_fees
+        notifications.append({
+            **_NOTIF_TEMPLATES["grace_period_active"],
+            "message": (
+                f"Your seat is at risk! Pay ₹{total_due:,.0f} "
+                f"(₹{grace_fee:,} grace fee + ₹{late_fees:,.0f} late fees)"
+                f"{expires_str} to save your spot."
+            ),
+            "action_url":  "/pay",
+            "expires_at":  user.grace_expires_at.isoformat() if user.grace_expires_at else None,
+            "remaining_hours": round(remaining_hours, 1) if remaining_hours is not None else None,
+            "total_due_inr": round(total_due, 2),
+        })
+
+    # ── 2. Elimination risk (not in grace) ────────────────────────────────────
+    elif user.elimination_risk and not user.grace_active:
+        notifications.append({
+            **_NOTIF_TEMPLATES["elimination_risk"],
+            "message": (
+                f"Your weekly payment is overdue and you are at risk of elimination. "
+                f"Pay ₹1,000 + ₹{late_fees:,.0f} late fees immediately to secure your seat. "
+                f"Contact admin for grace period options."
+            ),
+            "action_url":  "/pay",
+            "expires_at":  None,
+            "total_due_inr": round(1000 + late_fees, 2),
+        })
+
+    # ── 3. Payment overdue (early warning — unpaid active member) ──────────────
+    elif (
+        user.status == UserStatus.Active
+        and user.weekly_payment_status == WeeklyPaymentStatus.Unpaid
+        and not user.elimination_risk
+    ):
+        notifications.append({
+            **_NOTIF_TEMPLATES["payment_overdue"],
+            "message": (
+                f"Your weekly payment of ₹1,000 is due. "
+                + (f"Late fee of ₹{late_fees:,.0f} has accumulated. " if late_fees > 0 else "")
+                + "Pay now to avoid elimination risk."
+            ),
+            "action_url":  "/pay",
+            "expires_at":  None,
+            "total_due_inr": round(1000 + late_fees, 2),
+        })
+
+    # ── 4. Draw approaching (within 2h) ───────────────────────────────────────
+    # We check DrawHistory for last draw + 7 days ≈ next draw window
+    # This is a lightweight approximation — exact countdown via /draw/countdown
+    try:
+        from app.models.draw_history import DrawHistory as _DH
+        last_draw = (
+            db.query(_DH.draw_timestamp)
+            .order_by(_DH.draw_timestamp.desc())
+            .first()
+        )
+        if last_draw and last_draw[0]:
+            # Approximate next draw = last draw + 7 days
+            next_draw = last_draw[0] + timedelta(days=7)
+            secs_until = (next_draw - now).total_seconds()
+            if 0 < secs_until < 7200:   # within 2 hours
+                hrs = secs_until / 3600
+                notifications.append({
+                    **_NOTIF_TEMPLATES["draw_approaching"],
+                    "message": (
+                        f"The weekly draw starts in {hrs:.1f} hour(s). "
+                        f"Make sure your payment is confirmed."
+                    ),
+                    "action_url":  None,
+                    "expires_at":  next_draw.isoformat(),
+                })
+    except Exception:
+        pass   # Draw countdown is non-critical — never block the response
+
+    return {
+        "user_id":       user_id,
+        "has_alerts":    len(notifications) > 0,
+        "count":         len(notifications),
+        "notifications": notifications,
+    }

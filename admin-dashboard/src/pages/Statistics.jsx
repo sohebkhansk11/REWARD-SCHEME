@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, Fragment } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import {
   BarChart3, TrendingUp, TrendingDown, RefreshCw,
   IndianRupee, Users, Layers, Clock, Zap, AlertTriangle,
@@ -6,6 +7,11 @@ import {
   ChevronDown, ChevronRight, CheckCheck, AlertCircle,
   Calculator, Info, Cpu,
 } from 'lucide-react'
+
+// ── Framer-motion variants ─────────────────────────────────────────────────────
+const _fadeUp  = { initial:{opacity:0,y:12}, animate:{opacity:1,y:0}, exit:{opacity:0,y:-8},
+                   transition:{duration:0.32,ease:[0.25,1,0.5,1]} }
+const _stagger = { animate:{ transition:{ staggerChildren:0.06 }}}
 import {
   ResponsiveContainer,
   AreaChart, Area,
@@ -22,6 +28,7 @@ import {
   getAdminTokens, updateTokenStatus, burnToken,
   getBrain5Lpi,
   devLiveStats, devLevelMap, devWinnersAnalytics, devProjection,
+  getPauseCalendar,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -701,6 +708,251 @@ function ProjectionsPanel({ toast }) {
   )
 }
 
+// ── System Pauses panel ──────────────────────────────────────────────────────
+function PausesPanel({ toast }) {
+  const [data,        setData]        = useState(null)
+  const [loading,     setLoading]     = useState(true)
+  const [selectedDay, setSelectedDay] = useState(null)
+
+  const fetch_ = useCallback(async () => {
+    setLoading(true)
+    try   { const r = await getPauseCalendar(); setData(r.data) }
+    catch { toast('Failed to load pause calendar', 'error') }
+    finally { setLoading(false) }
+  }, [toast])
+  useEffect(() => { fetch_() }, [fetch_])
+
+  if (loading) return (
+    <div className="flex items-center justify-center h-48">
+      <Spinner className="w-8 h-8 text-amber-500" />
+    </div>
+  )
+  if (!data) return null
+
+  // ── Calendar grid helpers ────────────────────────────────────────────────
+  const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun',
+                       'Jul','Aug','Sep','Oct','Nov','Dec']
+
+  /** YYYY-MM-DD without timezone drift */
+  const toDateStr = d =>
+    `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+
+  const addDays = (d, n) => { const c = new Date(d); c.setDate(c.getDate() + n); return c }
+
+  const today    = new Date()
+  const todayStr = toDateStr(today)
+  const cutoff   = toDateStr(addDays(today, -90))   // oldest date to colour
+
+  // Align the calendar start to the Monday of the week containing (today − 90d)
+  const rawStart  = addDays(today, -90)
+  const dow       = rawStart.getDay()               // 0 = Sun
+  const backToMon = dow === 0 ? 6 : dow - 1
+  const startDate = addDays(rawStart, -backToMon)
+
+  // Build lookup map from API response
+  const pauseMap = {}
+  for (const entry of data.calendar) pauseMap[entry.date] = entry
+
+  // Build week rows
+  const weeks = []
+  let cur = new Date(startDate)
+  while (toDateStr(cur) <= todayStr) {
+    const week = []
+    for (let d = 0; d < 7; d++) {
+      const ds = toDateStr(cur)
+      week.push({
+        date:    ds,
+        dayNum:  cur.getDate(),
+        month:   cur.getMonth(),
+        inRange: ds >= cutoff && ds <= todayStr,
+        isToday: ds === todayStr,
+        data:    pauseMap[ds] || null,
+      })
+      cur = addDays(cur, 1)
+    }
+    weeks.push(week)
+  }
+
+  const cellCls = day => {
+    if (!day.inRange) return 'bg-transparent border-transparent cursor-default'
+    const c = day.data?.paused_count ?? 0
+    if (c >= 3) return 'bg-rose-200 border-rose-300 cursor-pointer hover:bg-rose-300'
+    if (c >= 1) return 'bg-amber-200 border-amber-300 cursor-pointer hover:bg-amber-300'
+    return 'bg-slate-100 border-slate-200 cursor-default'
+  }
+
+  const textCls = day => {
+    if (!day.inRange) return 'text-transparent'
+    const c = day.data?.paused_count ?? 0
+    if (c >= 3) return 'text-rose-800 font-semibold'
+    if (c >= 1) return 'text-amber-800 font-semibold'
+    return 'text-slate-400'
+  }
+
+  return (
+    <div className="space-y-5">
+
+      {/* ── KPI strip ──────────────────────────────────────────────────────── */}
+      <div className="grid grid-cols-3 gap-4">
+        {[
+          {
+            label: 'Currently Paused',
+            value: data.current_paused_count,
+            color: data.current_paused_count > 0 ? 'text-amber-600' : 'text-slate-400',
+          },
+          { label: 'Pause Events (90 d)', value: data.total_pause_events,  color: 'text-slate-700' },
+          { label: 'Days with Activity',  value: data.calendar.length,      color: 'text-slate-700' },
+        ].map(({ label, value, color }) => (
+          <div key={label} className="bg-white rounded-2xl p-5 shadow-sm border border-slate-100 text-center">
+            <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1">{label}</p>
+            <p className={`text-2xl font-black tabular-nums ${color}`}>{value}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* ── Heatmap card ───────────────────────────────────────────────────── */}
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-2">
+          <Clock className="w-4 h-4 text-amber-500" />
+          <h3 className="font-semibold text-slate-800 text-sm">
+            Pause Heatmap — Last 90 Days
+          </h3>
+          <button
+            onClick={fetch_}
+            className="ml-auto flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-xs text-slate-500 hover:bg-slate-50 transition"
+          >
+            <RefreshCw className="w-3.5 h-3.5" /> Refresh
+          </button>
+        </div>
+
+        <div className="p-6 overflow-x-auto">
+          {/* Day-of-week headers */}
+          <div className="flex gap-1 mb-2 min-w-[480px]">
+            <div className="w-9 flex-shrink-0" /> {/* month-label spacer */}
+            {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(d => (
+              <div key={d}
+                className="flex-1 text-center text-[10px] font-semibold text-slate-400 uppercase tracking-wide">
+                {d}
+              </div>
+            ))}
+          </div>
+
+          {/* Week rows */}
+          <div className="space-y-1 min-w-[480px]">
+            {weeks.map((week, wi) => {
+              const showMonth = wi === 0 || week[0].month !== weeks[wi - 1][0].month
+              return (
+                <div key={wi} className="flex gap-1 items-center">
+                  {/* Month label */}
+                  <div className="w-9 flex-shrink-0 text-right pr-1.5">
+                    {showMonth && (
+                      <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide">
+                        {MONTH_NAMES[week[0].month]}
+                      </span>
+                    )}
+                  </div>
+                  {/* Day cells */}
+                  {week.map(day => (
+                    <button
+                      key={day.date}
+                      onClick={() => {
+                        if (!day.data || !day.inRange) return
+                        setSelectedDay(p => p?.date === day.date ? null : day)
+                      }}
+                      title={
+                        day.inRange
+                          ? day.data
+                            ? `${day.data.paused_count} pool(s) — click for details`
+                            : 'No pause activity'
+                          : undefined
+                      }
+                      className={`flex-1 h-9 rounded-lg border text-xs transition-all select-none
+                        ${cellCls(day)}
+                        ${selectedDay?.date === day.date
+                          ? 'ring-2 ring-violet-500 ring-offset-1'
+                          : ''}
+                        ${day.isToday ? 'ring-2 ring-violet-400 ring-offset-0' : ''}
+                      `}
+                    >
+                      <span className={textCls(day)}>{day.inRange ? day.dayNum : ''}</span>
+                    </button>
+                  ))}
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Legend */}
+          <div className="mt-5 flex flex-wrap items-center gap-4 text-[11px] text-slate-500">
+            <span className="font-semibold text-slate-400">Legend</span>
+            {[
+              { cls: 'bg-slate-100 border-slate-200',  label: 'No pauses' },
+              { cls: 'bg-amber-200 border-amber-300',  label: '1–2 pools' },
+              { cls: 'bg-rose-200 border-rose-300',    label: '3+ pools'  },
+            ].map(({ cls, label }) => (
+              <div key={label} className="flex items-center gap-1.5">
+                <span className={`w-5 h-5 rounded border ${cls} inline-block flex-shrink-0`} />
+                <span>{label}</span>
+              </div>
+            ))}
+            <span className="ml-auto text-[10px] text-slate-300">
+              Click a highlighted cell to see which pools were paused
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Selected-day detail ─────────────────────────────────────────────── */}
+      {selectedDay?.data && (
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+          <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-2">
+            <Clock className="w-4 h-4 text-amber-500" />
+            <h3 className="font-semibold text-slate-800 text-sm">
+              {new Date(`${selectedDay.date}T12:00:00`).toLocaleDateString('en-IN', {
+                weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+              })}
+            </h3>
+            <button
+              onClick={() => setSelectedDay(null)}
+              className="ml-auto text-slate-400 hover:text-slate-600 transition"
+              title="Close"
+            >
+              <XCircle className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="p-5 space-y-1.5">
+            {selectedDay.data.pools.map(pool => (
+              <div key={pool.id}
+                className="flex items-center gap-3 py-2.5 border-b border-slate-50 last:border-0">
+                <span className="w-8 h-8 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 flex items-center justify-center text-[10px] font-bold flex-shrink-0 tabular-nums">
+                  #{pool.id}
+                </span>
+                <p className="font-semibold text-slate-800 text-sm">{pool.name}</p>
+              </div>
+            ))}
+            <p className="pt-2 text-[11px] text-slate-400 leading-relaxed">
+              {selectedDay.data.source === 'current'
+                ? 'These pools are currently in Paused_Awaiting_Members status.'
+                : 'Inferred from draw records: winners in these pools had experienced pauses during their journey. Exact pause date is not stored — the draw date is used as a proxy.'}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Empty state ─────────────────────────────────────────────────────── */}
+      {data.calendar.length === 0 && (
+        <div className="flex items-start gap-3 bg-emerald-50 border border-emerald-200 rounded-xl p-4">
+          <CheckCircle2 className="w-4 h-4 text-emerald-500 flex-shrink-0 mt-0.5" />
+          <p className="text-sm text-emerald-700">
+            No system pauses detected in the last 90 days — all pools have been
+            running without interruption.
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // Token row (shared by both WIT and REF action panels)
 function PendingTokenRow({ token, children }) {
   return (
@@ -893,6 +1145,7 @@ export default function Statistics() {
     { id: 'level_map',   label: 'Level Map',          icon: Layers    },
     { id: 'winners',     label: 'Winners Analytics',  icon: Target    },
     { id: 'projections', label: 'Projections',        icon: TrendingUp },
+    { id: 'pauses',      label: 'System Pauses',      icon: Clock     },
   ]
 
   // ── Early-return for analytics sub-tabs ───────────────────────────────────
@@ -927,6 +1180,7 @@ export default function Statistics() {
         {subTab === 'level_map'    && <LevelMapPanel    toast={toast} />}
         {subTab === 'winners'      && <WinnersPanel     toast={toast} />}
         {subTab === 'projections'  && <ProjectionsPanel toast={toast} />}
+        {subTab === 'pauses'       && <PausesPanel      toast={toast} />}
       </div>
     )
   }
@@ -936,10 +1190,10 @@ export default function Statistics() {
   // ─────────────────────────────────────────────────────────────────────────
 
   return (
-    <div className="p-8 space-y-8">
+    <motion.div {..._stagger} className="p-8 space-y-8">
 
       {/* ── Header ────────────────────────────────────────────────────────── */}
-      <div className="flex items-start justify-between">
+      <motion.div {..._fadeUp} className="flex items-start justify-between">
         <div>
           <h1 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
             <BarChart3 className="w-6 h-6 text-violet-600" />
@@ -957,10 +1211,10 @@ export default function Statistics() {
           <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
           Refresh All
         </button>
-      </div>
+      </motion.div>
 
       {/* Sub-tab nav (Overview tab active) */}
-      <div className="flex gap-0.5 border-b border-slate-200 overflow-x-auto pb-px">
+      <motion.div {..._fadeUp} className="flex gap-0.5 border-b border-slate-200 overflow-x-auto pb-px">
         {SUB_TABS.map(t => (
           <button key={t.id} onClick={() => setSubTab(t.id)}
             className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-semibold border-b-2 transition whitespace-nowrap ${
@@ -972,10 +1226,10 @@ export default function Statistics() {
             {t.label}
           </button>
         ))}
-      </div>
+      </motion.div>
 
       {/* ══ 1. SYSTEM LIQUIDITY  ·  ORGANIZER REVENUE ═══════════════════════ */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+      <motion.div {..._fadeUp} className="grid grid-cols-1 xl:grid-cols-3 gap-5">
 
         {/* ── A. System Liquidity (takes 2 of 3 columns on xl) ───────────── */}
         <div className="xl:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
@@ -1206,7 +1460,7 @@ export default function Statistics() {
           </div>
 
         </div>
-      </div>
+      </motion.div>
 
       {/* ══ 2. WEEKLY CASH FLOW HEALTH ════════════════════════════════════════ */}
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
@@ -2272,6 +2526,6 @@ export default function Statistics() {
         </SectionCard>
       </div>
 
-    </div>
+    </motion.div>
   )
 }

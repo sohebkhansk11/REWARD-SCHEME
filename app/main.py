@@ -35,6 +35,7 @@ from app.routers import referrals as referrals_router
 from app.routers import dev as dev_router
 from app.routers import auth as auth_router
 from app.routers import user_auth as user_auth_router
+from app.routers import admin_elimination as admin_elimination_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -150,6 +151,7 @@ app.include_router(draw_schedule_router)      # /draw/countdown               �
 app.include_router(admin_user_mgmt.router)    # /admin/users|tokens (destroy) — deep management (JWT required)
 app.include_router(referrals_router.router)   # /users/request-referral-payout + /admin/referrals/* (JWT required)
 app.include_router(dev_router.router)         # /dev/*                        — DEV MODE ONLY (JWT + ENABLE_DEV_MODE=true)
+app.include_router(admin_elimination_router.router)  # /admin/elimination/*  — Payment Compliance engine (JWT required)
 
 
 @app.get("/", tags=["Health"])

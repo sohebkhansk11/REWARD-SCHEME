@@ -22,7 +22,7 @@ import {
   IndianRupee, TrendingUp, GitMerge, ShieldAlert, BarChart3,
   DollarSign, Database, RefreshCw, Layers, Trophy, Target,
   Cpu, Settings, CalendarDays, Activity, ToggleLeft, ToggleRight,
-  Shuffle, ChevronRight,
+  Shuffle, ChevronRight, Download, TableProperties,
 } from 'lucide-react'
 import {
   AreaChart, Area, LineChart, Line, BarChart, Bar,
@@ -36,7 +36,7 @@ import {
   resetDataDev, advancedSimulationDev,
   devLiveStats, devLevelMap, devWinnersAnalytics,
   devProjection, devInjectTimed, devMarkAllPaid,
-  devSetPaymentScenario,
+  devSetPaymentScenario, getInjectionStatus,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -390,6 +390,204 @@ function SimCharts({ logs }) {
   )
 }
 
+// ── CSV download helper ──────────────────────────────────────────────────────
+function downloadCSV(rows, filename) {
+  if (!rows?.length) return
+  const headers = Object.keys(rows[0])
+  const lines = [
+    headers.join(','),
+    ...rows.map(r => headers.map(h => {
+      const v = r[h]
+      if (v === null || v === undefined) return ''
+      const s = typeof v === 'object' ? JSON.stringify(v) : String(v)
+      return s.includes(',') ? `"${s.replace(/"/g,'""')}"` : s
+    }).join(','))
+  ]
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' })
+  const url  = URL.createObjectURL(blob)
+  const a    = document.createElement('a'); a.href = url; a.download = filename
+  document.body.appendChild(a); a.click(); document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+// ── Report Sub-Tabs ──────────────────────────────────────────────────────────
+const REPORT_TABS = [
+  { id: 'summary',    label: 'Summary',          short: 'Sum'  },
+  { id: 'weekly',     label: 'Weekly Report',     short: 'Wkly' },
+  { id: 'pools',      label: 'Pool Activity',     short: 'Pool' },
+  { id: 'draws',      label: 'Draw Analysis',     short: 'Draw' },
+  { id: 'cashflow',   label: 'Cash Flow',         short: 'Cash' },
+  { id: 'levels',     label: 'Level Progression', short: 'Lvl'  },
+]
+
+// ── Weekly Report Table ──────────────────────────────────────────────────────
+function WeeklyReportTable({ rows }) {
+  if (!rows?.length) return <p className="text-xs text-slate-500 p-4">No weekly data</p>
+  const cols = [
+    { key: 'week', label: 'Week' },
+    { key: 'week_start_date', label: 'Date' },
+    { key: 'users_joined', label: 'Joined' },
+    { key: 'active_users', label: 'Active' },
+    { key: 'waitlist_count', label: 'Waitlist' },
+    { key: 'pools_active', label: 'Pools' },
+    { key: 'lpi', label: 'LPI%' },
+    { key: 'draws_this_week', label: 'Draws' },
+    { key: 'late_payers', label: 'Late' },
+    { key: 'scenario', label: 'AI Phase' },
+  ]
+  return (
+    <div className="overflow-auto max-h-96 rounded-xl border border-slate-700/60">
+      <table className="w-full text-xs whitespace-nowrap">
+        <thead className="bg-slate-800 sticky top-0 z-10">
+          <tr>{cols.map(c=><th key={c.key} className="text-left px-3 py-2.5 text-slate-400 font-semibold">{c.label}</th>)}</tr>
+        </thead>
+        <tbody>
+          {rows.map((r,i)=>(
+            <tr key={r.week} className={`border-b border-slate-800/50 ${r.high_pressure_mode?'bg-red-950/20':'i%2===0?bg-slate-900:bg-slate-900/50'}`}>
+              {cols.map(c=>(
+                <td key={c.key} className={`px-3 py-2 ${c.key==='lpi'?(parseFloat(r.lpi)>=50?'text-red-400 font-bold':parseFloat(r.lpi)>=25?'text-orange-400':parseFloat(r.lpi)>=14?'text-amber-400':'text-emerald-400'):c.key==='scenario'?'text-cyan-300 text-[10px]':'text-slate-300'}`}>
+                  {c.key==='lpi'?`${r.lpi}%`:r[c.key]??'—'}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+// ── Pool Activity Chart ───────────────────────────────────────────────────────
+function PoolActivityChart({ logs }) {
+  if (!logs?.length) return null
+  const data = logs.map(l=>({ week:l.week, active:l.active_pools, pauses:l.pauses, merges:l.merges }))
+  return (
+    <div className="h-48">
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={data} margin={{top:4,right:8,left:0,bottom:0}}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+          <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+          <YAxis tick={{fill:'#64748b',fontSize:10}}/>
+          <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
+          <Area type="monotone" dataKey="active" stroke="#6366f1" fill="#6366f120" name="Active Pools" strokeWidth={1.5}/>
+          <Area type="monotone" dataKey="pauses" stroke="#f59e0b" fill="#f59e0b10" name="Pauses" strokeWidth={1.5}/>
+          <Area type="monotone" dataKey="merges" stroke="#10b981" fill="#10b98110" name="Merges" strokeWidth={1.5}/>
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
+// ── Level Progression Chart ──────────────────────────────────────────────────
+function LevelProgressionChart({ weekly }) {
+  if (!weekly?.length) return null
+  const data = weekly.map(w=>({
+    week: w.week,
+    L1: w.level_distribution?.L1??0,
+    L2: w.level_distribution?.L2??0,
+    L3: w.level_distribution?.L3??0,
+    L4: w.level_distribution?.L4??0,
+    L5: w.level_distribution?.L5??w.l5_count??0,
+    L6: w.level_distribution?.L6??w.l6_count??0,
+    lpi: w.lpi??0,
+  }))
+  const LEVEL_COLORS = ['#64748b','#3b82f6','#8b5cf6','#f59e0b','#ef4444','#bf00ff']
+  return (
+    <div className="space-y-4">
+      <div className="h-56">
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={data} margin={{top:4,right:8,left:0,bottom:0}} stackOffset="expand">
+            <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+            <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+            <YAxis tickFormatter={v=>`${(v*100).toFixed(0)}%`} tick={{fill:'#64748b',fontSize:10}}/>
+            <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}} formatter={(v,n)=>[v,n]}/>
+            <Legend wrapperStyle={{fontSize:10}}/>
+            {['L1','L2','L3','L4','L5','L6'].map((lv,i)=>(
+              <Area key={lv} type="monotone" dataKey={lv} stackId="1"
+                stroke={LEVEL_COLORS[i]} fill={LEVEL_COLORS[i]+'40'} name={lv} strokeWidth={1}/>
+            ))}
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+      {/* L5/L6 spike highlight */}
+      <div className="h-32">
+        <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">L5+L6 Anti-Maturity Pressure</p>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={data} margin={{top:4,right:8,left:0,bottom:0}}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+            <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+            <YAxis tick={{fill:'#64748b',fontSize:10}}/>
+            <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
+            <Line type="monotone" dataKey="L5" stroke="#ef4444" strokeWidth={2} dot={false} name="L5 Members"/>
+            <Line type="monotone" dataKey="L6" stroke="#bf00ff" strokeWidth={2} dot={false} name="L6 Members"/>
+            <Line type="monotone" dataKey="lpi" stroke="#f59e0b" strokeWidth={1} strokeDasharray="4 2" dot={false} name="LPI%"/>
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  )
+}
+
+// ── Cash Flow Chart ──────────────────────────────────────────────────────────
+function CashFlowChart({ weekly }) {
+  if (!weekly?.length) return null
+  const data = weekly.map(w=>({ week:w.week, inflow:w.cash_inflow_inr??0, installments:w.installments_collected_inr??0, late_fees:w.late_fees_collected_inr??0 }))
+  return (
+    <div className="h-48">
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data} margin={{top:4,right:8,left:0,bottom:0}}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+          <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+          <YAxis tick={{fill:'#64748b',fontSize:10}} tickFormatter={v=>v>=1000?`₹${(v/1000).toFixed(0)}k`:`₹${v}`}/>
+          <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}} formatter={v=>INR(v)}/>
+          <Legend wrapperStyle={{fontSize:10}}/>
+          <Bar dataKey="inflow"       stackId="a" fill="#10b981" name="New Deposits" radius={[0,0,0,0]}/>
+          <Bar dataKey="installments" stackId="a" fill="#3b82f6" name="Installments" radius={[0,0,0,0]}/>
+          <Bar dataKey="late_fees"    stackId="a" fill="#f59e0b" name="Late Fees"    radius={[4,4,0,0]}/>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
+// ── Draw Analysis Chart ───────────────────────────────────────────────────────
+function DrawAnalysisChart({ weekly }) {
+  if (!weekly?.length) return null
+  // Compute per-week draw type breakdown from cumulative totals
+  const data = weekly.map((w,i)=>{
+    const prev = i>0?weekly[i-1]:null
+    const dt   = w.draw_type_breakdown??{}
+    const pdtA = prev?.draw_type_breakdown?.type_a??0
+    const pdtB = prev?.draw_type_breakdown?.type_b??0
+    const pdtS = prev?.draw_type_breakdown?.sde??0
+    const pdtR = prev?.draw_type_breakdown?.regular??0
+    return {
+      week:    w.week,
+      regular: Math.max(0,(dt.regular??0)-(pdtR)),
+      type_a:  Math.max(0,(dt.type_a??0)-(pdtA)),
+      type_b:  Math.max(0,(dt.type_b??0)-(pdtB)),
+      sde:     Math.max(0,(dt.sde??0)-(pdtS)),
+    }
+  })
+  return (
+    <div className="h-48">
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data} margin={{top:4,right:8,left:0,bottom:0}}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+          <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+          <YAxis tick={{fill:'#64748b',fontSize:10}}/>
+          <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
+          <Legend wrapperStyle={{fontSize:10}}/>
+          <Bar dataKey="regular" stackId="a" fill="#10b981" name="Regular"  radius={[0,0,0,0]}/>
+          <Bar dataKey="type_a"  stackId="a" fill="#3b82f6" name="Type A"   radius={[0,0,0,0]}/>
+          <Bar dataKey="type_b"  stackId="a" fill="#f59e0b" name="Type B"   radius={[0,0,0,0]}/>
+          <Bar dataKey="sde"     stackId="a" fill="#ef4444" name="SDE Exit" radius={[4,4,0,0]}/>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
 function StressTestTab({ toast }) {
   const [cycles, setCycles] = useState(50)
   const [lateFee, setLateFee] = useState(5.0)
@@ -400,9 +598,10 @@ function StressTestTab({ toast }) {
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState(null)
   const [showSetup, setShowSetup] = useState(false)
+  const [reportTab, setReportTab] = useState('summary')   // Phase 2-C report sub-tab
 
   const run = async () => {
-    setRunning(true); setResult(null)
+    setRunning(true); setResult(null); setReportTab('summary')
     try {
       const res = await advancedSimulationDev({ total_cycles:cycles, late_fee_pct:lateFee, late_users_ratio_pct:lateRatio, volatility_mode:vol, volatility_max_inflow:volMax, avg_rdr_pct:rdr })
       setResult(res.data)
@@ -517,15 +716,141 @@ function StressTestTab({ toast }) {
 
         {result&&!running&&(
           <div className="border-t border-slate-700/60 pt-6">
-            <div className="flex items-center gap-2 mb-1">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500"/>
-              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">Simulation Complete — {result.simulation_summary.total_cycles_run.toLocaleString()} cycles</p>
+            {/* Report header + download buttons */}
+            <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500"/>
+                <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
+                  Simulation Complete — {result.simulation_summary.total_cycles_run.toLocaleString()} cycles
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={()=>downloadCSV(result.weekly_detail, `sim_weekly_${Date.now()}.csv`)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold bg-slate-800 border border-slate-600 rounded-lg text-slate-300 hover:bg-slate-700 transition">
+                  <Download className="w-3 h-3"/>CSV
+                </button>
+                <button onClick={()=>{
+                  const blob=new Blob([JSON.stringify(result,null,2)],{type:'application/json'})
+                  const url=URL.createObjectURL(blob); const a=document.createElement('a')
+                  a.href=url; a.download=`sim_report_${Date.now()}.json`
+                  document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url)
+                }} className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold bg-slate-800 border border-slate-600 rounded-lg text-slate-300 hover:bg-slate-700 transition">
+                  <Download className="w-3 h-3"/>JSON
+                </button>
+              </div>
             </div>
-            <SimStatsGrid s={result.simulation_summary}/>
-            <SystemHealth fm={result.simulation_summary.financial_metrics} sh={result.simulation_summary.system_health}/>
-            <LevelMatrix levelWise={result.simulation_summary.level_wise_metrics}/>
-            <SimCharts logs={result.cycle_logs}/>
-            <AiBrainCharts logs={result.cycle_logs}/>
+
+            {/* 6-tab report navigation */}
+            <div className="flex gap-1 flex-wrap mb-5">
+              {REPORT_TABS.map(t=>(
+                <button key={t.id} onClick={()=>setReportTab(t.id)}
+                  className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-colors ${
+                    reportTab===t.id
+                      ?'bg-violet-700 text-white'
+                      :'bg-slate-800 text-slate-400 border border-slate-700/60 hover:bg-slate-700/80'
+                  }`}>
+                  <span className="hidden sm:inline">{t.label}</span>
+                  <span className="sm:hidden">{t.short}</span>
+                </button>
+              ))}
+            </div>
+
+            {/* ── Tab: Summary ── */}
+            {reportTab==='summary'&&(
+              <div>
+                {/* L5/L6 peak warning strip */}
+                {result.simulation_summary.system_health?.max_l5_count>0&&(
+                  <div className="flex gap-2.5 p-3 mb-4 rounded-xl bg-red-950/30 border border-red-800/40 text-xs text-red-300">
+                    <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5"/>
+                    <span>
+                      <strong>Anti-Maturity Pressure Detected:</strong>&nbsp;
+                      L5 peak = {result.simulation_summary.system_health.max_l5_count},&nbsp;
+                      L6 peak = {result.simulation_summary.system_health.max_l6_count}.&nbsp;
+                      Longest high-LPI streak = {result.simulation_summary.system_health.max_high_lpi_streak_weeks} weeks.
+                      {result.simulation_summary.system_health.max_l6_count>=3&&' ⚠️ Pool pauses likely.'}
+                    </span>
+                  </div>
+                )}
+                <SimStatsGrid s={result.simulation_summary}/>
+                <SystemHealth fm={result.simulation_summary.financial_metrics} sh={result.simulation_summary.system_health}/>
+                <LevelMatrix levelWise={result.simulation_summary.level_wise_metrics}/>
+              </div>
+            )}
+
+            {/* ── Tab: Weekly Report ── */}
+            {reportTab==='weekly'&&(
+              <div>
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-xs text-slate-400">{result.weekly_detail?.length??0} weeks of data</p>
+                  <button onClick={()=>downloadCSV(result.weekly_detail, `sim_weekly_${Date.now()}.csv`)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold bg-slate-800 border border-slate-600 rounded-lg text-slate-300 hover:bg-slate-700 transition">
+                    <Download className="w-3 h-3"/>Export CSV
+                  </button>
+                </div>
+                <WeeklyReportTable rows={result.weekly_detail}/>
+              </div>
+            )}
+
+            {/* ── Tab: Pool Activity ── */}
+            {reportTab==='pools'&&(
+              <div>
+                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Active Pools · Pauses · Merges Per Week</p>
+                <PoolActivityChart logs={result.cycle_logs}/>
+                <div className="mt-4 grid grid-cols-3 gap-3">
+                  <StatPill label="Total Pools Formed" value={result.simulation_summary.total_pools_auto_scaled} accent="violet"/>
+                  <StatPill label="Total Condensations" value={result.simulation_summary.total_condensation_events} accent="amber"/>
+                  <StatPill label="Total Draw Pauses"  value={result.simulation_summary.total_draw_pauses_triggered} accent="red"/>
+                </div>
+              </div>
+            )}
+
+            {/* ── Tab: Draw Analysis ── */}
+            {reportTab==='draws'&&(
+              <div>
+                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Draw Type Breakdown Per Week</p>
+                <DrawAnalysisChart weekly={result.weekly_detail}/>
+                <div className="mt-4 grid grid-cols-4 gap-3">
+                  <StatPill label="Total Draws"  value={result.simulation_summary.total_winners_drawn/2} accent="blue"/>
+                  <StatPill label="SDE Exits"    value={result.simulation_summary.system_health?.total_sde_exits??0} accent="red"/>
+                  <StatPill label="Type A Draws" value={result.simulation_summary.system_health?.total_type_a_draws??0} accent="violet"/>
+                  <StatPill label="Type B Draws" value={result.simulation_summary.system_health?.total_type_b_draws??0} accent="amber"/>
+                </div>
+              </div>
+            )}
+
+            {/* ── Tab: Cash Flow ── */}
+            {reportTab==='cashflow'&&(
+              <div>
+                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Cash Inflow Breakdown Per Week</p>
+                <CashFlowChart weekly={result.weekly_detail}/>
+                <div className="mt-4 grid grid-cols-3 gap-3">
+                  <StatPill label="Total Collected" value={INR(result.simulation_summary.financial_metrics?.total_collected_inr??0)} accent="emerald"/>
+                  <StatPill label="Total Paid Out"  value={INR(result.simulation_summary.financial_metrics?.total_distributed_inr??0)} accent="red"/>
+                  <StatPill label="Net Float"       value={INR(result.simulation_summary.final_virtual_liquidity_float??0)} accent="blue"/>
+                </div>
+              </div>
+            )}
+
+            {/* ── Tab: Level Progression ── */}
+            {reportTab==='levels'&&(
+              <div>
+                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Member Level Distribution Over Time</p>
+                <LevelProgressionChart weekly={result.weekly_detail}/>
+                <div className="mt-4 grid grid-cols-3 gap-3">
+                  <StatPill label="L5 Peak" value={result.simulation_summary.system_health?.max_l5_count??0} accent={result.simulation_summary.system_health?.max_l5_count>0?'red':'slate'}/>
+                  <StatPill label="L6 Peak" value={result.simulation_summary.system_health?.max_l6_count??0} accent={result.simulation_summary.system_health?.max_l6_count>0?'red':'slate'}/>
+                  <StatPill label="High-LPI Streak" value={`${result.simulation_summary.system_health?.max_high_lpi_streak_weeks??0} wks`} accent={result.simulation_summary.system_health?.max_high_lpi_streak_weeks>=3?'amber':'slate'}/>
+                </div>
+              </div>
+            )}
+
+            {/* Classic charts always visible at bottom of Summary tab only */}
+            {reportTab==='summary'&&(
+              <>
+                <SimCharts logs={result.cycle_logs}/>
+                <AiBrainCharts logs={result.cycle_logs}/>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -688,6 +1013,32 @@ function InjectionTab({ toast }) {
   const [timedAutoPool, setTimedAutoPool] = useState(true)
   const [timedLoading, setTimedLoading] = useState(false)
   const [timedResult, setTimedResult] = useState(null)
+  // Background pool-formation polling
+  const [bgStatus, setBgStatus] = useState(null)   // null | {status, pools_formed, waitlist_remaining, error}
+  const [bgPrefix, setBgPrefix] = useState(null)   // prefix key to poll
+  const [bgPolling, setBgPolling] = useState(false)
+
+  // Auto-poll injection status while bg task is running (every 2s)
+  useEffect(() => {
+    if (!bgPrefix || bgStatus?.status === 'done' || bgStatus?.status === 'error') return
+    setBgPolling(true)
+    const id = setInterval(async () => {
+      try {
+        const res = await getInjectionStatus(bgPrefix)
+        setBgStatus(res.data)
+        if (res.data.status === 'done') {
+          toast(`Pool formation complete — ${res.data.pools_formed} pool(s) formed`, 'success')
+          setBgPolling(false)
+          clearInterval(id)
+        } else if (res.data.status === 'error') {
+          toast(`Pool formation error: ${res.data.error}`, 'error')
+          setBgPolling(false)
+          clearInterval(id)
+        }
+      } catch { /* ignore transient poll errors */ }
+    }, 2_000)
+    return () => { clearInterval(id); setBgPolling(false) }
+  }, [bgPrefix, bgStatus?.status]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleBulk = async () => {
     setLoading(true); setResult(null)
@@ -700,7 +1051,7 @@ function InjectionTab({ toast }) {
   }
 
   const handleTimed = async () => {
-    setTimedLoading(true); setTimedResult(null)
+    setTimedLoading(true); setTimedResult(null); setBgStatus(null); setBgPrefix(null)
     try {
       const params = {
         count: tCount,
@@ -712,7 +1063,14 @@ function InjectionTab({ toast }) {
       }
       const res = await devInjectTimed(params)
       setTimedResult(res.data)
-      toast(`${res.data.users_created} timed users injected`, 'success')
+      if (res.data.pool_formation === 'background' && res.data.status_key) {
+        // Large batch — pool formation running in background; start polling
+        setBgPrefix(res.data.status_key)
+        setBgStatus({ status: 'running', pools_formed: 0, waitlist_remaining: null, error: null })
+        toast(`${res.data.users_created.toLocaleString()} users injected — pool formation running…`, 'info')
+      } else {
+        toast(`${res.data.users_created.toLocaleString()} timed users injected`, 'success')
+      }
     } catch(err){ toast(err.response?.data?.detail??'Timed injection failed','error') }
     finally{ setTimedLoading(false) }
   }
@@ -778,12 +1136,38 @@ function InjectionTab({ toast }) {
             {timedResult&&<ResultBox>
               <div className="grid grid-cols-2 gap-3">
                 <StatPill label="Users Created" value={timedResult.users_created.toLocaleString('en-IN')} accent="cyan"/>
-                <StatPill label="Pools Formed"  value={timedResult.pools_formed} accent={timedResult.pools_formed>0?'blue':'slate'}/>
-                <StatPill label="Date From"      value={timedResult.date_from?new Date(timedResult.date_from).toLocaleDateString('en-IN'):'—'} accent="slate"/>
-                <StatPill label="Date To"        value={timedResult.date_to  ?new Date(timedResult.date_to  ).toLocaleDateString('en-IN'):'—'} accent="slate"/>
+                <StatPill label="Pools Formed"
+                  value={timedResult.pool_formation==='background' ? '…' : (timedResult.pools_formed??0)}
+                  accent={timedResult.pools_formed>0?'blue':'slate'}/>
+                <StatPill label="Date From" value={timedResult.date_from?new Date(timedResult.date_from).toLocaleDateString('en-IN'):'—'} accent="slate"/>
+                <StatPill label="Date To"   value={timedResult.date_to  ?new Date(timedResult.date_to  ).toLocaleDateString('en-IN'):'—'} accent="slate"/>
               </div>
               <p className="text-xs text-slate-400 mt-2 font-mono leading-relaxed">{timedResult.note}</p>
             </ResultBox>}
+
+            {/* Background pool-formation status banner */}
+            {bgStatus && (
+              <div className={`rounded-xl border px-4 py-3 text-xs font-mono ${
+                bgStatus.status === 'running' ? 'bg-amber-950/40 border-amber-700/50 text-amber-300' :
+                bgStatus.status === 'done'    ? 'bg-emerald-950/40 border-emerald-700/50 text-emerald-300' :
+                                                'bg-red-950/40 border-red-700/50 text-red-300'
+              }`}>
+                <div className="flex items-center gap-2">
+                  {bgStatus.status === 'running' && <Spinner className="w-3 h-3"/>}
+                  {bgStatus.status === 'done'    && <CheckCircle2 className="w-3.5 h-3.5"/>}
+                  {bgStatus.status === 'error'   && <XCircle className="w-3.5 h-3.5"/>}
+                  <span className="font-bold uppercase tracking-wider">{bgStatus.status}</span>
+                  {bgStatus.status === 'running' && <span className="text-amber-400 ml-1">— Pool formation in progress…</span>}
+                </div>
+                {bgStatus.status === 'done' && (
+                  <div className="mt-1.5 flex gap-4">
+                    <span>Pools formed: <span className="font-bold text-white">{bgStatus.pools_formed}</span></span>
+                    <span>Waitlist remaining: <span className="font-bold text-white">{(bgStatus.waitlist_remaining??'—').toLocaleString?.() ?? bgStatus.waitlist_remaining}</span></span>
+                  </div>
+                )}
+                {bgStatus.status === 'error' && <p className="mt-1 text-red-400">{bgStatus.error}</p>}
+              </div>
+            )}
           </div>
         </DevCard>
       </div>
@@ -1292,9 +1676,12 @@ function ControlsTab({ toast }) {
   const [masterPaidLoading, setMasterPaidLoading] = useState(false)
   const [masterPaidResult, setMasterPaidResult] = useState(null)
   // Payment scenario
+  // NOTE: lateFeeInr was removed (Phase 2-B) — it conflicted with the stress-test
+  // engine's late_fee_pct parameter.  Pre-Test Setup applies a fixed ₹50 default fee
+  // when applyLateFee=true.  The stress-test engine controls simulation-level late fees
+  // independently via its own "Late Fee %" and "Late Users Ratio %" controls.
   const [paidPct, setPaidPct] = useState(100)
   const [applyLateFee, setApplyLateFee] = useState(false)
-  const [lateFeeInr, setLateFeeInr] = useState(50)
   const [elimPct, setElimPct] = useState(0)
   const [scenarioLoading, setScenarioLoading] = useState(false)
   const [scenarioResult, setScenarioResult] = useState(null)
@@ -1312,7 +1699,14 @@ function ControlsTab({ toast }) {
   const handleScenario = async () => {
     setScenarioLoading(true); setScenarioResult(null)
     try {
-      const res = await devSetPaymentScenario({ paid_pct:paidPct, apply_late_fee:applyLateFee, late_fee_inr:lateFeeInr, eliminate_unpaid_pct:elimPct })
+      // late_fee_inr uses fixed ₹50 default when applyLateFee=true
+      // (the field is kept in the API for backward-compat but hidden from this UI)
+      const res = await devSetPaymentScenario({
+        paid_pct:             paidPct,
+        apply_late_fee:       applyLateFee,
+        late_fee_inr:         applyLateFee ? 50 : 0,
+        eliminate_unpaid_pct: elimPct,
+      })
       setScenarioResult(res.data)
       toast(res.data.message, paidPct<50?'warning':'success')
     } catch(err){ toast(err.response?.data?.detail??'Failed','error') }
@@ -1321,6 +1715,14 @@ function ControlsTab({ toast }) {
 
   return (
     <div className="space-y-6">
+      {/* Scope clarification banner */}
+      <div className="flex gap-2.5 p-3.5 rounded-xl bg-blue-950/30 border border-blue-800/40 text-xs text-blue-300 leading-relaxed">
+        <Info className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+        <span><strong>Pre-Test Setup</strong> writes to the live DB before the stress-test runs.
+        &nbsp;The Stress-Test engine's own <em>Late Fee %</em> and <em>Late Users Ratio %</em> controls
+        affect the in-memory simulation engine independently — they don't touch the DB.</span>
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
         {/* Master Paid Toggle */}
@@ -1347,7 +1749,7 @@ function ControlsTab({ toast }) {
         </DevCard>
 
         {/* Payment Scenario */}
-        <DevCard icon={Settings} iconBg="bg-blue-900/40 border border-blue-700/50" iconColor="text-blue-400" title="Payment Scenario" subtitle="Configure paid/unpaid/elimination ratios for testing">
+        <DevCard icon={Settings} iconBg="bg-blue-900/40 border border-blue-700/50" iconColor="text-blue-400" title="Payment Scenario" subtitle="Set DB payment state (paid %, late fees, elimination) before running">
           <div className="space-y-4">
             {/* Paid % slider */}
             <div>
@@ -1364,28 +1766,39 @@ function ControlsTab({ toast }) {
               </div>
             </div>
 
-            {/* Late fee */}
+            {/* Late fee toggle — no amount input (uses fixed ₹50 default) */}
             <div className={`rounded-xl border p-3.5 cursor-pointer select-none transition-colors ${applyLateFee?'bg-amber-950/30 border-amber-700/60':'bg-slate-800/50 border-slate-700/50'}`} onClick={()=>setApplyLateFee(v=>!v)}>
-              <div className="flex items-center justify-between mb-2">
-                <p className={`text-xs font-semibold ${applyLateFee?'text-amber-300':'text-slate-300'}`}>Apply Late Fee</p>
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className={`text-xs font-semibold ${applyLateFee?'text-amber-300':'text-slate-300'}`}>Apply Late Fee to Unpaid</p>
+                  <p className="text-[10px] text-slate-500 mt-0.5">Creates ₹50/member late-fee tokens for all unpaid members</p>
+                </div>
                 <Toggle checked={applyLateFee} onChange={()=>{}} label="Apply late fee"/>
               </div>
-              {applyLateFee&&<div className="mt-2" onClick={e=>e.stopPropagation()}>
-                <DevInput label="Late Fee Amount (₹)" type="number" min={0} step={10} value={lateFeeInr} onChange={e=>setLateFeeInr(Math.max(0,parseFloat(e.target.value)||0))}/>
-              </div>}
             </div>
 
-            {/* Elimination % */}
+            {/* Elimination % — granular 0.05–100% range (Phase 2-B) */}
             <div>
               <div className="flex items-center justify-between mb-2">
-                <label className="text-xs text-slate-400 font-medium">Eliminate Unpaid % <span className="text-slate-600">(of unpaid members)</span></label>
-                <div className={`border rounded-lg px-2.5 py-1 text-sm font-black ${elimPct>0?'bg-red-950 border-red-800 text-red-300':'bg-slate-800 border-slate-600 text-slate-500'}`}>{elimPct}%</div>
+                <label className="text-xs text-slate-400 font-medium">
+                  Eliminate Unpaid %&nbsp;<span className="text-slate-600">(of unpaid members)</span>
+                </label>
+                <div className={`border rounded-lg px-2.5 py-1 text-sm font-black tabular-nums ${
+                  elimPct>0?'bg-red-950 border-red-800 text-red-300':'bg-slate-800 border-slate-600 text-slate-500'
+                }`}>{elimPct.toFixed(2)}%</div>
               </div>
-              <input type="range" min={0} max={100} step={5} value={elimPct} onChange={e=>setElimPct(parseInt(e.target.value))}
+              {/* Fine-grained 0.05% steps — allows testing "eliminate 1 in 2000 members" */}
+              <input type="range" min={0} max={100} step={0.05} value={elimPct}
+                onChange={e=>setElimPct(parseFloat(e.target.value))}
                 className="w-full h-2 rounded-full appearance-none cursor-pointer"
-                style={{background:elimPct>0?`linear-gradient(to right,#ef4444 ${elimPct}%,#334155 ${elimPct}%)`:`linear-gradient(to right,#334155 0%,#334155 100%)`}}
+                style={{background:elimPct>0
+                  ?`linear-gradient(to right,#ef4444 ${elimPct}%,#334155 ${elimPct}%)`
+                  :`linear-gradient(to right,#334155 0%,#334155 100%)`}}
               />
-              {elimPct>0&&<InfoBanner text={`${elimPct}% of unpaid members will be permanently eliminated (Eliminated_Unpaid status). This cannot be undone without a DB reset.`} accent="red"/>}
+              <div className="flex justify-between text-[10px] text-slate-600 mt-1 select-none">
+                <span>0.05%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
+              </div>
+              {elimPct>0&&<InfoBanner text={`${elimPct.toFixed(2)}% of unpaid members will be permanently eliminated. This cannot be undone without a DB reset.`} accent="red"/>}
             </div>
 
             <button onClick={handleScenario} disabled={scenarioLoading}

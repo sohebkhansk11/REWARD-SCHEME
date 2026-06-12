@@ -1353,3 +1353,97 @@ def manual_execute_draw(db: Session = Depends(get_db)):
         "refill":              result.refill,
         "late_override_choice": late_choice,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14.  GET /admin/stats/pause-calendar  — System Pause Heatmap (rolling 90 d)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/stats/pause-calendar")
+def get_pause_calendar(db: Session = Depends(get_db)):
+    """
+    Rolling 90-day pause-activity calendar.
+
+    Because the schema stores no explicit pause-event timestamps, data comes
+    from two proxy sources and the frontend labels each source accordingly:
+
+    source = "current"
+      Pools whose status is currently Paused_Awaiting_Members are placed under
+      today's date.  This is the most reliable signal.
+
+    source = "draw_history"
+      DrawHistory rows in the last 90 days where either winner carried a
+      non-zero pauses_experienced count.  The draw_timestamp date is used as a
+      proxy — it shows that the winning pool had experienced at least one pause
+      during its lifetime, even if the exact pause date is unknown.
+
+    The response is a sparse list: only dates with ≥1 pause event are included.
+    The frontend fills the remaining calendar cells with "no data" styling.
+    """
+    from app.models.draw_history import DrawHistory
+
+    today     = datetime.now(timezone.utc).date()
+    date_from = today - timedelta(days=90)
+    since_dt  = datetime(date_from.year, date_from.month, date_from.day,
+                         tzinfo=timezone.utc)
+
+    # ── Source 1: currently paused pools → today ──────────────────────────────
+    paused_now: list[Pool] = (
+        db.query(Pool)
+        .filter(Pool.status == PoolStatus.Paused_Awaiting_Members)
+        .order_by(Pool.id)
+        .all()
+    )
+
+    # ── Source 2: draw dates where winners had pause history ──────────────────
+    history_rows = (
+        db.query(DrawHistory, Pool.name.label("pool_name"))
+        .outerjoin(Pool, DrawHistory.pool_id == Pool.id)
+        .filter(
+            DrawHistory.draw_timestamp >= since_dt,
+            (
+                (DrawHistory.winner_1_pauses_experienced > 0)
+                | (DrawHistory.winner_2_pauses_experienced > 0)
+            ),
+        )
+        .order_by(DrawHistory.draw_timestamp)
+        .all()
+    )
+
+    # ── Build sparse calendar dict keyed by ISO date ──────────────────────────
+    cal: dict[str, dict] = {}
+
+    def _ensure(d: date, source: str) -> dict:
+        key = d.isoformat()
+        if key not in cal:
+            cal[key] = {"date": key, "paused_count": 0, "source": source, "pools": []}
+        return cal[key]
+
+    for pool in paused_now:
+        entry = _ensure(today, "current")
+        entry["pools"].append({"id": pool.id, "name": pool.name})
+        entry["paused_count"] += 1
+
+    seen: set[tuple[int, str]] = set()
+    for dh, pool_name in history_rows:
+        draw_date  = dh.draw_timestamp.date()
+        dedup_key  = (dh.pool_id, draw_date.isoformat())
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        entry = _ensure(draw_date, "draw_history")
+        entry["pools"].append({
+            "id":   dh.pool_id,
+            "name": pool_name or f"Pool #{dh.pool_id}",
+        })
+        entry["paused_count"] += 1
+
+    calendar_days = sorted(cal.values(), key=lambda x: x["date"])
+
+    return {
+        "date_from":            date_from.isoformat(),
+        "date_to":              today.isoformat(),
+        "calendar":             calendar_days,
+        "current_paused_count": len(paused_now),
+        "total_pause_events":   sum(d["paused_count"] for d in calendar_days),
+    }

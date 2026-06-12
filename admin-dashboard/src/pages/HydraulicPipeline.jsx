@@ -15,11 +15,19 @@
  */
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import {
   Search, RefreshCw, AlertTriangle, Users, Layers,
   Clock, Zap, ToggleLeft, ToggleRight, ChevronLeft, ChevronRight,
   Activity, Shield, X, Info,
 } from 'lucide-react'
+
+// ── Framer-motion variants ─────────────────────────────────────────────────────
+const _fadeUp  = { initial:{opacity:0,y:12}, animate:{opacity:1,y:0}, exit:{opacity:0,y:-8},
+                   transition:{duration:0.32,ease:[0.25,1,0.5,1]} }
+const _stagger = { animate:{ transition:{ staggerChildren:0.05 }}}
+const _slideIn = { initial:{opacity:0,x:-10}, animate:{opacity:1,x:0},
+                   transition:{duration:0.28,ease:[0.25,1,0.5,1]} }
 import Spinner from '../components/Spinner'
 import { getAdminUsers, getPools, getAiSnapshot } from '../api/client'
 import { useToast } from '../context/ToastContext'
@@ -536,10 +544,10 @@ export default function HydraulicPipeline() {
   const dimAll = !!highlightedMember
 
   return (
-    <div className="p-6 space-y-5 h-full">
+    <motion.div {..._stagger} className="p-6 space-y-5 h-full">
 
       {/* ── Header ──────────────────────────────────────────────────────────── */}
-      <div className="flex items-start justify-between gap-4">
+      <motion.div {..._fadeUp} className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold text-white flex items-center gap-2.5">
             <div className="p-2 rounded-xl bg-blue-900/40">
@@ -572,7 +580,7 @@ export default function HydraulicPipeline() {
             <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`}/>
           </button>
         </div>
-      </div>
+      </motion.div>
 
       {/* ── Entity Search ──────────────────────────────────────────────────── */}
       <EntitySearch
@@ -736,6 +744,6 @@ export default function HydraulicPipeline() {
           </button>
         </div>
       )}
-    </div>
+    </motion.div>
   )
 }

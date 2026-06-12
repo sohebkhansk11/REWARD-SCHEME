@@ -1,12 +1,12 @@
 from decimal import Decimal
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 from dataclasses import asdict
 
 from app.core.config import LATE_FEE_DAILY_INR
-from app.database import get_db
+from app.database import get_db, get_pool_status
 from app.models.user import UserStatus, WeeklyPaymentStatus
 from app.models.pool import Pool, PoolStatus
 from app.models.token import Token, TokenType, TokenStatus
@@ -32,6 +32,231 @@ from app.core.security import require_admin_jwt
 # Every endpoint on this router requires a valid Admin JWT.
 # The JWT is validated by require_admin_jwt before the handler runs.
 router = APIRouter(tags=["Admin"], dependencies=[Depends(require_admin_jwt)])
+
+
+# ── System Health Watchdog ────────────────────────────────────────────────────
+
+@router.get("/admin/health")
+def get_system_health(db: Session = Depends(get_db)):
+    """
+    Real-time system health snapshot — called by the Diagnostics page every 30 s.
+
+    Returns:
+      db_reachable          — True if a test query succeeds within connect_timeout
+      db_pool               — Connection pool utilisation stats from SQLAlchemy
+      active_users          — Users in Active status (in pools)
+      waitlist_count        — Users waiting for pool assignment
+      pools_active          — Pools with status=Active
+      pools_paused          — Pools paused (SafeStopped / awaiting members)
+      pools_under_capacity  — Active+Paused pools with < 12 members
+      last_draw_at          — ISO timestamp of the most recent completed draw
+      last_pool_created_at  — ISO timestamp of the most recently created pool
+      checked_at            — ISO timestamp of this response
+    """
+    checked_at = datetime.now(timezone.utc).isoformat()
+
+    # ── Database connectivity check ───────────────────────────────────────────
+    db_reachable = False
+    db_error: str | None = None
+    try:
+        db.execute(text("SELECT 1"))
+        db_reachable = True
+    except Exception as exc:
+        db_error = str(exc)
+
+    # ── Pool stats ────────────────────────────────────────────────────────────
+    pool_status_snap = {}
+    try:
+        pool_status_snap = get_pool_status()
+    except Exception:
+        pass
+
+    # ── User & pool counts ────────────────────────────────────────────────────
+    active_users   = 0
+    waitlist_count = 0
+    pools_active   = 0
+    pools_paused   = 0
+    pools_under_cap = 0
+    last_draw_at: str | None   = None
+    last_pool_at:  str | None  = None
+
+    try:
+        active_users   = db.query(func.count(User.id)).filter(User.status == UserStatus.Active).scalar()   or 0
+        waitlist_count = db.query(func.count(User.id)).filter(User.status == UserStatus.Waitlist).scalar() or 0
+        pools_active   = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Active).scalar()   or 0
+        pools_paused   = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Paused_Awaiting_Members).scalar() or 0
+
+        # Count pools where active members < POOL_CAPACITY (12)
+        all_op_pools = (
+            db.query(Pool)
+            .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
+            .all()
+        )
+        for p in all_op_pools:
+            members_count = (
+                db.query(func.count(User.id))
+                .filter(User.current_pool_id == p.id, User.status == UserStatus.Active)
+                .scalar() or 0
+            )
+            if members_count < 12:
+                pools_under_cap += 1
+
+        # Last draw timestamp
+        from app.models.draw_history import DrawHistory
+        last_dh = (
+            db.query(DrawHistory.draw_timestamp)
+            .order_by(DrawHistory.draw_timestamp.desc())
+            .first()
+        )
+        if last_dh:
+            last_draw_at = last_dh[0].isoformat() if last_dh[0] else None
+
+        # Last pool created
+        last_p = (
+            db.query(Pool.created_at)
+            .order_by(Pool.created_at.desc())
+            .first()
+        )
+        if last_p and last_p[0]:
+            last_pool_at = last_p[0].isoformat()
+
+    except Exception:
+        pass   # partial data is still useful; db_reachable=False signals the root cause
+
+    # ── Capacity utilisation rating ───────────────────────────────────────────
+    # "critical" when DB pool is 80%+ full OR DB is unreachable
+    checked_out  = pool_status_snap.get("checked_out", 0)
+    total_cap    = pool_status_snap.get("total_capacity", 40)
+    utilisation  = round(checked_out / max(total_cap, 1) * 100, 1)
+    if not db_reachable:
+        health_rating = "critical"
+    elif utilisation >= 80:
+        health_rating = "warning"
+    elif utilisation >= 60:
+        health_rating = "caution"
+    else:
+        health_rating = "healthy"
+
+    return {
+        "checked_at":          checked_at,
+        "health_rating":       health_rating,
+        "db_reachable":        db_reachable,
+        "db_error":            db_error,
+        "db_pool":             pool_status_snap,
+        "db_pool_utilisation_pct": utilisation,
+        "active_users":        active_users,
+        "waitlist_count":      waitlist_count,
+        "pools_active":        pools_active,
+        "pools_paused":        pools_paused,
+        "pools_under_capacity": pools_under_cap,
+        "last_draw_at":        last_draw_at,
+        "last_pool_created_at": last_pool_at,
+    }
+
+
+# ── Pipeline Health ──────────────────────────────────────────────────────────
+
+@router.get("/admin/pipeline-health")
+def get_pipeline_health(db: Session = Depends(get_db)):
+    """
+    Comprehensive pipeline health snapshot — includes DB connection pool,
+    user/pool counts, injection task status, and data integrity last run.
+
+    Called by the Diagnostics page every 30 s.  More detailed than /admin/health.
+    """
+    from datetime import datetime, timezone as _tz
+    from app.database import get_pool_status as _gps
+    from app.models.pool import PoolStatus as _PS
+
+    checked_at = datetime.now(_tz.utc).isoformat()
+
+    # ── DB pool ───────────────────────────────────────────────────────────────
+    pool_snap: dict = {}
+    db_reachable = False
+    try:
+        db.execute(text("SELECT 1"))
+        db_reachable = True
+        pool_snap    = _gps()
+    except Exception as exc:
+        pool_snap    = {"error": str(exc)}
+
+    # ── User/pool counts ──────────────────────────────────────────────────────
+    try:
+        active_users   = db.query(func.count(User.id)).filter(User.status == UserStatus.Active).scalar()   or 0
+        waitlist_count = db.query(func.count(User.id)).filter(User.status == UserStatus.Waitlist).scalar() or 0
+        pools_active   = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Active).scalar()   or 0
+        pools_paused   = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Paused_Awaiting_Members).scalar() or 0
+
+        # Pools with fewer than 12 active members (under capacity)
+        all_op_pools = (
+            db.query(Pool)
+            .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
+            .all()
+        )
+        pools_under_cap = sum(
+            1 for p in all_op_pools
+            if (db.query(func.count(User.id))
+                .filter(User.current_pool_id == p.id, User.status == UserStatus.Active)
+                .scalar() or 0) < 12
+        )
+    except Exception:
+        active_users = waitlist_count = pools_active = pools_paused = pools_under_cap = None
+
+    # ── Last draw timestamp ───────────────────────────────────────────────────
+    last_draw_at: str | None = None
+    try:
+        from app.models.draw_history import DrawHistory
+        dh = db.query(DrawHistory.draw_timestamp).order_by(DrawHistory.draw_timestamp.desc()).first()
+        if dh and dh[0]: last_draw_at = dh[0].isoformat()
+    except Exception:
+        pass
+
+    # ── Last pool created ──────────────────────────────────────────────────────
+    last_pool_at: str | None = None
+    try:
+        lp = db.query(Pool.created_at).order_by(Pool.created_at.desc()).first()
+        if lp and lp[0]: last_pool_at = lp[0].isoformat()
+    except Exception:
+        pass
+
+    # ── Injection background tasks ─────────────────────────────────────────────
+    try:
+        from app.routers.dev import _INJECT_STATUS, _INJECT_LOCK
+        with _INJECT_LOCK:
+            running_injects = sum(1 for v in _INJECT_STATUS.values() if v.get("status") == "running")
+    except Exception:
+        running_injects = 0
+
+    # ── Data integrity last run ────────────────────────────────────────────────
+    # We don't persist the last-run time yet, so approximate from the scheduler log
+    integrity_last_run: str | None = None   # future: persist in SystemSettings
+
+    utilisation = round(
+        pool_snap.get("checked_out", 0) / max(pool_snap.get("total_capacity", 40), 1) * 100, 1
+    )
+    health_rating = (
+        "critical" if not db_reachable
+        else "warning" if utilisation >= 80
+        else "caution" if utilisation >= 60
+        else "healthy"
+    )
+
+    return {
+        "checked_at":              checked_at,
+        "health_rating":           health_rating,
+        "db_reachable":            db_reachable,
+        "db_pool":                 pool_snap,
+        "db_pool_utilisation_pct": utilisation,
+        "active_users":            active_users,
+        "waitlist_count":          waitlist_count,
+        "pools_active":            pools_active,
+        "pools_paused":            pools_paused,
+        "pools_under_capacity":    pools_under_cap,
+        "last_draw_at":            last_draw_at,
+        "last_pool_created_at":    last_pool_at,
+        "injection_tasks_running": running_injects,
+        "data_integrity_last_run": integrity_last_run,
+    }
 
 
 # ── Aggregate Stats ───────────────────────────────────────────────────────────

@@ -13,12 +13,13 @@ import Diagnostics from './pages/Diagnostics'
 import SystemSettings from './pages/SystemSettings'
 import NotFound from './pages/NotFound'
 // Code-split heavy Recharts pages — loaded only when first visited
-const Statistics        = lazy(() => import('./pages/Statistics'))
-const DevTools          = lazy(() => import('./pages/DevTools'))
-const WinningLedger     = lazy(() => import('./pages/WinningLedger'))
-const DrawEngine        = lazy(() => import('./pages/DrawEngine'))
-const CommandCenter     = lazy(() => import('./pages/CommandCenter'))
-const HydraulicPipeline = lazy(() => import('./pages/HydraulicPipeline'))
+const Statistics          = lazy(() => import('./pages/Statistics'))
+const DevTools            = lazy(() => import('./pages/DevTools'))
+const WinningLedger       = lazy(() => import('./pages/WinningLedger'))
+const DrawEngine          = lazy(() => import('./pages/DrawEngine'))
+const CommandCenter       = lazy(() => import('./pages/CommandCenter'))
+const HydraulicPipeline   = lazy(() => import('./pages/HydraulicPipeline'))
+const PaymentCompliance   = lazy(() => import('./pages/PaymentCompliance'))
 
 // Dev Tools route is only accessible when the build was compiled with
 // VITE_ENABLE_DEV_MODE=true.  Any other value redirects to the dashboard.
@@ -83,6 +84,7 @@ export default function App() {
                 <Route path="draw-engine"        element={<DrawEngine />} />
                 <Route path="winning-ledger" element={<WinningLedger />} />
                 <Route path="referrals"      element={<ReferralQueue />} />
+                <Route path="payment-compliance" element={<PaymentCompliance />} />
                 <Route path="diagnostics" element={<Diagnostics />} />
                 <Route path="settings"    element={<SystemSettings />} />
                 <Route path="dev-tools"   element={<DevModeRoute><DevTools /></DevModeRoute>} />

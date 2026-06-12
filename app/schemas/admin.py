@@ -77,6 +77,14 @@ class AdminUserListItem(BaseModel):
     referred_by_user_id:            Optional[int]
     total_referrals_count:          int     = 0
     accumulated_referral_bonus_inr: Decimal = Decimal("0")
+    # Phase 4: IRCTC-style dynamic waitlist position
+    # Null for Active/Eliminated users; "WL-60" string for Waitlist users.
+    # Computed via ROW_NUMBER() window function — always live, never stale.
+    wl_position:                    Optional[str] = None   # e.g. "WL-60" | null
+    # Compliance flags (Phase 1)
+    sde_required:                   bool    = False
+    elimination_risk:               bool    = False
+    grace_active:                   bool    = False
 
     model_config = {"from_attributes": True}
 

@@ -26,7 +26,9 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+import threading
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, insert as sa_insert, text
 from sqlalchemy.orm import Session
@@ -49,6 +51,23 @@ router = APIRouter(
     tags=["Developer Mode"],
     dependencies=[Depends(require_dev_mode)],
 )
+
+# ── Injection Background Task Registry ───────────────────────────────────────
+# Tracks the status of timed-injection pool-formation jobs that run after the
+# HTTP response is returned.  Keyed by `prefix` (unique per injection call).
+# Thread-safe via threading.Lock since FastAPI may serve concurrent requests.
+#
+# Schema per entry:
+#   {
+#     "status":       "running" | "done" | "error",
+#     "pools_formed": int,
+#     "waitlist_remaining": int,
+#     "error":        str | None,
+#     "started_at":   datetime ISO,
+#     "finished_at":  datetime ISO | None,
+#   }
+_INJECT_STATUS: dict[str, dict] = {}
+_INJECT_LOCK   = threading.Lock()
 
 # Rows per executemany batch — keeps individual SQL statements a manageable size
 _BULK_BATCH = 5_000
@@ -1002,6 +1021,19 @@ class _AdvSimEngine:
         self.n_type_a_draws: int = 0   # Type A draw executions (LPI 14-25%)
         self.n_type_b_draws: int = 0   # Type B draw executions (L1/L2 shortage)
 
+        # ── L5/L6 peak tracking (Anti-Maturity pressure metrics) ──────────────
+        # Tracks the maximum L5 and L6 member counts seen in any single cycle.
+        # Used by the Stress Test panel to show heavy pressure accumulation.
+        self._max_l5:        int = 0   # peak L5 member count across all cycles
+        self._max_l6:        int = 0   # peak L6 member count across all cycles
+        self._high_lpi_streak: int = 0   # consecutive cycles with LPI > 40%
+        self._max_high_lpi_streak: int = 0   # longest high-LPI streak seen
+
+        # ── Weekly detail log (for Master Weekly Report, Phase 2-C) ──────────
+        # Each element is a rich per-cycle record emitted by run_cycle().
+        # Stored here so the endpoint can return it alongside simulation_summary.
+        self.weekly_detail: list[dict] = []
+
         self.logs: list[dict] = []
         self._ins:  list[dict] = []   # pending DB-insert buffer
 
@@ -1414,30 +1446,124 @@ class _AdvSimEngine:
         )
         momentum   = velocity - prev_vel
 
-        # ── Execute cycle ────────────────────────────────────────────────────
-        self.step_a(cycle, req.volatility_mode, req.volatility_max_inflow, base, hpw)
-        self.step_b(req.late_fee_pct, req.late_users_ratio_pct)
-        self.step_c()
-        _, merges = self.step_d(ts, rdr_pct)
-        _, pauses = self.step_e()
+        # ── Pre-draw level snapshot ──────────────────────────────────────────
+        # Count active pool members at each level before the draw executes.
+        level_counts_pre: dict[str, int] = {f"L{l}": 0 for l in range(1, 7)}
+        for u in self._users.values():
+            if u.alive and u.pool_sid is not None:
+                key = f"L{min(u.level, 6)}"
+                level_counts_pre[key] = level_counts_pre.get(key, 0) + 1
 
-        active_n = sum(1 for p in self._pools.values() if not p.dissolved and not p.paused)
+        # Track L5/L6 peaks for Anti-Maturity pressure metrics
+        l5_this = level_counts_pre.get("L5", 0)
+        l6_this = level_counts_pre.get("L6", 0)
+        if l5_this > self._max_l5: self._max_l5 = l5_this
+        if l6_this > self._max_l6: self._max_l6 = l6_this
+
+        # ── Execute cycle ────────────────────────────────────────────────────
+        n_joined = self.step_a(cycle, req.volatility_mode, req.volatility_max_inflow, base, hpw)
+        n_late   = self.step_b(req.late_fee_pct, req.late_users_ratio_pct)
+        self.step_c()
+        condensed, merges = self.step_d(ts, rdr_pct)
+        draws_this_cycle, pauses = self.step_e()
+
+        # ── Post-draw state ──────────────────────────────────────────────────
+        lpi_post   = self._calc_lpi()
+        active_n   = sum(1 for p in self._pools.values() if not p.dissolved and not p.paused)
+        paused_n   = sum(1 for p in self._pools.values() if not p.dissolved and p.paused)
+        total_pools = sum(1 for p in self._pools.values() if not p.dissolved)
+
+        # LPI streak tracking for "heavy pressure mode"
+        if lpi_post > 40.0:
+            self._high_lpi_streak += 1
+            if self._high_lpi_streak > self._max_high_lpi_streak:
+                self._max_high_lpi_streak = self._high_lpi_streak
+        else:
+            self._high_lpi_streak = 0
+
+        # Post-draw level distribution (after winners exit + new members join)
+        level_counts_post: dict[str, int] = {f"L{l}": 0 for l in range(1, 7)}
+        for u in self._users.values():
+            if u.alive and u.pool_sid is not None:
+                key = f"L{min(u.level, 6)}"
+                level_counts_post[key] = level_counts_post.get(key, 0) + 1
+
+        # Financial snapshot this cycle
+        cash_inflow_this  = n_joined * float(_S_DEP)    # new deposits
+        # Weekly installments collected (approximated from active members × 1000)
+        total_active_in_pools = sum(level_counts_post.values())
+        installments_this  = total_active_in_pools * float(_S_DEP)
+        late_fees_this     = n_late * float(_S_DEP) * (req.late_fee_pct / 100.0) if n_late else 0.0
+
+        # Randomised join timestamps for realistic week representation
+        # Join dates are distributed across the week via Gaussian (σ=2 days)
+        week_start_iso = ts.date().isoformat()
+
+        # ── Append to cycle_logs (backward-compatible lean log) ──────────────
         self.logs.append({
-            "week":           cycle,
-            "active_pools":   active_n,
-            "waitlist_count": len(self._wl),
-            "pauses":         pauses,
-            "merges":         merges,
-            "momentum_value": round(momentum, 3),
-            "rdr_value":      round(rdr_pct,  1),
-            "scenario":       scenario,
-            "phase":          phase,
-            "burn_rate":      burn_rate,
+            "week":               cycle,
+            "active_pools":       active_n,
+            "waitlist_count":     len(self._wl),
+            "pauses":             pauses,
+            "merges":             merges,
+            "momentum_value":     round(momentum, 3),
+            "rdr_value":          round(rdr_pct,  1),
+            "scenario":           scenario,
+            "phase":              phase,
+            "burn_rate":          burn_rate,
             "velocity":           round(velocity, 2),
-            "lpi":                round(self._calc_lpi(), 1),
+            "lpi":                round(lpi_post, 1),
             "sde_exits_total":    self.n_sde_exits,
             "type_a_draws_total": self.n_type_a_draws,
             "type_b_draws_total": self.n_type_b_draws,
+            # Extended L5/L6 pressure data
+            "l5_count":           l5_this,
+            "l6_count":           l6_this,
+            "high_pressure_mode": lpi_post > 40.0,
+        })
+
+        # ── Append to weekly_detail (Master Weekly Report, Phase 2-C) ────────
+        self.weekly_detail.append({
+            "week":             cycle,
+            "week_start_date":  week_start_iso,
+            # Inflow
+            "users_joined":     n_joined,
+            # Counts
+            "active_users":     sum(1 for u in self._users.values() if u.alive and u.pool_sid is not None),
+            "waitlist_count":   len(self._wl),
+            "pools_active":     active_n,
+            "pools_paused":     paused_n,
+            "pools_total":      total_pools,
+            "pools_formed_this_week":  max(0, total_pools - (len(self.logs) > 1 and self.logs[-2].get("active_pools", 0) or 0) - paused_n),
+            "pools_merged_this_week":  merges,
+            # Level distribution
+            "level_distribution": {**level_counts_post},
+            "l5_count":           l5_this,
+            "l6_count":           l6_this,
+            # LPI & draw intelligence
+            "lpi":                round(lpi_post, 2),
+            "high_pressure_mode": lpi_post > 40.0,
+            "draws_this_week":    draws_this_cycle,
+            "draw_type_breakdown": {
+                "regular": max(0, draws_this_cycle - self.n_type_a_draws - self.n_type_b_draws - self.n_sde_exits),
+                "type_a":  self.n_type_a_draws,
+                "type_b":  self.n_type_b_draws,
+                "sde":     self.n_sde_exits,
+            },
+            # Payment stats
+            "late_payers":        n_late,
+            "late_fees_collected_inr": round(late_fees_this, 2),
+            "condensation_events": condensed,
+            # Financials (approximate per-cycle)
+            "cash_inflow_inr":    round(cash_inflow_this, 2),
+            "installments_collected_inr": round(installments_this, 2),
+            "total_inflow_inr":   round(cash_inflow_this + installments_this + late_fees_this, 2),
+            # AI/market signals
+            "scenario":           scenario,
+            "phase":              phase,
+            "velocity":           round(velocity, 2),
+            "momentum":           round(momentum, 3),
+            "rdr_pct":            round(rdr_pct, 1),
         })
 
     # ── Response helpers ──────────────────────────────────────────────────────
@@ -1501,6 +1627,14 @@ class _AdvSimEngine:
             }
 
         # ── System health counters ─────────────────────────────────────────────
+        # ── L5/L6 peak timeline (Anti-Maturity pressure) ──────────────────────
+        # Peak counts per cycle for the Level Progression chart
+        l5_by_week = [log.get("l5_count", 0) for log in self.logs]
+        l6_by_week = [log.get("l6_count", 0) for log in self.logs]
+
+        # Pool pause timeline (used by Pool Activity tab)
+        pauses_by_week = [log.get("pauses", 0) for log in self.logs]
+
         system_health = {
             "total_members_injected":        self.n_created,
             "total_direct_pool_assignments": self.direct_assignments,
@@ -1514,6 +1648,13 @@ class _AdvSimEngine:
             "sde_exit_rate_pct": round(
                 self.n_sde_exits / max(self.n_winners, 1) * 100, 1
             ),
+            # Anti-Maturity pressure metrics (Phase 2-A)
+            "max_l5_count":                 self._max_l5,
+            "max_l6_count":                 self._max_l6,
+            "max_high_lpi_streak_weeks":    self._max_high_lpi_streak,
+            "l5_peak_by_week":              l5_by_week,
+            "l6_peak_by_week":              l6_by_week,
+            "pauses_by_week":               pauses_by_week,
         }
 
         return {
@@ -1618,6 +1759,7 @@ def advanced_simulation(
         return {
             "simulation_summary": summ,
             "cycle_logs":         engine.logs,
+            "weekly_detail":      engine.weekly_detail,   # Phase 2-C Master Weekly Report
         }
 
     except Exception:
@@ -2131,8 +2273,130 @@ class TimedInjectRequest(BaseModel):
     auto_pool:          bool  = Field(True,                  description="Auto-trigger pool formation after creation.")
 
 
+def _build_join_dates(
+    body: "TimedInjectRequest",
+    anchor: datetime,
+    count: int,
+) -> list[datetime]:
+    """
+    Compute the sorted list of join_date timestamps for a timed injection.
+    Extracted here so it can be unit-tested independently of the endpoint.
+    """
+    join_dates: list[datetime] = []
+
+    if body.spread_days == 0:
+        # All users at the anchor datetime, sequential minutes apart
+        for i in range(count):
+            join_dates.append(anchor + timedelta(minutes=i))
+
+    elif body.daily_count and body.spread_days > 0:
+        # Daily cadence: daily_count per day for spread_days days
+        for day in range(body.spread_days):
+            day_base = anchor - timedelta(days=(body.spread_days - 1 - day))
+            for j in range(body.daily_count):
+                if len(join_dates) >= count:
+                    break
+                minute_offset = random.randint(0, 1439) if body.randomize_dates else j
+                join_dates.append(day_base + timedelta(minutes=minute_offset))
+            if len(join_dates) >= count:
+                break
+        # Pad to count if daily_count × spread_days < count
+        while len(join_dates) < count:
+            join_dates.append(anchor - timedelta(minutes=random.randint(0, body.spread_days * 1440)))
+
+    elif body.randomize_dates:
+        # Random scatter within the spread window
+        spread_minutes = body.spread_days * 24 * 60
+        for i in range(count):
+            offset = random.randint(0, max(1, spread_minutes))
+            join_dates.append(anchor - timedelta(minutes=offset) + timedelta(seconds=i))
+
+    else:
+        # Linear spread: evenly spaced across the window
+        if count == 1 or body.spread_days == 0:
+            join_dates = [anchor + timedelta(minutes=i) for i in range(count)]
+        else:
+            interval = (body.spread_days * 24 * 60) / (count - 1)
+            for i in range(count):
+                join_dates.append(anchor - timedelta(minutes=interval * (count - 1 - i)))
+
+    return sorted(join_dates)[:count]   # FIFO order guaranteed
+
+
+def _background_pool_formation(prefix: str) -> None:
+    """
+    Background task: form pools from the users just injected.
+
+    Runs AFTER the HTTP response is returned to the client.  This prevents
+    HTTP timeouts on large batches (2000+ users → 10–30 s pool-formation loop).
+
+    Uses a fresh DB session so it doesn't compete with the request-scoped
+    session that has already closed.  Status is written to _INJECT_STATUS so
+    clients can poll GET /dev/injection-status?prefix=<prefix>.
+    """
+    from app.database import SessionLocal as _SL   # local import avoids circular
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    with _INJECT_LOCK:
+        _INJECT_STATUS[prefix] = {
+            "status":            "running",
+            "pools_formed":      0,
+            "waitlist_remaining": None,
+            "error":             None,
+            "started_at":        started_at,
+            "finished_at":       None,
+        }
+
+    db = _SL()
+    try:
+        pools_formed = 0
+        fill_pool_vacancies(db)
+        while True:
+            new_pool = manual_create_pool(db)
+            if not new_pool:
+                break
+            pools_formed += 1
+
+        wl_remaining = (
+            db.query(func.count(User.id))
+            .filter(User.status == UserStatus.Waitlist)
+            .scalar() or 0
+        )
+
+        with _INJECT_LOCK:
+            _INJECT_STATUS[prefix].update({
+                "status":            "done",
+                "pools_formed":      pools_formed,
+                "waitlist_remaining": wl_remaining,
+                "finished_at":       datetime.now(timezone.utc).isoformat(),
+            })
+        _logger_sim.info(
+            "inject-timed background: prefix=%s  pools_formed=%d  wl_remaining=%d",
+            prefix, pools_formed, wl_remaining,
+        )
+
+    except Exception as exc:
+        _logger_sim.error("inject-timed background FAILED: prefix=%s  error=%s", prefix, exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        with _INJECT_LOCK:
+            _INJECT_STATUS[prefix].update({
+                "status":    "error",
+                "error":     str(exc),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+    finally:
+        db.close()
+
+
 @router.post("/inject-timed")
-def dev_inject_timed(body: TimedInjectRequest, db: Session = Depends(get_db)):
+def dev_inject_timed(
+    body: TimedInjectRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """
     Inject users with fully-customizable date/time distribution.
 
@@ -2141,8 +2405,27 @@ def dev_inject_timed(body: TimedInjectRequest, db: Session = Depends(get_db)):
       • Random spread: each user gets a random date within the last N days
       • Daily cadence: daily_count users per day for spread_days days
 
-    This lets you simulate realistic historical member growth with accurate
-    temporal spacing so FIFO ordering is meaningful.
+    IMPORTANT DESIGN CHANGE (pool formation is now asynchronous):
+    ──────────────────────────────────────────────────────────────
+    For large batches (200+ users) the pool-formation loop (fill vacancies →
+    manual_create_pool loop) takes 5–30 seconds.  Executing it inline blocked
+    the HTTP response and caused:
+      1. The browser to show a timeout / request-failed error.
+      2. All subsequent API calls to queue behind the blocking operation,
+         exhausting the connection pool and making ALL buttons fail.
+
+    Fix: user rows + DEP tokens are committed synchronously (fast, ~200 ms for
+    2000 users).  The pool-formation loop is handed off to FastAPI's
+    BackgroundTasks which run AFTER the HTTP response is sent.  The client
+    receives an immediate 200 with:
+      {
+        "users_created": N,
+        "pool_formation": "background",
+        "status_key": prefix
+      }
+    Poll GET /dev/injection-status?prefix=<prefix> to get live pool-formation
+    progress.  The admin Dashboard's "Check Waitlist Threshold" button will
+    also catch any missed formations.
     """
     import time as _time
 
@@ -2164,45 +2447,7 @@ def dev_inject_timed(body: TimedInjectRequest, db: Session = Depends(get_db)):
         anchor = datetime.now(timezone.utc)
 
     # ── Build join_date list ──────────────────────────────────────────────────
-    join_dates: list[datetime] = []
-
-    if body.spread_days == 0:
-        # All users at the anchor datetime, sequential minutes apart
-        for i in range(count):
-            join_dates.append(anchor + timedelta(minutes=i))
-
-    elif body.daily_count and body.spread_days > 0:
-        # Daily cadence: daily_count per day for spread_days days
-        for day in range(body.spread_days):
-            day_base = anchor - timedelta(days=(body.spread_days - 1 - day))
-            for j in range(body.daily_count):
-                if len(join_dates) >= count:
-                    break
-                minute_offset = random.randint(0, 1439) if body.randomize_dates else j
-                join_dates.append(day_base + timedelta(minutes=minute_offset))
-            if len(join_dates) >= count:
-                break
-        # Pad to count if daily_count * spread_days < count
-        while len(join_dates) < count:
-            join_dates.append(anchor - timedelta(minutes=random.randint(0, body.spread_days * 1440)))
-
-    elif body.randomize_dates:
-        # Random scatter within the spread window
-        spread_minutes = body.spread_days * 24 * 60
-        for i in range(count):
-            offset = random.randint(0, max(1, spread_minutes))
-            join_dates.append(anchor - timedelta(minutes=offset) + timedelta(seconds=i))
-
-    else:
-        # Linear spread: evenly spaced across the window
-        if count == 1 or body.spread_days == 0:
-            join_dates = [anchor + timedelta(minutes=i) for i in range(count)]
-        else:
-            interval = (body.spread_days * 24 * 60) / (count - 1)
-            for i in range(count):
-                join_dates.append(anchor - timedelta(minutes=interval * (count - 1 - i)))
-
-    join_dates = sorted(join_dates)[:count]   # FIFO order guaranteed
+    join_dates = _build_join_dates(body, anchor, count)
 
     # ── Build user rows ───────────────────────────────────────────────────────
     hashed_pw = _get_dev_pw_hash()
@@ -2242,6 +2487,10 @@ def dev_inject_timed(body: TimedInjectRequest, db: Session = Depends(get_db)):
         ).fetchall()
     ]
 
+    if not user_ids:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Bulk user insert produced no rows — check DB constraints.")
+
     codes: set[str] = set()
     while len(codes) < len(user_ids):
         codes.update(f"DEP-{secrets.token_hex(4).upper()}" for _ in range(len(user_ids) - len(codes)))
@@ -2260,43 +2509,127 @@ def dev_inject_timed(body: TimedInjectRequest, db: Session = Depends(get_db)):
     ]
     for start in range(0, len(token_rows), _BULK_BATCH):
         db.execute(sa_insert(Token), token_rows[start:start + _BULK_BATCH])
-    db.commit()
+    db.commit()   # ← HTTP response can now return; pool formation continues below
 
-    # ── Auto-pool formation ───────────────────────────────────────────────────
-    pools_formed = 0
-    if body.auto_pool:
-        fill_pool_vacancies(db)
-        while True:
-            new_pool = manual_create_pool(db)
-            if not new_pool:
-                break
-            pools_formed += 1
-
-    wl_remaining = db.query(func.count(User.id)).filter(User.status == UserStatus.Waitlist).scalar() or 0
+    # ── Pool formation: schedule as background task ───────────────────────────
+    # For small counts (≤ 100 users) run inline — background overhead not worth it.
+    # For large counts run in background so the HTTP response returns immediately.
+    date_from    = join_dates[0].isoformat() if join_dates else None
+    date_to      = join_dates[-1].isoformat() if join_dates else None
     elapsed_ms   = int((time.perf_counter() - t0) * 1000)
 
-    # Date range summary
-    date_from = join_dates[0].isoformat() if join_dates else None
-    date_to   = join_dates[-1].isoformat() if join_dates else None
+    if body.auto_pool:
+        if count <= 100:
+            # ── Inline (small batch — fast) ───────────────────────────────────
+            pools_formed = 0
+            fill_pool_vacancies(db)
+            while True:
+                new_pool = manual_create_pool(db)
+                if not new_pool:
+                    break
+                pools_formed += 1
+            wl_remaining = (
+                db.query(func.count(User.id))
+                .filter(User.status == UserStatus.Waitlist)
+                .scalar() or 0
+            )
+            return {
+                "users_created":      len(user_ids),
+                "dep_tokens_created": len(user_ids),
+                "pools_formed":       pools_formed,
+                "pool_formation":     "inline",
+                "waitlist_remaining": wl_remaining,
+                "elapsed_ms":         elapsed_ms,
+                "date_from":          date_from,
+                "date_to":            date_to,
+                "spread_days":        body.spread_days,
+                "randomized":         body.randomize_dates,
+                "daily_cadence":      body.daily_count,
+                "prefix":             prefix,
+                "status_key":         None,
+                "note": (
+                    f"{len(user_ids)} timed users created (inline pool formation). "
+                    f"{pools_formed} pool(s) formed. {wl_remaining} on waitlist."
+                ),
+            }
+        else:
+            # ── Background (large batch — avoids HTTP timeout) ─────────────────
+            background_tasks.add_task(_background_pool_formation, prefix)
+            return {
+                "users_created":      len(user_ids),
+                "dep_tokens_created": len(user_ids),
+                "pools_formed":       None,
+                "pool_formation":     "background",
+                "waitlist_remaining": None,
+                "elapsed_ms":         elapsed_ms,
+                "date_from":          date_from,
+                "date_to":            date_to,
+                "spread_days":        body.spread_days,
+                "randomized":         body.randomize_dates,
+                "daily_cadence":      body.daily_count,
+                "prefix":             prefix,
+                "status_key":         prefix,
+                "note": (
+                    f"{len(user_ids)} users + DEP tokens committed. "
+                    f"Pool formation running in background — "
+                    f"poll GET /dev/injection-status?prefix={prefix} for progress."
+                ),
+            }
+    else:
+        wl_remaining = (
+            db.query(func.count(User.id))
+            .filter(User.status == UserStatus.Waitlist)
+            .scalar() or 0
+        )
+        return {
+            "users_created":      len(user_ids),
+            "dep_tokens_created": len(user_ids),
+            "pools_formed":       0,
+            "pool_formation":     "skipped",
+            "waitlist_remaining": wl_remaining,
+            "elapsed_ms":         elapsed_ms,
+            "date_from":          date_from,
+            "date_to":            date_to,
+            "spread_days":        body.spread_days,
+            "randomized":         body.randomize_dates,
+            "daily_cadence":      body.daily_count,
+            "prefix":             prefix,
+            "status_key":         None,
+            "note": (
+                f"{len(user_ids)} timed users created (auto_pool=false). "
+                f"Call POST /admin/waitlist/check to form pools manually."
+            ),
+        }
 
-    return {
-        "users_created":    len(user_ids),
-        "dep_tokens_created": len(user_ids),
-        "pools_formed":     pools_formed,
-        "waitlist_remaining": wl_remaining,
-        "elapsed_ms":       elapsed_ms,
-        "date_from":        date_from,
-        "date_to":          date_to,
-        "spread_days":      body.spread_days,
-        "randomized":       body.randomize_dates,
-        "daily_cadence":    body.daily_count,
-        "prefix":           prefix,
-        "note": (
-            f"{len(user_ids)} timed users created — "
-            f"join dates from {date_from} to {date_to}.  "
-            f"{pools_formed} pool(s) formed.  {wl_remaining} on waitlist."
-        ),
-    }
+
+@router.get("/injection-status")
+def dev_injection_status(prefix: str):
+    """
+    Poll the status of a background pool-formation job started by POST /dev/inject-timed.
+
+    Returns the current state:
+      • status = "running"  — pool formation is in progress
+      • status = "done"     — complete; pools_formed and waitlist_remaining filled
+      • status = "error"    — background task raised an exception; see error field
+      • status = "unknown"  — prefix not found (job hasn't started or expired from memory)
+
+    The in-memory registry holds at most ~1000 entries (one per injection call since
+    server start).  On server restart all entries are lost — check pool counts directly
+    via GET /pools/ to verify formation completed.
+    """
+    with _INJECT_LOCK:
+        entry = _INJECT_STATUS.get(prefix)
+
+    if entry is None:
+        return {
+            "prefix": prefix,
+            "status": "unknown",
+            "message": (
+                "No background task found for this prefix. "
+                "Either it hasn't started, the server was restarted, or this prefix is invalid."
+            ),
+        }
+    return {"prefix": prefix, **entry}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

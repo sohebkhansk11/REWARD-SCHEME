@@ -82,8 +82,11 @@ export const eliminateUnpaid   = () => api.post('/admin/penalty/eliminate-unpaid
 export const getUsers = (params) => api.get('/users/', { params: { limit: 500, ...params } })
 
 // ── Admin User Directory ──────────────────────────────────────────────────────
+// Default limit 2000 — backend now supports up to 5000.  UserDirectory
+// renders with a "Load More" pattern; this covers even large stress-test
+// injections (2000+ users) in a single fetch without pagination overhead.
 export const getAdminUsers  = (params) =>
-  api.get('/admin/users', { params: { limit: 500, ...params } })
+  api.get('/admin/users', { params: { limit: 2000, ...params } })
 
 export const getAdminUser   = (userId) => api.get(`/admin/users/${userId}`)
 
@@ -282,6 +285,62 @@ export const getDrawCountdown = () =>
 export const getBrain5Lpi = () =>
   api.get('/admin/stats/brain5-lpi')
 
+/** GET /admin/health — System health watchdog: DB pool, user/pool counts, last draw */
+export const getSystemHealth = () =>
+  api.get('/admin/health')
+
+/** GET /admin/pipeline-health — Full pipeline health: DB pool + injection tasks + integrity */
+export const getPipelineHealth = () =>
+  api.get('/admin/pipeline-health')
+
+// ── Payment Compliance & Elimination Engine ────────────────────────────────────
+
+/** GET /admin/elimination/settings — all 8 elimination config settings */
+export const getEliminationSettings = () =>
+  api.get('/admin/elimination/settings')
+
+/** PUT /admin/elimination/settings — update settings (admin password required) */
+export const updateEliminationSettings = (data) =>
+  api.put('/admin/elimination/settings', data)
+
+/** GET /admin/elimination/late-payers — all unpaid active members */
+export const getLatePayers = (params = {}) =>
+  api.get('/admin/elimination/late-payers', { params })
+
+/** GET /admin/elimination/at-risk — members past due date, not in grace */
+export const getAtRiskUsers = (params = {}) =>
+  api.get('/admin/elimination/at-risk', { params })
+
+/** GET /admin/elimination/grace-period — members in grace period window */
+export const getGracePeriodUsers = () =>
+  api.get('/admin/elimination/grace-period')
+
+/** GET /admin/elimination/history — EliminationEvent audit log */
+export const getEliminationHistory = (params = {}) =>
+  api.get('/admin/elimination/history', { params })
+
+/** POST /admin/elimination/mark-at-risk — flag all unpaid-past-due users */
+export const markAtRisk = () =>
+  api.post('/admin/elimination/mark-at-risk')
+
+/** POST /admin/elimination/grant-grace/:uid — move user to grace period */
+export const grantGracePeriod = (uid, hours = 48) =>
+  api.post(`/admin/elimination/grant-grace/${uid}`, { hours_until_expiry: hours })
+
+/** POST /admin/elimination/save-seat/:uid — confirm grace payment received */
+export const saveSeat = (uid, adminPassword, notes = undefined) =>
+  api.post(`/admin/elimination/save-seat/${uid}`, {
+    admin_password: adminPassword,
+    ...(notes ? { notes } : {}),
+  })
+
+/** POST /admin/elimination/execute — run elimination cycle */
+export const executeElimination = (adminPassword, dryRun = false) =>
+  api.post('/admin/elimination/execute', {
+    admin_password: adminPassword,
+    dry_run: dryRun,
+  })
+
 // ── Developer Mode — new analytics endpoints ──────────────────────────────────
 
 /** GET /dev/live-stats — Combined real-time statistics for dev panel */
@@ -300,9 +359,16 @@ export const devWinnersAnalytics = () =>
 export const devProjection = () =>
   api.get('/dev/projection')
 
-/** POST /dev/inject-timed — Inject users with custom date/time distribution */
+/** POST /dev/inject-timed — Inject users with custom date/time distribution.
+ *  Pool formation now runs in background for count > 100; response returns
+ *  immediately (~1s).  Poll getInjectionStatus(prefix) for pool-formation progress.
+ */
 export const devInjectTimed = (params) =>
-  api.post('/dev/inject-timed', params, { timeout: 60_000 })
+  api.post('/dev/inject-timed', params, { timeout: 120_000 })
+
+/** GET /dev/injection-status?prefix=<prefix> — Poll background pool-formation status */
+export const getInjectionStatus = (prefix) =>
+  api.get('/dev/injection-status', { params: { prefix } })
 
 /** POST /dev/mark-all-paid — Master paid toggle for all active pool members */
 export const devMarkAllPaid = () =>
@@ -311,6 +377,10 @@ export const devMarkAllPaid = () =>
 /** POST /dev/set-payment-scenario — Set paid/late/elimination percentages */
 export const devSetPaymentScenario = (params) =>
   api.post('/dev/set-payment-scenario', params)
+
+/** GET /admin/stats/pause-calendar — rolling 90-day system pause heatmap */
+export const getPauseCalendar = () =>
+  api.get('/admin/stats/pause-calendar')
 
 // ── System Settings ───────────────────────────────────────────────────────────
 

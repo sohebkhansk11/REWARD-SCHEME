@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { UserProvider, useUser } from './context/UserContext'
+import { NotificationProvider } from './context/NotificationContext'
 import Auth from './pages/Auth'
 import Dashboard from './pages/Dashboard'
 import TokenWallet from './pages/TokenWallet'
@@ -46,11 +47,14 @@ function AppRoutes() {
 export default function App() {
   return (
     <UserProvider>
-      <BrowserRouter>
-        <div className="max-w-[430px] mx-auto min-h-dvh relative">
-          <AppRoutes />
-        </div>
-      </BrowserRouter>
+      {/* NotificationProvider must be inside UserProvider so it can read token */}
+      <NotificationProvider>
+        <BrowserRouter>
+          <div className="max-w-[430px] mx-auto min-h-dvh relative">
+            <AppRoutes />
+          </div>
+        </BrowserRouter>
+      </NotificationProvider>
     </UserProvider>
   )
 }

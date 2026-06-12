@@ -583,21 +583,42 @@ function DrawAnalysisChart({ weekly }) {
 }
 
 function StressTestTab({ toast }) {
-  const [cycles, setCycles] = useState(50)
-  const [lateFee, setLateFee] = useState(5.0)
+  const [cycles,    setCycles]    = useState(50)
+  // ── A/B/C Circular Late-Fee Parameters (A-2) ──────────────────────────────
+  // A — Elimination %: what % of unpaid members are eliminated (don't attempt grace)
+  // B — Late Fee Rate %: fee per day as % of ₹1000 deposit (min 5% = ₹50/day)
+  // C — Grace Saver %: of at-risk members, what % actually pay the grace fee
+  // Circular: B cost → affects C willingness → affects effective A elimination rate
+  const [elimPctA,  setElimPctA]  = useState(80.0)   // A: 0.05–100%
+  const [lateFeeB,  setLateFeeB]  = useState(5.0)    // B: 5–100% per day of deposit
+  const [gracePctC, setGracePctC] = useState(15.0)   // C: 0.05–100%
+  // late_users_ratio_pct: % of active members who miss the payment due date
   const [lateRatio, setLateRatio] = useState(2.0)
-  const [vol, setVol] = useState(false)
-  const [volMax, setVolMax] = useState(100)
-  const [rdr, setRdr] = useState(40.0)
-  const [running, setRunning] = useState(false)
-  const [result, setResult] = useState(null)
+  const [vol,       setVol]       = useState(false)
+  const [volMax,    setVolMax]    = useState(100)
+  const [rdr,       setRdr]       = useState(40.0)
+  const [running,   setRunning]   = useState(false)
+  const [result,    setResult]    = useState(null)
   const [showSetup, setShowSetup] = useState(false)
   const [reportTab, setReportTab] = useState('summary')   // Phase 2-C report sub-tab
+
+  // Derived: effective elimination = those who fail + those in grace who don't pay
+  const effectiveElim = ((elimPctA / 100) + (1 - elimPctA / 100) * (1 - gracePctC / 100)) * 100
+  const lateFeeINR    = Math.round(lateFeeB / 100 * 1000)
 
   const run = async () => {
     setRunning(true); setResult(null); setReportTab('summary')
     try {
-      const res = await advancedSimulationDev({ total_cycles:cycles, late_fee_pct:lateFee, late_users_ratio_pct:lateRatio, volatility_mode:vol, volatility_max_inflow:volMax, avg_rdr_pct:rdr })
+      const res = await advancedSimulationDev({
+        total_cycles:         cycles,
+        late_fee_pct:         lateFeeB,           // B → ₹/day as % of deposit
+        late_users_ratio_pct: lateRatio,          // % who miss due date (feeds A+C pool)
+        elim_pct_a:           elimPctA,           // A → direct eliminate (skip grace)
+        grace_saver_pct_c:    gracePctC,          // C → % of grace-eligible who pay
+        volatility_mode:      vol,
+        volatility_max_inflow: volMax,
+        avg_rdr_pct:          rdr,
+      })
       setResult(res.data)
       const s = res.data.simulation_summary
       toast(`Simulation complete — ${s.total_cycles_run} cycles · ${INR(s.final_virtual_liquidity_float)} liquidity`, 'success')
@@ -637,10 +658,80 @@ function StressTestTab({ toast }) {
           {cycles>=500&&!running&&<p className="text-[11px] text-amber-400 flex items-center gap-1.5 mt-2"><AlertTriangle className="w-3.5 h-3.5"/>{cycles>=800?`${cycles} cycles — expect 45–90s`:`${cycles} cycles — expect 20–45s`}</p>}
         </div>
 
-        {/* Late fee/ratio */}
-        <div className="grid grid-cols-2 gap-4">
-          <DevInput label="Late Fee %" hint="(e.g. 5 = ₹50 per defaulter)" type="number" min={0} step={0.5} value={lateFee} disabled={running} onChange={e=>setLateFee(Math.max(0,parseFloat(e.target.value)||0))}/>
-          <DevInput label="Late Users Ratio %" hint="(of active members)" type="number" min={0} max={100} step={0.5} value={lateRatio} disabled={running} onChange={e=>setLateRatio(Math.min(100,Math.max(0,parseFloat(e.target.value)||0)))}/>
+        {/* ── A/B/C Circular Late-Fee Parameters ───────────────────────────── */}
+        <div className="border border-slate-600/60 rounded-xl overflow-hidden">
+          <div className="px-4 py-3 bg-slate-800/60 border-b border-slate-700/60">
+            <p className="text-xs font-bold text-amber-400 uppercase tracking-widest flex items-center gap-2">
+              <ShieldAlert className="w-3.5 h-3.5"/>Circular Late-Fee Parameters A ⟷ B ⟷ C
+            </p>
+            <p className="text-[10px] text-slate-500 mt-0.5">These three parameters are co-related. Changing one affects the system's real effective elimination rate.</p>
+          </div>
+          <div className="p-4 space-y-5">
+            {/* Late payers ratio (who misses due date) */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs text-slate-300 font-semibold">Late Members % <span className="text-slate-500 font-normal">(of all active, miss due date)</span></label>
+                <div className="bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1 text-sm font-black text-slate-200">{lateRatio.toFixed(1)}%</div>
+              </div>
+              <input type="range" min={0} max={30} step={0.5} value={lateRatio} disabled={running}
+                onChange={e=>setLateRatio(parseFloat(e.target.value))}
+                className="w-full h-2 rounded-full appearance-none cursor-pointer accent-slate-400 disabled:opacity-40"
+                style={{background:`linear-gradient(to right,#94a3b8 ${lateRatio/30*100}%,#334155 ${lateRatio/30*100}%)`}}/>
+              <p className="text-[10px] text-slate-600 mt-1">Feeds into: A (direct elim pool) + C (grace period pool)</p>
+            </div>
+
+            {/* A — Elimination % */}
+            <div className="p-3 rounded-xl border border-red-900/50 bg-red-950/20">
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs font-bold text-red-300 uppercase tracking-wider">A — Elimination % <span className="text-red-500/60 font-normal normal-case">(skip grace, directly eliminated)</span></label>
+                <div className="bg-red-950 border border-red-800 rounded-lg px-2.5 py-1 text-sm font-black text-red-300">{elimPctA.toFixed(2)}%</div>
+              </div>
+              <input type="range" min={0.05} max={100} step={0.05} value={elimPctA} disabled={running}
+                onChange={e=>setElimPctA(parseFloat(e.target.value))}
+                className="w-full h-2 rounded-full appearance-none cursor-pointer disabled:opacity-40"
+                style={{background:`linear-gradient(to right,#ef4444 ${elimPctA}%,#334155 ${elimPctA}%)`}}/>
+              <div className="flex justify-between text-[10px] text-slate-600 mt-1 select-none"><span>0.05%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div>
+            </div>
+
+            {/* B — Late Fee Rate */}
+            <div className="p-3 rounded-xl border border-amber-900/50 bg-amber-950/20">
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs font-bold text-amber-300 uppercase tracking-wider">B — Late Fee Rate <span className="text-amber-500/60 font-normal normal-case">(% of ₹1000 deposit per day)</span></label>
+                <div className="flex items-center gap-1.5">
+                  <div className="bg-amber-950 border border-amber-800 rounded-lg px-2.5 py-1 text-sm font-black text-amber-300">{lateFeeB.toFixed(1)}%</div>
+                  <div className="text-[10px] text-amber-600 font-semibold">= ₹{lateFeeINR}/day</div>
+                </div>
+              </div>
+              <input type="range" min={5} max={100} step={0.5} value={lateFeeB} disabled={running}
+                onChange={e=>setLateFeeB(parseFloat(e.target.value))}
+                className="w-full h-2 rounded-full appearance-none cursor-pointer disabled:opacity-40"
+                style={{background:`linear-gradient(to right,#f59e0b ${(lateFeeB-5)/95*100}%,#334155 ${(lateFeeB-5)/95*100}%)`}}/>
+              <div className="flex justify-between text-[10px] text-slate-600 mt-1 select-none"><span>5% min (₹50/day)</span><span>50%</span><span>100% (₹1000/day)</span></div>
+              <p className="text-[10px] text-amber-700/80 mt-1">Higher B → fewer members attempt grace period (C↓ follows B↑)</p>
+            </div>
+
+            {/* C — Grace Saver % */}
+            <div className="p-3 rounded-xl border border-violet-900/50 bg-violet-950/20">
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs font-bold text-violet-300 uppercase tracking-wider">C — Grace Saver % <span className="text-violet-500/60 font-normal normal-case">(of at-risk, pay grace fee + late fee)</span></label>
+                <div className="bg-violet-950 border border-violet-800 rounded-lg px-2.5 py-1 text-sm font-black text-violet-300">{gracePctC.toFixed(2)}%</div>
+              </div>
+              <input type="range" min={0.05} max={100} step={0.05} value={gracePctC} disabled={running}
+                onChange={e=>setGracePctC(parseFloat(e.target.value))}
+                className="w-full h-2 rounded-full appearance-none cursor-pointer disabled:opacity-40"
+                style={{background:`linear-gradient(to right,#7c3aed ${gracePctC}%,#334155 ${gracePctC}%)`}}/>
+              <div className="flex justify-between text-[10px] text-slate-600 mt-1 select-none"><span>0.05%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div>
+            </div>
+
+            {/* Circular effect summary */}
+            <div className="flex items-center gap-3 p-3 bg-slate-800/60 rounded-xl border border-slate-700/40">
+              <div className="text-[10px] text-slate-400 flex-1 space-y-0.5">
+                <p>↳ <span className="text-red-400 font-bold">A={elimPctA.toFixed(1)}%</span> eliminated directly · remaining <span className="text-violet-400 font-bold">{(100-elimPctA).toFixed(1)}%</span> enter grace period</p>
+                <p>↳ Of grace-eligible: <span className="text-violet-400 font-bold">C={gracePctC.toFixed(1)}%</span> pay B=₹{lateFeeINR}/day + ₹500 seat fee → saved</p>
+                <p>↳ <span className="text-orange-400 font-bold">Effective total elim = {effectiveElim.toFixed(1)}%</span> of late payers ({(effectiveElim/100*lateRatio).toFixed(2)}% of all active)</p>
+              </div>
+            </div>
+          </div>
         </div>
 
         {/* Volatility */}

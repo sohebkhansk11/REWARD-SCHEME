@@ -5,7 +5,8 @@ import {
   IndianRupee, Users, Layers, Clock, Zap, AlertTriangle,
   CheckCircle2, XCircle, Shield, Target, Activity,
   ChevronDown, ChevronRight, CheckCheck, AlertCircle,
-  Calculator, Info, Cpu,
+  Calculator, Info, Cpu, CalendarRange, Download, TableProperties,
+  Gavel, DollarSign, Trophy,
 } from 'lucide-react'
 
 // ── Framer-motion variants ─────────────────────────────────────────────────────
@@ -28,7 +29,7 @@ import {
   getAdminTokens, updateTokenStatus, burnToken,
   getBrain5Lpi,
   devLiveStats, devLevelMap, devWinnersAnalytics, devProjection,
-  getPauseCalendar,
+  getPauseCalendar, getWeeklyPoolReports,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -973,6 +974,309 @@ function PendingTokenRow({ token, children }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Weekly Pool Reports panel (A-7 Statistics sub-tab)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const INR_W = v => new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:0}).format(v??0)
+
+function downloadCSVStats(rows, filename) {
+  if (!rows?.length) return
+  const headers = Object.keys(rows[0])
+  const lines   = [
+    headers.join(','),
+    ...rows.map(r => headers.map(h => {
+      const v = r[h]
+      if (v == null) return ''
+      const s = typeof v === 'object' ? JSON.stringify(v) : String(v)
+      return s.includes(',') ? `"${s.replace(/"/g,'""')}"` : s
+    }).join(',')),
+  ]
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' })
+  const url  = URL.createObjectURL(blob)
+  const a    = document.createElement('a'); a.href = url; a.download = filename
+  document.body.appendChild(a); a.click(); document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+function WeeklyPoolReportsPanel({ toast }) {
+  const [data,     setData]     = useState(null)
+  const [loading,  setLoading]  = useState(true)
+  const [weeks,    setWeeks]    = useState(24)
+  const [viewTab,  setViewTab]  = useState('table')  // 'table' | 'draws' | 'payouts' | 'levels'
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await getWeeklyPoolReports(weeks)
+      setData(res.data)
+    } catch {
+      toast('Failed to load weekly pool reports', 'error')
+    } finally {
+      setLoading(false)
+    }
+  }, [weeks]) // eslint-disable-line
+
+  useEffect(() => { load() }, [load])
+
+  if (loading) return (
+    <div className="flex items-center justify-center py-20">
+      <div className="w-8 h-8 border-2 border-violet-400 border-t-transparent rounded-full animate-spin" />
+    </div>
+  )
+
+  const rows = data?.weeks ?? []
+  const snap = data?.snapshot ?? {}
+
+  // Flatten rows for CSV (convert nested objects)
+  const flatRows = rows.map(r => ({
+    week_id:          r.week_id,
+    week_start:       r.week_start,
+    draw_count:       r.draw_count,
+    pool_count:       r.pool_count,
+    winner_count:     r.winner_count,
+    total_payout_inr: r.total_payout_inr,
+    avg_payout_inr:   r.avg_payout_inr,
+    total_deposits_inr: r.total_deposits_inr,
+    sde_exits:        r.total_sde_exits,
+    type_regular:     r.draw_types?.regular ?? 0,
+    type_a:           r.draw_types?.type_a  ?? 0,
+    type_b:           r.draw_types?.type_b  ?? 0,
+    type_sde:         r.draw_types?.sde     ?? 0,
+    L1_winners:       r.winner_levels?.L1   ?? 0,
+    L2_winners:       r.winner_levels?.L2   ?? 0,
+    L3_winners:       r.winner_levels?.L3   ?? 0,
+    L4_winners:       r.winner_levels?.L4   ?? 0,
+    L5_winners:       r.winner_levels?.L5   ?? 0,
+    L6_winners:       r.winner_levels?.L6   ?? 0,
+  }))
+
+  // Chart data
+  const chartDraws   = rows.map(r => ({ week: r.week_id.slice(-3), ...r.draw_types }))
+  const chartPayouts = rows.map(r => ({ week: r.week_id.slice(-3), total_payout: r.total_payout_inr, deposits: r.total_deposits_inr }))
+  const chartLevels  = rows.map(r => ({ week: r.week_id.slice(-3), ...Object.fromEntries(Object.entries(r.winner_levels ?? {}).map(([k,v]) => [k,v])) }))
+
+  const VIEW_TABS = [
+    { id: 'table',  label: 'Table',       icon: TableProperties },
+    { id: 'draws',  label: 'Draw Types',  icon: Gavel           },
+    { id: 'payouts',label: 'Payouts',     icon: DollarSign      },
+    { id: 'levels', label: 'Win Levels',  icon: Trophy          },
+  ]
+
+  const LEVEL_COLORS = { L1:'#64748b', L2:'#3b82f6', L3:'#8b5cf6', L4:'#f59e0b', L5:'#ef4444', L6:'#bf00ff' }
+
+  return (
+    <div className="space-y-5">
+      {/* Summary strip */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {[
+          { label:'Active Users',   value: snap.active_users?.toLocaleString('en-IN') ?? '—',   icon: Users,       cls:'text-emerald-700 bg-emerald-50' },
+          { label:'Waitlist',       value: snap.waitlist_count?.toLocaleString('en-IN') ?? '—', icon: Clock,       cls:'text-amber-700 bg-amber-50'     },
+          { label:'Active Pools',   value: snap.active_pools?.toLocaleString('en-IN') ?? '—',   icon: Layers,      cls:'text-violet-700 bg-violet-50'   },
+          { label:'Total Draws',    value: snap.total_draws?.toLocaleString('en-IN') ?? '—',    icon: Gavel,       cls:'text-blue-700 bg-blue-50'       },
+        ].map(({ label, value, icon: Icon, cls }) => (
+          <div key={label} className="bg-white border border-slate-100 rounded-xl px-4 py-3 flex items-center gap-3 shadow-sm">
+            <div className={`p-2 rounded-lg ${cls.split(' ')[1]}`}><Icon className={`w-4 h-4 ${cls.split(' ')[0]}`} /></div>
+            <div>
+              <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider">{label}</p>
+              <p className="text-lg font-black text-slate-800 tabular-nums">{value}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Controls row */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div className="flex items-center gap-3">
+          <label className="text-sm text-slate-600 font-medium">Show last</label>
+          <select value={weeks} onChange={e => setWeeks(+e.target.value)}
+            className="border border-slate-200 rounded-xl px-3 py-1.5 text-sm text-slate-700 bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-400">
+            {[8,12,24,36,52,104].map(w => <option key={w} value={w}>{w} weeks{w===52?' (1 yr)':w===104?' (2 yr)':''}</option>)}
+          </select>
+          <button onClick={load} className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50 shadow-sm transition">
+            <RefreshCw className="w-3.5 h-3.5" /> Refresh
+          </button>
+        </div>
+        <button onClick={() => downloadCSVStats(flatRows, `weekly_pool_reports_${Date.now()}.csv`)}
+          className="flex items-center gap-1.5 px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white rounded-xl text-sm font-semibold shadow-sm transition">
+          <Download className="w-3.5 h-3.5" /> Export CSV
+        </button>
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="bg-white border border-slate-100 rounded-2xl py-16 text-center">
+          <CalendarRange className="w-10 h-10 text-slate-300 mx-auto mb-3" />
+          <p className="text-slate-500 font-medium">No draw data yet</p>
+          <p className="text-xs text-slate-400 mt-1">Run your first draw to see weekly reports here</p>
+        </div>
+      ) : (
+        <div className="bg-white border border-slate-100 rounded-2xl shadow-sm overflow-hidden">
+          {/* View tabs */}
+          <div className="flex border-b border-slate-100 overflow-x-auto">
+            {VIEW_TABS.map(t => (
+              <button key={t.id} onClick={() => setViewTab(t.id)}
+                className={`flex items-center gap-1.5 px-5 py-3.5 text-sm font-semibold border-b-2 transition whitespace-nowrap ${
+                  viewTab === t.id
+                    ? 'border-violet-600 text-violet-700 bg-violet-50/40 -mb-px'
+                    : 'border-transparent text-slate-500 hover:text-slate-700'
+                }`}>
+                <t.icon className="w-3.5 h-3.5" />
+                {t.label}
+              </button>
+            ))}
+            <div className="ml-auto px-4 py-3 text-xs text-slate-400 self-center whitespace-nowrap">
+              {rows.length} weeks
+            </div>
+          </div>
+
+          {/* ── TABLE view ── */}
+          {viewTab === 'table' && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm min-w-[900px]">
+                <thead className="bg-slate-50 border-b border-slate-100">
+                  <tr>
+                    {['Week', 'Start Date', 'Draws', 'Pools', 'Winners', 'Total Payout', 'Avg Payout', 'SDE Exits', 'Types (R/A/B/S)'].map(h => (
+                      <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wide whitespace-nowrap">{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-50">
+                  {[...rows].reverse().map((r, i) => (
+                    <tr key={r.week_id} className={`hover:bg-violet-50/30 transition-colors ${i === 0 ? 'bg-violet-50/20' : ''}`}>
+                      <td className="px-4 py-3 font-mono font-bold text-violet-700 text-xs">{r.week_id}</td>
+                      <td className="px-4 py-3 text-xs text-slate-500">{r.week_start}</td>
+                      <td className="px-4 py-3 font-semibold text-slate-800">{r.draw_count}</td>
+                      <td className="px-4 py-3 text-slate-600">{r.pool_count}</td>
+                      <td className="px-4 py-3 font-semibold text-slate-800">{r.winner_count}</td>
+                      <td className="px-4 py-3 font-mono font-bold text-emerald-700">{INR_W(r.total_payout_inr)}</td>
+                      <td className="px-4 py-3 text-slate-500">{INR_W(r.avg_payout_inr)}</td>
+                      <td className="px-4 py-3">
+                        {r.total_sde_exits > 0
+                          ? <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-red-100 text-red-700 border border-red-200">{r.total_sde_exits} SDE</span>
+                          : <span className="text-slate-300 text-xs">—</span>}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-[11px] text-slate-500">
+                        <span className="text-emerald-600">{r.draw_types?.regular ?? 0}</span>
+                        <span className="text-slate-300 mx-0.5">/</span>
+                        <span className="text-blue-600">{r.draw_types?.type_a ?? 0}</span>
+                        <span className="text-slate-300 mx-0.5">/</span>
+                        <span className="text-amber-600">{r.draw_types?.type_b ?? 0}</span>
+                        <span className="text-slate-300 mx-0.5">/</span>
+                        <span className="text-red-600">{r.draw_types?.sde ?? 0}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* ── DRAW TYPES chart ── */}
+          {viewTab === 'draws' && (
+            <div className="p-6 space-y-4">
+              <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Draw Type Breakdown Per Week</p>
+              <div className="h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={chartDraws} margin={{top:4,right:8,left:-10,bottom:0}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+                    <XAxis dataKey="week" tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} interval="preserveStartEnd"/>
+                    <YAxis tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} axisLine={false}/>
+                    <Tooltip contentStyle={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,fontSize:11}} formatter={(v,n)=>[v,n]}/>
+                    <Legend wrapperStyle={{fontSize:11,color:'#64748b'}}/>
+                    <Bar dataKey="regular" stackId="a" fill="#10b981" name="Regular"  radius={[0,0,0,0]}/>
+                    <Bar dataKey="type_a"  stackId="a" fill="#3b82f6" name="Type A"   radius={[0,0,0,0]}/>
+                    <Bar dataKey="type_b"  stackId="a" fill="#f59e0b" name="Type B"   radius={[0,0,0,0]}/>
+                    <Bar dataKey="sde"     stackId="a" fill="#ef4444" name="SDE Exit" radius={[4,4,0,0]}/>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="grid grid-cols-4 gap-3 text-center">
+                {['regular','type_a','type_b','sde'].map((t,i) => {
+                  const total = rows.reduce((s,r) => s + (r.draw_types?.[t] ?? 0), 0)
+                  const color = ['text-emerald-700','text-blue-700','text-amber-700','text-red-700'][i]
+                  const bg    = ['bg-emerald-50','bg-blue-50','bg-amber-50','bg-red-50'][i]
+                  return (
+                    <div key={t} className={`${bg} rounded-xl py-3`}>
+                      <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider">{t.replace('_',' ')}</p>
+                      <p className={`text-2xl font-black ${color} tabular-nums`}>{total}</p>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ── PAYOUTS chart ── */}
+          {viewTab === 'payouts' && (
+            <div className="p-6 space-y-4">
+              <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Weekly Payout vs Deposits</p>
+              <div className="h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={chartPayouts} margin={{top:4,right:8,left:0,bottom:0}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+                    <XAxis dataKey="week" tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} interval="preserveStartEnd"/>
+                    <YAxis tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} axisLine={false} tickFormatter={v=>v>=1000?`₹${(v/1000).toFixed(0)}k`:`₹${v}`}/>
+                    <Tooltip contentStyle={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,fontSize:11}} formatter={v=>INR_W(v)}/>
+                    <Legend wrapperStyle={{fontSize:11,color:'#64748b'}}/>
+                    <Bar dataKey="deposits"    fill="#e0f2fe" stroke="#0284c7" strokeWidth={1} name="Total Deposits" radius={[3,3,0,0]}/>
+                    <Line dataKey="total_payout" stroke="#10b981" strokeWidth={2.5} dot={false} name="Total Payout" type="monotone"/>
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="grid grid-cols-3 gap-3 text-center">
+                {[
+                  { label:'Total Paid Out', val: rows.reduce((s,r)=>s+r.total_payout_inr,0), color:'text-emerald-700', bg:'bg-emerald-50' },
+                  { label:'Total Deposits', val: rows.reduce((s,r)=>s+r.total_deposits_inr,0), color:'text-blue-700', bg:'bg-blue-50' },
+                  { label:'Avg Weekly Payout', val: rows.length ? rows.reduce((s,r)=>s+r.total_payout_inr,0)/rows.length : 0, color:'text-violet-700', bg:'bg-violet-50' },
+                ].map(({label,val,color,bg}) => (
+                  <div key={label} className={`${bg} rounded-xl py-3`}>
+                    <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider">{label}</p>
+                    <p className={`text-xl font-black ${color} tabular-nums`}>{INR_W(val)}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── WIN LEVELS chart ── */}
+          {viewTab === 'levels' && (
+            <div className="p-6 space-y-4">
+              <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Winner Level Distribution Per Week</p>
+              <div className="h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={chartLevels} margin={{top:4,right:8,left:-10,bottom:0}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+                    <XAxis dataKey="week" tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} interval="preserveStartEnd"/>
+                    <YAxis tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} axisLine={false}/>
+                    <Tooltip contentStyle={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,fontSize:11}}/>
+                    <Legend wrapperStyle={{fontSize:11,color:'#64748b'}}/>
+                    {['L1','L2','L3','L4','L5','L6'].map(lv => (
+                      <Bar key={lv} dataKey={lv} stackId="a" fill={LEVEL_COLORS[lv]}
+                        radius={lv==='L6'?[4,4,0,0]:[0,0,0,0]} name={lv}/>
+                    ))}
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="grid grid-cols-6 gap-2 text-center">
+                {['L1','L2','L3','L4','L5','L6'].map(lv => {
+                  const total = rows.reduce((s,r) => s + (r.winner_levels?.[lv] ?? 0), 0)
+                  return (
+                    <div key={lv} className="rounded-xl py-3" style={{ background: LEVEL_COLORS[lv] + '15', border: `1px solid ${LEVEL_COLORS[lv]}30` }}>
+                      <p className="text-[10px] font-bold text-slate-500 uppercase">{lv}</p>
+                      <p className="text-xl font-black tabular-nums" style={{ color: LEVEL_COLORS[lv] }}>{total}</p>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main page
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1140,12 +1444,13 @@ export default function Statistics() {
 
   // ── Sub-tab navigation ────────────────────────────────────────────────────
   const SUB_TABS = [
-    { id: 'overview',    label: 'Overview',          icon: BarChart3 },
-    { id: 'live_stats',  label: 'Live Stats',         icon: Activity  },
-    { id: 'level_map',   label: 'Level Map',          icon: Layers    },
-    { id: 'winners',     label: 'Winners Analytics',  icon: Target    },
-    { id: 'projections', label: 'Projections',        icon: TrendingUp },
-    { id: 'pauses',      label: 'System Pauses',      icon: Clock     },
+    { id: 'overview',      label: 'Overview',            icon: BarChart3    },
+    { id: 'weekly_pools',  label: 'Weekly Pool Reports', icon: CalendarRange },
+    { id: 'live_stats',    label: 'Live Stats',           icon: Activity     },
+    { id: 'level_map',     label: 'Level Map',            icon: Layers       },
+    { id: 'winners',       label: 'Winners Analytics',    icon: Target       },
+    { id: 'projections',   label: 'Projections',          icon: TrendingUp   },
+    { id: 'pauses',        label: 'System Pauses',        icon: Clock        },
   ]
 
   // ── Early-return for analytics sub-tabs ───────────────────────────────────
@@ -1176,6 +1481,7 @@ export default function Statistics() {
           ))}
         </div>
         {/* Panel content */}
+        {subTab === 'weekly_pools' && <WeeklyPoolReportsPanel toast={toast} />}
         {subTab === 'live_stats'   && <LiveStatsPanel   toast={toast} />}
         {subTab === 'level_map'    && <LevelMapPanel    toast={toast} />}
         {subTab === 'winners'      && <WinnersPanel     toast={toast} />}

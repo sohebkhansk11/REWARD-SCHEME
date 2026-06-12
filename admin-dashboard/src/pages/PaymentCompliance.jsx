@@ -16,7 +16,8 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   ShieldAlert, Clock, XCircle, CheckCircle2, AlertTriangle,
   RefreshCw, DollarSign, Users, Gavel, Timer, ChevronRight,
-  BadgeAlert, Info, Settings, Eye, Save,
+  BadgeAlert, Info, Settings, Eye, Save, Lock, ToggleLeft, ToggleRight,
+  ChevronDown,
 } from 'lucide-react'
 import Spinner from '../components/Spinner'
 import StatusBadge from '../components/StatusBadge'
@@ -65,10 +66,11 @@ function RiskChip({ score }) {
 
 // ── Section Tabs ─────────────────────────────────────────────────────────────
 const TABS = [
-  { id: 'late',    label: 'Late Payers',      icon: DollarSign,  color: 'amber' },
-  { id: 'grace',   label: 'Grace Period',     icon: Timer,       color: 'violet' },
-  { id: 'risk',    label: 'Elimination Risk', icon: BadgeAlert,  color: 'red' },
-  { id: 'history', label: 'History',          icon: Gavel,       color: 'slate' },
+  { id: 'late',     label: 'Late Payers',      icon: DollarSign,  color: 'amber'  },
+  { id: 'grace',    label: 'Grace Period',     icon: Timer,       color: 'violet' },
+  { id: 'risk',     label: 'Elimination Risk', icon: BadgeAlert,  color: 'red'    },
+  { id: 'history',  label: 'History',          icon: Gavel,       color: 'slate'  },
+  { id: 'settings', label: 'Settings',         icon: Settings,    color: 'blue'   },
 ]
 
 const TAB_ACTIVE = {
@@ -76,8 +78,53 @@ const TAB_ACTIVE = {
   violet: 'bg-violet-600 text-white',
   red:    'bg-red-600    text-white',
   slate:  'bg-slate-700  text-white',
+  blue:   'bg-blue-600   text-white',
 }
 const TAB_INACTIVE = 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
+
+// ── Due-day and time dropdown options ─────────────────────────────────────────
+const DUE_DAY_OPTIONS = [
+  { value: 1, label: 'Monday (Day 1 after draw)'    },
+  { value: 2, label: 'Tuesday (Day 2 after draw)'   },
+  { value: 3, label: 'Wednesday (Day 3 after draw)' },
+  { value: 4, label: 'Thursday (Day 4 after draw)'  },
+  { value: 5, label: 'Friday (Day 5 after draw)'    },
+  { value: 6, label: 'Saturday (Day 6 after draw)'  },
+]
+
+const DUE_HOUR_OPTIONS = [
+  { value: 0,  label: '12:00 AM (Midnight)' },
+  { value: 6,  label: '6:00 AM'  },
+  { value: 8,  label: '8:00 AM'  },
+  { value: 10, label: '10:00 AM' },
+  { value: 12, label: '12:00 PM (Noon)' },
+  { value: 14, label: '2:00 PM'  },
+  { value: 16, label: '4:00 PM'  },
+  { value: 18, label: '6:00 PM'  },
+  { value: 20, label: '8:00 PM'  },
+  { value: 22, label: '10:00 PM' },
+  { value: 23, label: '11:00 PM' },
+]
+
+const LATE_FEE_OPTIONS = [
+  { value: 0,   label: '₹0 / day  (no late fee)'       },
+  { value: 25,  label: '₹25 / day  (2.5% of deposit)'  },
+  { value: 50,  label: '₹50 / day  (5% of deposit)'    },
+  { value: 75,  label: '₹75 / day  (7.5% of deposit)'  },
+  { value: 100, label: '₹100 / day  (10% of deposit)'  },
+  { value: -1,  label: 'Custom amount per day →'        },
+]
+
+const GRACE_HOURS_OPTIONS = [
+  { value: 12,  label: '12 hours'  },
+  { value: 24,  label: '24 hours (1 day)' },
+  { value: 36,  label: '36 hours'  },
+  { value: 48,  label: '48 hours (2 days)' },
+  { value: 72,  label: '72 hours (3 days)' },
+  { value: 96,  label: '96 hours (4 days)' },
+  { value: 120, label: '120 hours (5 days)' },
+  { value: 168, label: '168 hours (7 days)' },
+]
 
 // ── Confirmation countdown for Execute button ─────────────────────────────────
 function ExecuteModal({ open, onClose, onConfirm, loading }) {
@@ -589,6 +636,11 @@ export default function PaymentCompliance() {
         </div>
       )}
 
+      {/* ── TAB: Settings ─────────────────────────────────────────────────────── */}
+      {tab === 'settings' && settings && (
+        <SettingsPanel settings={settings} onSaved={() => fetchAll(true)} toast={toast} />
+      )}
+
       {/* Elimination Execute Modal */}
       <ExecuteModal
         open={execOpen}
@@ -615,6 +667,238 @@ export default function PaymentCompliance() {
         </div>
       )}
 
+    </div>
+  )
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Settings Panel — full elimination & grace period configuration
+// ═════════════════════════════════════════════════════════════════════════════
+
+function SettingsPanel({ settings: initSettings, onSaved, toast }) {
+  const [form,        setForm]        = useState({ ...initSettings })
+  const [password,    setPassword]    = useState('')
+  const [saving,      setSaving]      = useState(false)
+  const [customFee,   setCustomFee]   = useState(initSettings.late_fee_per_day_inr ?? 50)
+  // Determine if the current fee value matches a preset
+  const presetMatch = LATE_FEE_OPTIONS.find(o => o.value === (initSettings.late_fee_per_day_inr ?? 50) && o.value !== -1)
+  const [feeMode,     setFeeMode]     = useState(presetMatch ? 'preset' : 'custom')
+  const [graceMode,   setGraceMode]   = useState('preset')  // 'preset' | 'custom'
+  const [customGrace, setCustomGrace] = useState(initSettings.grace_period_hours ?? 48)
+
+  const update = (key, val) => setForm(prev => ({ ...prev, [key]: val }))
+
+  const handleSave = async () => {
+    if (!password.trim()) { toast('Admin password required', 'error'); return }
+    setSaving(true)
+    try {
+      const payload = {
+        ...form,
+        late_fee_per_day_inr: feeMode === 'custom' ? customFee : form.late_fee_per_day_inr,
+        grace_period_hours:   graceMode === 'custom' ? customGrace : form.grace_period_hours,
+        admin_password:       password,
+      }
+      await updateEliminationSettings(payload)
+      toast('Settings saved', 'success')
+      setPassword('')
+      onSaved()
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Failed to save settings', 'error')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const SelectRow = ({ label, hint, children }) => (
+    <div className="grid grid-cols-1 sm:grid-cols-3 items-start gap-3 py-4 border-b border-slate-100 last:border-0">
+      <div>
+        <p className="text-sm font-semibold text-slate-700">{label}</p>
+        {hint && <p className="text-xs text-slate-400 mt-0.5">{hint}</p>}
+      </div>
+      <div className="sm:col-span-2">{children}</div>
+    </div>
+  )
+
+  const Toggle2 = ({ checked, onChange }) => (
+    <button type="button" role="switch" aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors ${checked ? 'bg-emerald-500' : 'bg-slate-200'}`}>
+      <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-6' : 'translate-x-1'}`} />
+    </button>
+  )
+
+  return (
+    <div className="space-y-5">
+      {/* Info banner */}
+      <div className="flex gap-3 p-4 bg-blue-50 border border-blue-200 rounded-2xl text-sm text-blue-800">
+        <Info className="w-4 h-4 flex-shrink-0 mt-0.5 text-blue-600" />
+        <p>Changes require admin password confirmation and take effect from the next penalty cycle. Due date settings are relative to the weekly draw (Sunday T+0).</p>
+      </div>
+
+      {/* Settings card */}
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/50">
+          <h2 className="font-bold text-slate-800 flex items-center gap-2">
+            <Settings className="w-4 h-4 text-blue-600" />
+            Elimination & Grace Period Configuration
+          </h2>
+        </div>
+        <div className="px-6 py-2 divide-y divide-slate-100">
+
+          {/* Due day */}
+          <SelectRow label="Payment Due Day" hint="Days after draw opens (draw = Sunday T+0)">
+            <select value={form.payment_due_days ?? 4} onChange={e => update('payment_due_days', +e.target.value)}
+              className="w-full border border-slate-300 rounded-xl px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+              {DUE_DAY_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </SelectRow>
+
+          {/* Due hour */}
+          <SelectRow label="Payment Due Time" hint="Hour of the due day (IST, 24-hour format)">
+            <select value={form.payment_due_hour ?? 23} onChange={e => update('payment_due_hour', +e.target.value)}
+              className="w-full border border-slate-300 rounded-xl px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+              {DUE_HOUR_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </SelectRow>
+
+          {/* Late fee rate */}
+          <SelectRow label="Late Fee Rate" hint="Charged per day from T+1 until payment or elimination">
+            <div className="space-y-2">
+              <select
+                value={feeMode === 'custom' ? -1 : (form.late_fee_per_day_inr ?? 50)}
+                onChange={e => {
+                  const v = +e.target.value
+                  if (v === -1) { setFeeMode('custom') }
+                  else { setFeeMode('preset'); update('late_fee_per_day_inr', v) }
+                }}
+                className="w-full border border-slate-300 rounded-xl px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+                {LATE_FEE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+              {feeMode === 'custom' && (
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-slate-500">₹</span>
+                  <input type="number" min={0} max={500} step={5} value={customFee}
+                    onChange={e => { const v = Math.max(0, Math.min(500, +e.target.value || 0)); setCustomFee(v); update('late_fee_per_day_inr', v) }}
+                    className="flex-1 border border-slate-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" placeholder="Custom ₹ per day" />
+                  <span className="text-xs text-slate-400">/ day (max ₹500)</span>
+                </div>
+              )}
+              <p className="text-[11px] text-slate-400">
+                ₹1,000 deposit × 5% min = <strong>₹50/day</strong> minimum recommended
+              </p>
+            </div>
+          </SelectRow>
+
+          {/* Late fee max cap */}
+          <SelectRow label="Late Fee Max Cap" hint="Maximum total late fee accumulation before member is auto-eliminated">
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-slate-500">₹</span>
+              <input type="number" min={50} max={2000} step={50} value={form.late_fee_max_cap_inr ?? 500}
+                onChange={e => update('late_fee_max_cap_inr', Math.max(50, Math.min(2000, +e.target.value || 50)))}
+                className="flex-1 border border-slate-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
+              <span className="text-xs text-slate-400">maximum total</span>
+            </div>
+          </SelectRow>
+
+          {/* Grace period duration */}
+          <SelectRow label="Grace Period Duration" hint="Window between due date and draw T-2H for seat-saving payment">
+            <div className="space-y-2">
+              <select
+                value={graceMode === 'custom' ? -1 : (form.grace_period_hours ?? 48)}
+                onChange={e => {
+                  const v = +e.target.value
+                  if (v === -1) { setGraceMode('custom') }
+                  else { setGraceMode('preset'); update('grace_period_hours', v) }
+                }}
+                className="w-full border border-slate-300 rounded-xl px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+                {GRACE_HOURS_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                <option value={-1}>Custom hours →</option>
+              </select>
+              {graceMode === 'custom' && (
+                <div className="flex items-center gap-2">
+                  <input type="number" min={1} max={168} step={1} value={customGrace}
+                    onChange={e => { const v = Math.max(1, Math.min(168, +e.target.value || 1)); setCustomGrace(v); update('grace_period_hours', v) }}
+                    className="flex-1 border border-slate-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
+                  <span className="text-xs text-slate-400">hours (1–168)</span>
+                </div>
+              )}
+            </div>
+          </SelectRow>
+
+          {/* Grace seat-save fee */}
+          <SelectRow label="Grace Seat-Save Fee" hint="Extra fee member must pay during grace period to keep their seat (in addition to late fees)">
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-slate-500">₹</span>
+              <input type="number" min={0} max={2000} step={50} value={form.grace_seat_save_fee_inr ?? 500}
+                onChange={e => update('grace_seat_save_fee_inr', Math.max(0, Math.min(2000, +e.target.value || 0)))}
+                className="flex-1 border border-slate-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
+              <span className="text-xs text-slate-400">seat-save fee</span>
+            </div>
+          </SelectRow>
+
+          {/* Auto-eliminate toggle */}
+          <SelectRow label="Auto-Eliminate" hint="Automatically eliminate unpaid members when due date passes">
+            <div className="flex items-center gap-3">
+              <Toggle2 checked={!!form.auto_eliminate_enabled} onChange={v => update('auto_eliminate_enabled', v)} />
+              <span className={`text-sm font-semibold ${form.auto_eliminate_enabled ? 'text-emerald-600' : 'text-slate-500'}`}>
+                {form.auto_eliminate_enabled ? 'Enabled — system eliminates automatically' : 'Disabled — manual elimination only'}
+              </span>
+            </div>
+          </SelectRow>
+
+          {/* Grace period enabled toggle */}
+          <SelectRow label="Grace Period" hint="Allow members to pay late fee + seat-save fee during grace window to keep their pool position">
+            <div className="flex items-center gap-3">
+              <Toggle2 checked={!!form.grace_period_enabled} onChange={v => update('grace_period_enabled', v)} />
+              <span className={`text-sm font-semibold ${form.grace_period_enabled ? 'text-emerald-600' : 'text-slate-500'}`}>
+                {form.grace_period_enabled ? 'Enabled — grace period window active' : 'Disabled — no grace window (immediate elimination)'}
+              </span>
+            </div>
+          </SelectRow>
+
+        </div>
+      </div>
+
+      {/* Preview card */}
+      <div className="bg-blue-50 border border-blue-200 rounded-2xl p-5 text-sm">
+        <p className="font-bold text-blue-800 mb-3 flex items-center gap-2">
+          <Info className="w-4 h-4" /> Timeline Preview (based on Sunday T+0 draw)
+        </p>
+        <div className="space-y-1.5 text-blue-700">
+          <div className="flex gap-2"><span className="w-2 h-2 rounded-full bg-emerald-400 mt-1.5 flex-shrink-0" /><p><strong>Draw opens:</strong> Sunday T+0</p></div>
+          <div className="flex gap-2"><span className="w-2 h-2 rounded-full bg-amber-400 mt-1.5 flex-shrink-0" />
+            <p><strong>Due date:</strong> Day {form.payment_due_days ?? 4} at {DUE_HOUR_OPTIONS.find(o => o.value === (form.payment_due_hour ?? 23))?.label ?? '11:00 PM'}</p>
+          </div>
+          <div className="flex gap-2"><span className="w-2 h-2 rounded-full bg-violet-400 mt-1.5 flex-shrink-0" />
+            <p><strong>Grace window:</strong> {form.grace_period_hours ?? 48}h after due date (pay ₹{form.grace_seat_save_fee_inr ?? 500} + late fees)</p>
+          </div>
+          <div className="flex gap-2"><span className="w-2 h-2 rounded-full bg-red-400 mt-1.5 flex-shrink-0" />
+            <p><strong>Elimination:</strong> Grace window ends → unpaid members removed (non-refundable)</p>
+          </div>
+          <div className="flex gap-2"><span className="w-2 h-2 rounded-full bg-blue-400 mt-1.5 flex-shrink-0" />
+            <p><strong>Late fee accrual:</strong> ₹{feeMode === 'custom' ? customFee : (form.late_fee_per_day_inr ?? 50)}/day (max ₹{form.late_fee_max_cap_inr ?? 500})</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Save section */}
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 space-y-4">
+        <p className="text-sm font-bold text-slate-700 flex items-center gap-2">
+          <Lock className="w-4 h-4 text-slate-400" />
+          Admin Authorization Required
+        </p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <input type="password" value={password} onChange={e => setPassword(e.target.value)}
+            className="border border-slate-300 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+            placeholder="Enter admin password to save changes" />
+          <button onClick={handleSave} disabled={saving || !password.trim()}
+            className="flex items-center justify-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white font-bold rounded-xl text-sm transition shadow-sm">
+            {saving ? <div className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" /> : <Save className="w-4 h-4" />}
+            Save Settings
+          </button>
+        </div>
+        <p className="text-[11px] text-slate-400">⚠️ Settings take effect from the next penalty cycle. Members currently in grace period are not affected until the window closes.</p>
+      </div>
     </div>
   )
 }

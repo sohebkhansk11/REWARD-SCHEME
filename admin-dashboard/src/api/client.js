@@ -382,6 +382,10 @@ export const devSetPaymentScenario = (params) =>
 export const getPauseCalendar = () =>
   api.get('/admin/stats/pause-calendar')
 
+/** GET /admin/stats/weekly-pool-reports — per-week draw & pool activity report */
+export const getWeeklyPoolReports = (weeks = 24) =>
+  api.get('/admin/stats/weekly-pool-reports', { params: { weeks } })
+
 // ── System Settings ───────────────────────────────────────────────────────────
 
 /** GET  /admin/settings/threshold — current pool-creation threshold */

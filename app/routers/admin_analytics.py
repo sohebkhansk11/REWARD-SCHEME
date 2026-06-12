@@ -1089,6 +1089,143 @@ def get_draw_countdown_public(db: Session = Depends(get_db)):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 10B.  GET /admin/stats/weekly-pool-reports  — Weekly Pool & Draw Activity Report
+#        Feeds the Statistics → "Weekly Pool Reports" sub-tab.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/stats/weekly-pool-reports")
+def get_weekly_pool_reports(
+    weeks: int = Query(24, ge=1, le=104, description="Number of recent weeks to return (max 104 = 2 years)"),
+    db: Session = Depends(get_db),
+):
+    """
+    Per-week draw and pool activity report.
+
+    Groups DrawHistory rows by ISO calendar week.  For each week returns:
+      week_id              — ISO week key "YYYY-WXX"
+      week_start           — Monday date of that week "YYYY-MM-DD"
+      draw_count           — total draws that week
+      pool_count           — unique pools that drew that week
+      winner_count         — total winners that week  (2 per draw)
+      total_payout_inr     — sum of all winner payouts
+      avg_payout_inr       — average payout per winner
+      draw_types           — {regular, type_a, type_b, sde} counts
+      winner_levels        — {L1…L6} winner counts
+      total_sde_exits      — draws with targeted_early_exit = True
+      total_deposits_inr   — sum of all winner deposits (1000 × winner_count as proxy)
+
+    Also returns a snapshot of current system state for context.
+    """
+    from app.models.draw_history import DrawHistory
+    from app.models.pool import Pool, PoolStatus
+    from app.models.user import User, UserStatus
+    from datetime import datetime, timezone
+
+    all_draws = (
+        db.query(DrawHistory)
+        .order_by(DrawHistory.draw_timestamp.asc())
+        .all()
+    )
+
+    if not all_draws:
+        return {"weeks": [], "total_weeks": 0, "snapshot": {}}
+
+    # ── Group by ISO calendar week ─────────────────────────────────────────────
+    weekly: dict[str, list] = {}
+    for dh in all_draws:
+        dt = dh.draw_timestamp
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        iso = dt.isocalendar()
+        wk  = f"{iso.year}-W{iso.week:02d}"
+        weekly.setdefault(wk, []).append(dh)
+
+    sorted_keys = sorted(weekly.keys())
+    # Return most recent N weeks only
+    if len(sorted_keys) > weeks:
+        sorted_keys = sorted_keys[-weeks:]
+
+    # ── Build per-week rows ────────────────────────────────────────────────────
+    result_weeks = []
+    for wk in sorted_keys:
+        draws = weekly[wk]
+
+        # Week start date from first draw's ISO info
+        dt0 = draws[0].draw_timestamp
+        if dt0.tzinfo is None:
+            dt0 = dt0.replace(tzinfo=timezone.utc)
+        iso0 = dt0.isocalendar()
+        try:
+            week_start_dt = datetime.fromisocalendar(iso0.year, iso0.week, 1)
+            week_start    = week_start_dt.strftime("%Y-%m-%d")
+        except Exception:
+            week_start = str(draws[0].draw_timestamp)[:10]
+
+        # Draw-type counts
+        type_counts: dict[str, int] = {"regular": 0, "type_a": 0, "type_b": 0, "sde": 0}
+        sde_exits = 0
+        for dh in draws:
+            raw_type = (dh.draw_type or "regular").lower().replace("-", "_")
+            mapped   = raw_type if raw_type in type_counts else "regular"
+            type_counts[mapped] += 1
+            if dh.targeted_early_exit:
+                sde_exits += 1
+
+        # Winner aggregates
+        level_dist: dict[int, int] = {l: 0 for l in range(1, 7)}
+        total_payout = 0.0
+        winner_count = 0
+        total_deposits = 0
+
+        for dh in draws:
+            for lvl, pay, dep in (
+                (dh.winner_1_level, dh.winner_1_net_payout, dh.winner_1_total_deposited),
+                (dh.winner_2_level, dh.winner_2_net_payout, dh.winner_2_total_deposited),
+            ):
+                if lvl and 1 <= lvl <= 6:
+                    level_dist[lvl] += 1
+                    total_payout    += float(pay or 0)
+                    total_deposits  += int(dep or 1000)
+                    winner_count    += 1
+
+        pool_ids = {dh.pool_id for dh in draws}
+
+        result_weeks.append({
+            "week_id":          wk,
+            "week_start":       week_start,
+            "draw_count":       len(draws),
+            "pool_count":       len(pool_ids),
+            "winner_count":     winner_count,
+            "total_payout_inr": round(total_payout, 2),
+            "avg_payout_inr":   round(total_payout / winner_count, 2) if winner_count else 0.0,
+            "total_deposits_inr": total_deposits,
+            "draw_types":       type_counts,
+            "winner_levels":    {f"L{l}": level_dist[l] for l in range(1, 7)},
+            "total_sde_exits":  sde_exits,
+        })
+
+    # ── Current system snapshot ────────────────────────────────────────────────
+    try:
+        active_users    = db.query(func.count(User.id)).filter(User.status == UserStatus.Active).scalar() or 0
+        waitlist_count  = db.query(func.count(User.id)).filter(User.status == UserStatus.Waitlist).scalar() or 0
+        active_pools    = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Active).scalar() or 0
+        total_draws_all = len(all_draws)
+    except Exception:
+        active_users = waitlist_count = active_pools = total_draws_all = 0
+
+    return {
+        "weeks":       result_weeks,
+        "total_weeks": len(result_weeks),
+        "snapshot": {
+            "active_users":   active_users,
+            "waitlist_count": waitlist_count,
+            "active_pools":   active_pools,
+            "total_draws":    total_draws_all,
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 11.  GET  /admin/draw/state            — Current WeeklyDrawState
 #      POST /admin/draw/prepare          — Trigger T-2H preparation (manual)
 #      POST /admin/draw/cleanup          — Trigger post-draw cleanup (manual)

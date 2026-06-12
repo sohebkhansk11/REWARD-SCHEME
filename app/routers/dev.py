@@ -982,13 +982,35 @@ class AdvancedSimRequest(BaseModel):
         ..., ge=1, le=1000,
         description="Number of consecutive weekly cycles to simulate (1–1000)",
     )
+    # ── B parameter: Late Fee Rate (% of ₹1000 deposit per day) ──────────────
     late_fee_pct: float = Field(
-        5.0, ge=0.0,
-        description="Late fee as % of the ₹1,000 weekly installment",
+        5.0, ge=5.0,
+        description=(
+            "B parameter: Late fee per day as % of ₹1,000 deposit (minimum 5% = ₹50/day). "
+            "Higher B → fewer members attempt grace period (C decreases as B increases)."
+        ),
     )
+    # ── Late defaulters ratio (feeds A + C pool) ──────────────────────────────
     late_users_ratio_pct: float = Field(
         2.0, ge=0.0, le=100.0,
-        description="Percentage of active pool members defaulting on payment each cycle",
+        description="% of active pool members who miss the payment due date each cycle",
+    )
+    # ── A parameter: Direct Elimination % ────────────────────────────────────
+    elim_pct_a: float = Field(
+        80.0, ge=0.05, le=100.0,
+        description=(
+            "A parameter: % of late members who are directly eliminated (skip grace period). "
+            "Remaining (100-A)% enter the grace period and are eligible for C."
+        ),
+    )
+    # ── C parameter: Grace Saver % ────────────────────────────────────────────
+    grace_saver_pct_c: float = Field(
+        15.0, ge=0.05, le=100.0,
+        description=(
+            "C parameter: % of grace-eligible members who actually pay the grace fee "
+            "(seat-save fee + accumulated late fees). "
+            "Circular: B cost reduces C willingness; lower B → higher C."
+        ),
     )
     volatility_mode: bool = Field(
         False,
@@ -1231,24 +1253,92 @@ class _AdvSimEngine:
         self._inflow_history.append(n)  # record for velocity calculations
         return n
 
-    # ── Step B — Ratio Penalty Application ────────────────────────────────────
+    # ── Step B — Ratio Penalty Application (A/B/C Circular Model) ──────────────
 
-    def step_b(self, late_fee_pct: float, late_ratio_pct: float) -> int:
+    def step_b(
+        self,
+        late_fee_pct:      float,
+        late_ratio_pct:    float,
+        elim_pct_a:        float = 80.0,
+        grace_saver_pct_c: float = 15.0,
+    ) -> dict:
         """
-        Randomly select late_ratio_pct% of active pool members, mark them
-        Late (unpaid this week), and accumulate the virtual penalty.
+        Circular A/B/C late-payment model:
+
+        A (elim_pct_a):        % of late members directly eliminated (skip grace period).
+        B (late_fee_pct):      Late fee per day as % of ₹1000 deposit. Minimum 5% = ₹50/day.
+                               Higher B → fewer members attempt grace (C follows B inversely).
+        C (grace_saver_pct_c): % of grace-eligible members who actually pay the grace fee.
+
+        Flow:
+          1. Select late_ratio_pct% of active pool members as "late".
+          2. Of those: A% are directly eliminated (they skip grace entirely).
+          3. Remaining (100-A)% enter grace period.
+          4. Of grace-eligible: C% pay grace fee + late fees → seat saved.
+          5. Remaining grace-eligible who don't pay → also eliminated.
+
+        Revenue:
+          - Late fees collected = C% of grace-eligible * daily fee * avg_days_late
+          - Grace seat-save fee (₹500 proxy) collected from C%
+
+        Returns dict of {n_late, n_direct_elim, n_grace_eligible, n_grace_saved, n_grace_elim}
         """
         pool_mbrs = [u for u in self._users.values()
                      if u.alive and u.pool_sid is not None]
-        n_late    = int(len(pool_mbrs) * late_ratio_pct / 100.0)
+        n_pool    = len(pool_mbrs)
+        n_late    = int(n_pool * late_ratio_pct / 100.0)
         if not n_late:
-            return 0
-        late_sel  = random.sample(pool_mbrs, min(n_late, len(pool_mbrs)))
-        fee_each  = _S_DEP * Decimal(str(late_fee_pct)) / Decimal("100")
+            return {"n_late": 0, "n_direct_elim": 0, "n_grace_eligible": 0,
+                    "n_grace_saved": 0, "n_grace_elim": 0}
+
+        late_sel      = random.sample(pool_mbrs, min(n_late, len(pool_mbrs)))
+        n_actual_late = len(late_sel)
+
+        # B — Late fee accumulation (proxy: 3 days late on average)
+        avg_days_late = 3.0
+        fee_each      = _S_DEP * Decimal(str(late_fee_pct)) / Decimal("100") * Decimal(str(avg_days_late))
+        grace_seat_fee = Decimal("500")  # proxy for ₹500 grace seat-save fee
+
         for u in late_sel:
-            u.late      = True
-            self._late += fee_each
-        return len(late_sel)
+            u.late = True
+
+        # A — Direct elimination
+        n_direct_elim   = max(0, int(n_actual_late * elim_pct_a / 100.0))
+        direct_elim_sel = late_sel[:n_direct_elim]
+        grace_eligible  = late_sel[n_direct_elim:]
+
+        # Eliminate directly (A path)
+        for u in direct_elim_sel:
+            u.alive = False
+            self._elim += 1
+            # Late fees are forfeited — NOT collected (user never paid)
+
+        # C — Grace period saving
+        n_grace_elg   = len(grace_eligible)
+        n_grace_saved = max(0, int(n_grace_elg * grace_saver_pct_c / 100.0))
+        grace_saved   = grace_eligible[:n_grace_saved]
+        grace_elim    = grace_eligible[n_grace_saved:]
+
+        # Grace savers: collect late fees + grace seat-save fee (REVENUE)
+        for u in grace_saved:
+            u.late  = False   # paid, seat saved
+            u.paid  = True
+            self._late      += fee_each          # late fee collected (B parameter)
+            self._late      += grace_seat_fee    # seat-save fee also collected as revenue
+
+        # Grace non-payers: eliminated
+        for u in grace_elim:
+            u.alive = False
+            self._elim += 1
+            # Forfeited: late fees NOT collected
+
+        return {
+            "n_late":          n_actual_late,
+            "n_direct_elim":   n_direct_elim,
+            "n_grace_eligible":n_grace_elg,
+            "n_grace_saved":   n_grace_saved,
+            "n_grace_elim":    len(grace_elim),
+        }
 
     # ── Step C — Auto Billing + Weekly Installment Collection ────────────────
 
@@ -1562,9 +1652,15 @@ class _AdvSimEngine:
         if l5_this > self._max_l5: self._max_l5 = l5_this
         if l6_this > self._max_l6: self._max_l6 = l6_this
 
-        # ── Execute cycle ────────────────────────────────────────────────────
-        n_joined = self.step_a(cycle, req.volatility_mode, req.volatility_max_inflow, base, hpw)
-        n_late   = self.step_b(req.late_fee_pct, req.late_users_ratio_pct)
+        # ── Execute cycle (A/B/C circular late-fee model) ───────────────────
+        n_joined  = self.step_a(cycle, req.volatility_mode, req.volatility_max_inflow, base, hpw)
+        late_info = self.step_b(
+            late_fee_pct      = req.late_fee_pct,
+            late_ratio_pct    = req.late_users_ratio_pct,
+            elim_pct_a        = getattr(req, "elim_pct_a",        80.0),
+            grace_saver_pct_c = getattr(req, "grace_saver_pct_c", 15.0),
+        )
+        n_late = late_info["n_late"]
         self.step_c()
         condensed, merges = self.step_d(ts, rdr_pct)
         draws_this_cycle, pauses = self.step_e()
@@ -1652,9 +1748,13 @@ class _AdvSimEngine:
                 "type_b":  self.n_type_b_draws,
                 "sde":     self.n_sde_exits,
             },
-            # Payment stats
-            "late_payers":        n_late,
-            "late_fees_collected_inr": round(late_fees_this, 2),
+            # Payment stats (A/B/C breakdown)
+            "late_payers":              n_late,
+            "direct_eliminated":        late_info.get("n_direct_elim",    0),
+            "grace_eligible":           late_info.get("n_grace_eligible", 0),
+            "grace_saved":              late_info.get("n_grace_saved",    0),
+            "grace_eliminated":         late_info.get("n_grace_elim",     0),
+            "late_fees_collected_inr":  round(late_fees_this, 2),
             "condensation_events": condensed,
             # Financials (approximate per-cycle)
             "cash_inflow_inr":    round(cash_inflow_this, 2),

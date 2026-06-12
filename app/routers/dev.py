@@ -665,24 +665,7 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
         db.execute(sa_insert(Token), token_rows[start : start + _BULK_BATCH])
     db.commit()
 
-    # ── Auto-form pools ───────────────────────────────────────────────────────
-    pools_formed = 0
-    if body.auto_pool:
-        # Step 1: fill existing pool vacancies before creating new pools.
-        # This fixes any under-capacity active pools (e.g. after eliminations)
-        # regardless of the AUTO_POOL_CREATION_ENABLED toggle state.
-        fill_pool_vacancies(db)
-
-        # Step 2: create new pools while ≥ NEW_POOL_INTAKE paid members remain.
-        # Use manual_create_pool (ignores the toggle) so this dev tool works
-        # whether auto-creation is ON or OFF.
-        while True:
-            new_pool = manual_create_pool(db)
-            if not new_pool:
-                break
-            pools_formed += 1
-
-    # ── Count remaining waitlist users ────────────────────────────────────────
+    # ── Count remaining waitlist users (before pool formation) ───────────────
     waitlist_remaining = (
         db.query(User)
         .filter(User.status == UserStatus.Waitlist)
@@ -691,20 +674,90 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
-    live_threshold = get_pool_threshold(db)
-    if pools_formed:
+    # ── Auto-form pools — runs in BACKGROUND to avoid HTTP timeout ────────────
+    #
+    # CRITICAL FIX: the while-True pool formation loop was previously executed
+    # synchronously inside this HTTP handler.  For large injections (10,000+
+    # users → 800+ pools), the loop could run for 30–120 s, causing:
+    #   1. HTTP client timeout → connection closed, but thread keeps running.
+    #   2. Abandoned thread holds DB connections → subsequent requests starve.
+    #
+    # Fix: the _INJECT_STATUS dict and _INJECT_LOCK were ALREADY DEFINED for this
+    # purpose (lines 55–70 in this file) but were never wired up.  We now:
+    #   • Immediately return HTTP 200 with the prefix (job ID).
+    #   • Spawn pool formation in a daemon thread so the HTTP connection closes.
+    #   • Poll via GET /dev/injection-status/{prefix} to track progress.
+    #
+    # Thread safety: _INJECT_LOCK guards all reads/writes to _INJECT_STATUS.
+    # The background thread opens its own DB session (SessionLocal()) rather
+    # than reusing the request session (which closes when the handler returns).
+
+    if body.auto_pool:
+        # Register job as "running" BEFORE spawning so poll can see it instantly
+        with _INJECT_LOCK:
+            _INJECT_STATUS[prefix] = {
+                "status":             "running",
+                "pools_formed":       0,
+                "waitlist_remaining": waitlist_remaining,
+                "error":              None,
+                "started_at":         datetime.now(timezone.utc).isoformat(),
+                "finished_at":        None,
+            }
+
+        def _bg_pool_formation(job_prefix: str) -> None:
+            """
+            Background pool-formation job.  Runs in a daemon thread.
+            Opens its own DB session — the request session has already closed.
+            """
+            from app.database import SessionLocal
+            bg_db = SessionLocal()
+            pools_formed_bg = 0
+            try:
+                fill_pool_vacancies(bg_db)
+                while True:
+                    new_pool = manual_create_pool(bg_db)
+                    if not new_pool:
+                        break
+                    pools_formed_bg += 1
+
+                wl_remaining_bg = (
+                    bg_db.query(User)
+                    .filter(User.status == UserStatus.Waitlist)
+                    .count()
+                )
+                with _INJECT_LOCK:
+                    _INJECT_STATUS[job_prefix].update({
+                        "status":             "done",
+                        "pools_formed":       pools_formed_bg,
+                        "waitlist_remaining": wl_remaining_bg,
+                        "finished_at":        datetime.now(timezone.utc).isoformat(),
+                    })
+            except Exception as exc:
+                with _INJECT_LOCK:
+                    _INJECT_STATUS[job_prefix].update({
+                        "status":    "error",
+                        "error":     str(exc),
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                    })
+            finally:
+                bg_db.close()
+
+        import threading as _th
+        t = _th.Thread(target=_bg_pool_formation, args=(prefix,), daemon=True)
+        t.start()
+
         note = (
             f"{len(user_ids)} users + {len(user_ids)} DEP tokens created "
-            f"(sequential join_dates, bcrypt passwords). "
-            f"{pools_formed} pool(s) auto-formed. "
-            f"{waitlist_remaining} users still on waitlist — "
-            f"run POST /dev/force-draw to draw from the new pool(s)."
+            f"({elapsed_ms} ms). Pool formation running in background — "
+            f"poll GET /dev/injection-status/{prefix} for progress."
         )
+        pool_formation_info = "background"
     else:
+        pool_formation_info = "skipped"
         note = (
             f"{len(user_ids)} users + {len(user_ids)} DEP tokens created "
             f"(sequential join_dates, bcrypt passwords). "
-            f"No pools formed yet (threshold: {live_threshold} paid waitlist users needed). "
+            f"auto_pool=False — no pool formation triggered. "
             f"Call POST /admin/waitlist/check when ready."
         )
 
@@ -712,11 +765,60 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
         users_created=len(user_ids),
         dep_tokens_created=len(user_ids),
         prefix=prefix,
-        pools_formed=pools_formed,
+        pools_formed=0,           # always 0 in response — formation is async now
         waitlist_remaining=waitlist_remaining,
         elapsed_ms=elapsed_ms,
         note=note,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dev/injection-status/{prefix}
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/injection-status/{prefix}")
+def injection_status(prefix: str):
+    """
+    Poll the background pool-formation job started by POST /dev/simulate-users.
+
+    Returns the current status of the job keyed by `prefix` (returned in the
+    simulate-users response).
+
+    Status values:
+      "running"  — pool formation in progress
+      "done"     — completed successfully
+      "error"    — failed; see `error` field for details
+
+    The _INJECT_STATUS dict is process-local — it is NOT persisted across
+    server restarts.  If the server restarts mid-job, the status entry will
+    be absent and this endpoint returns 404.
+
+    Usage pattern:
+      POST /dev/simulate-users  → prefix=dev_user_1234_...
+      loop:  GET /dev/injection-status/{prefix}  every 2s
+             break when status == "done" or "error"
+    """
+    with _INJECT_LOCK:
+        entry = _INJECT_STATUS.get(prefix)
+
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No injection job found for prefix '{prefix}'. "
+                "The server may have restarted, or auto_pool=False was used."
+            ),
+        )
+
+    return {
+        "prefix":             prefix,
+        "status":             entry["status"],
+        "pools_formed":       entry["pools_formed"],
+        "waitlist_remaining": entry["waitlist_remaining"],
+        "error":              entry["error"],
+        "started_at":         entry["started_at"],
+        "finished_at":        entry["finished_at"],
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

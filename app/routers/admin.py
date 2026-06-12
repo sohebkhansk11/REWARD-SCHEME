@@ -419,12 +419,16 @@ def get_threshold(db: Session = Depends(get_db)):
     before check_and_scale_waitlist() creates a new pool automatically.
     Default: 24.  Configurable via PUT /admin/settings/threshold.
     """
-    from app.services.settings import get_pool_threshold
-    threshold = get_pool_threshold(db)
+    from app.services.settings import get_pool_threshold, get_adaptive_threshold_info
+    threshold          = get_pool_threshold(db)
+    adaptive_info      = get_adaptive_threshold_info(db)
+    effective_threshold = adaptive_info["effective_threshold"]
     return ThresholdResponse(
-        pool_creation_threshold=threshold,
+        pool_creation_threshold=effective_threshold,
         message=(
-            f"Current threshold: {threshold} paid Waitlist members needed to auto-trigger a new pool."
+            f"Base threshold: {threshold}. "
+            f"Effective (adaptive): {effective_threshold}. "
+            f"{adaptive_info['note']}"
         ),
     )
 
@@ -476,6 +480,138 @@ def update_threshold(
             f"{new_val} paid Waitlist members before creating a new pool."
         ),
     )
+
+
+# ── Adaptive Threshold Info ───────────────────────────────────────────────────
+
+@router.get("/admin/settings/adaptive-threshold")
+def get_adaptive_threshold_detail(db: Session = Depends(get_db)):
+    """
+    POINT 7 — Return full adaptive threshold calculation with explanation.
+
+    Shows WHY the effective threshold differs from the admin-set base threshold.
+    Useful for diagnosing why new pools are (or aren't) forming.
+    """
+    from app.services.settings import get_adaptive_threshold_info
+    return get_adaptive_threshold_info(db)
+
+
+# ── SDE Extension II/III Check ────────────────────────────────────────────────
+
+@router.post("/admin/sde/run-extensions")
+def run_sde_extensions(db: Session = Depends(get_db)):
+    """
+    POINT 2+3 — Manually trigger SDE Extension II/III check and execution.
+
+    Scans ALL active pools for L5 (Ext-II) or L6 (Ext-III) members and runs
+    forced-exit draws for each.  Normally this runs automatically at the start
+    of execute_weekly_draw().  Use this endpoint if the weekly draw was skipped
+    or if L5/L6 members need to be cleared immediately.
+
+    Returns list of draws executed (if any).
+    """
+    from app.services.sde_engine import check_and_run_sde_extensions
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    iso = now.isocalendar()
+    week_id = f"{iso.year}-W{iso.week:02d}"
+
+    results = check_and_run_sde_extensions(db, week_id)
+    return {
+        "week_id":        week_id,
+        "draws_executed": len(results),
+        "draws": [
+            {
+                "pool_id":             r.pool_id,
+                "pool_name":           r.pool_name,
+                "draw_type":           r.draw_type,
+                "upper_winner":        {
+                    "level":      r.upper_winner_level,
+                    "payout_inr": float(r.upper_winner_payout),
+                },
+                "lower_winner":        {
+                    "level":      r.lower_winner_level,
+                    "payout_inr": float(r.lower_winner_payout),
+                },
+                "drawdown_projection": r.drawdown_projection,
+            }
+            for r in results
+        ],
+        "note": (
+            f"{len(results)} SDE Ext-II/III draw(s) executed. "
+            "L5/L6 members have been forced to exit their pools."
+            if results else
+            "No L5 or L6 members found across any active pools. System is healthy."
+        ),
+    }
+
+
+# ── Accelerated Dissolution ───────────────────────────────────────────────────
+
+@router.post("/admin/pools/{pool_id}/accelerated-dissolution")
+def trigger_accelerated_dissolution(
+    pool_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    POINT 5 — Trigger accelerated dissolution for a specific pool.
+
+    Used when a pool has ≥60% L4+ members and normal weekly draws are too slow
+    to clear the upper-tier backlog.  Both winners are drawn from L4+ tier.
+    A new relief pool is automatically created from waitlist if available.
+
+    Conditions checked:
+      • Pool must be Active
+      • Pool must not have drawn this week yet
+      • Pool must have ≥ 2 L4+ members
+
+    Returns the draw result and dissolution status.
+    """
+    from app.services.draw import run_accelerated_dissolution_draw, check_accelerated_dissolution
+    from app.models.pool import Pool as PoolModel
+
+    pool = db.query(PoolModel).filter(PoolModel.id == pool_id).first()
+    if not pool:
+        raise HTTPException(status_code=404, detail=f"Pool {pool_id} not found.")
+
+    # Show the current L4+ ratio alongside the result
+    from app.models.user import User as UserModel, UserStatus as US
+    members = db.query(UserModel).filter(
+        UserModel.current_pool_id == pool_id,
+        UserModel.status == US.Active,
+    ).all()
+    l4plus_count = sum(1 for m in members if m.current_level >= 4)
+    l4plus_ratio = l4plus_count / max(1, len(members))
+
+    try:
+        result = run_accelerated_dissolution_draw(db, pool_id, create_relief_pool=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {
+        "pool_id":         pool_id,
+        "pool_name":       pool.name,
+        "l4plus_ratio_pct": round(l4plus_ratio * 100, 1),
+        "winner_upper": {
+            "username":   result.winner_1.winner_username,
+            "level":      result.winner_1.winner_level,
+            "payout_inr": float(result.winner_1.net_payout_inr),
+        },
+        "winner_lower": {
+            "username":   result.winner_2.winner_username,
+            "level":      result.winner_2.winner_level,
+            "payout_inr": float(result.winner_2.net_payout_inr),
+        },
+        "relief_pool_created": result.relief_pool_id is not None,
+        "relief_pool_id":      result.relief_pool_id,
+        "pool_dissolved":      result.pool_dissolved,
+        "note": (
+            f"Pool dissolved — {len(members) - 2} members returned to waitlist for redistribution."
+            if result.pool_dissolved else
+            f"Accelerated draw complete — 2 L4+ members exited. Pool continues."
+        ),
+    }
 
 
 # ── Pool Settings (auto-creation toggle) ─────────────────────────────────────

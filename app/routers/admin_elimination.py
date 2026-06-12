@@ -565,6 +565,41 @@ def confirm_grace_payment(
         )
 
     late_fees_cleared = float(user.late_fees_inr or 0)
+    settings          = _get_all_settings(db)
+    grace_fee_inr     = settings["grace_seat_save_fee_inr"]
+    total_paid        = grace_fee_inr + late_fees_cleared
+
+    # ── POINT 6 FIX: Track collected revenue BEFORE clearing the fields ────────
+    #
+    # Late fees PAID (before/during grace) = business revenue.
+    # Grace seat-save fee PAID = business revenue.
+    # These must be persisted to system_settings cumulative counters so that
+    # the revenue analytics endpoint can report them accurately.
+    #
+    # Previously: late_fees_inr was set to 0 without recording what was collected.
+    # Fix: increment running totals in system_settings before clearing.
+    #
+    # Keys used:
+    #   "revenue_late_fees_collected_inr"   — cumulative late fees collected (₹)
+    #   "revenue_grace_fees_collected_inr"  — cumulative grace fees collected (₹)
+    # These are INT keys (rupees, no decimal needed for summary).
+
+    def _increment_revenue(key: str, amount: float) -> None:
+        """Atomically add `amount` (rounded to nearest rupee) to a revenue counter."""
+        amt_int = int(round(amount))
+        if amt_int <= 0:
+            return
+        row: SystemSettings | None = (
+            db.query(SystemSettings).filter(SystemSettings.key == key).first()
+        )
+        if row is None:
+            row = SystemSettings(key=key, value_int=amt_int)
+            db.add(row)
+        else:
+            row.value_int = (row.value_int or 0) + amt_int
+
+    _increment_revenue("revenue_late_fees_collected_inr",  late_fees_cleared)
+    _increment_revenue("revenue_grace_fees_collected_inr", grace_fee_inr)
 
     # ── Clear all elimination flags and settle payment ────────────────────────
     user.grace_fee_paid          = True
@@ -577,23 +612,92 @@ def confirm_grace_payment(
     db.commit()
     db.refresh(user)
 
-    settings = _get_all_settings(db)
-    total_paid = settings["grace_seat_save_fee_inr"] + late_fees_cleared
-
     return {
         "user_id":            user.id,
         "username":           user.username,
         "seat_saved":         True,
-        "grace_fee_paid_inr": settings["grace_seat_save_fee_inr"],
+        "grace_fee_paid_inr": grace_fee_inr,
         "late_fees_cleared":  late_fees_cleared,
         "total_paid_inr":     total_paid,
         "notes":              body.notes,
         "message": (
             f"Seat saved for @{user.username}. "
             f"Total payment confirmed: ₹{total_paid:,.0f} "
-            f"(₹{settings['grace_seat_save_fee_inr']:,} grace fee + "
+            f"(₹{grace_fee_inr:,} grace fee + "
             f"₹{late_fees_cleared:,.0f} late fees). "
-            f"Elimination risk cleared. Weekly payment marked Paid."
+            f"Elimination risk cleared. Weekly payment marked Paid. "
+            f"Revenue counters updated."
+        ),
+    }
+
+
+# ── GET /admin/elimination/revenue-summary ────────────────────────────────────
+
+@router.get("/revenue-summary")
+def get_revenue_summary(db: Session = Depends(get_db)):
+    """
+    POINT 6 — Financial revenue summary for late fees and grace fees.
+
+    Returns the cumulative totals of:
+      • Late fees actually COLLECTED (paid before/during grace period)
+      • Grace seat-save fees actually COLLECTED
+      • Total revenue from compliance enforcement
+
+    Separately shows:
+      • Late fees FORFEITED (from EliminationEvent — never collected)
+      • Grace fees FORFEITED (from EliminationEvent — never collected)
+      • Total deposits FORFEITED (user losses)
+
+    KEY DISTINCTION:
+      Collected = real business revenue (money we received)
+      Forfeited = money the user lost that we NEVER received (not our loss)
+    """
+    # ── Collected revenue (from system_settings revenue counters) ─────────────
+    def _read_revenue_key(key: str) -> float:
+        row: SystemSettings | None = (
+            db.query(SystemSettings).filter(SystemSettings.key == key).first()
+        )
+        return float(row.value_int or 0) if row else 0.0
+
+    late_fees_collected  = _read_revenue_key("revenue_late_fees_collected_inr")
+    grace_fees_collected = _read_revenue_key("revenue_grace_fees_collected_inr")
+    total_collected      = late_fees_collected + grace_fees_collected
+
+    # ── Forfeited amounts (from EliminationEvent — uncollected) ──────────────
+    summary_q = db.query(
+        func.count(EliminationEvent.id).label("total_eliminations"),
+        func.coalesce(func.sum(EliminationEvent.late_fees_forfeited), 0).label("late_fees_forfeited"),
+        func.coalesce(func.sum(EliminationEvent.seat_save_fee),        0).label("grace_fees_forfeited"),
+        func.coalesce(func.sum(EliminationEvent.deposit_forfeited),    0).label("deposits_forfeited"),
+        func.coalesce(func.sum(EliminationEvent.total_forfeited),      0).label("total_forfeited"),
+    ).one()
+
+    return {
+        "revenue": {
+            "late_fees_collected_inr":  late_fees_collected,
+            "grace_fees_collected_inr": grace_fees_collected,
+            "total_compliance_revenue_inr": total_collected,
+            "note": (
+                "Late fees and grace fees PAID by members before elimination. "
+                "This is actual business revenue collected."
+            ),
+        },
+        "forfeited": {
+            "total_eliminations":         summary_q.total_eliminations or 0,
+            "late_fees_forfeited_inr":    float(summary_q.late_fees_forfeited),
+            "grace_fees_forfeited_inr":   float(summary_q.grace_fees_forfeited),
+            "deposits_forfeited_inr":     float(summary_q.deposits_forfeited),
+            "total_forfeited_inr":        float(summary_q.total_forfeited),
+            "note": (
+                "Amounts the MEMBER lost. "
+                "We never collected these — they are NOT our business losses. "
+                "Deposits forfeited = member's own accumulated weekly payments."
+            ),
+        },
+        "combined_note": (
+            "REVENUE = what we collected. "
+            "FORFEITED = what members lost (we had no claim to uncollected amounts). "
+            "Do not confuse forfeited amounts with business losses."
         ),
     }
 

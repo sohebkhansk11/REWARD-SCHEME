@@ -51,7 +51,7 @@ from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.models.pool import Pool, PoolStatus
 from app.schemas.pool import PoolCreate, PoolUpdate
 from app.schemas.user import UserUpdate
-from app.services.settings import get_pool_threshold
+from app.services.settings import get_pool_threshold, get_adaptive_threshold
 
 _logger = logging.getLogger(__name__)
 
@@ -309,7 +309,12 @@ def assign_waitlist_to_pools(db: Session) -> dict:
     if not get_auto_pool_creation():
         _logger.info("Phase 2: AUTO_POOL_CREATION is OFF — skipping new pool creation.")
     else:
-        threshold = get_pool_threshold(db)
+        # POINT 7 FIX: Use adaptive threshold (LPI-pressure-adjusted) instead of
+        # the fixed base threshold.  This prevents the mathematical deadlock where
+        # growth_rate ≤ pool_consumption_rate means WL never reaches 24.
+        # At LPI ≥ 50%, threshold auto-reduces to POOL_CAPACITY (12).
+        threshold = get_adaptive_threshold(db)   # was: get_pool_threshold(db)
+        base_threshold = get_pool_threshold(db)
         remaining: int = (
             db.query(User)
             .filter(
@@ -319,8 +324,9 @@ def assign_waitlist_to_pools(db: Session) -> dict:
             .count()
         )
         _logger.info(
-            "Phase 2: remaining paid Waitlist = %d  |  threshold = %d",
-            remaining, threshold,
+            "Phase 2: remaining paid Waitlist = %d  |  effective_threshold = %d  "
+            "(base=%d — adaptive reduction applied if different)",
+            remaining, threshold, base_threshold,
         )
 
         # ── AI Quant Engine gate ──────────────────────────────────────────────

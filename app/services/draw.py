@@ -46,6 +46,9 @@ from app.core.config import (
     EXEC_LEVEL_LOW, EXEC_LEVEL_HIGH,    # type_a tier split
     TYPE_B_LEVEL_LOW, TYPE_B_LEVEL_HIGH,# type_b tier split
     POOL_DRAW_REGULAR, POOL_DRAW_TYPE_A, POOL_DRAW_TYPE_B, POOL_DRAW_SDE,
+    POOL_DRAW_ACCELERATED,              # accelerated dissolution draw type
+    ACCEL_DISS_TRIGGER_RATIO,          # ≥60% L4+ triggers accelerated mode
+    ACCEL_DISS_DISSOLVE_BELOW,         # dissolve pool if active count falls below 8
     LEVEL_PAYOUTS, PAYOUT_FEE_INR, REFERRAL_REWARD_INR,
 )
 from app.crud import token as crud_token, user as crud_user, pool as crud_pool
@@ -498,6 +501,37 @@ def execute_weekly_draw(
     """
     from app.services.waitlist import assign_waitlist_to_pools
 
+    # ── 0. SDE Extension II/III pre-pass — clear any L5/L6 members FIRST ───────
+    #
+    # POINT 2+3 FIX: Before regular draws, run SDE Ext-II/III to eliminate any
+    # L5 or L6 members.  These should never exist in normal operation.  If they
+    # do, it means SDE failed at some point and level advancement went unchecked.
+    #
+    # SDE Ext-II (L5) and Ext-III (L6) run here as a safety net BEFORE the
+    # regular draw loop, so that normal pools don't accidentally try to run a
+    # regular draw on a pool containing an L5/L6 member.
+    #
+    # The drawdown projection is calculated and logged inside the Ext-II function
+    # to confirm we're choosing the cheaper option (always: eliminate now).
+    try:
+        from app.services.sde_engine import check_and_run_sde_extensions
+        from app.services.waitlist import assign_waitlist_to_pools as _wl_refill
+        week_id_str = _current_week_id()
+        ext_results = check_and_run_sde_extensions(db, week_id_str)
+        if ext_results:
+            # Run a quick partial refill so ext-II/III pools get replacements
+            # before the main draw checks pool capacity.
+            _wl_refill(db)
+            _logger.info(
+                "execute_weekly_draw: SDE Ext-II/III ran %d draw(s) before main loop.",
+                len(ext_results),
+            )
+    except Exception as _ext_exc:
+        _logger.error(
+            "execute_weekly_draw: SDE Extension check failed (non-fatal): %s",
+            _ext_exc, exc_info=True,
+        )
+
     # ── 1. Discover eligible pools + apply draw-protection safeguard ─────────
     #
     # Draw protection (spec requirement):
@@ -738,3 +772,266 @@ def post_draw_cleanup(db: Session) -> dict:
     }
     _logger.info("post_draw_cleanup complete: %s", summary)
     return summary
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ACCELERATED DISSOLUTION — POINT 5
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Trigger: a pool's L4+ ratio exceeds ACCEL_DISS_TRIGGER_RATIO (60%).
+#   Example: 8 of 12 members are L4+ → upper tier crowded → normal draws
+#   take 4+ weeks to clear them.
+#
+# Action:
+#   1. BOTH winners drawn from L4+ tier (not the normal lower/upper split).
+#      This removes 2 upper-tier members per week instead of 1.
+#   2. A new "relief pool" is created from waitlist simultaneously, injecting
+#      fresh L1 members into the system.
+#   3. If after accelerated draws the pool falls below ACCEL_DISS_DISSOLVE_BELOW
+#      (8) active members, it is dissolved — remaining members are condensed
+#      into other pools via Phase 3 of assign_waitlist_to_pools().
+#
+# Both winners come from the same tier (L4+).
+# The "lower winner" = smallest L4 member by AI weight (more time to recoup).
+# The "upper winner" = highest L4 member by AI weight (longest overstayed).
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def check_accelerated_dissolution(db: Session, pool: Pool) -> bool:
+    """
+    Check if a pool qualifies for Accelerated Dissolution mode.
+
+    Returns True if ≥ ACCEL_DISS_TRIGGER_RATIO (60%) of active members are L4+.
+    Called after each draw's level advancement to detect newly-triggered pools.
+    """
+    members: list[User] = (
+        db.query(User)
+        .filter(
+            User.current_pool_id == pool.id,
+            User.status          == UserStatus.Active,
+        )
+        .all()
+    )
+    if not members:
+        return False
+
+    l4plus_count = sum(1 for m in members if m.current_level >= 4)
+    ratio        = l4plus_count / len(members)
+    return ratio >= ACCEL_DISS_TRIGGER_RATIO
+
+
+@dataclass
+class AccelDissolutionResult:
+    """Result of one accelerated dissolution draw."""
+    pool_id:         int
+    pool_name:       str
+    winner_1:        WinnerResult   # "lower" L4+ winner (by AI weight — lower ranked)
+    winner_2:        WinnerResult   # "upper" L4+ winner (by AI weight — higher ranked)
+    relief_pool_id:  int | None     # newly created relief pool from WL (if any)
+    pool_dissolved:  bool           # True if pool fell below ACCEL_DISS_DISSOLVE_BELOW
+    l4plus_ratio:    float          # L4+ ratio at time of draw (for audit)
+    draw_type:       str = POOL_DRAW_ACCELERATED
+
+
+def run_accelerated_dissolution_draw(
+    db: Session,
+    pool_id: int,
+    *,
+    create_relief_pool: bool = True,
+) -> AccelDissolutionResult:
+    """
+    Execute one Accelerated Dissolution draw for the given pool.
+
+    POINT 5: Both winners are drawn from the L4+ tier (≥ Level 4).
+    The pool is expected to have ≥60% L4+ members when this is called.
+
+    If create_relief_pool=True (default):
+      - Attempt to create a new pool from paid WL members if WL >= POOL_CAPACITY.
+      - The relief pool restores L1 member supply to the system.
+
+    After the draw:
+      - If pool.active_count falls below ACCEL_DISS_DISSOLVE_BELOW (8):
+        → Pool condensed into other pools via Phase 3 (pool dissolved).
+      - Otherwise: survivors advance, pool continues with accelerated mode
+        for subsequent weeks until L4+ ratio normalises.
+
+    Raises ValueError on validation failure.
+    """
+    from app.services.waitlist import assign_waitlist_to_pools, manual_create_pool
+
+    pool: Pool | None = crud_pool.get_pool(db, pool_id)
+    if not pool:
+        raise ValueError(f"Accelerated dissolution: pool {pool_id} not found.")
+    if pool.status != PoolStatus.Active:
+        raise ValueError(
+            f"Accelerated dissolution: pool '{pool.name}' is not Active."
+        )
+    if pool.draw_completed_this_week:
+        raise ValueError(
+            f"Accelerated dissolution: pool '{pool.name}' already drew this week."
+        )
+
+    # ── Get all active members ────────────────────────────────────────────────
+    members: list[User] = (
+        db.query(User)
+        .filter(User.current_pool_id == pool_id, User.status == UserStatus.Active)
+        .all()
+    )
+
+    l4plus = [m for m in members if m.current_level >= 4]
+    l4plus_ratio = len(l4plus) / max(1, len(members))
+
+    if len(l4plus) < 2:
+        raise ValueError(
+            f"Accelerated dissolution: pool '{pool.name}' needs ≥ 2 L4+ members "
+            f"(has {len(l4plus)})."
+        )
+
+    # ── Select both winners from L4+ using AI weights ─────────────────────────
+    # "Lower winner"  = lower AI weight (less urgency — gives pool cleanup time)
+    # "Upper winner"  = higher AI weight (most urgent exit per SDE score)
+    from app.services.sde_engine import _compute_weighted_selection, _weighted_choice
+
+    probabilities = _compute_weighted_selection(l4plus)
+    upper_winner_id   = _weighted_choice(probabilities)
+    upper_winner: User = next(m for m in l4plus if m.id == upper_winner_id)
+
+    # Exclude upper winner for lower selection
+    remaining_l4plus = [m for m in l4plus if m.id != upper_winner_id]
+    lower_winner: User
+    if remaining_l4plus:
+        lower_probabilities = _compute_weighted_selection(remaining_l4plus)
+        lower_winner_id = _weighted_choice(lower_probabilities)
+        lower_winner = next(m for m in remaining_l4plus if m.id == lower_winner_id)
+    else:
+        raise ValueError(
+            f"Accelerated dissolution: pool '{pool.name}' needs at least 2 distinct "
+            f"L4+ members to draw two winners."
+        )
+
+    # ── Process both winners ──────────────────────────────────────────────────
+    # skip_waitlist_fill=True here; we handle refill via assign_waitlist_to_pools later
+    result_1 = _process_winner(db, upper_winner, pool, pull_replacement=False)
+    db.refresh(pool)
+    result_2 = _process_winner(db, lower_winner, pool, pull_replacement=False)
+
+    # ── Advance surviving members ─────────────────────────────────────────────
+    surviving_ids   = {m.id for m in members} - {upper_winner.id, lower_winner.id}
+    week_id         = _current_week_id()
+    new_l4_flagged  = False
+
+    for member_id in surviving_ids:
+        member = crud_user.get_user(db, member_id)
+        if member and member.status == UserStatus.Active and member.current_pool_id == pool_id:
+            new_level    = min(member.current_level + 1, 6)
+            reaching_l4  = (new_level == 4)
+            if reaching_l4:
+                new_l4_flagged = True
+            crud_user.update_user(
+                db, member_id,
+                UserUpdate(
+                    current_level         = new_level,
+                    weekly_payment_status = WeeklyPaymentStatus.Unpaid,
+                    sde_required          = (True    if reaching_l4 else None),
+                    sde_flagged_week      = (week_id if reaching_l4 else None),
+                ),
+            )
+
+    if new_l4_flagged:
+        pool.contains_flagged_l4 = True
+
+    pool.draw_completed_this_week = True
+    pool.pool_draw_type           = POOL_DRAW_ACCELERATED
+
+    # ── DrawHistory record ────────────────────────────────────────────────────
+    db.add(DrawHistory(
+        pool_id             = pool.id,
+        draw_type           = POOL_DRAW_ACCELERATED,
+        targeted_early_exit = True,   # both winners are upper-tier forced exits
+        edge_case_triggered = False,
+        winner_1_user_id            = result_1.winner_id,
+        winner_1_level              = result_1.winner_level,
+        winner_1_net_payout         = result_1.net_payout_inr,
+        winner_1_total_deposited    = upper_winner.total_deposited_inr or 1000,
+        winner_1_merges_experienced = upper_winner.dynamic_merges_experienced or 0,
+        winner_1_pauses_experienced = upper_winner.pauses_experienced or 0,
+        winner_1_journey_type       = "merged" if (upper_winner.dynamic_merges_experienced or 0) > 0 else "direct",
+        winner_2_user_id            = result_2.winner_id,
+        winner_2_level              = result_2.winner_level,
+        winner_2_net_payout         = result_2.net_payout_inr,
+        winner_2_total_deposited    = lower_winner.total_deposited_inr or 1000,
+        winner_2_merges_experienced = lower_winner.dynamic_merges_experienced or 0,
+        winner_2_pauses_experienced = lower_winner.pauses_experienced or 0,
+        winner_2_journey_type       = "merged" if (lower_winner.dynamic_merges_experienced or 0) > 0 else "direct",
+    ))
+    db.commit()
+
+    # ── Create relief pool from waitlist ──────────────────────────────────────
+    relief_pool_id: int | None = None
+    if create_relief_pool:
+        relief_pool = manual_create_pool(db)
+        if relief_pool:
+            relief_pool_id = relief_pool.id
+            _logger.info(
+                "Accelerated dissolution: relief pool '%s' (id=%d) created from WL.",
+                relief_pool.name, relief_pool.id,
+            )
+
+    # ── Check dissolution threshold ───────────────────────────────────────────
+    pool_dissolved = False
+    remaining_active: int = (
+        db.query(User)
+        .filter(User.current_pool_id == pool_id, User.status == UserStatus.Active)
+        .count()
+    )
+
+    if remaining_active < ACCEL_DISS_DISSOLVE_BELOW:
+        _logger.warning(
+            "Accelerated dissolution: pool '%s' has only %d active members "
+            "(< threshold %d) — triggering condensation / dissolution.",
+            pool.name, remaining_active, ACCEL_DISS_DISSOLVE_BELOW,
+        )
+        # Demote remaining members back to Waitlist so Phase 3 condensation
+        # can redistribute them into other pools (fills under-capacity pools).
+        db.query(User).filter(
+            User.current_pool_id == pool_id,
+            User.status          == UserStatus.Active,
+        ).update(
+            {
+                "status":          UserStatus.Waitlist,
+                "current_pool_id": None,
+            },
+            synchronize_session=False,
+        )
+        pool.status = PoolStatus.Dissolved
+        db.commit()
+        pool_dissolved = True
+        _logger.info(
+            "Accelerated dissolution: pool '%s' DISSOLVED — %d member(s) returned "
+            "to Waitlist for Phase 3 condensation.",
+            pool.name, remaining_active,
+        )
+        # Run condensation to redistribute the returned members
+        assign_waitlist_to_pools(db)
+    else:
+        # Run normal refill — fills the 2 vacancies from waitlist
+        assign_waitlist_to_pools(db)
+
+    _logger.info(
+        "Accelerated dissolution COMPLETE: pool='%s'  L4+_ratio=%.0f%%  "
+        "upper=@%s(L%d)  lower=@%s(L%d)  dissolved=%s  relief_pool=%s",
+        pool.name, l4plus_ratio * 100,
+        upper_winner.username, upper_winner.current_level,
+        lower_winner.username, lower_winner.current_level,
+        pool_dissolved, relief_pool_id,
+    )
+
+    return AccelDissolutionResult(
+        pool_id=pool_id,
+        pool_name=pool.name,
+        winner_1=result_1,
+        winner_2=result_2,
+        relief_pool_id=relief_pool_id,
+        pool_dissolved=pool_dissolved,
+        l4plus_ratio=l4plus_ratio,
+    )

@@ -45,10 +45,20 @@ TYPE_B_LEVEL_LOW:  tuple[int, int] = (3, 3)
 TYPE_B_LEVEL_HIGH: tuple[int, int] = (4, 4)
 
 # ── Draw type string constants (stored in pool.pool_draw_type) ────────────────
-POOL_DRAW_REGULAR = "regular"
-POOL_DRAW_TYPE_A  = "type_a"
-POOL_DRAW_SDE     = "sde"
-POOL_DRAW_TYPE_B  = "type_b"
+POOL_DRAW_REGULAR  = "regular"
+POOL_DRAW_TYPE_A   = "type_a"
+POOL_DRAW_SDE      = "sde"
+POOL_DRAW_TYPE_B   = "type_b"
+# SDE Extension II  — L5 forced exit (L5 should never exist; escalation tier)
+#   Upper tier: L5 ONLY    Lower tier: L1–L4 (all members below L5)
+POOL_DRAW_SDE_EXT2 = "sde_ext2"
+# SDE Extension III — L6 forced exit (extreme admin-override edge case only)
+#   Upper tier: L6 ONLY    Lower tier: L1–L5 (all members below L6)
+POOL_DRAW_SDE_EXT3 = "sde_ext3"
+# Accelerated Dissolution — BOTH winners from L4+ (used when pool is >60% upper tier)
+#   Both Winner 1 and Winner 2 drawn from L4/L5/L6.
+#   Created simultaneously with a new relief pool from waitlist.
+POOL_DRAW_ACCELERATED = "accelerated_dissolution"
 
 # ── LPI (Level Pressure Index) thresholds ────────────────────────────────────
 # LPI = (L3 + L4 + L5 + L6) ÷ Total Active Members × 100
@@ -57,9 +67,36 @@ LPI_TYPE_A_MIN:   float = 14.0   # LPI 14–24 → Execution Pool Type A
 LPI_SDE_PROACTIVE: float = 25.0  # LPI ≥ 25  → SDE proactive (regardless of L4 count)
 LPI_L3_WIN_EXCEPTION: float = 50.0  # LPI > 50 → L3 allowed to win SDE lower tier
 
+# ── SDE Extension II tier splits ─────────────────────────────────────────────
+# SDE Ext-II  triggers when any pool member reaches L5 (SDE failure / admin override)
+SDE_EXT2_LEVEL_UPPER: tuple[int, int] = (5, 5)   # exactly L5 — forced exit
+SDE_EXT2_LEVEL_LOWER: tuple[int, int] = (1, 4)   # L1-L4 — all below L5
+
+# SDE Extension III triggers when any pool member reaches L6 (extreme edge case)
+SDE_EXT3_LEVEL_UPPER: tuple[int, int] = (6, 6)   # exactly L6 — forced exit
+SDE_EXT3_LEVEL_LOWER: tuple[int, int] = (1, 5)   # L1-L5 — all below L6
+
+# Accelerated Dissolution tier split — BOTH winners from upper tier
+ACCEL_DISS_LEVEL_LOWER: tuple[int, int] = (4, 6)  # L4-L6 (lower = minimum L4)
+ACCEL_DISS_LEVEL_UPPER: tuple[int, int] = (4, 6)  # L4-L6 (upper = any L4+)
+# Trigger: this fraction of pool members must be L4+ to auto-activate
+ACCEL_DISS_TRIGGER_RATIO: float = 0.60   # 60% of pool is L4+ → accelerated draws
+# After accelerated draws, dissolve pool if active member count drops below this
+ACCEL_DISS_DISSOLVE_BELOW: int  = 8
+
+# ── L5/L6 Payout Drawdown Protection ──────────────────────────────────────────
+# If any member reaches L5, dual-L5 draw is ALWAYS cheaper than waiting.
+# Math:  dual-L5 = ₹6,500 × 2 = ₹13,000 payout
+#        L5+L6   = ₹6,500 + ₹8,000 = ₹14,500 (₹1,500 more per week of delay)
+#        L6+L6   = ₹8,000 × 2 = ₹16,000 (₹3,000 more per 2-week delay)
+# System always chooses lowest-drawdown option: eliminate L5 NOW via SDE Ext-II.
+L5_DRAWDOWN_ENABLED: bool = True   # compute and log projection before Ext-II draw
+
 # ── SDE operational constraints ───────────────────────────────────────────────
 SDE_MAX_POOLS_PER_SESSION:  int = 6   # sub-draws per SDE session (6 shared seeds)
 SDE_L1L2_THRESHOLD_PER_L4:  int = 2   # minimum L1/L2 candidates needed per L4 member
+# Emergency WL promotion: when L1/L2 < 1 for lower tier, pull this many WL members
+SDE_WL_EMERGENCY_PROMOTE:   int = 2   # max WL members to pull per emergency draw
 
 # ── Condensation / draw window ────────────────────────────────────────────────
 # System pauses only when confirmed new member inflow drops below this threshold.
@@ -93,3 +130,17 @@ SDE_WEIGHT_PAUSE:   float = 0.20
 SDE_WEIGHT_ORGANIC: float = 0.15   # 1.0 if organic join, 0.3 if referred
 SDE_WEIGHT_NOISE:   float = 0.10
 SDE_WEIGHT_MIN_FLOOR: float = 0.05  # minimum probability floor for any eligible candidate
+
+# ── Adaptive Pool Creation Threshold ──────────────────────────────────────────
+# Default threshold: 24 paid waitlist members triggers a new pool of 12.
+# When growth rate ≤ pool consumption rate (active_pools × 2/week), the WL never
+# accumulates enough to hit 24 → system freezes in single-pool equilibrium.
+# Fix: reduce threshold when pressure rises or growth is insufficient.
+#
+# Formula:
+#   effective_threshold = max(POOL_CAPACITY, WAITLIST_TRIGGER × (1 - pressure_factor))
+#   pressure_factor     = min(0.5, LPI / 100)
+#   Emergency override: if growth ≤ consumption AND LPI > 10% → threshold = POOL_CAPACITY
+ADAPTIVE_THRESHOLD_ENABLED: bool  = True    # auto-reduce threshold under pressure
+ADAPTIVE_THRESHOLD_MIN:     int   = 12      # hard floor = pool capacity
+ADAPTIVE_THRESHOLD_LPI_FULL: float = 50.0  # LPI at which threshold = POOL_CAPACITY

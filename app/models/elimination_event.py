@@ -24,7 +24,7 @@ Columns:
 import enum
 
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, Enum,
+    Boolean, Column, DateTime, Enum,
     ForeignKey, Integer, Numeric, String,
 )
 from sqlalchemy.sql import func

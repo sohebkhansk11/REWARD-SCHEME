@@ -641,8 +641,15 @@ def execute_elimination(
         .all()
     )
     grace_expired_count = 0
+    # Track IDs of users whose grace window just closed so we can correctly set
+    # EliminationReason below.  After u.grace_active = False is flushed, the ORM
+    # field is False for ALL to_eliminate candidates — we cannot use the field to
+    # distinguish "was in grace / grace expired" from "was never in grace" at that
+    # point, hence this explicit set.
+    grace_expired_ids: set = set()
     for u in expired_grace:
         u.grace_active = False  # grace window closed without payment
+        grace_expired_ids.add(u.id)
         grace_expired_count += 1
 
     if grace_expired_count:
@@ -661,7 +668,7 @@ def execute_elimination(
     )
 
     if body.dry_run:
-        # Report only — no DB changes made (flush is rolled back)
+        # Report only — no DB changes are committed (the flush above is rolled back).
         db.rollback()
         return {
             "dry_run":             True,
@@ -674,21 +681,29 @@ def execute_elimination(
                     "level":      u.current_level,
                     "pool_id":    u.current_pool_id,
                     "late_fees":  float(u.late_fees_inr or 0),
-                    "reason":     "grace_expired" if getattr(u, 'grace_active', False) else "non_payment",
+                    # Use the set — u.grace_active is False for everyone in this list
+                    "reason":     "grace_expired" if u.id in grace_expired_ids else "non_payment",
                 }
                 for u in to_eliminate
             ],
         }
 
     # ── Execute eliminations ──────────────────────────────────────────────────
-    eliminated_count = 0
-    total_forfeited  = Decimal("0")
-    iso_week         = now.strftime("%G-W%V")   # e.g. "2026-W24"
+    eliminated_count    = 0
+    total_forfeited     = Decimal("0")
+    iso_week            = now.strftime("%G-W%V")   # e.g. "2026-W24"
+    grace_sv_fee_cfg    = Decimal(str(settings.get("grace_seat_save_fee_inr", 500)))
 
     for u in to_eliminate:
-        # Determine reason
-        was_grace = bool(u.grace_active)   # False since we just cleared them, but use history
-        reason    = EliminationReason.grace_expired if was_grace else EliminationReason.non_payment
+        # Determine reason — users in grace_expired_ids had their grace window
+        # close without payment in the loop above.  All others never entered grace.
+        # IMPORTANT: u.grace_active is False for EVERY member in to_eliminate (it's
+        # a query filter condition).  We MUST use grace_expired_ids to distinguish.
+        was_grace   = u.id in grace_expired_ids
+        reason      = EliminationReason.grace_expired if was_grace else EliminationReason.non_payment
+        # Grace seat-save fee is forfeited only for members who entered the grace
+        # window but then let it expire without paying.
+        seat_sv_fee = grace_sv_fee_cfg if was_grace else Decimal("0")
 
         # Fetch pool name for snapshot
         pool_name = None
@@ -697,7 +712,8 @@ def execute_elimination(
             pool_name = pool.name if pool else None
 
         late_fees = Decimal(str(u.late_fees_inr or 0))
-        total_ev  = Decimal("1000") + late_fees   # deposit + accumulated fees
+        # Total forfeited = ₹1,000 deposit + accrued late fees + grace seat-save fee
+        total_ev  = Decimal("1000") + late_fees + seat_sv_fee
 
         # ── Write EliminationEvent audit record ───────────────────────────────
         event = EliminationEvent(
@@ -709,7 +725,7 @@ def execute_elimination(
             draw_week_id              = iso_week,
             reason                    = reason,
             late_fees_forfeited       = late_fees,
-            seat_save_fee             = Decimal("0"),
+            seat_save_fee             = seat_sv_fee,
             deposit_forfeited         = Decimal("1000"),
             total_forfeited           = total_ev,
             was_in_grace_period       = was_grace,

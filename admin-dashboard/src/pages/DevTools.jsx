@@ -1,16 +1,11 @@
 /**
  * DevTools.jsx — Developer Mode · God Mode Control Panel
  *
- * 9 sub-tabs:
- *  0. STRESS TEST   — AI Platform Stress-Tester (1–1,000 cycles)
+ * 4 tabs:
+ *  0. STRESS TEST   — AI Platform Stress-Tester (1–1,000 cycles) + Pre-Test Setup
  *  1. DRAW CONTROL  — Force Draw + Time-Travel + Date controls
  *  2. INJECTION     — User injection with date/time/cadence customization
- *  3. LIVE STATS    — Real-time production-grade statistics (dark theme)
- *  4. LEVEL MAP     — Visual pool-by-pool member level distribution
- *  5. WINNERS       — Level-wise winner analytics + amount distribution
- *  6. PROJECTIONS   — Next draw projections, pool formation forecasts
- *  7. CONTROLS      — Payment scenarios, auto-paid toggle, late %
- *  8. DANGER ZONE   — Database nuclear reset
+ *  3. DANGER ZONE   — Database nuclear reset
  *
  * All /dev/* calls authenticated via JWT request interceptor.
  */
@@ -34,8 +29,7 @@ import Spinner from '../components/Spinner'
 import {
   forceDrawDev, simulateCycleDev, simulateUsersDev,
   resetDataDev, advancedSimulationDev,
-  devLiveStats, devLevelMap, devWinnersAnalytics,
-  devProjection, devInjectTimed, devMarkAllPaid,
+  devInjectTimed, devMarkAllPaid,
   devSetPaymentScenario, getInjectionStatus,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
@@ -1176,18 +1170,10 @@ function InjectionTab({ toast }) {
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TAB 3 — LIVE STATS (production-grade real-time statistics, dark theme)
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── (LiveStatsTab, LevelMapTab, WinnersTab, ProjectionsTab removed — these
+//      tabs were consolidated into StressTestTab's 6-sub-tab report panel) ───
 
-const SCENARIO_BADGE = {
-  SUSTAINABLE_WAVE:'text-emerald-400 bg-emerald-950 border-emerald-800', BOOM_GOLDEN_CROSS:'text-blue-400 bg-blue-950 border-blue-800',
-  FLASH_FLOOD:'text-amber-400 bg-amber-950 border-amber-800', DRY_PHASE:'text-red-400 bg-red-950 border-red-800',
-  REFERRAL_LIFELINE:'text-violet-400 bg-violet-950 border-violet-800', NEUTRAL:'text-slate-400 bg-slate-800 border-slate-700',
-  VELOCITY_CLIFF:'text-orange-400 bg-orange-950 border-orange-800',
-}
-
-function LiveStatsTab({ toast }) {
+function _NeverRendered_LiveStatsTab_placeholder() {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)

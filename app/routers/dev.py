@@ -1153,6 +1153,15 @@ class _AdvSimEngine:
         self._high_lpi_streak: int = 0   # consecutive cycles with LPI > 40%
         self._max_high_lpi_streak: int = 0   # longest high-LPI streak seen
 
+        # ── SDE Extension event counters (A-1: WHY members reach L5/L6) ────────
+        # l5_escalation_events: times an L5 member was found in a pool (Ext-II draw)
+        # l6_escalation_events: times an L6 member was found in a pool (Ext-III draw)
+        # accel_diss_events:    times accelerated dissolution triggered (≥60% L4+)
+        # Escalation root cause: accelerated dissolution surviving L4s advance → L5
+        self._l5_escalation_events:   int = 0
+        self._l6_escalation_events:   int = 0
+        self._accel_diss_events:       int = 0
+
         # ── Weekly detail log (for Master Weekly Report, Phase 2-C) ──────────
         # Each element is a rich per-cycle record emitted by run_cycle().
         # Stored here so the endpoint can return it alongside simulation_summary.
@@ -1521,13 +1530,14 @@ class _AdvSimEngine:
         ):
             members = self._mbrs(pool.sid)
 
-            # ── Safestop ──────────────────────────────────────────────────────
-            if len(members) < 8:     # below minimum viable pool size
-                pool.paused = True
-                new_pauses += 1
-                self.n_paused += 1
-                continue
-            if len(members) != _S_CAP and len(members) < 8:
+            # ── Safestop — pool must have exactly POOL_CAPACITY (12) members to draw ─
+            # Members only advance level when they survive a draw.
+            # Under-capacity pools never draw, so members inside cannot advance.
+            # L5/L6 escalation therefore only occurs via accelerated dissolution:
+            #   → pool with ≥60% L4+ draws both winners from L4+
+            #   → surviving L4 members advance +1 → L5
+            #   → Ext-II then forces L5 exit in the following eligible cycle.
+            if len(members) != _S_CAP:
                 pool.paused = True
                 new_pauses += 1
                 self.n_paused += 1
@@ -1560,10 +1570,7 @@ class _AdvSimEngine:
                     w1 = random.choice(lowers)
                     draw_tag = "sde"
                     self.n_sde_exits += 1
-                    # Track L6 escalation event
-                    if not hasattr(self, '_l6_escalation_events'):
-                        self._l6_escalation_events = 0
-                    self._l6_escalation_events += 1
+                    self._l6_escalation_events += 1   # Ext-III: L6 forced exit
 
             # ── SDE Ext-II: L5 found — both winners: upper=L5, lower=L1-L4 ──────────
             elif l5:
@@ -1578,9 +1585,7 @@ class _AdvSimEngine:
                     w1 = random.choice(lowers)
                     draw_tag = "sde"
                     self.n_sde_exits += 1
-                    if not hasattr(self, '_l5_escalation_events'):
-                        self._l5_escalation_events = 0
-                    self._l5_escalation_events += 1
+                    self._l5_escalation_events += 1   # Ext-II: L5 forced exit
 
             # ── Accelerated Dissolution: ≥60% L4+ → both winners from L4+ ─────────
             elif l4_plus_ratio >= 0.60 and len(l4_l6) >= 2:
@@ -1590,10 +1595,7 @@ class _AdvSimEngine:
                     w2 = random.choice(l4_l6_remaining)
                     draw_tag = "sde"
                     self.n_sde_exits += 1
-                    # Mark pool for dissolution check after draw (< 8 members)
-                    if not hasattr(self, '_accel_diss_events'):
-                        self._accel_diss_events = 0
-                    self._accel_diss_events += 1
+                    self._accel_diss_events += 1   # Accel dissolution: ≥60% L4+ triggered
 
             # ── SDE Draw: sde_required L4 member guaranteed exit ─────────────────────
             elif sde_mbrs:
@@ -1821,6 +1823,10 @@ class _AdvSimEngine:
             "grace_saved":              late_info.get("n_grace_saved",    0),
             "grace_eliminated":         late_info.get("n_grace_elim",     0),
             "late_fees_collected_inr":  round(late_fees_this, 2),
+            # A-1: Why members reach L5/L6 — SDE extension events this cycle
+            "ext2_exits_this_week":     self._l5_escalation_events,  # cumulative: frontend diffs
+            "ext3_exits_this_week":     self._l6_escalation_events,
+            "accel_diss_this_week":     self._accel_diss_events,
             "condensation_events": condensed,
             # Financials (approximate per-cycle)
             "cash_inflow_inr":    round(cash_inflow_this, 2),
@@ -1903,9 +1909,9 @@ class _AdvSimEngine:
         # Pool pause timeline (used by Pool Activity tab)
         pauses_by_week = [log.get("pauses", 0) for log in self.logs]
 
-        l5_escalation_events = getattr(self, '_l5_escalation_events', 0)
-        l6_escalation_events = getattr(self, '_l6_escalation_events', 0)
-        accel_diss_events    = getattr(self, '_accel_diss_events',    0)
+        l5_escalation_events = self._l5_escalation_events
+        l6_escalation_events = self._l6_escalation_events
+        accel_diss_events    = self._accel_diss_events
 
         system_health = {
             "total_members_injected":        self.n_created,

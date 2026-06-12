@@ -230,21 +230,39 @@ function SimStatsGrid({ s }) {
         <p className="text-[10px] font-bold text-cyan-400 uppercase tracking-widest flex items-center gap-2 mb-3"><Cpu className="w-3.5 h-3.5" />Brain 5 SDE &amp; Draw Type Analytics</p>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           {[
-            { label:'L4 SDE Flaggings', value:sdeFlg, accent:'amber',  desc:'Members reaching L4' },
-            { label:'SDE Exits',        value:sdeEx,  accent:'rose',   desc:'Guaranteed L4 eliminations' },
-            { label:'Type A Draws',     value:typeA,  accent:'cyan',   desc:'LPI 14-25% routing' },
-            { label:'Type B Draws',     value:typeB,  accent:'orange', desc:'L1/L2 shortage fallback' },
+            { label:'L4 SDE Flaggings', value:sdeFlg,                                    accent:'amber',  desc:'Members reaching L4 — flagged for forced exit' },
+            { label:'SDE Exits',        value:sdeEx,                                     accent:'rose',   desc:'Total guaranteed SDE exits (L4+L5+L6)' },
+            { label:'L5 Ext-II Exits',  value:sh.total_l5_ext2_forced_exits??0,          accent:'orange', desc:'L5 members forced out before becoming L6' },
+            { label:'L6 Ext-III Exits', value:sh.total_l6_ext3_forced_exits??0,          accent:'purple', desc:'L6 members emergency forced exit' },
+            { label:'Type A Draws',     value:typeA,                                     accent:'cyan',   desc:'LPI 14-25% routing' },
+            { label:'Type B Draws',     value:typeB,                                     accent:'orange', desc:'L1/L2 shortage fallback' },
+            { label:'Accel Diss',       value:sh.total_accel_dissolution_events??0,      accent:'red',    desc:'≥60% L4+ → both winners from L4+' },
+            { label:'Draw Pauses',      value:(sh.total_draw_pauses_triggered??0),       accent:'amber',  desc:'Pools paused (safestop, under-capacity)' },
           ].map((c, i) => (
             <div key={i} className="border border-slate-700/60 bg-slate-800/40 rounded-xl p-3">
               <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider">{c.label}</p>
               <p className={`text-xl font-black tabular-nums mt-1 ${
-                c.accent==='amber'?'text-amber-400':c.accent==='rose'?'text-rose-400':c.accent==='cyan'?'text-cyan-400':'text-orange-400'
+                c.accent==='amber'?'text-amber-400':c.accent==='rose'?'text-rose-400':c.accent==='cyan'?'text-cyan-400':c.accent==='orange'?'text-orange-400':c.accent==='purple'?'text-purple-400':'text-red-400'
               }`}>{c.value}</p>
               <p className="text-[9px] text-slate-600 mt-0.5">{c.desc}</p>
             </div>
           ))}
         </div>
       </div>
+
+      {/* A-1: L5/L6 Escalation Explanation */}
+      {sh.l5_l6_escalation_explanation && (
+        <div className={`p-3 rounded-xl border text-xs ${
+          (sh.max_l5_count>0||sh.max_l6_count>0)
+            ? 'bg-red-950/30 border-red-800/50 text-red-300'
+            : 'bg-emerald-950/30 border-emerald-800/50 text-emerald-300'
+        }`}>
+          <p className="font-bold uppercase tracking-wider text-[10px] mb-1 opacity-70">
+            {(sh.max_l5_count>0||sh.max_l6_count>0) ? '⚠ Anti-Maturity Pressure Analysis (A-1)' : '✓ Anti-Maturity Health (A-1)'}
+          </p>
+          <p>{sh.l5_l6_escalation_explanation}</p>
+        </div>
+      )}
     </div>
   )
 }
@@ -472,9 +490,11 @@ function PoolActivityChart({ logs }) {
   )
 }
 
-// ── Level Progression Chart ──────────────────────────────────────────────────
-function LevelProgressionChart({ weekly }) {
+// ── Level Progression Chart (A-1: full L5/L6 visibility) ─────────────────────
+function LevelProgressionChart({ weekly, logs }) {
   if (!weekly?.length) return null
+
+  // Main stacked area data
   const data = weekly.map(w=>({
     week: w.week,
     L1: w.level_distribution?.L1??0,
@@ -485,39 +505,135 @@ function LevelProgressionChart({ weekly }) {
     L6: w.level_distribution?.L6??w.l6_count??0,
     lpi: w.lpi??0,
   }))
+
+  // Escalation events: compute per-cycle from cumulative weekly_detail fields
+  const escalData = weekly.map((w,i)=>{
+    const prev = i>0?weekly[i-1]:null
+    return {
+      week: w.week,
+      ext2_exits:  Math.max(0,(w.ext2_exits_this_week??0)-(prev?.ext2_exits_this_week??0)),
+      ext3_exits:  Math.max(0,(w.ext3_exits_this_week??0)-(prev?.ext3_exits_this_week??0)),
+      accel_diss:  Math.max(0,(w.accel_diss_this_week??0)-(prev?.accel_diss_this_week??0)),
+      pool_pauses: logs?.[i]?.pauses??0,
+      l5_count:    w.l5_count??w.level_distribution?.L5??0,
+      l6_count:    w.l6_count??w.level_distribution?.L6??0,
+    }
+  })
+
+  // Find weeks where L5/L6 actually appeared (for WHY table)
+  const escalWeeks = escalData.filter(w => w.l5_count>0 || w.l6_count>0 || w.ext2_exits>0 || w.ext3_exits>0 || w.accel_diss>0)
+
   const LEVEL_COLORS = ['#64748b','#3b82f6','#8b5cf6','#f59e0b','#ef4444','#bf00ff']
+
   return (
-    <div className="space-y-4">
-      <div className="h-56">
-        <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={data} margin={{top:4,right:8,left:0,bottom:0}} stackOffset="expand">
-            <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
-            <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
-            <YAxis tickFormatter={v=>`${(v*100).toFixed(0)}%`} tick={{fill:'#64748b',fontSize:10}}/>
-            <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}} formatter={(v,n)=>[v,n]}/>
-            <Legend wrapperStyle={{fontSize:10}}/>
-            {['L1','L2','L3','L4','L5','L6'].map((lv,i)=>(
-              <Area key={lv} type="monotone" dataKey={lv} stackId="1"
-                stroke={LEVEL_COLORS[i]} fill={LEVEL_COLORS[i]+'40'} name={lv} strokeWidth={1}/>
-            ))}
-          </AreaChart>
-        </ResponsiveContainer>
+    <div className="space-y-5">
+      {/* 1. Full stacked area — L1–L6 distribution */}
+      <div>
+        <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">Member Level Distribution (Proportional)</p>
+        <div className="h-48">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={data} margin={{top:4,right:8,left:0,bottom:0}} stackOffset="expand">
+              <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+              <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+              <YAxis tickFormatter={v=>`${(v*100).toFixed(0)}%`} tick={{fill:'#64748b',fontSize:10}}/>
+              <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}} formatter={(v,n)=>[v,n]}/>
+              <Legend wrapperStyle={{fontSize:10}}/>
+              {['L1','L2','L3','L4','L5','L6'].map((lv,i)=>(
+                <Area key={lv} type="monotone" dataKey={lv} stackId="1"
+                  stroke={LEVEL_COLORS[i]} fill={LEVEL_COLORS[i]+'40'} name={lv} strokeWidth={lv==='L5'||lv==='L6'?2:1}/>
+              ))}
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
       </div>
-      {/* L5/L6 spike highlight */}
-      <div className="h-32">
-        <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">L5+L6 Anti-Maturity Pressure</p>
-        <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={data} margin={{top:4,right:8,left:0,bottom:0}}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
-            <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
-            <YAxis tick={{fill:'#64748b',fontSize:10}}/>
-            <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
-            <Line type="monotone" dataKey="L5" stroke="#ef4444" strokeWidth={2} dot={false} name="L5 Members"/>
-            <Line type="monotone" dataKey="L6" stroke="#bf00ff" strokeWidth={2} dot={false} name="L6 Members"/>
-            <Line type="monotone" dataKey="lpi" stroke="#f59e0b" strokeWidth={1} strokeDasharray="4 2" dot={false} name="LPI%"/>
-          </LineChart>
-        </ResponsiveContainer>
+
+      {/* 2. L5+L6 Anti-Maturity Pressure spike chart */}
+      <div>
+        <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">L5+L6 Anti-Maturity Pressure + LPI</p>
+        <div className="h-36">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={data} margin={{top:4,right:8,left:0,bottom:0}}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+              <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+              <YAxis tick={{fill:'#64748b',fontSize:10}}/>
+              <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
+              <Legend wrapperStyle={{fontSize:10}}/>
+              <Line type="monotone" dataKey="L5" stroke="#ef4444" strokeWidth={2.5} dot={false} name="L5 Active"/>
+              <Line type="monotone" dataKey="L6" stroke="#bf00ff" strokeWidth={2.5} dot={false} name="L6 Active"/>
+              <Line type="monotone" dataKey="lpi" stroke="#f59e0b" strokeWidth={1} strokeDasharray="4 2" dot={false} name="LPI%"/>
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
       </div>
+
+      {/* 3. Pool Pause Timeline + SDE Extension Events per week */}
+      <div>
+        <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">Pool Pauses + SDE Extension Events Per Week</p>
+        <div className="h-36">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={escalData} margin={{top:4,right:8,left:0,bottom:0}}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+              <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+              <YAxis tick={{fill:'#64748b',fontSize:10}}/>
+              <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
+              <Legend wrapperStyle={{fontSize:10}}/>
+              <Bar dataKey="pool_pauses" fill="#f59e0b"  name="Pool Pauses"   radius={[2,2,0,0]}/>
+              <Bar dataKey="ext2_exits"  fill="#ef4444"  name="Ext-II (L5→exit)" radius={[2,2,0,0]}/>
+              <Bar dataKey="ext3_exits"  fill="#bf00ff"  name="Ext-III (L6→exit)" radius={[2,2,0,0]}/>
+              <Bar dataKey="accel_diss"  fill="#f97316"  name="Accel Diss"    radius={[2,2,0,0]}/>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* 4. A-1: WHY table — escalation event breakdown */}
+      {escalWeeks.length > 0 ? (
+        <div className="border border-red-900/50 bg-red-950/20 rounded-xl overflow-hidden">
+          <div className="px-4 py-2 border-b border-red-900/40">
+            <p className="text-[10px] font-bold text-red-400 uppercase tracking-widest">⚠ A-1 Anti-Maturity Escalation — WHY Members Reached L5/L6</p>
+            <p className="text-[9px] text-red-700 mt-0.5">
+              Escalation cause: Accelerated dissolution (≥60% L4+ pool) runs both winners from L4+.
+              Surviving L4 members advance +1 → reach L5. Ext-II catches them immediately next eligible draw.
+            </p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-[10px] whitespace-nowrap">
+              <thead className="bg-red-950/30">
+                <tr>
+                  {['Week','L5 Count','L6 Count','Ext-II Exits','Ext-III Exits','Accel Diss','Pool Pauses','Root Cause'].map(h=>(
+                    <th key={h} className="text-left px-3 py-2 text-slate-500 font-semibold">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {escalWeeks.slice(0,20).map(w=>(
+                  <tr key={w.week} className="border-t border-red-900/30">
+                    <td className="px-3 py-2 font-mono font-bold text-slate-400">{w.week}</td>
+                    <td className={`px-3 py-2 font-bold tabular-nums ${w.l5_count>0?'text-red-400':'text-slate-600'}`}>{w.l5_count}</td>
+                    <td className={`px-3 py-2 font-bold tabular-nums ${w.l6_count>0?'text-purple-400':'text-slate-600'}`}>{w.l6_count}</td>
+                    <td className="px-3 py-2 tabular-nums text-red-300">{w.ext2_exits}</td>
+                    <td className="px-3 py-2 tabular-nums text-purple-300">{w.ext3_exits}</td>
+                    <td className="px-3 py-2 tabular-nums text-orange-300">{w.accel_diss}</td>
+                    <td className={`px-3 py-2 tabular-nums ${w.pool_pauses>0?'text-amber-400':'text-slate-600'}`}>{w.pool_pauses}</td>
+                    <td className="px-3 py-2 text-slate-500">
+                      {w.accel_diss>0 ? 'Accel diss → L4 survivors → L5' :
+                       w.pool_pauses>0 ? 'Pool paused (under-capacity)' :
+                       w.ext2_exits>0 ? 'Ext-II cleared L5' :
+                       w.ext3_exits>0 ? 'Ext-III cleared L6' : '—'}
+                    </td>
+                  </tr>
+                ))}
+                {escalWeeks.length>20&&<tr><td colSpan={8} className="px-3 py-2 text-slate-600 text-center">…{escalWeeks.length-20} more weeks</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2 p-3 bg-emerald-950/30 border border-emerald-800/40 rounded-xl text-[10px] text-emerald-400">
+          <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0"/>
+          <span>✓ No L5/L6 escalation detected — SDE cleared all L4 members before advancement.</span>
+        </div>
+      )}
     </div>
   )
 }
@@ -920,7 +1036,7 @@ function StressTestTab({ toast }) {
             {reportTab==='levels'&&(
               <div>
                 <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Member Level Distribution Over Time</p>
-                <LevelProgressionChart weekly={result.weekly_detail}/>
+                <LevelProgressionChart weekly={result.weekly_detail} logs={result.cycle_logs}/>
                 <div className="mt-4 grid grid-cols-3 gap-3">
                   <StatPill label="L5 Peak" value={result.simulation_summary.system_health?.max_l5_count??0} accent={result.simulation_summary.system_health?.max_l5_count>0?'red':'slate'}/>
                   <StatPill label="L6 Peak" value={result.simulation_summary.system_health?.max_l6_count??0} accent={result.simulation_summary.system_health?.max_l6_count>0?'red':'slate'}/>

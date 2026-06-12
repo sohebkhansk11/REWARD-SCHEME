@@ -28,7 +28,7 @@ import {
 import Spinner from '../components/Spinner'
 import {
   forceDrawDev, simulateCycleDev, simulateUsersDev,
-  resetDataDev, advancedSimulationDev,
+  resetDataDev, advancedSimulationDev, realSimulationDev,
   devInjectTimed, devMarkAllPaid,
   devSetPaymentScenario, getInjectionStatus,
 } from '../api/client'
@@ -699,7 +699,12 @@ function DrawAnalysisChart({ weekly }) {
 }
 
 function StressTestTab({ toast }) {
-  const [cycles,    setCycles]    = useState(50)
+  const [cycles,       setCycles]       = useState(50)
+  // ── Engine Mode ────────────────────────────────────────────────────────────
+  // Real Engine: calls actual production services (draw, SDE, waitlist, Brain 2/3/5)
+  //   on an isolated in-memory SQLite DB with mocked time — ZERO logic duplication.
+  // Fast Preview: uses _AdvSimEngine (in-memory duplicate logic) — faster but may drift.
+  const [useRealEngine, setUseRealEngine] = useState(true)
   // ── A/B/C Circular Late-Fee Parameters (A-2) ──────────────────────────────
   // A — Elimination %: what % of unpaid members are eliminated (don't attempt grace)
   // B — Late Fee Rate %: fee per day as % of ₹1000 deposit (min 5% = ₹50/day)
@@ -713,9 +718,14 @@ function StressTestTab({ toast }) {
   const [vol,       setVol]       = useState(false)
   const [volMax,    setVolMax]    = useState(100)
   const [rdr,       setRdr]       = useState(40.0)
+  // Real-engine–specific params
+  const [usersPerWeek,  setUsersPerWeek]  = useState(24)
+  const [initialUsers,  setInitialUsers]  = useState(24)
+  const [organicRatio,  setOrganicRatio]  = useState(60)   // %
   const [running,   setRunning]   = useState(false)
   const [result,    setResult]    = useState(null)
   const [showSetup, setShowSetup] = useState(false)
+  const [showRealCfg, setShowRealCfg] = useState(false)
   const [reportTab, setReportTab] = useState('summary')   // Phase 2-C report sub-tab
 
   // Derived: effective elimination = those who fail + those in grace who don't pay
@@ -725,19 +735,39 @@ function StressTestTab({ toast }) {
   const run = async () => {
     setRunning(true); setResult(null); setReportTab('summary')
     try {
-      const res = await advancedSimulationDev({
-        total_cycles:         cycles,
-        late_fee_pct:         lateFeeB,           // B → ₹/day as % of deposit
-        late_users_ratio_pct: lateRatio,          // % who miss due date (feeds A+C pool)
-        elim_pct_a:           elimPctA,           // A → direct eliminate (skip grace)
-        grace_saver_pct_c:    gracePctC,          // C → % of grace-eligible who pay
-        volatility_mode:      vol,
-        volatility_max_inflow: volMax,
-        avg_rdr_pct:          rdr,
-      })
+      let res
+      if (useRealEngine) {
+        // ── Real Engine: call actual production services ──────────────────────
+        res = await realSimulationDev({
+          weeks:                cycles,
+          users_per_week:       usersPerWeek,
+          initial_users:        initialUsers,
+          organic_ratio:        organicRatio / 100.0,
+          late_users_ratio_pct: lateRatio,
+          elim_pct_a:           elimPctA,
+          grace_saver_pct_c:    gracePctC,
+          volatility_mode:      vol,
+          volatility_max_inflow: volMax,
+        })
+      } else {
+        // ── Fast Preview: legacy in-memory engine ─────────────────────────────
+        res = await advancedSimulationDev({
+          total_cycles:          cycles,
+          late_fee_pct:          lateFeeB,
+          late_users_ratio_pct:  lateRatio,
+          elim_pct_a:            elimPctA,
+          grace_saver_pct_c:     gracePctC,
+          volatility_mode:       vol,
+          volatility_max_inflow: volMax,
+          avg_rdr_pct:           rdr,
+        })
+      }
       setResult(res.data)
       const s = res.data.simulation_summary
-      toast(`Simulation complete — ${s.total_cycles_run} cycles · ${INR(s.final_virtual_liquidity_float)} liquidity`, 'success')
+      toast(
+        `${useRealEngine ? '🔬 Real Engine' : '⚡ Fast Preview'} — ${s.total_cycles_run} cycles · ${INR(s.final_virtual_liquidity_float)} liquidity`,
+        'success'
+      )
     } catch(err) {
       toast(err.response?.data?.detail ?? 'Simulation failed', 'error')
     } finally { setRunning(false) }
@@ -747,10 +777,33 @@ function StressTestTab({ toast }) {
     <div className="relative bg-slate-900 border border-slate-700/60 rounded-2xl overflow-hidden shadow-2xl shadow-violet-950/20">
       {running && <SimLockout/>}
       <div className="flex items-center gap-3 px-6 py-5 border-b border-slate-700/60 bg-gradient-to-r from-violet-950/50 via-slate-900/80 to-slate-900">
-        <div className="bg-violet-900/40 border border-violet-700/50 p-3 rounded-xl"><FlaskConical className="w-5 h-5 text-violet-400"/></div>
+        <div className={`p-3 rounded-xl border ${useRealEngine ? 'bg-emerald-900/40 border-emerald-700/50' : 'bg-violet-900/40 border-violet-700/50'}`}>
+          <FlaskConical className={`w-5 h-5 ${useRealEngine ? 'text-emerald-400' : 'text-violet-400'}`}/>
+        </div>
         <div className="flex-1">
-          <p className="font-extrabold text-slate-100 text-base leading-none">AI Platform Stress-Tester</p>
-          <p className="text-xs text-slate-500 mt-0.5">Isolated N-cycle engine · FIFO refill · Condensation · Draw safeguards</p>
+          <div className="flex items-center gap-2">
+            <p className="font-extrabold text-slate-100 text-base leading-none">AI Platform Stress-Tester</p>
+            {useRealEngine
+              ? <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-emerald-900/60 border border-emerald-700/60 text-emerald-300 uppercase tracking-wider">🔬 Real Engine</span>
+              : <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-violet-900/60 border border-violet-700/60 text-violet-300 uppercase tracking-wider">⚡ Fast Preview</span>
+            }
+          </div>
+          <p className="text-xs text-slate-500 mt-0.5">
+            {useRealEngine
+              ? 'Zero-duplication · Calls real production services · Isolated SQLite DB · Chronos time-travel'
+              : 'In-memory engine · FIFO refill · Condensation · Draw safeguards'}
+          </p>
+        </div>
+        {/* Engine toggle */}
+        <div className="flex items-center bg-slate-800/80 border border-slate-700/60 rounded-xl p-1 gap-1">
+          <button
+            onClick={() => setUseRealEngine(true)} disabled={running}
+            className={`text-[11px] font-bold px-3 py-1.5 rounded-lg transition-all ${useRealEngine ? 'bg-emerald-700 text-emerald-100 shadow-sm' : 'text-slate-400 hover:text-emerald-400'}`}
+          >🔬 Real</button>
+          <button
+            onClick={() => setUseRealEngine(false)} disabled={running}
+            className={`text-[11px] font-bold px-3 py-1.5 rounded-lg transition-all ${!useRealEngine ? 'bg-violet-700 text-violet-100 shadow-sm' : 'text-slate-400 hover:text-violet-400'}`}
+          >⚡ Fast</button>
         </div>
       </div>
       <div className="p-6 space-y-6">
@@ -771,8 +824,83 @@ function StressTestTab({ toast }) {
           <div className="flex justify-between text-[10px] text-slate-600 mt-1.5 select-none">
             {[1,250,500,750,1000].map(v=><button key={v} onClick={()=>!running&&setCycles(v)} disabled={running} className="hover:text-violet-400 transition-colors">{v.toLocaleString()}</button>)}
           </div>
-          {cycles>=500&&!running&&<p className="text-[11px] text-amber-400 flex items-center gap-1.5 mt-2"><AlertTriangle className="w-3.5 h-3.5"/>{cycles>=800?`${cycles} cycles — expect 45–90s`:`${cycles} cycles — expect 20–45s`}</p>}
+          {useRealEngine
+            ? cycles>=100&&!running&&<p className="text-[11px] text-amber-400 flex items-center gap-1.5 mt-2"><AlertTriangle className="w-3.5 h-3.5"/>{cycles>=150?`${cycles} weeks — real engine: expect 3–8 min`:`${cycles} weeks — real engine: expect 1–3 min`}</p>
+            : cycles>=500&&!running&&<p className="text-[11px] text-amber-400 flex items-center gap-1.5 mt-2"><AlertTriangle className="w-3.5 h-3.5"/>{cycles>=800?`${cycles} cycles — expect 45–90s`:`${cycles} cycles — expect 20–45s`}</p>
+          }
         </div>
+
+        {/* ── Real Engine Config (only visible when Real Engine is active) ──── */}
+        {useRealEngine && (
+          <div className="border border-emerald-800/50 rounded-xl overflow-hidden bg-emerald-950/10">
+            <button
+              onClick={() => setShowRealCfg(v => !v)}
+              className="w-full flex items-center justify-between px-4 py-3 bg-emerald-950/30 hover:bg-emerald-950/50 transition-colors"
+            >
+              <p className="text-xs font-bold text-emerald-400 uppercase tracking-widest flex items-center gap-2">
+                🔬 Real Engine — Load Configuration
+              </p>
+              <span className="text-emerald-600 text-xs">{showRealCfg ? '▲ collapse' : '▼ expand'}</span>
+            </button>
+            {showRealCfg && (
+              <div className="p-4 grid grid-cols-3 gap-4">
+                {/* Users per week */}
+                <div>
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                    Users / Week
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input type="number" min={0} max={2000} value={usersPerWeek} disabled={running}
+                      onChange={e => setUsersPerWeek(Math.max(0, parseInt(e.target.value) || 0))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40"
+                    />
+                    <span className="text-[10px] text-slate-500 whitespace-nowrap">users/wk</span>
+                  </div>
+                  <p className="text-[10px] text-slate-600 mt-1">New waitlist joins per week</p>
+                </div>
+                {/* Initial seed */}
+                <div>
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                    Seed Users
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input type="number" min={12} max={5000} value={initialUsers} disabled={running}
+                      onChange={e => setInitialUsers(Math.max(12, parseInt(e.target.value) || 12))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40"
+                    />
+                    <span className="text-[10px] text-slate-500 whitespace-nowrap">before W1</span>
+                  </div>
+                  <p className="text-[10px] text-slate-600 mt-1">Pre-seeded before week 1</p>
+                </div>
+                {/* Organic ratio */}
+                <div>
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                    Organic % <span className="text-slate-600 normal-case font-normal">(Brain 3 RDR)</span>
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input type="number" min={0} max={100} value={organicRatio} disabled={running}
+                      onChange={e => setOrganicRatio(Math.max(0, Math.min(100, parseInt(e.target.value) || 0)))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40"
+                    />
+                    <span className="text-[10px] text-slate-500">%</span>
+                  </div>
+                  <p className="text-[10px] text-slate-600 mt-1">100% = all organic, 0% = all referral</p>
+                </div>
+              </div>
+            )}
+            {/* Architecture note */}
+            <div className="px-4 pb-3">
+              <div className="bg-emerald-950/30 border border-emerald-900/50 rounded-lg p-2.5 text-[10px] text-emerald-400/70 leading-relaxed">
+                <span className="font-bold text-emerald-400">Zero-Duplication Guarantee:</span> This engine calls{' '}
+                <code className="text-emerald-300">draw.execute_weekly_draw()</code>,{' '}
+                <code className="text-emerald-300">sde_engine.run_sde_meta_pool()</code>,{' '}
+                <code className="text-emerald-300">waitlist.assign_waitlist_to_pools()</code>, and{' '}
+                <code className="text-emerald-300">brain5_lpi_engine</code> directly — on an isolated in-memory SQLite DB
+                with mocked time. Any rule change in production is reflected automatically.
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* ── A/B/C Circular Late-Fee Parameters ───────────────────────────── */}
         <div className="border border-slate-600/60 rounded-xl overflow-hidden">
@@ -924,6 +1052,10 @@ function StressTestTab({ toast }) {
                 <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
                   Simulation Complete — {result.simulation_summary.total_cycles_run.toLocaleString()} cycles
                 </p>
+                {result.engine === 'real'
+                  ? <span className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-emerald-900/60 border border-emerald-700/60 text-emerald-300 uppercase tracking-wider">🔬 Real Engine</span>
+                  : <span className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-violet-900/60 border border-violet-700/60 text-violet-300 uppercase tracking-wider">⚡ Fast Preview</span>
+                }
               </div>
               <div className="flex gap-2">
                 <button onClick={()=>downloadCSV(result.weekly_detail, `sim_weekly_${Date.now()}.csv`)}

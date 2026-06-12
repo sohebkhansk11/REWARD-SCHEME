@@ -3047,3 +3047,113 @@ def dev_set_payment_scenario(body: PaymentScenarioRequest, db: Session = Depends
             f"({eliminated} eliminated, {late_tokens} late-fee tokens)."
         ),
     }
+
+
+# =============================================================================
+# POST /dev/real-simulation
+# =============================================================================
+#
+# Zero-duplication stress-test harness.
+#
+# Unlike /dev/advanced-simulation (which has its own _AdvSimEngine with
+# duplicated in-memory logic), this endpoint calls the REAL production services
+# on an isolated in-memory SQLite database with mocked time.
+#
+# Architecture:
+#   ChronosEngine  — patches datetime.now() across all production modules
+#   SimulationDB   — isolated SQLite with all production tables (zero schema dup)
+#   MassLoadInjector — creates synthetic users, manages payment state
+#   RealSimEngine  — calls real services in exact weekly chronological order:
+#     a. inject_week()         — new waitlist users
+#     b. auto_pay_active()     — mark active members Paid
+#     c. apply_abc_model()     — A/B/C late-fee + elimination
+#     d. flag_l4_members()     — catch-up L4 flagging
+#     e. run_sde_meta_pool()   — SDE guaranteed L4 exits
+#     f. assign_waitlist_to_pools() — refill after SDE
+#     g. execute_weekly_draw() — draw all remaining eligible pools
+#     h. post_draw_cleanup()   — reset weekly flags
+#
+# DRY contract: any rule change in production is automatically reflected.
+# =============================================================================
+
+class RealSimRequest(BaseModel):
+    weeks:              int   = Field(52,   ge=1,    le=200,
+                                      description="Number of weekly draw cycles to simulate.")
+    users_per_week:     int   = Field(24,   ge=0,    le=2000,
+                                      description="New users injected into waitlist each week.")
+    initial_users:      int   = Field(24,   ge=12,   le=5000,
+                                      description="Seed users created before week 1 draw.")
+    organic_ratio:      float = Field(0.6,  ge=0.0,  le=1.0,
+                                      description="Fraction of new users who join organically (Brain 3 RDR feed).")
+    late_users_ratio_pct: float = Field(2.0, ge=0.0, le=100.0,
+                                        description="% of active members who miss payment each week.")
+    elim_pct_a:         float = Field(80.0, ge=0.05, le=100.0,
+                                      description="A — % of late payers directly eliminated (skip grace).")
+    grace_saver_pct_c:  float = Field(15.0, ge=0.05, le=100.0,
+                                      description="C — % of grace-eligible late payers who pay and survive.")
+    volatility_mode:    bool  = Field(False,
+                                      description="When True, weekly inflow is random 0–volatility_max.")
+    volatility_max_inflow: int = Field(100, ge=5,
+                                       description="Maximum random weekly inflow in volatility mode.")
+    start_year:         int   = Field(2024, ge=2020, le=2040,
+                                      description="ISO year for simulated week 1 (affects Brain 2 timestamps).")
+    start_week:         int   = Field(1,    ge=1,    le=52,
+                                      description="ISO week number for simulated week 1.")
+
+
+@router.post("/real-simulation")
+def run_real_simulation(
+    body: RealSimRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Real-Strategy Stress-Test Engine.
+
+    Calls ACTUAL production services (draw, SDE, waitlist, Brain 2/3/5)
+    on an isolated in-memory SQLite database with mocked time.
+
+    Guarantees:
+      - Zero logic duplication: all math lives in production services
+      - Chronos Engine: datetime.now() mocked globally across 7 modules
+      - SimulationDB: isolated SQLite — production DB never touched
+      - Same response schema as /dev/advanced-simulation for frontend compatibility
+
+    Use this for architecture validation, bottleneck discovery, and stress testing.
+    Use /dev/advanced-simulation for fast parameter sweeps (< 1 second per 100 cycles).
+    """
+    from app.services.real_simulation import RealSimEngine
+
+    engine = RealSimEngine(
+        weeks           = body.weeks,
+        users_per_week  = body.users_per_week,
+        initial_users   = body.initial_users,
+        organic_ratio   = body.organic_ratio,
+        late_ratio      = body.late_users_ratio_pct / 100.0,
+        elim_pct_a      = body.elim_pct_a,
+        grace_pct_c     = body.grace_saver_pct_c,
+        volatility_mode = body.volatility_mode,
+        volatility_max  = body.volatility_max_inflow,
+        start_year      = body.start_year,
+        start_week      = body.start_week,
+    )
+
+    _logger_sim.info(
+        "RealSim START  weeks=%d  upw=%d  init=%d  late=%.1f%%  A=%.1f%%  C=%.1f%%  vol=%s",
+        body.weeks, body.users_per_week, body.initial_users,
+        body.late_users_ratio_pct, body.elim_pct_a, body.grace_saver_pct_c,
+        body.volatility_mode,
+    )
+
+    result = engine.run()
+
+    s = result["simulation_summary"]
+    _logger_sim.info(
+        "RealSim DONE  weeks=%d  users=%d  winners=%d  pauses=%d  liquidity=%.0f",
+        body.weeks,
+        s.get("total_simulated_users_created", 0),
+        s.get("total_winners_drawn", 0),
+        s.get("total_draw_pauses_triggered", 0),
+        s.get("final_virtual_liquidity_float", 0),
+    )
+
+    return result

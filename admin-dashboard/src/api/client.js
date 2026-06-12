@@ -222,6 +222,31 @@ export const advancedSimulationDev = (params) =>
     timeout: 120_000,   // 120 s — sufficient for 1000-cycle in-memory run
   })
 
+/**
+ * POST /dev/real-simulation — Zero-duplication Real-Strategy Stress-Test Engine
+ *
+ * Calls the ACTUAL production services (draw, SDE, waitlist, Brain 2/3/5) on an
+ * isolated in-memory SQLite database with mocked time (Chronos Engine).
+ *
+ * DRY guarantee: any rule change in production is automatically reflected.
+ * Returns the same schema as advancedSimulationDev for full frontend compatibility.
+ *
+ * @param {Object} params
+ * @param {number}  params.weeks                  1–200 (weekly draw cycles)
+ * @param {number}  params.users_per_week          new users per week (0–2000)
+ * @param {number}  params.initial_users           seed users before week 1 (≥12)
+ * @param {number}  params.organic_ratio           0.0–1.0 (Brain 3 RDR feed)
+ * @param {number}  params.late_users_ratio_pct    % who miss payment per week
+ * @param {number}  params.elim_pct_a              A: % of late payers directly eliminated
+ * @param {number}  params.grace_saver_pct_c       C: % of grace-eligible who survive
+ * @param {boolean} params.volatility_mode         random weekly inflow
+ * @param {number}  params.volatility_max_inflow   max inflow in volatility mode
+ */
+export const realSimulationDev = (params) =>
+  api.post('/dev/real-simulation', params, {
+    timeout: 600_000,   // 10 min — real DB ops per cycle are slower than in-memory
+  })
+
 // ── Winners History & AI Snapshot ────────────────────────────────────────────
 
 /**

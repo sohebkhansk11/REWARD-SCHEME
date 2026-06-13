@@ -331,6 +331,152 @@ def job_post_cleanup() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Job 5 — Data Integrity Auto-Repair (every 6 hours)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def job_data_integrity_check() -> None:
+    """
+    Runs every 6 hours — detects and repairs data inconsistencies that can
+    accumulate over time from partial transactions, timeouts, or race conditions.
+
+    Repairs performed (all idempotent — safe to run multiple times):
+
+      1. Pool member count sync
+         Sets pool.total_members = COUNT(active users in that pool)
+         for every pool whose stored total_members differs from the real count.
+         Root cause: concurrent draws or large injections can leave totals stale.
+
+      2. Orphaned SDE flags
+         Clears sde_required=True on users whose status is NOT Active.
+         (Eliminated or Waitlist users should never have sde_required=True.)
+
+      3. Expired grace periods
+         Clears grace_active=True on users whose grace_expires_at is in the past
+         AND grace_fee_paid=False.  These users should already be elimination_risk=True.
+
+      4. Pool contains_flagged_l4 consistency
+         Sets contains_flagged_l4 = True/False on each pool based on whether
+         any active member in that pool has sde_required=True.
+
+    All corrections are logged with counts so admins can monitor for patterns.
+    """
+    _logger.info("Scheduler ▶ job_data_integrity_check")
+    corrections: dict[str, int] = {}
+
+    try:
+        with _get_db() as db:
+            from app.models.pool import Pool, PoolStatus
+            from app.models.user import User, UserStatus
+            from sqlalchemy import func as _func, text as _text
+
+            now = datetime.now(timezone.utc)
+
+            # ── 1. Sync pool.total_members ─────────────────────────────────────
+            pools = (
+                db.query(Pool)
+                .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
+                .all()
+            )
+            pool_fixes = 0
+            for pool in pools:
+                real_count = (
+                    db.query(_func.count(User.id))
+                    .filter(User.current_pool_id == pool.id, User.status == UserStatus.Active)
+                    .scalar() or 0
+                )
+                if pool.total_members != real_count:
+                    _logger.warning(
+                        "DataIntegrity: pool %d (%s) total_members=%d → correcting to %d",
+                        pool.id, pool.name, pool.total_members, real_count,
+                    )
+                    pool.total_members = real_count
+                    pool_fixes += 1
+            if pool_fixes:
+                db.commit()
+            corrections["pool_member_count_fixed"] = pool_fixes
+
+            # ── 2. Orphaned SDE flags ─────────────────────────────────────────
+            orphan_sde = (
+                db.query(User)
+                .filter(
+                    User.sde_required == True,       # noqa: E712
+                    User.status       != UserStatus.Active,
+                )
+                .all()
+            )
+            for u in orphan_sde:
+                _logger.warning(
+                    "DataIntegrity: orphaned sde_required on non-Active user %d (%s status=%s) — clearing",
+                    u.id, u.username, u.status.value,
+                )
+                u.sde_required = False
+            if orphan_sde:
+                db.commit()
+            corrections["orphan_sde_flags_cleared"] = len(orphan_sde)
+
+            # ── 3. Expired grace periods ──────────────────────────────────────
+            try:
+                expired_grace = (
+                    db.query(User)
+                    .filter(
+                        User.grace_active     == True,       # noqa: E712
+                        User.grace_fee_paid   == False,      # noqa: E712
+                        User.grace_expires_at <= now,
+                    )
+                    .all()
+                )
+                for u in expired_grace:
+                    _logger.warning(
+                        "DataIntegrity: expired grace period on user %d (%s) — closing",
+                        u.id, u.username,
+                    )
+                    u.grace_active = False
+                    u.elimination_risk = True   # grace expired without payment = at risk
+                if expired_grace:
+                    db.commit()
+                corrections["expired_grace_cleared"] = len(expired_grace)
+            except Exception as _e:
+                # grace_active column may not exist yet on older DBs
+                corrections["expired_grace_cleared"] = 0
+                _logger.debug("DataIntegrity: grace period check skipped (column may not exist): %s", _e)
+
+            # ── 4. Pool contains_flagged_l4 consistency ───────────────────────
+            l4_fixes = 0
+            for pool in pools:
+                has_l4 = (
+                    db.query(_func.count(User.id))
+                    .filter(
+                        User.current_pool_id == pool.id,
+                        User.status          == UserStatus.Active,
+                        User.sde_required    == True,         # noqa: E712
+                    )
+                    .scalar() or 0
+                ) > 0
+                if bool(pool.contains_flagged_l4) != has_l4:
+                    pool.contains_flagged_l4 = has_l4
+                    l4_fixes += 1
+            if l4_fixes:
+                db.commit()
+            corrections["l4_flag_fixes"] = l4_fixes
+
+        _logger.info(
+            "Scheduler ✓ job_data_integrity_check COMPLETE  "
+            "pool_fixes=%d  orphan_sde=%d  grace_expired=%d  l4_fixes=%d",
+            corrections.get("pool_member_count_fixed",   0),
+            corrections.get("orphan_sde_flags_cleared",  0),
+            corrections.get("expired_grace_cleared",     0),
+            corrections.get("l4_flag_fixes",             0),
+        )
+
+    except Exception as exc:
+        _logger.error(
+            "Scheduler ✗ job_data_integrity_check FAILED  %s: %s",
+            type(exc).__name__, exc,
+            exc_info=True,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Scheduler lifecycle
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -417,6 +563,18 @@ def start_scheduler() -> AsyncIOScheduler:
         coalesce=True,
     )
 
+    # ── Job 5: Data Integrity Check (every 6 hours) ───────────────────────────
+    sched.add_job(
+        job_data_integrity_check,
+        trigger=CronTrigger(hour="*/6", timezone="UTC"),   # 00:00, 06:00, 12:00, 18:00 UTC
+        id="data_integrity_check",
+        name="Data Integrity Auto-Repair (6h)",
+        replace_existing=True,
+        misfire_grace_time=1800,   # 30 min tolerance — non-critical job
+        max_instances=1,
+        coalesce=True,
+    )
+
     sched.start()
     _scheduler = sched
 
@@ -425,7 +583,8 @@ def start_scheduler() -> AsyncIOScheduler:
         "prep=%s %02d:%02dUTC  "
         "draw=sun %02d:%02dUTC  "
         "cleanup=%s %02d:%02dUTC  "
-        "watchdog=every-5min",
+        "watchdog=every-5min  "
+        "integrity=every-6h",
         _PREP_DOW, _PREP_HOUR_UTC, _PREP_MINUTE_UTC,
         _DRAW_HOUR_UTC, _DRAW_MINUTE_UTC,
         _CLEANUP_DOW, _CLEANUP_HOUR_UTC, _CLEANUP_MINUTE_UTC,

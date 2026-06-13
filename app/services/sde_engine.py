@@ -49,11 +49,15 @@ from app.core.config import (
     LEVEL_PAYOUTS, PAYOUT_FEE_INR,
     SDE_MAX_POOLS_PER_SESSION,
     SDE_L1L2_THRESHOLD_PER_L4,
+    SDE_WL_EMERGENCY_PROMOTE,
     SDE_LEVEL_LOWER_NORMAL, SDE_LEVEL_LOWER_EXCEPTION, SDE_LEVEL_UPPER,
+    SDE_EXT2_LEVEL_UPPER, SDE_EXT2_LEVEL_LOWER,
+    SDE_EXT3_LEVEL_UPPER, SDE_EXT3_LEVEL_LOWER,
+    L5_DRAWDOWN_ENABLED,
     LPI_L3_WIN_EXCEPTION,
     SDE_WEIGHT_TIME, SDE_WEIGHT_DEPOSIT, SDE_WEIGHT_PAUSE,
     SDE_WEIGHT_ORGANIC, SDE_WEIGHT_NOISE, SDE_WEIGHT_MIN_FLOOR,
-    POOL_DRAW_SDE,
+    POOL_DRAW_SDE, POOL_DRAW_SDE_EXT2, POOL_DRAW_SDE_EXT3,
 )
 from app.crud import token as crud_token, user as crud_user
 from app.models.draw_history import DrawHistory
@@ -314,10 +318,74 @@ def execute_sde_sub_draw(
 
     if not lower_candidates:
         tier_desc = "L1/L2/L3" if allow_l3_lower else "L1/L2"
-        raise ValueError(
-            f"SDE sub-draw: pool '{pool.name}' has no eligible {tier_desc} members "
-            f"for the lower tier.  Pool may need supply injection."
+        # ── WL Emergency Promotion — pull waitlisted members into pool ─────────
+        # POINT 4 FIX: Instead of immediately raising ValueError (which causes
+        # this draw to be skipped / overflowed), attempt to pull paid Waitlist
+        # members directly into the pool as L1 members.  This temporarily
+        # expands the pool beyond 12; the two winners exiting this draw will
+        # normalise the count back to 10-12 (refill handles the rest).
+        #
+        # Special conditions for emergency promotion:
+        #   (a) Waitlist has paid members available
+        #   (b) Pool upper tier has at least 1 L4+ member (valid SDE trigger)
+        #   (c) Promotion count limited to SDE_WL_EMERGENCY_PROMOTE (default 2)
+        #
+        # If WL is also empty after this → final fallback: raise ValueError.
+        wl_members: list[User] = (
+            db.query(User)
+            .filter(
+                User.status                == UserStatus.Waitlist,
+                User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+            )
+            .order_by(User.join_date.asc())
+            .limit(SDE_WL_EMERGENCY_PROMOTE)
+            .all()
         )
+
+        if wl_members:
+            for wl_m in wl_members:
+                crud_user.update_user(
+                    db, wl_m.id,
+                    UserUpdate(
+                        status          = UserStatus.Active,
+                        current_pool_id = pool_id,
+                        current_level   = 1,
+                    ),
+                )
+                # Credit referral bonus if referred (mirrors draw.py _process_winner)
+                if wl_m.referred_by_user_id:
+                    from app.services.draw import _credit_referral_bonus
+                    _credit_referral_bonus(db, wl_m.referred_by_user_id)
+            db.flush()
+
+            # Re-query lower candidates now that WL members are in pool
+            lower_candidates = (
+                db.query(User)
+                .filter(
+                    User.current_pool_id == pool_id,
+                    User.status          == UserStatus.Active,
+                    User.current_level   >= lower_bounds[0],
+                    User.current_level   <= lower_bounds[1],
+                    User.id              != l4_member_id,
+                )
+                .all()
+            )
+            _logger.warning(
+                "SDE sub-draw %d.%d: WL EMERGENCY PROMOTION — promoted %d WL member(s) "
+                "into pool '%s' (L1/L2 shortage). Pool temporarily has %d members.",
+                session_id, sub_draw_number, len(wl_members), pool.name,
+                db.query(User).filter(
+                    User.current_pool_id == pool_id,
+                    User.status == UserStatus.Active,
+                ).count(),
+            )
+
+        if not lower_candidates:
+            raise ValueError(
+                f"SDE sub-draw: pool '{pool.name}' has no eligible {tier_desc} members "
+                f"for the lower tier, and Waitlist is also empty. "
+                f"Pool needs manual supply injection before this draw can proceed."
+            )
 
     # ── AI-weighted lower winner selection ────────────────────────────────────
     probabilities      = _compute_weighted_selection(lower_candidates)
@@ -787,3 +855,490 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
         meta_result.total_l4_cleared, meta_result.overflow_l4_count,
     )
     return meta_result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SDE EXTENSION II — L5 Forced Exit
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# POINT 2 IMPLEMENTATION:
+# Triggered when ANY pool member reaches Level 5.  L5 should NEVER exist in
+# normal operation — it means SDE failed to clear an L4 member at least once.
+#
+# Rules:
+#   Upper tier: L5 ONLY (forced exit — mirrors SDE's L4 guarantee)
+#   Lower tier: L1, L2, L3, L4  (everyone below L5)
+#
+# POINT 3 — L5 Drawdown Projection:
+# Before executing, calculate the financial comparison:
+#   Option A (act now):  dual-L5 = ₹6,500 × 2 = ₹13,000 payout
+#   Option B (wait 1w):  L5→L6 + L5 = ₹8,000 + ₹6,500 = ₹14,500 payout
+#   Option C (wait 2w):  both L5→L6 = ₹8,000 × 2 = ₹16,000 payout
+# Conclusion: ALWAYS eliminate L5 now.  ₹1,500 saved per week of earlier action.
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@_dc
+class SDEExt2DrawResult:
+    """Result of one SDE Extension II draw (L5 forced exit)."""
+    pool_id:                 int
+    pool_name:               str
+    upper_winner_user_id:    int       # L5 member — guaranteed exit
+    upper_winner_level:      int       # always 5
+    upper_winner_payout:     Decimal
+    lower_winner_user_id:    int
+    lower_winner_level:      int       # L1-L4
+    lower_winner_payout:     Decimal
+    draw_type:               str       # POOL_DRAW_SDE_EXT2 or POOL_DRAW_SDE_EXT3
+    drawdown_projection:     dict      # financial projection that justified this draw
+
+
+def calculate_l5_drawdown_projection(pool_members: list) -> dict:
+    """
+    Calculate the payout drawdown comparison for an L5 (or L6) emergency draw.
+
+    POINT 3: This projection is ALWAYS computed before any SDE Ext-II execution.
+    The system always chooses the lowest-drawdown option (which is always: act now).
+
+    Returns a dict with the projection details for logging and audit purposes.
+    """
+    l5_members = [m for m in pool_members if m.current_level == 5]
+    l6_members = [m for m in pool_members if m.current_level == 6]
+    n_l5 = len(l5_members)
+    n_l6 = len(l6_members)
+
+    l5_net = Decimal(str(LEVEL_PAYOUTS[5][1]))   # ₹6,500
+    l6_net = Decimal(str(LEVEL_PAYOUTS[6][1]))   # ₹8,000
+
+    # Option A: dual-L5 exit NOW
+    dual_l5_payout = l5_net * 2   # ₹13,000
+
+    # Option B: wait 1 week (one L5 becomes L6)
+    projected_l5_l6_payout = l6_net + l5_net   # ₹14,500
+
+    # Option C: wait 2 weeks (both L5 become L6)
+    projected_l6_l6_payout = l6_net * 2   # ₹16,000
+
+    savings_vs_1_week  = projected_l5_l6_payout - dual_l5_payout   # ₹1,500
+    savings_vs_2_weeks = projected_l6_l6_payout - dual_l5_payout   # ₹3,000
+
+    # Pool collects ₹12,000 this week; dual-L5 creates ₹1,000 deficit
+    # This is covered by float from earlier low-payout cycles (L1/L2 winners).
+    weekly_collection = Decimal("12000")
+    this_week_deficit = max(Decimal("0"), dual_l5_payout - weekly_collection)
+
+    return {
+        "n_l5_members":                  n_l5,
+        "n_l6_members":                  n_l6,
+        "dual_l5_payout_inr":            int(dual_l5_payout),
+        "projected_1week_payout_inr":    int(projected_l5_l6_payout),
+        "projected_2week_payout_inr":    int(projected_l6_l6_payout),
+        "savings_acting_now_vs_1week":   int(savings_vs_1_week),
+        "savings_acting_now_vs_2weeks":  int(savings_vs_2_weeks),
+        "this_week_deficit_inr":         int(this_week_deficit),
+        "deficit_note": (
+            "Covered by float from prior low-payout draw cycles."
+            if this_week_deficit > 0 else "No deficit — within weekly collection."
+        ),
+        "recommendation":               "EXECUTE_DUAL_L5_IMMEDIATELY",
+        "reasoning": (
+            f"Eliminating {n_l5} L5 member(s) NOW saves ₹{int(savings_vs_1_week):,} "
+            f"vs waiting 1 week (₹{int(savings_vs_2_weeks):,} vs 2 weeks). "
+            f"Dual-L5 draw is always the lowest-drawdown option."
+        ),
+    }
+
+
+def execute_sde_ext2_draw(
+    db: Session,
+    pool_id: int,
+    l5_member_id: int,
+    *,
+    draw_type: str = POOL_DRAW_SDE_EXT2,
+) -> SDEExt2DrawResult:
+    """
+    Execute one SDE Extension II sub-draw.
+
+    POINT 2: Guarantees L5 (or L6 for Ext-III) member exits this draw.
+    POINT 3: Calculates drawdown projection before executing and logs it.
+
+    draw_type = POOL_DRAW_SDE_EXT2  → L5 forced exit  (lower tier: L1-L4)
+    draw_type = POOL_DRAW_SDE_EXT3  → L6 forced exit  (lower tier: L1-L5)
+
+    Upper tier: L5 (Ext-II) or L6 (Ext-III)
+    Lower tier: L1-L4 (Ext-II) or L1-L5 (Ext-III) — AI-weighted selection
+
+    Raises ValueError on validation failure.
+    """
+    from app.schemas.token import TokenCreate
+    from app.models.token import TokenType, TokenStatus
+
+    # ── Determine tier bounds by draw type ───────────────────────────────────
+    if draw_type == POOL_DRAW_SDE_EXT3:
+        upper_bounds = SDE_EXT3_LEVEL_UPPER   # (6, 6)
+        lower_bounds = SDE_EXT3_LEVEL_LOWER   # (1, 5)
+        expected_upper_level = 6
+    else:
+        # Default: SDE Ext-II
+        draw_type    = POOL_DRAW_SDE_EXT2
+        upper_bounds = SDE_EXT2_LEVEL_UPPER   # (5, 5)
+        lower_bounds = SDE_EXT2_LEVEL_LOWER   # (1, 4)
+        expected_upper_level = 5
+
+    # ── Load and validate pool ────────────────────────────────────────────────
+    pool: Pool | None = db.query(Pool).filter(Pool.id == pool_id).first()
+    if not pool:
+        raise ValueError(f"SDE Ext-II draw: pool {pool_id} not found.")
+    if pool.draw_completed_this_week:
+        raise ValueError(
+            f"SDE Ext-II draw: pool '{pool.name}' already drew this week."
+        )
+
+    # ── Load and validate the upper-tier member (L5 or L6) ───────────────────
+    upper_member: User | None = db.query(User).filter(User.id == l5_member_id).first()
+    if not upper_member:
+        raise ValueError(f"SDE Ext-II draw: member {l5_member_id} not found.")
+    if upper_member.current_level != expected_upper_level:
+        raise ValueError(
+            f"SDE Ext-II draw: member {l5_member_id} is level "
+            f"{upper_member.current_level}, expected {expected_upper_level}."
+        )
+    if upper_member.current_pool_id != pool_id:
+        raise ValueError(
+            f"SDE Ext-II draw: member {l5_member_id} is not in pool {pool_id}."
+        )
+
+    # ── Drawdown projection (POINT 3) ─────────────────────────────────────────
+    all_pool_members: list[User] = (
+        db.query(User)
+        .filter(
+            User.current_pool_id == pool_id,
+            User.status          == UserStatus.Active,
+        )
+        .all()
+    )
+
+    projection = {}
+    if L5_DRAWDOWN_ENABLED and draw_type == POOL_DRAW_SDE_EXT2:
+        projection = calculate_l5_drawdown_projection(all_pool_members)
+        _logger.info(
+            "SDE Ext-II DRAWDOWN PROJECTION pool='%s': %s",
+            pool.name, projection["reasoning"],
+        )
+
+    # ── Build lower tier candidates ───────────────────────────────────────────
+    lower_candidates: list[User] = (
+        db.query(User)
+        .filter(
+            User.current_pool_id == pool_id,
+            User.status          == UserStatus.Active,
+            User.current_level   >= lower_bounds[0],
+            User.current_level   <= lower_bounds[1],
+            User.id              != l5_member_id,
+        )
+        .all()
+    )
+
+    # WL emergency promotion if lower candidates are empty (same logic as Ext-I)
+    if not lower_candidates:
+        wl_members: list[User] = (
+            db.query(User)
+            .filter(
+                User.status                == UserStatus.Waitlist,
+                User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+            )
+            .order_by(User.join_date.asc())
+            .limit(SDE_WL_EMERGENCY_PROMOTE)
+            .all()
+        )
+        if wl_members:
+            for wl_m in wl_members:
+                crud_user.update_user(
+                    db, wl_m.id,
+                    UserUpdate(
+                        status=UserStatus.Active,
+                        current_pool_id=pool_id,
+                        current_level=1,
+                    ),
+                )
+                if wl_m.referred_by_user_id:
+                    from app.services.draw import _credit_referral_bonus
+                    _credit_referral_bonus(db, wl_m.referred_by_user_id)
+            db.flush()
+            lower_candidates = (
+                db.query(User)
+                .filter(
+                    User.current_pool_id == pool_id,
+                    User.status          == UserStatus.Active,
+                    User.current_level   >= lower_bounds[0],
+                    User.current_level   <= lower_bounds[1],
+                    User.id              != l5_member_id,
+                )
+                .all()
+            )
+            _logger.warning(
+                "SDE Ext-II: WL emergency promotion — %d member(s) added to pool '%s'.",
+                len(wl_members), pool.name,
+            )
+
+    if not lower_candidates:
+        raise ValueError(
+            f"SDE Ext-II: pool '{pool.name}' has no eligible L{lower_bounds[0]}"
+            f"–L{lower_bounds[1]} members for lower tier, and Waitlist is empty."
+        )
+
+    # ── AI-weighted lower winner selection ────────────────────────────────────
+    probabilities     = _compute_weighted_selection(lower_candidates)
+    lower_winner_id   = _weighted_choice(probabilities)
+    lower_winner: User = next(m for m in lower_candidates if m.id == lower_winner_id)
+
+    # ── Snapshot journey data ─────────────────────────────────────────────────
+    _up_dep    = upper_member.total_deposited_inr        or 1000
+    _up_merges = upper_member.dynamic_merges_experienced or 0
+    _up_pauses = upper_member.pauses_experienced         or 0
+    _lo_dep    = lower_winner.total_deposited_inr        or 1000
+    _lo_merges = lower_winner.dynamic_merges_experienced or 0
+    _lo_pauses = lower_winner.pauses_experienced         or 0
+
+    # ── Payout calculation ────────────────────────────────────────────────────
+    upper_gross, upper_net = LEVEL_PAYOUTS.get(upper_member.current_level, (7000, 6500))
+    lower_gross, lower_net = LEVEL_PAYOUTS.get(lower_winner.current_level, (2500, 2000))
+    upper_net_d = Decimal(str(upper_net))
+    lower_net_d = Decimal(str(lower_net))
+
+    # ── BEGIN ATOMIC TRANSACTION ──────────────────────────────────────────────
+
+    # (a) WIT token — upper winner (L5/L6 guaranteed exit)
+    upper_token_code = _get_unique_token_code(db, "WIT-")
+    crud_token.create_token(
+        db,
+        TokenCreate(
+            code=upper_token_code,
+            type=TokenType.Withdraw,
+            value_inr=upper_net_d,
+            user_id=upper_member.id,
+            pool_id=pool.id,
+            status=TokenStatus.Active,
+        ),
+    )
+
+    # (b) WIT token — lower winner
+    lower_token_code = _get_unique_token_code(db, "WIT-")
+    crud_token.create_token(
+        db,
+        TokenCreate(
+            code=lower_token_code,
+            type=TokenType.Withdraw,
+            value_inr=lower_net_d,
+            user_id=lower_winner.id,
+            pool_id=pool.id,
+            status=TokenStatus.Active,
+        ),
+    )
+
+    # (c) Eliminate both winners
+    crud_user.update_user(
+        db, upper_member.id,
+        UserUpdate(
+            status=UserStatus.Eliminated_Won,
+            current_pool_id=None,
+            sde_required=False,
+        ),
+    )
+    crud_user.update_user(
+        db, lower_winner.id,
+        UserUpdate(status=UserStatus.Eliminated_Won, current_pool_id=None),
+    )
+
+    # (d) DrawHistory row — targeted_early_exit=True for the upper (L5/L6) winner
+    now_utc  = datetime.now(timezone.utc)
+    iso      = now_utc.isocalendar()
+    week_id  = f"{iso.year}-W{iso.week:02d}"
+
+    db.add(DrawHistory(
+        pool_id             = pool.id,
+        draw_type           = draw_type,   # sde_ext2 or sde_ext3
+        targeted_early_exit = True,
+        edge_case_triggered = False,
+        # Upper winner (L5/L6 — guaranteed forced exit)
+        winner_1_user_id            = upper_member.id,
+        winner_1_level              = upper_member.current_level,
+        winner_1_net_payout         = upper_net_d,
+        winner_1_total_deposited    = _up_dep,
+        winner_1_merges_experienced = _up_merges,
+        winner_1_pauses_experienced = _up_pauses,
+        winner_1_journey_type       = "merged" if _up_merges > 0 else "direct",
+        # Lower winner (AI-weighted from L1-L4 / L1-L5)
+        winner_2_user_id            = lower_winner.id,
+        winner_2_level              = lower_winner.current_level,
+        winner_2_net_payout         = lower_net_d,
+        winner_2_total_deposited    = _lo_dep,
+        winner_2_merges_experienced = _lo_merges,
+        winner_2_pauses_experienced = _lo_pauses,
+        winner_2_journey_type       = "merged" if _lo_merges > 0 else "direct",
+    ))
+
+    # (e) Advance surviving members +1 level, atomically flag any new L4/L5
+    new_escalation_in_pool = False
+    surviving_members: list[User] = (
+        db.query(User)
+        .filter(
+            User.current_pool_id == pool_id,
+            User.status          == UserStatus.Active,
+            User.id.notin_([upper_member.id, lower_winner.id]),
+        )
+        .all()
+    )
+    for survivor in surviving_members:
+        new_level    = min(survivor.current_level + 1, 6)
+        reaching_l4  = (new_level == 4)
+        reaching_l5  = (new_level == 5)
+        if reaching_l4 or reaching_l5:
+            new_escalation_in_pool = True
+        crud_user.update_user(
+            db, survivor.id,
+            UserUpdate(
+                current_level         = new_level,
+                weekly_payment_status = WeeklyPaymentStatus.Unpaid,
+                sde_required          = (True    if reaching_l4 else None),
+                sde_flagged_week      = (week_id if reaching_l4 else None),
+            ),
+        )
+
+    # (f) Mark pool drawn — prevent double-draw; update pool draw type
+    pool.draw_completed_this_week = True
+    pool.pool_draw_type           = draw_type
+    if not new_escalation_in_pool:
+        pool.contains_flagged_l4 = False
+
+    db.commit()
+    # ── END ATOMIC TRANSACTION ────────────────────────────────────────────────
+
+    _logger.info(
+        "SDE Ext-II COMPLETE pool='%s': upper=@%s(L%d ₹%s)  lower=@%s(L%d ₹%s)  "
+        "savings=₹%s vs waiting 1 week",
+        pool.name,
+        upper_member.username, upper_member.current_level, upper_net_d,
+        lower_winner.username, lower_winner.current_level, lower_net_d,
+        projection.get("savings_acting_now_vs_1week", "N/A"),
+    )
+
+    return SDEExt2DrawResult(
+        pool_id=pool.id,
+        pool_name=pool.name,
+        upper_winner_user_id=upper_member.id,
+        upper_winner_level=upper_member.current_level,
+        upper_winner_payout=upper_net_d,
+        lower_winner_user_id=lower_winner.id,
+        lower_winner_level=lower_winner.current_level,
+        lower_winner_payout=lower_net_d,
+        draw_type=draw_type,
+        drawdown_projection=projection,
+    )
+
+
+def check_and_run_sde_extensions(db: Session, week_id: str) -> list[SDEExt2DrawResult]:
+    """
+    Check ALL active pools for L5 and L6 members and execute SDE Ext-II/III draws.
+
+    Called BEFORE regular SDE and before the weekly draw to ensure no L5/L6
+    members remain when the regular draw cycle runs.
+
+    Priority order (most severe first):
+      1. SDE Ext-III (L6 members)  — extreme edge case
+      2. SDE Ext-II  (L5 members)  — rare but critical
+
+    Returns list of all Ext-II/III draws executed this run.
+    """
+    results: list[SDEExt2DrawResult] = []
+
+    # ── Step 1: Check for L6 members (Ext-III — extreme priority) ────────────
+    l6_members: list[User] = (
+        db.query(User)
+        .filter(
+            User.status        == UserStatus.Active,
+            User.current_level == 6,
+        )
+        .all()
+    )
+    if l6_members:
+        _logger.critical(
+            "SDE Ext-III REQUIRED: %d L6 member(s) detected across pools. "
+            "This indicates SDE Ext-II also failed previously. "
+            "Executing L6 forced exits immediately.",
+            len(l6_members),
+        )
+        for l6_member in l6_members:
+            if l6_member.current_pool_id is None:
+                continue
+            # Skip pools already drawn this week
+            pool_check = db.query(Pool).filter(Pool.id == l6_member.current_pool_id).first()
+            if pool_check and pool_check.draw_completed_this_week:
+                _logger.warning(
+                    "SDE Ext-III: pool '%s' already drew this week — "
+                    "L6 member %d (%s) will be processed next week.",
+                    pool_check.name, l6_member.id, l6_member.username,
+                )
+                continue
+            try:
+                r = execute_sde_ext2_draw(
+                    db,
+                    pool_id=l6_member.current_pool_id,
+                    l5_member_id=l6_member.id,
+                    draw_type=POOL_DRAW_SDE_EXT3,
+                )
+                results.append(r)
+            except ValueError as exc:
+                _logger.error(
+                    "SDE Ext-III FAILED for member %d (%s) pool %d: %s",
+                    l6_member.id, l6_member.username, l6_member.current_pool_id, exc,
+                )
+
+    # ── Step 2: Check for L5 members (Ext-II) ────────────────────────────────
+    l5_members: list[User] = (
+        db.query(User)
+        .filter(
+            User.status        == UserStatus.Active,
+            User.current_level == 5,
+        )
+        .all()
+    )
+    if l5_members:
+        _logger.error(
+            "SDE Ext-II REQUIRED: %d L5 member(s) detected across pools. "
+            "SDE failed to clear L4 → L5 advancement occurred. "
+            "Executing L5 forced exits immediately.",
+            len(l5_members),
+        )
+        for l5_member in l5_members:
+            if l5_member.current_pool_id is None:
+                continue
+            # Skip pools already drawn this week (e.g., just ran Ext-III above)
+            pool_check = db.query(Pool).filter(Pool.id == l5_member.current_pool_id).first()
+            if pool_check and pool_check.draw_completed_this_week:
+                _logger.warning(
+                    "SDE Ext-II: pool '%s' already drew this week — "
+                    "L5 member %d (%s) will be processed next week.",
+                    pool_check.name, l5_member.id, l5_member.username,
+                )
+                continue
+            try:
+                r = execute_sde_ext2_draw(
+                    db,
+                    pool_id=l5_member.current_pool_id,
+                    l5_member_id=l5_member.id,
+                    draw_type=POOL_DRAW_SDE_EXT2,
+                )
+                results.append(r)
+            except ValueError as exc:
+                _logger.error(
+                    "SDE Ext-II FAILED for member %d (%s) pool %d: %s",
+                    l5_member.id, l5_member.username, l5_member.current_pool_id, exc,
+                )
+
+    if results:
+        _logger.info(
+            "SDE Extensions complete: %d Ext-II/III draw(s) executed this week.",
+            len(results),
+        )
+    return results

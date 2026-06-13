@@ -15,11 +15,19 @@
  */
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import {
   Search, RefreshCw, AlertTriangle, Users, Layers,
   Clock, Zap, ToggleLeft, ToggleRight, ChevronLeft, ChevronRight,
   Activity, Shield, X, Info,
 } from 'lucide-react'
+
+// ── Framer-motion variants ─────────────────────────────────────────────────────
+const _fadeUp  = { initial:{opacity:0,y:12}, animate:{opacity:1,y:0}, exit:{opacity:0,y:-8},
+                   transition:{duration:0.32,ease:[0.25,1,0.5,1]} }
+const _stagger = { animate:{ transition:{ staggerChildren:0.05 }}}
+const _slideIn = { initial:{opacity:0,x:-10}, animate:{opacity:1,x:0},
+                   transition:{duration:0.28,ease:[0.25,1,0.5,1]} }
 import Spinner from '../components/Spinner'
 import { getAdminUsers, getPools, getAiSnapshot } from '../api/client'
 import { useToast } from '../context/ToastContext'
@@ -319,31 +327,40 @@ function PoolMiniCard({ pool, dimmed }) {
   const members = pool.total_members ?? pool.current_member_count ?? 0
   const status  = pool.status ?? pool.pool_status
   const hasVacancy = members < 12 && status === 'Active'
+  const fillPct = (members / 12) * 100
+  const fillColor = members >= 12 ? '#10b981' : members >= 8 ? '#3b82f6' : members >= 4 ? '#f59e0b' : '#ef4444'
 
   return (
-    <div className={`rounded-xl border p-3 transition-all ${
-      dimmed ? 'opacity-20' : ''
-    } ${
-      hasVacancy
-        ? 'border-red-700/50 bg-red-950/15'
-        : 'border-slate-700/50 bg-slate-800/50'
-    }`}>
+    <motion.div
+      layout
+      initial={{ opacity: 0, scale: 0.88 }}
+      animate={{ opacity: dimmed ? 0.2 : 1, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.85 }}
+      transition={{ duration: 0.28, ease: [0.25, 1, 0.5, 1] }}
+      className={`rounded-xl border p-3 ${
+        hasVacancy
+          ? 'border-red-700/50 bg-red-950/15'
+          : 'border-slate-700/50 bg-slate-800/50'
+      }`}
+    >
       <div className="flex items-center justify-between mb-2">
         <span className="text-xs font-bold text-slate-200 truncate">{name}</span>
         {hasVacancy && (
-          <span className="text-[8px] font-black text-red-400 border border-red-800/50 px-1 py-0.5 rounded-full ml-1 flex-shrink-0 animate-pulse">
+          <motion.span
+            animate={{ opacity: [1, 0.4, 1] }}
+            transition={{ duration: 1.4, repeat: Infinity }}
+            className="text-[8px] font-black text-red-400 border border-red-800/50 px-1 py-0.5 rounded-full ml-1 flex-shrink-0"
+          >
             VACANCY
-          </span>
+          </motion.span>
         )}
       </div>
-      {/* Fill progress */}
+      {/* Fill progress — motion.div animated on member count change */}
       <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden mb-1.5">
-        <div
-          className="h-full rounded-full transition-all duration-500"
-          style={{
-            width: `${(members / 12) * 100}%`,
-            background: members >= 12 ? '#10b981' : members >= 8 ? '#3b82f6' : members >= 4 ? '#f59e0b' : '#ef4444',
-          }}
+        <motion.div
+          className="h-full rounded-full"
+          animate={{ width: `${fillPct}%`, backgroundColor: fillColor }}
+          transition={{ duration: 0.7, ease: 'easeOut' }}
         />
       </div>
       <div className="flex items-center justify-between text-[9px]">
@@ -357,7 +374,7 @@ function PoolMiniCard({ pool, dimmed }) {
           <span className="text-slate-600">✓ done</span>
         )}
       </div>
-    </div>
+    </motion.div>
   )
 }
 
@@ -536,10 +553,10 @@ export default function HydraulicPipeline() {
   const dimAll = !!highlightedMember
 
   return (
-    <div className="p-6 space-y-5 h-full">
+    <motion.div {..._stagger} className="p-6 space-y-5 h-full">
 
       {/* ── Header ──────────────────────────────────────────────────────────── */}
-      <div className="flex items-start justify-between gap-4">
+      <motion.div {..._fadeUp} className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold text-white flex items-center gap-2.5">
             <div className="p-2 rounded-xl bg-blue-900/40">
@@ -572,7 +589,7 @@ export default function HydraulicPipeline() {
             <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`}/>
           </button>
         </div>
-      </div>
+      </motion.div>
 
       {/* ── Entity Search ──────────────────────────────────────────────────── */}
       <EntitySearch
@@ -664,6 +681,7 @@ export default function HydraulicPipeline() {
               <p className="text-xs text-slate-600 text-center py-8">No active pools</p>
             ) : (
               <div className="grid grid-cols-2 gap-2">
+                <AnimatePresence mode="popLayout" initial={false}>
                 {activePools.map(p => (
                   <PoolMiniCard
                     key={p.id ?? p.pool_id}
@@ -678,6 +696,7 @@ export default function HydraulicPipeline() {
                     dimmed={true}
                   />
                 ))}
+                </AnimatePresence>
               </div>
             )}
           </div>
@@ -736,6 +755,6 @@ export default function HydraulicPipeline() {
           </button>
         </div>
       )}
-    </div>
+    </motion.div>
   )
 }

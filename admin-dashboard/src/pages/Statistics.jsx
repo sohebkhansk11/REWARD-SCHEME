@@ -1,11 +1,18 @@
 import { useState, useEffect, useCallback, Fragment } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import {
   BarChart3, TrendingUp, TrendingDown, RefreshCw,
   IndianRupee, Users, Layers, Clock, Zap, AlertTriangle,
   CheckCircle2, XCircle, Shield, Target, Activity,
   ChevronDown, ChevronRight, CheckCheck, AlertCircle,
-  Calculator, Info, Cpu,
+  Calculator, Info, Cpu, CalendarRange, Download, TableProperties,
+  Gavel, DollarSign, Trophy, Award, GitFork,
 } from 'lucide-react'
+
+// ── Framer-motion variants ─────────────────────────────────────────────────────
+const _fadeUp  = { initial:{opacity:0,y:12}, animate:{opacity:1,y:0}, exit:{opacity:0,y:-8},
+                   transition:{duration:0.32,ease:[0.25,1,0.5,1]} }
+const _stagger = { animate:{ transition:{ staggerChildren:0.06 }}}
 import {
   ResponsiveContainer,
   AreaChart, Area,
@@ -22,6 +29,8 @@ import {
   getAdminTokens, updateTokenStatus, burnToken,
   getBrain5Lpi,
   devLiveStats, devLevelMap, devWinnersAnalytics, devProjection,
+  getPauseCalendar, getWeeklyPoolReports,
+  getReferralTrend, getWinnerLevelTrend,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -701,6 +710,1120 @@ function ProjectionsPanel({ toast }) {
   )
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// S-01: LPI History Chart — rolling weekly LPI from draw_history
+// ═══════════════════════════════════════════════════════════════════════════
+function LpiHistoryPanel({ toast }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [weeks,   setWeeks]   = useState(24)
+
+  const fetch_ = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r = await getWeeklyPoolReports(weeks)
+      setData(r.data)
+    } catch { toast('Failed to load LPI history', 'error') }
+    finally  { setLoading(false) }
+  }, [weeks, toast])
+
+  useEffect(() => { fetch_() }, [fetch_])
+
+  if (loading) return <div className="flex justify-center h-48"><Spinner className="w-8 h-8 text-violet-500 mt-16"/></div>
+  if (!data?.weeks?.length) return <p className="text-slate-400 text-sm p-4">No draw history yet. Run at least one draw cycle.</p>
+
+  const lpiHistory = data.weeks.map(w => ({
+    week: w.week_id,
+    lpi:  fP(w.avg_lpi_snapshot ?? 0),
+    draws: fI(w.draw_count),
+    winners: fI(w.winner_count),
+  }))
+
+  return (
+    <motion.div {..._fadeUp} className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-bold text-slate-800">LPI History — Level Pressure Index Trend</h2>
+          <p className="text-sm text-slate-400 mt-0.5">
+            Weekly LPI evolution. &gt;25% → SDE proactive, &gt;50% → L3 exception.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {[12, 24, 52].map(w => (
+            <button key={w} onClick={() => setWeeks(w)}
+              className={`px-3 py-1.5 text-xs font-bold rounded-lg transition ${weeks===w?'bg-violet-600 text-white':'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
+              {w}W
+            </button>
+          ))}
+          <button onClick={() => fetch_()} className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 transition">
+            <RefreshCw className="w-3.5 h-3.5 text-slate-500"/>
+          </button>
+        </div>
+      </div>
+
+      <SectionCard title="LPI Weekly Evolution" icon={Activity} iconColor="text-violet-500">
+        <ResponsiveContainer width="100%" height={260}>
+          <ComposedChart data={lpiHistory} margin={{top:8,right:16,left:0,bottom:4}}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+            <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} tickLine={false} interval="preserveStartEnd"/>
+            <YAxis yAxisId="lpi" tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false} domain={[0,100]} tickFormatter={v=>`${v}%`}/>
+            <YAxis yAxisId="draws" orientation="right" tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false}/>
+            <Tooltip content={<ChartTip />}/>
+            <Legend wrapperStyle={{fontSize:11}}/>
+            {/* LPI zones */}
+            <ReferenceLine yAxisId="lpi" y={14} stroke="#10b981" strokeDasharray="4 2" label={{value:'14% Regular',fill:'#10b981',fontSize:10,position:'left'}}/>
+            <ReferenceLine yAxisId="lpi" y={25} stroke="#f59e0b" strokeDasharray="4 2" label={{value:'25% SDE',fill:'#f59e0b',fontSize:10,position:'left'}}/>
+            <ReferenceLine yAxisId="lpi" y={50} stroke="#ef4444" strokeDasharray="4 2" label={{value:'50% Critical',fill:'#ef4444',fontSize:10,position:'left'}}/>
+            <Area yAxisId="lpi" type="monotone" dataKey="lpi" name="LPI %" stroke={C.violet} strokeWidth={2}
+              fill={C.violet + '18'} dot={false} activeDot={{r:4}}/>
+            <Bar yAxisId="draws" dataKey="draws" name="Draws" fill={C.blue + '40'} radius={[2,2,0,0]}/>
+          </ComposedChart>
+        </ResponsiveContainer>
+      </SectionCard>
+
+      {/* LPI zone summary */}
+      <div className="grid grid-cols-3 gap-4">
+        {[
+          { label:'Healthy (< 14%)',  color:'text-emerald-600', bg:'bg-emerald-50 border-emerald-200',  count: lpiHistory.filter(w=>w.lpi<14).length },
+          { label:'Caution (14–25%)', color:'text-amber-600',   bg:'bg-amber-50 border-amber-200',     count: lpiHistory.filter(w=>w.lpi>=14&&w.lpi<25).length },
+          { label:'Critical (≥ 25%)', color:'text-red-600',     bg:'bg-red-50 border-red-200',         count: lpiHistory.filter(w=>w.lpi>=25).length },
+        ].map(z => (
+          <div key={z.label} className={`rounded-2xl border p-4 ${z.bg}`}>
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">{z.label}</p>
+            <p className={`text-3xl font-black tabular-nums mt-1 ${z.color}`}>{z.count}<span className="text-sm font-semibold text-slate-400 ml-1">wks</span></p>
+          </div>
+        ))}
+      </div>
+    </motion.div>
+  )
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S-02: Financial Waterfall — cash inflow, outflow, profit waterfall chart
+// ═══════════════════════════════════════════════════════════════════════════
+function FinWaterfallPanel({ toast }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    setLoading(true)
+    getFinancials()
+      .then(r => setData(r.data))
+      .catch(() => toast('Failed to load financial data', 'error'))
+      .finally(() => setLoading(false))
+  }, [toast])
+
+  if (loading) return <div className="flex justify-center h-48"><Spinner className="w-8 h-8 text-emerald-500 mt-16"/></div>
+  if (!data)   return null
+
+  const inflow    = fP(data.total_collected_inr)
+  const outflow   = fP(data.total_distributed_inr)
+  const refOut    = fP(data.total_referrals_paid_inr)
+  const mntFees   = fP(data.maintenance_fees_total_inr)
+  const lateFees  = fP(data.total_late_fees_collected_inr)
+  const graceFees = fP(data.total_grace_fees_collected_inr)
+  const netProfit = fP(data.pure_realized_profit_inr)
+  const liability = fP(data.current_active_liability_inr)
+
+  // Build waterfall bars
+  const bars = [
+    { name: 'Deposits In',    value: inflow,    fill: C.emerald, type: 'income' },
+    { name: 'Late Fees',      value: lateFees,  fill: C.amber,   type: 'income' },
+    { name: 'Grace Fees',     value: graceFees, fill: C.teal,    type: 'income' },
+    { name: 'Payouts Out',    value: outflow,   fill: C.rose,    type: 'expense' },
+    { name: 'Referral Out',   value: refOut,    fill: C.violet,  type: 'expense' },
+    { name: 'Platform Fees',  value: mntFees,   fill: C.blue,    type: 'fee' },
+    { name: 'Active Liability',value: liability, fill: '#f97316', type: 'liability' },
+    { name: 'Net Realized',   value: netProfit, fill: netProfit >= 0 ? C.emerald : C.rose, type: 'net' },
+  ].map(b => ({ ...b, display: b.type === 'expense' || b.type === 'liability' ? -Math.abs(b.value) : b.value }))
+
+  return (
+    <motion.div {..._fadeUp} className="space-y-6">
+      <div>
+        <h2 className="text-lg font-bold text-slate-800">Financial Cash Waterfall</h2>
+        <p className="text-sm text-slate-400 mt-0.5">All-time financial flow — inflows, outflows, and net realized profit.</p>
+      </div>
+
+      <SectionCard title="Cash Flow Waterfall" icon={Calculator} iconColor="text-emerald-500">
+        <ResponsiveContainer width="100%" height={300}>
+          <BarChart data={bars} margin={{top:8,right:16,left:8,bottom:40}}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+            <XAxis dataKey="name" tick={{fill:'#64748b',fontSize:10}} tickLine={false} angle={-35} textAnchor="end" interval={0}/>
+            <YAxis tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false} tickFormatter={v=>INR_COMPACT(Math.abs(v))}/>
+            <Tooltip formatter={(v,n)=>[INR(Math.abs(v)), n]} contentStyle={{border:'1px solid #e2e8f0',borderRadius:12,fontSize:12}}/>
+            <ReferenceLine y={0} stroke="#94a3b8" />
+            <Bar dataKey="display" name="Amount" radius={[4,4,0,0]}>
+              {bars.map((b,i) => <Cell key={i} fill={b.fill} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </SectionCard>
+
+      {/* Summary strip */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {[
+          { label:'Total Inflow',      val:INR(inflow),                 color:'text-emerald-600', bg:'bg-emerald-50 border-emerald-200' },
+          { label:'Total Outflow',     val:INR(outflow+refOut),         color:'text-red-600',     bg:'bg-red-50 border-red-200' },
+          { label:'Compliance Rev',    val:INR(lateFees+graceFees),     color:'text-amber-600',   bg:'bg-amber-50 border-amber-200' },
+          { label:'Net Realized',      val:INR(Math.abs(netProfit)),    color:netProfit>=0?'text-emerald-700':'text-red-700', bg:netProfit>=0?'bg-emerald-50 border-emerald-200':'bg-red-50 border-red-200' },
+        ].map(c => (
+          <div key={c.label} className={`rounded-2xl border p-4 ${c.bg}`}>
+            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">{c.label}</p>
+            <p className={`text-xl font-black tabular-nums mt-1 ${c.color}`}>{c.val}</p>
+          </div>
+        ))}
+      </div>
+    </motion.div>
+  )
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S-05: Brain 5 Forward Signal Panel — live LPI + L3→L4 projection
+// ═══════════════════════════════════════════════════════════════════════════
+function Brain5SignalPanel({ toast }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  const fetch_ = useCallback(async () => {
+    setLoading(true)
+    try   { const r = await getBrain5Lpi(); setData(r.data) }
+    catch { toast('Failed to load Brain 5 signal', 'error') }
+    finally { setLoading(false) }
+  }, [toast])
+  useEffect(() => { fetch_(); const id=setInterval(fetch_,30_000); return()=>clearInterval(id) }, [fetch_])
+
+  if (loading) return <div className="flex justify-center h-48"><Spinner className="w-8 h-8 text-violet-500 mt-16"/></div>
+  if (!data)   return null
+
+  const lpi       = fP(data.lpi)
+  const fwd       = fP(data.forward_signal_l3)
+  const dist      = data.level_distribution ?? {}
+  const demand    = data.sde_demand ?? {}
+  const decision  = data.pool_type_decision ?? {}
+
+  const lpiColor  = lpi>=50?'text-red-600':lpi>=25?'text-orange-600':lpi>=14?'text-amber-600':'text-emerald-600'
+
+  const distData = [1,2,3,4,5,6].map(l => ({
+    level: `L${l}`,
+    count: fI(dist[`l${l}`]??dist[`L${l}`]??0),
+    fill:  ['#94a3b8','#3b82f6','#8b5cf6','#f59e0b','#f97316','#ef4444'][l-1],
+  }))
+
+  return (
+    <motion.div {..._fadeUp} className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-bold text-slate-800">Brain 5 — LPI &amp; Forward Signal</h2>
+          <p className="text-sm text-slate-400 mt-0.5">Level Pressure Index with L3→L4 forward projection. Auto-refreshes every 30 s.</p>
+        </div>
+        <button onClick={fetch_} className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 transition">
+          <RefreshCw className="w-4 h-4 text-slate-500"/>
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+        {/* LPI Gauge */}
+        <SectionCard title="Live LPI" icon={Cpu} iconColor="text-violet-500">
+          <div className="flex flex-col items-center py-2">
+            <LpiGauge lpi={lpi}/>
+            <div className="mt-3 space-y-1 w-full">
+              <ARow label="Decision" value={decision.summary ?? '—'} color={lpiColor}/>
+              <ARow label="L4 Flagged" value={demand.l4_count??0} color={demand.l4_count>0?'text-red-600':'text-emerald-600'}/>
+              <ARow label="SDE Sessions" value={demand.sessions_needed??0}/>
+            </div>
+          </div>
+        </SectionCard>
+
+        {/* Forward Signal */}
+        <SectionCard title="Forward Signal (L3→L4)" icon={TrendingUp} iconColor="text-amber-500">
+          <div className="flex flex-col items-center py-4">
+            <p className={`text-5xl font-black tabular-nums ${fwd>=3?'text-red-600':fwd>=1?'text-amber-600':'text-emerald-600'}`}>{fwd}</p>
+            <p className="text-xs text-slate-400 mt-1">Paid L3 members → next L4 after draw</p>
+            <div className="mt-4 w-full space-y-1">
+              <ARow label="L3→L4 Threshold" value={demand.l1l2_threshold??0}/>
+              <ARow label="L1+L2 Available" value={demand.l1l2_available??0}/>
+              <ARow label="Clearable L4s"   value={demand.clearable_count??0}/>
+              {demand.overflow_count>0&&(
+                <ARow label="SDE Overflow" value={demand.overflow_count} color="text-red-600"/>
+              )}
+            </div>
+          </div>
+        </SectionCard>
+
+        {/* Level Distribution mini-chart */}
+        <SectionCard title="Active Level Distribution" icon={BarChart3} iconColor="text-blue-500">
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={distData} margin={{top:4,right:4,left:-20,bottom:4}}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+              <XAxis dataKey="level" tick={{fill:'#64748b',fontSize:11,fontWeight:700}} tickLine={false} axisLine={false}/>
+              <YAxis tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false}/>
+              <Tooltip formatter={(v,n)=>[v,n]} contentStyle={{border:'1px solid #e2e8f0',borderRadius:10,fontSize:11}}/>
+              <Bar dataKey="count" name="Members" radius={[6,6,0,0]}>
+                {distData.map((d,i) => <Cell key={i} fill={d.fill}/>)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </SectionCard>
+      </div>
+
+      {/* AI scenario from brain5 */}
+      {data.elevated_risk && (
+        <div className="flex items-center gap-3 p-4 bg-red-50 border border-red-200 rounded-2xl">
+          <AlertCircle className="w-5 h-5 text-red-500 flex-shrink-0"/>
+          <div>
+            <p className="text-sm font-bold text-red-700">Elevated Risk — L5/L6 Members Present</p>
+            <p className="text-xs text-red-500 mt-0.5">SDE Extension II/III will trigger automatically at next draw. Admin attention recommended.</p>
+          </div>
+        </div>
+      )}
+    </motion.div>
+  )
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S-06: SDE Event Timeline — history of SDE draws from draw_history
+// ═══════════════════════════════════════════════════════════════════════════
+function SdeTimelinePanel({ toast }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [weeks,   setWeeks]   = useState(24)
+
+  const fetch_ = useCallback(async () => {
+    setLoading(true)
+    try   { const r = await getWeeklyPoolReports(weeks); setData(r.data) }
+    catch { toast('Failed to load SDE timeline', 'error') }
+    finally { setLoading(false) }
+  }, [weeks, toast])
+  useEffect(() => { fetch_() }, [fetch_])
+
+  if (loading) return <div className="flex justify-center h-48"><Spinner className="w-8 h-8 text-rose-500 mt-16"/></div>
+  if (!data?.weeks?.length) return <p className="text-slate-400 text-sm p-4">No draw history yet.</p>
+
+  const timeline = data.weeks.map(w => ({
+    week:    w.week_id,
+    sde:     fI(w.total_sde_exits),
+    regular: fI((w.draw_types?.regular??0)),
+    type_a:  fI((w.draw_types?.type_a??0)),
+    type_b:  fI((w.draw_types?.type_b??0)),
+    winners: fI(w.winner_count),
+    payout:  fP(w.total_payout_inr),
+  }))
+
+  const totalSde = timeline.reduce((s,w)=>s+w.sde,0)
+
+  return (
+    <motion.div {..._fadeUp} className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-bold text-slate-800">SDE Event Timeline</h2>
+          <p className="text-sm text-slate-400 mt-0.5">SDE (L4 forced-exit) draws vs normal draws per week.</p>
+        </div>
+        <div className="flex items-center gap-2">
+          {[12, 24, 52].map(w => (
+            <button key={w} onClick={() => setWeeks(w)}
+              className={`px-3 py-1.5 text-xs font-bold rounded-lg transition ${weeks===w?'bg-rose-600 text-white':'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
+              {w}W
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* SDE vs normal draw chart */}
+      <SectionCard title="Draw Type Breakdown Per Week" icon={Zap} iconColor="text-rose-500">
+        <ResponsiveContainer width="100%" height={240}>
+          <BarChart data={timeline} margin={{top:4,right:16,left:0,bottom:4}}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+            <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} tickLine={false} interval="preserveStartEnd"/>
+            <YAxis tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false}/>
+            <Tooltip contentStyle={{border:'1px solid #e2e8f0',borderRadius:12,fontSize:11}}/>
+            <Legend wrapperStyle={{fontSize:11}}/>
+            <Bar dataKey="regular" stackId="a" fill={C.emerald} name="Regular"  radius={[0,0,0,0]}/>
+            <Bar dataKey="type_a"  stackId="a" fill={C.blue}    name="Type A"   radius={[0,0,0,0]}/>
+            <Bar dataKey="type_b"  stackId="a" fill={C.amber}   name="Type B"   radius={[0,0,0,0]}/>
+            <Bar dataKey="sde"     stackId="a" fill={C.rose}    name="SDE Exit" radius={[4,4,0,0]}/>
+          </BarChart>
+        </ResponsiveContainer>
+      </SectionCard>
+
+      {/* SDE summary */}
+      <div className="grid grid-cols-3 gap-4">
+        <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4">
+          <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">SDE Exits</p>
+          <p className="text-3xl font-black tabular-nums mt-1 text-rose-600">{NUM(totalSde)}</p>
+          <p className="text-xs text-rose-400 mt-0.5">L4 forced exits in {weeks}W</p>
+        </div>
+        <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+          <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Total Draws</p>
+          <p className="text-3xl font-black tabular-nums mt-1 text-slate-800">{NUM(timeline.reduce((s,w)=>s+w.regular+w.type_a+w.type_b+w.sde,0))}</p>
+        </div>
+        <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
+          <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Total Winners</p>
+          <p className="text-3xl font-black tabular-nums mt-1 text-emerald-600">{NUM(timeline.reduce((s,w)=>s+w.winners,0))}</p>
+        </div>
+      </div>
+    </motion.div>
+  )
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S-08: Alert Thresholds Panel — live system health + configurable alerts
+// ═══════════════════════════════════════════════════════════════════════════
+function AlertThreshPanel({ toast }) {
+  const [health,   setHealth]   = useState(null)
+  const [lpi5,     setLpi5]     = useState(null)
+  const [loading,  setLoading]  = useState(true)
+  const [lastUp,   setLastUp]   = useState(null)
+
+  const fetch_ = useCallback(async () => {
+    try {
+      const [hRes, lRes] = await Promise.all([
+        devLiveStats().catch(()=>null),
+        getBrain5Lpi().catch(()=>null),
+      ])
+      if (hRes) setHealth(hRes.data)
+      if (lRes) setLpi5(lRes.data)
+      setLastUp(new Date())
+    } catch { toast('Failed to load system health', 'error') }
+    finally { setLoading(false) }
+  }, [toast])
+
+  useEffect(() => {
+    fetch_()
+    const id = setInterval(fetch_, 30_000)
+    return () => clearInterval(id)
+  }, [fetch_])
+
+  if (loading) return <div className="flex justify-center h-48"><Spinner className="w-8 h-8 text-slate-500 mt-16"/></div>
+
+  const lpi         = fP(lpi5?.lpi ?? health?.sde?.lpi ?? 0)
+  const l4Flagged   = fI(lpi5?.sde_demand?.l4_count ?? health?.sde?.l4_flagged ?? 0)
+  const activeUsers = fI(health?.users?.active ?? 0)
+  const waitlist    = fI(health?.users?.waitlist ?? 0)
+  const activePools = fI(health?.pools?.active ?? 0)
+
+  // Threshold matrix
+  const checks = [
+    {
+      label:    'LPI Level',
+      value:    `${lpi.toFixed(1)}%`,
+      status:   lpi>=50?'critical':lpi>=25?'warning':lpi>=14?'caution':'healthy',
+      note:     lpi>=50?'CRITICAL — SDE Extended immediately required':lpi>=25?'SDE proactive draw scheduled':lpi>=14?'Type A routing active':'System in healthy zone',
+    },
+    {
+      label:    'L4 Flagged Members',
+      value:    l4Flagged,
+      status:   l4Flagged>=6?'critical':l4Flagged>=3?'warning':l4Flagged>=1?'caution':'healthy',
+      note:     l4Flagged>=6?'High SDE demand — admin override likely required':l4Flagged>=3?'Multiple SDE sessions needed':l4Flagged>=1?'SDE sessions planned':'No L4 pressure',
+    },
+    {
+      label:    'Active Users',
+      value:    activeUsers,
+      status:   activeUsers<12?'critical':activeUsers<24?'warning':'healthy',
+      note:     activeUsers<12?'Below minimum for 1 pool — system at risk':activeUsers<24?'Low active count':'Active count healthy',
+    },
+    {
+      label:    'Waitlist Queue',
+      value:    waitlist,
+      status:   waitlist<12?'warning':waitlist>=100?'caution':'healthy',
+      note:     waitlist<12?'Insufficient waitlist for pool refill':waitlist>=100?'Large waitlist — consider threshold adjustment':'Waitlist depth healthy',
+    },
+    {
+      label:    'Active Pools',
+      value:    activePools,
+      status:   activePools===0?'critical':activePools===1?'caution':'healthy',
+      note:     activePools===0?'NO ACTIVE POOLS — system halted':activePools===1?'Single pool — condensation risk':'Multiple pools operational',
+    },
+    {
+      label:    'AI Scenario',
+      value:    health?.ai?.scenario?.replace(/_/g,' ') ?? '—',
+      status:   ['DRY_PHASE','VELOCITY_CLIFF'].includes(health?.ai?.scenario)?'warning':'healthy',
+      note:     ['DRY_PHASE','VELOCITY_CLIFF'].includes(health?.ai?.scenario)?'Momentum concern — monitor inflow closely':'AI scenario within normal operating range',
+    },
+  ]
+
+  const STATUS_CFG = {
+    critical: { bg:'bg-red-50 border-red-200',    label:'bg-red-600 text-white',    dot:'bg-red-500',    text:'text-red-700'    },
+    warning:  { bg:'bg-amber-50 border-amber-200', label:'bg-amber-600 text-white',  dot:'bg-amber-500',  text:'text-amber-700'  },
+    caution:  { bg:'bg-yellow-50 border-yellow-200',label:'bg-yellow-500 text-white',dot:'bg-yellow-500', text:'text-yellow-700' },
+    healthy:  { bg:'bg-emerald-50 border-emerald-200',label:'bg-emerald-600 text-white',dot:'bg-emerald-500',text:'text-emerald-700'},
+  }
+
+  const criticals = checks.filter(c=>c.status==='critical').length
+  const warnings  = checks.filter(c=>c.status==='warning').length
+
+  return (
+    <motion.div {..._fadeUp} className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-bold text-slate-800">System Alert Thresholds</h2>
+          <p className="text-sm text-slate-400 mt-0.5">
+            Live health checks against all critical system boundaries.
+            {lastUp && ` · Updated ${lastUp.toLocaleTimeString()}`}
+          </p>
+        </div>
+        <button onClick={fetch_} className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 transition">
+          <RefreshCw className="w-4 h-4 text-slate-500"/>
+        </button>
+      </div>
+
+      {/* Overall status banner */}
+      {criticals > 0 && (
+        <div className="flex items-center gap-3 p-4 bg-red-50 border border-red-200 rounded-2xl">
+          <XCircle className="w-5 h-5 text-red-500 flex-shrink-0"/>
+          <p className="text-sm font-bold text-red-700">
+            {criticals} critical alert{criticals!==1?'s':''} — immediate action required.
+          </p>
+        </div>
+      )}
+      {criticals === 0 && warnings > 0 && (
+        <div className="flex items-center gap-3 p-4 bg-amber-50 border border-amber-200 rounded-2xl">
+          <AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0"/>
+          <p className="text-sm font-semibold text-amber-700">
+            {warnings} warning{warnings!==1?'s':''} — monitor closely.
+          </p>
+        </div>
+      )}
+      {criticals === 0 && warnings === 0 && (
+        <div className="flex items-center gap-3 p-4 bg-emerald-50 border border-emerald-200 rounded-2xl">
+          <CheckCircle2 className="w-5 h-5 text-emerald-500 flex-shrink-0"/>
+          <p className="text-sm font-semibold text-emerald-700">All systems healthy — no alerts active.</p>
+        </div>
+      )}
+
+      {/* Alert cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {checks.map(c => {
+          const cfg = STATUS_CFG[c.status]
+          return (
+            <div key={c.label} className={`rounded-2xl border p-4 ${cfg.bg}`}>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-bold text-slate-600 uppercase tracking-wider">{c.label}</span>
+                <span className={`text-[10px] font-black px-2 py-0.5 rounded-full uppercase tracking-wider ${cfg.label}`}>
+                  {c.status}
+                </span>
+              </div>
+              <p className={`text-2xl font-black tabular-nums ${cfg.text}`}>{c.value}</p>
+              <p className="text-xs text-slate-500 mt-1">{c.note}</p>
+            </div>
+          )
+        })}
+      </div>
+    </motion.div>
+  )
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S-03: Winner Level Distribution Trend — per-week winner level stacked chart
+// ═══════════════════════════════════════════════════════════════════════════
+function WinnerTrendPanel({ toast }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [window_, setWindow_] = useState(24)   // 12W / 24W / 52W
+
+  const fetch_ = useCallback(async (w) => {
+    setLoading(true)
+    try {
+      const r = await getWinnerLevelTrend(w)
+      setData(r.data)
+    } catch { toast('Failed to load winner trend', 'error') }
+    finally { setLoading(false) }
+  }, [toast])
+
+  useEffect(() => { fetch_(window_) }, [fetch_, window_])
+
+  // Level colour map — matches production Brain 5 visual language
+  const LEVEL_COLORS = {
+    L1: C.emerald, L2: C.teal, L3: C.blue,
+    L4: C.amber,   L5: '#f97316', L6: C.rose,
+  }
+
+  if (loading) return (
+    <div className="flex justify-center h-48">
+      <Spinner className="w-8 h-8 text-slate-500 mt-16" />
+    </div>
+  )
+  if (!data) return null
+
+  const rows      = data.weeks ?? []
+  const summary   = data.summary ?? {}
+  const chartData = rows.map(r => ({
+    week: r.week_id.slice(-3),
+    ...r.levels,
+    total: r.total_winners,
+  }))
+
+  const domLvl   = summary.dominant_level ?? 'L1'
+  const domColor = LEVEL_COLORS[domLvl] ?? C.slate
+
+  return (
+    <motion.div {..._fadeUp} className="space-y-6">
+      {/* Header */}
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-bold text-slate-800">Winner Level Distribution Trend</h2>
+          <p className="text-sm text-slate-400 mt-0.5">
+            Which levels are winning most often over time — a leading indicator of SDE pressure.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          {[12, 24, 52].map(w => (
+            <button key={w} onClick={() => setWindow_(w)}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition border ${
+                window_===w
+                  ? 'bg-slate-800 border-slate-700 text-white'
+                  : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
+              }`}>
+              {w}W
+            </button>
+          ))}
+          <button onClick={() => fetch_(window_)} className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 transition">
+            <RefreshCw className="w-4 h-4 text-slate-500" />
+          </button>
+        </div>
+      </div>
+
+      {/* Summary cards */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {[
+          {
+            label: 'Dominant Level',
+            value: domLvl,
+            color: `text-[${domColor}]`,
+            note: `${summary.level_totals?.[domLvl] ?? 0} wins`,
+          },
+          { label: 'Total Winners',  value: NUM(summary.total_winners ?? 0), color: 'text-slate-800', note: `${window_}W window` },
+          { label: 'Total Draws',    value: NUM(summary.total_draws   ?? 0), color: 'text-blue-700',  note: '2 winners/draw'   },
+          {
+            label: 'Weeks with Data',
+            value: rows.filter(r => r.total_winners > 0).length,
+            color: 'text-slate-600',
+            note: `of ${rows.length} weeks`,
+          },
+        ].map(c => (
+          <div key={c.label} className="bg-white rounded-2xl p-5 shadow-sm border border-slate-100">
+            <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1.5">{c.label}</p>
+            <p className={`text-2xl font-black tabular-nums ${c.color}`} style={
+              c.label === 'Dominant Level' ? { color: domColor } : {}
+            }>{c.value}</p>
+            <p className="text-xs text-slate-400 mt-1">{c.note}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Level pct of total breakdown */}
+      {summary.level_totals && summary.total_winners > 0 && (
+        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
+          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4">Level Share of All Wins</p>
+          <div className="space-y-2">
+            {Object.entries(summary.level_totals).map(([lvl, cnt]) => {
+              const pct = summary.total_winners ? (cnt / summary.total_winners * 100) : 0
+              return (
+                <div key={lvl} className="flex items-center gap-3">
+                  <span className="text-xs font-bold text-slate-500 w-5">{lvl}</span>
+                  <div className="flex-1 bg-slate-100 rounded-full h-2.5 overflow-hidden">
+                    <div
+                      className="h-full rounded-full transition-all duration-700"
+                      style={{ width: `${pct}%`, backgroundColor: LEVEL_COLORS[lvl] }}
+                    />
+                  </div>
+                  <span className="text-xs text-slate-600 tabular-nums w-14 text-right">
+                    {NUM(cnt)} ({pct.toFixed(1)}%)
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Stacked bar chart */}
+      {chartData.length > 0 ? (
+        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
+          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4">
+            Winners per Level per Week
+          </p>
+          <ResponsiveContainer width="100%" height={300}>
+            <BarChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+              <XAxis dataKey="week" tick={{ fontSize: 10, fill: '#94a3b8' }} interval="preserveStartEnd" />
+              <YAxis allowDecimals={false} tick={{ fontSize: 10, fill: '#94a3b8' }} />
+              <Tooltip
+                contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: 12 }}
+                cursor={{ fill: '#f8fafc' }}
+              />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              {['L1','L2','L3','L4','L5','L6'].map(lvl => (
+                <Bar key={lvl} dataKey={lvl} stackId="a" fill={LEVEL_COLORS[lvl]} name={lvl} />
+              ))}
+            </BarChart>
+          </ResponsiveContainer>
+          <p className="text-[10px] text-slate-400 text-center mt-2">
+            Week labels = ISO week number. L4+ wins in the stack indicate growing SDE pressure.
+          </p>
+        </div>
+      ) : (
+        <div className="bg-slate-50 rounded-2xl border border-slate-200 p-12 text-center">
+          <Award className="w-8 h-8 text-slate-300 mx-auto mb-3" />
+          <p className="text-sm text-slate-400">No draw history found in the selected window.</p>
+        </div>
+      )}
+    </motion.div>
+  )
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S-04: Referral Quality Heatmap — weekly RDR% GitHub-style calendar
+// ═══════════════════════════════════════════════════════════════════════════
+function ReferralHeatmapPanel({ toast }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [window_, setWindow_] = useState(52)
+  const [hovered, setHovered] = useState(null)   // hovered week cell
+
+  const fetch_ = useCallback(async (w) => {
+    setLoading(true)
+    try {
+      const r = await getReferralTrend(w)
+      setData(r.data)
+    } catch { toast('Failed to load referral trend', 'error') }
+    finally { setLoading(false) }
+  }, [toast])
+
+  useEffect(() => { fetch_(window_) }, [fetch_, window_])
+
+  /** Map RDR% → heatmap cell background colour (teal scale) */
+  const rdrToColor = (rdr) => {
+    if (rdr === 0)   return '#f1f5f9'   // slate-100 — no data or organic-only
+    if (rdr < 20)    return '#ccfbf1'   // teal-100
+    if (rdr < 40)    return '#5eead4'   // teal-300
+    if (rdr < 60)    return '#0d9488'   // teal-600
+    if (rdr < 80)    return '#0f766e'   // teal-700
+    return           '#134e4a'          // teal-900 — very high referral
+  }
+
+  if (loading) return (
+    <div className="flex justify-center h-48">
+      <Spinner className="w-8 h-8 text-teal-500 mt-16" />
+    </div>
+  )
+  if (!data) return null
+
+  const weeks   = data.weeks   ?? []
+  const summary = data.summary ?? {}
+
+  // Split weeks into rows of 13 (quarterly display)
+  const COLS = 13
+  const rows  = []
+  for (let i = 0; i < weeks.length; i += COLS) {
+    rows.push(weeks.slice(i, i + COLS))
+  }
+
+  // Trend line for LineChart
+  const chartData = weeks.map(w => ({
+    week:     w.week_id.slice(-3),
+    rdr_pct:  w.rdr_pct,
+    total:    w.total_joins,
+    referral: w.referral_joins,
+  }))
+
+  return (
+    <motion.div {..._fadeUp} className="space-y-6">
+      {/* Header */}
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-bold text-slate-800">Referral Quality Heatmap</h2>
+          <p className="text-sm text-slate-400 mt-0.5">
+            Weekly Referral Density Ratio (RDR%) — darker teal = higher referral share that week.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          {[26, 52, 104].map(w => (
+            <button key={w} onClick={() => setWindow_(w)}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition border ${
+                window_===w
+                  ? 'bg-teal-700 border-teal-600 text-white'
+                  : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
+              }`}>
+              {w <= 52 ? `${w}W` : `${w/52}Y`}
+            </button>
+          ))}
+          <button onClick={() => fetch_(window_)} className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 transition">
+            <RefreshCw className="w-4 h-4 text-slate-500" />
+          </button>
+        </div>
+      </div>
+
+      {/* Summary cards */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {[
+          { label: 'Avg RDR%',        value: `${(summary.avg_rdr_pct ?? 0).toFixed(1)}%`,
+            color: 'text-teal-700', note: 'across window' },
+          { label: 'Peak RDR%',       value: `${(summary.peak_rdr_pct ?? 0).toFixed(1)}%`,
+            color: 'text-teal-900', note: summary.peak_rdr_week ?? '—' },
+          { label: 'Total Joins',     value: NUM(summary.total_joins_in_window ?? 0),
+            color: 'text-slate-800', note: 'all users' },
+          { label: 'Referral Joins',  value: NUM(summary.referral_joins_in_window ?? 0),
+            color: 'text-blue-700',  note: `${(summary.avg_rdr_pct ?? 0).toFixed(1)}% of total` },
+        ].map(c => (
+          <div key={c.label} className="bg-white rounded-2xl p-5 shadow-sm border border-slate-100">
+            <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1.5">{c.label}</p>
+            <p className={`text-2xl font-black tabular-nums ${c.color}`}>{c.value}</p>
+            <p className="text-xs text-slate-400 mt-1">{c.note}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Heatmap calendar */}
+      <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
+        <div className="flex items-center justify-between mb-4">
+          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+            Weekly RDR% Heatmap
+          </p>
+          {/* Legend */}
+          <div className="flex items-center gap-1.5">
+            <span className="text-[10px] text-slate-400 mr-1">Organic</span>
+            {['#f1f5f9','#ccfbf1','#5eead4','#0d9488','#0f766e','#134e4a'].map(c => (
+              <div key={c} className="w-4 h-4 rounded-sm" style={{ backgroundColor: c }} />
+            ))}
+            <span className="text-[10px] text-slate-400 ml-1">Referral</span>
+          </div>
+        </div>
+
+        {weeks.length === 0 ? (
+          <div className="text-center py-8">
+            <GitFork className="w-8 h-8 text-slate-300 mx-auto mb-3" />
+            <p className="text-sm text-slate-400">No join data found in the selected window.</p>
+          </div>
+        ) : (
+          <div className="space-y-1.5 overflow-x-auto">
+            {rows.map((row, ri) => (
+              <div key={ri} className="flex gap-1.5">
+                {row.map(wk => (
+                  <div
+                    key={wk.week_id}
+                    onMouseEnter={() => setHovered(wk)}
+                    onMouseLeave={() => setHovered(null)}
+                    className="relative flex-shrink-0 w-9 h-9 rounded-lg flex flex-col items-center justify-center cursor-pointer
+                               transition-transform hover:scale-110 border border-white/20"
+                    style={{ backgroundColor: rdrToColor(wk.rdr_pct) }}
+                    title={`${wk.week_id}: ${wk.rdr_pct}% RDR — ${wk.referral_joins}/${wk.total_joins} joins`}
+                  >
+                    <span className="text-[9px] font-bold leading-none"
+                          style={{ color: wk.rdr_pct >= 40 ? '#f0fdfa' : '#475569' }}>
+                      {wk.week_id.slice(-2)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Tooltip detail */}
+        {hovered && (
+          <div className="mt-4 p-3 bg-teal-50 border border-teal-200 rounded-xl text-xs text-teal-800 flex gap-4">
+            <span className="font-bold">{hovered.week_id}</span>
+            <span>📅 w/c {hovered.week_start}</span>
+            <span>🔗 {hovered.referral_joins} referral joins</span>
+            <span>👤 {hovered.total_joins} total</span>
+            <span className="font-bold text-teal-900">RDR = {hovered.rdr_pct}%</span>
+          </div>
+        )}
+      </div>
+
+      {/* RDR trend line chart */}
+      {chartData.length > 0 && (
+        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
+          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4">
+            RDR% Over Time
+          </p>
+          <ResponsiveContainer width="100%" height={220}>
+            <ComposedChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+              <XAxis dataKey="week" tick={{ fontSize: 10, fill: '#94a3b8' }} interval="preserveStartEnd" />
+              <YAxis yAxisId="pct" domain={[0, 100]} tickFormatter={v => `${v}%`}
+                     tick={{ fontSize: 10, fill: '#0d9488' }} />
+              <YAxis yAxisId="cnt" orientation="right" tick={{ fontSize: 10, fill: '#94a3b8' }} />
+              <Tooltip
+                contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: 12 }}
+                formatter={(val, name) =>
+                  name === 'rdr_pct' ? [`${Number(val).toFixed(1)}%`, 'RDR%'] :
+                  name === 'total'   ? [NUM(val), 'Total Joins'] :
+                                      [NUM(val), 'Referral Joins']
+                }
+              />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              <Bar yAxisId="cnt" dataKey="total"    fill="#f1f5f9"  name="Total Joins"    />
+              <Bar yAxisId="cnt" dataKey="referral" fill="#5eead4"  name="Referral Joins" />
+              <Line yAxisId="pct" type="monotone" dataKey="rdr_pct"
+                    stroke="#0d9488" strokeWidth={2.5} dot={false} name="RDR%" />
+              <ReferenceLine yAxisId="pct" y={30} stroke="#f59e0b" strokeDasharray="4 4"
+                             label={{ value: '30% healthy', position: 'right', fontSize: 10, fill: '#f59e0b' }} />
+              <ReferenceLine yAxisId="pct" y={60} stroke="#ef4444" strokeDasharray="4 4"
+                             label={{ value: '60% high', position: 'right', fontSize: 10, fill: '#ef4444' }} />
+            </ComposedChart>
+          </ResponsiveContainer>
+          <p className="text-[10px] text-slate-400 text-center mt-2">
+            RDR% between 30–60% indicates healthy organic/referral balance. Above 60% risks FLASH_FLOOD scenario.
+          </p>
+        </div>
+      )}
+    </motion.div>
+  )
+}
+
+
+// ── System Pauses panel ──────────────────────────────────────────────────────
+function PausesPanel({ toast }) {
+  const [data,        setData]        = useState(null)
+  const [loading,     setLoading]     = useState(true)
+  const [selectedDay, setSelectedDay] = useState(null)
+
+  const fetch_ = useCallback(async () => {
+    setLoading(true)
+    try   { const r = await getPauseCalendar(); setData(r.data) }
+    catch { toast('Failed to load pause calendar', 'error') }
+    finally { setLoading(false) }
+  }, [toast])
+  useEffect(() => { fetch_() }, [fetch_])
+
+  if (loading) return (
+    <div className="flex items-center justify-center h-48">
+      <Spinner className="w-8 h-8 text-amber-500" />
+    </div>
+  )
+  if (!data) return null
+
+  // ── Calendar grid helpers ────────────────────────────────────────────────
+  const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun',
+                       'Jul','Aug','Sep','Oct','Nov','Dec']
+
+  /** YYYY-MM-DD without timezone drift */
+  const toDateStr = d =>
+    `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+
+  const addDays = (d, n) => { const c = new Date(d); c.setDate(c.getDate() + n); return c }
+
+  const today    = new Date()
+  const todayStr = toDateStr(today)
+  const cutoff   = toDateStr(addDays(today, -90))   // oldest date to colour
+
+  // Align the calendar start to the Monday of the week containing (today − 90d)
+  const rawStart  = addDays(today, -90)
+  const dow       = rawStart.getDay()               // 0 = Sun
+  const backToMon = dow === 0 ? 6 : dow - 1
+  const startDate = addDays(rawStart, -backToMon)
+
+  // Build lookup map from API response
+  const pauseMap = {}
+  for (const entry of data.calendar) pauseMap[entry.date] = entry
+
+  // Build week rows
+  const weeks = []
+  let cur = new Date(startDate)
+  while (toDateStr(cur) <= todayStr) {
+    const week = []
+    for (let d = 0; d < 7; d++) {
+      const ds = toDateStr(cur)
+      week.push({
+        date:    ds,
+        dayNum:  cur.getDate(),
+        month:   cur.getMonth(),
+        inRange: ds >= cutoff && ds <= todayStr,
+        isToday: ds === todayStr,
+        data:    pauseMap[ds] || null,
+      })
+      cur = addDays(cur, 1)
+    }
+    weeks.push(week)
+  }
+
+  const cellCls = day => {
+    if (!day.inRange) return 'bg-transparent border-transparent cursor-default'
+    const c = day.data?.paused_count ?? 0
+    if (c >= 3) return 'bg-rose-200 border-rose-300 cursor-pointer hover:bg-rose-300'
+    if (c >= 1) return 'bg-amber-200 border-amber-300 cursor-pointer hover:bg-amber-300'
+    return 'bg-slate-100 border-slate-200 cursor-default'
+  }
+
+  const textCls = day => {
+    if (!day.inRange) return 'text-transparent'
+    const c = day.data?.paused_count ?? 0
+    if (c >= 3) return 'text-rose-800 font-semibold'
+    if (c >= 1) return 'text-amber-800 font-semibold'
+    return 'text-slate-400'
+  }
+
+  return (
+    <div className="space-y-5">
+
+      {/* ── KPI strip ──────────────────────────────────────────────────────── */}
+      <div className="grid grid-cols-3 gap-4">
+        {[
+          {
+            label: 'Currently Paused',
+            value: data.current_paused_count,
+            color: data.current_paused_count > 0 ? 'text-amber-600' : 'text-slate-400',
+          },
+          { label: 'Pause Events (90 d)', value: data.total_pause_events,  color: 'text-slate-700' },
+          { label: 'Days with Activity',  value: data.calendar.length,      color: 'text-slate-700' },
+        ].map(({ label, value, color }) => (
+          <div key={label} className="bg-white rounded-2xl p-5 shadow-sm border border-slate-100 text-center">
+            <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1">{label}</p>
+            <p className={`text-2xl font-black tabular-nums ${color}`}>{value}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* ── Heatmap card ───────────────────────────────────────────────────── */}
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-2">
+          <Clock className="w-4 h-4 text-amber-500" />
+          <h3 className="font-semibold text-slate-800 text-sm">
+            Pause Heatmap — Last 90 Days
+          </h3>
+          <button
+            onClick={fetch_}
+            className="ml-auto flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-xs text-slate-500 hover:bg-slate-50 transition"
+          >
+            <RefreshCw className="w-3.5 h-3.5" /> Refresh
+          </button>
+        </div>
+
+        <div className="p-6 overflow-x-auto">
+          {/* Day-of-week headers */}
+          <div className="flex gap-1 mb-2 min-w-[480px]">
+            <div className="w-9 flex-shrink-0" /> {/* month-label spacer */}
+            {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(d => (
+              <div key={d}
+                className="flex-1 text-center text-[10px] font-semibold text-slate-400 uppercase tracking-wide">
+                {d}
+              </div>
+            ))}
+          </div>
+
+          {/* Week rows */}
+          <div className="space-y-1 min-w-[480px]">
+            {weeks.map((week, wi) => {
+              const showMonth = wi === 0 || week[0].month !== weeks[wi - 1][0].month
+              return (
+                <div key={wi} className="flex gap-1 items-center">
+                  {/* Month label */}
+                  <div className="w-9 flex-shrink-0 text-right pr-1.5">
+                    {showMonth && (
+                      <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide">
+                        {MONTH_NAMES[week[0].month]}
+                      </span>
+                    )}
+                  </div>
+                  {/* Day cells */}
+                  {week.map(day => (
+                    <button
+                      key={day.date}
+                      onClick={() => {
+                        if (!day.data || !day.inRange) return
+                        setSelectedDay(p => p?.date === day.date ? null : day)
+                      }}
+                      title={
+                        day.inRange
+                          ? day.data
+                            ? `${day.data.paused_count} pool(s) — click for details`
+                            : 'No pause activity'
+                          : undefined
+                      }
+                      className={`flex-1 h-9 rounded-lg border text-xs transition-all select-none
+                        ${cellCls(day)}
+                        ${selectedDay?.date === day.date
+                          ? 'ring-2 ring-violet-500 ring-offset-1'
+                          : ''}
+                        ${day.isToday ? 'ring-2 ring-violet-400 ring-offset-0' : ''}
+                      `}
+                    >
+                      <span className={textCls(day)}>{day.inRange ? day.dayNum : ''}</span>
+                    </button>
+                  ))}
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Legend */}
+          <div className="mt-5 flex flex-wrap items-center gap-4 text-[11px] text-slate-500">
+            <span className="font-semibold text-slate-400">Legend</span>
+            {[
+              { cls: 'bg-slate-100 border-slate-200',  label: 'No pauses' },
+              { cls: 'bg-amber-200 border-amber-300',  label: '1–2 pools' },
+              { cls: 'bg-rose-200 border-rose-300',    label: '3+ pools'  },
+            ].map(({ cls, label }) => (
+              <div key={label} className="flex items-center gap-1.5">
+                <span className={`w-5 h-5 rounded border ${cls} inline-block flex-shrink-0`} />
+                <span>{label}</span>
+              </div>
+            ))}
+            <span className="ml-auto text-[10px] text-slate-300">
+              Click a highlighted cell to see which pools were paused
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Selected-day detail ─────────────────────────────────────────────── */}
+      {selectedDay?.data && (
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+          <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-2">
+            <Clock className="w-4 h-4 text-amber-500" />
+            <h3 className="font-semibold text-slate-800 text-sm">
+              {new Date(`${selectedDay.date}T12:00:00`).toLocaleDateString('en-IN', {
+                weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+              })}
+            </h3>
+            <button
+              onClick={() => setSelectedDay(null)}
+              className="ml-auto text-slate-400 hover:text-slate-600 transition"
+              title="Close"
+            >
+              <XCircle className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="p-5 space-y-1.5">
+            {selectedDay.data.pools.map(pool => (
+              <div key={pool.id}
+                className="flex items-center gap-3 py-2.5 border-b border-slate-50 last:border-0">
+                <span className="w-8 h-8 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 flex items-center justify-center text-[10px] font-bold flex-shrink-0 tabular-nums">
+                  #{pool.id}
+                </span>
+                <p className="font-semibold text-slate-800 text-sm">{pool.name}</p>
+              </div>
+            ))}
+            <p className="pt-2 text-[11px] text-slate-400 leading-relaxed">
+              {selectedDay.data.source === 'current'
+                ? 'These pools are currently in Paused_Awaiting_Members status.'
+                : 'Inferred from draw records: winners in these pools had experienced pauses during their journey. Exact pause date is not stored — the draw date is used as a proxy.'}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Empty state ─────────────────────────────────────────────────────── */}
+      {data.calendar.length === 0 && (
+        <div className="flex items-start gap-3 bg-emerald-50 border border-emerald-200 rounded-xl p-4">
+          <CheckCircle2 className="w-4 h-4 text-emerald-500 flex-shrink-0 mt-0.5" />
+          <p className="text-sm text-emerald-700">
+            No system pauses detected in the last 90 days — all pools have been
+            running without interruption.
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // Token row (shared by both WIT and REF action panels)
 function PendingTokenRow({ token, children }) {
   return (
@@ -719,6 +1842,309 @@ function PendingTokenRow({ token, children }) {
     </div>
   )
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Weekly Pool Reports panel (A-7 Statistics sub-tab)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const INR_W = v => new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:0}).format(v??0)
+
+function downloadCSVStats(rows, filename) {
+  if (!rows?.length) return
+  const headers = Object.keys(rows[0])
+  const lines   = [
+    headers.join(','),
+    ...rows.map(r => headers.map(h => {
+      const v = r[h]
+      if (v == null) return ''
+      const s = typeof v === 'object' ? JSON.stringify(v) : String(v)
+      return s.includes(',') ? `"${s.replace(/"/g,'""')}"` : s
+    }).join(',')),
+  ]
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' })
+  const url  = URL.createObjectURL(blob)
+  const a    = document.createElement('a'); a.href = url; a.download = filename
+  document.body.appendChild(a); a.click(); document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+function WeeklyPoolReportsPanel({ toast }) {
+  const [data,     setData]     = useState(null)
+  const [loading,  setLoading]  = useState(true)
+  const [weeks,    setWeeks]    = useState(24)
+  const [viewTab,  setViewTab]  = useState('table')  // 'table' | 'draws' | 'payouts' | 'levels'
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await getWeeklyPoolReports(weeks)
+      setData(res.data)
+    } catch {
+      toast('Failed to load weekly pool reports', 'error')
+    } finally {
+      setLoading(false)
+    }
+  }, [weeks]) // eslint-disable-line
+
+  useEffect(() => { load() }, [load])
+
+  if (loading) return (
+    <div className="flex items-center justify-center py-20">
+      <div className="w-8 h-8 border-2 border-violet-400 border-t-transparent rounded-full animate-spin" />
+    </div>
+  )
+
+  const rows = data?.weeks ?? []
+  const snap = data?.snapshot ?? {}
+
+  // Flatten rows for CSV (convert nested objects)
+  const flatRows = rows.map(r => ({
+    week_id:          r.week_id,
+    week_start:       r.week_start,
+    draw_count:       r.draw_count,
+    pool_count:       r.pool_count,
+    winner_count:     r.winner_count,
+    total_payout_inr: r.total_payout_inr,
+    avg_payout_inr:   r.avg_payout_inr,
+    total_deposits_inr: r.total_deposits_inr,
+    sde_exits:        r.total_sde_exits,
+    type_regular:     r.draw_types?.regular ?? 0,
+    type_a:           r.draw_types?.type_a  ?? 0,
+    type_b:           r.draw_types?.type_b  ?? 0,
+    type_sde:         r.draw_types?.sde     ?? 0,
+    L1_winners:       r.winner_levels?.L1   ?? 0,
+    L2_winners:       r.winner_levels?.L2   ?? 0,
+    L3_winners:       r.winner_levels?.L3   ?? 0,
+    L4_winners:       r.winner_levels?.L4   ?? 0,
+    L5_winners:       r.winner_levels?.L5   ?? 0,
+    L6_winners:       r.winner_levels?.L6   ?? 0,
+  }))
+
+  // Chart data
+  const chartDraws   = rows.map(r => ({ week: r.week_id.slice(-3), ...r.draw_types }))
+  const chartPayouts = rows.map(r => ({ week: r.week_id.slice(-3), total_payout: r.total_payout_inr, deposits: r.total_deposits_inr }))
+  const chartLevels  = rows.map(r => ({ week: r.week_id.slice(-3), ...Object.fromEntries(Object.entries(r.winner_levels ?? {}).map(([k,v]) => [k,v])) }))
+
+  const VIEW_TABS = [
+    { id: 'table',  label: 'Table',       icon: TableProperties },
+    { id: 'draws',  label: 'Draw Types',  icon: Gavel           },
+    { id: 'payouts',label: 'Payouts',     icon: DollarSign      },
+    { id: 'levels', label: 'Win Levels',  icon: Trophy          },
+  ]
+
+  const LEVEL_COLORS = { L1:'#64748b', L2:'#3b82f6', L3:'#8b5cf6', L4:'#f59e0b', L5:'#ef4444', L6:'#bf00ff' }
+
+  return (
+    <div className="space-y-5">
+      {/* Summary strip */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {[
+          { label:'Active Users',   value: snap.active_users?.toLocaleString('en-IN') ?? '—',   icon: Users,       cls:'text-emerald-700 bg-emerald-50' },
+          { label:'Waitlist',       value: snap.waitlist_count?.toLocaleString('en-IN') ?? '—', icon: Clock,       cls:'text-amber-700 bg-amber-50'     },
+          { label:'Active Pools',   value: snap.active_pools?.toLocaleString('en-IN') ?? '—',   icon: Layers,      cls:'text-violet-700 bg-violet-50'   },
+          { label:'Total Draws',    value: snap.total_draws?.toLocaleString('en-IN') ?? '—',    icon: Gavel,       cls:'text-blue-700 bg-blue-50'       },
+        ].map(({ label, value, icon: Icon, cls }) => (
+          <div key={label} className="bg-white border border-slate-100 rounded-xl px-4 py-3 flex items-center gap-3 shadow-sm">
+            <div className={`p-2 rounded-lg ${cls.split(' ')[1]}`}><Icon className={`w-4 h-4 ${cls.split(' ')[0]}`} /></div>
+            <div>
+              <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider">{label}</p>
+              <p className="text-lg font-black text-slate-800 tabular-nums">{value}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Controls row */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div className="flex items-center gap-3">
+          <label className="text-sm text-slate-600 font-medium">Show last</label>
+          <select value={weeks} onChange={e => setWeeks(+e.target.value)}
+            className="border border-slate-200 rounded-xl px-3 py-1.5 text-sm text-slate-700 bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-400">
+            {[8,12,24,36,52,104].map(w => <option key={w} value={w}>{w} weeks{w===52?' (1 yr)':w===104?' (2 yr)':''}</option>)}
+          </select>
+          <button onClick={load} className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50 shadow-sm transition">
+            <RefreshCw className="w-3.5 h-3.5" /> Refresh
+          </button>
+        </div>
+        <button onClick={() => downloadCSVStats(flatRows, `weekly_pool_reports_${Date.now()}.csv`)}
+          className="flex items-center gap-1.5 px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white rounded-xl text-sm font-semibold shadow-sm transition">
+          <Download className="w-3.5 h-3.5" /> Export CSV
+        </button>
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="bg-white border border-slate-100 rounded-2xl py-16 text-center">
+          <CalendarRange className="w-10 h-10 text-slate-300 mx-auto mb-3" />
+          <p className="text-slate-500 font-medium">No draw data yet</p>
+          <p className="text-xs text-slate-400 mt-1">Run your first draw to see weekly reports here</p>
+        </div>
+      ) : (
+        <div className="bg-white border border-slate-100 rounded-2xl shadow-sm overflow-hidden">
+          {/* View tabs */}
+          <div className="flex border-b border-slate-100 overflow-x-auto">
+            {VIEW_TABS.map(t => (
+              <button key={t.id} onClick={() => setViewTab(t.id)}
+                className={`flex items-center gap-1.5 px-5 py-3.5 text-sm font-semibold border-b-2 transition whitespace-nowrap ${
+                  viewTab === t.id
+                    ? 'border-violet-600 text-violet-700 bg-violet-50/40 -mb-px'
+                    : 'border-transparent text-slate-500 hover:text-slate-700'
+                }`}>
+                <t.icon className="w-3.5 h-3.5" />
+                {t.label}
+              </button>
+            ))}
+            <div className="ml-auto px-4 py-3 text-xs text-slate-400 self-center whitespace-nowrap">
+              {rows.length} weeks
+            </div>
+          </div>
+
+          {/* ── TABLE view ── */}
+          {viewTab === 'table' && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm min-w-[900px]">
+                <thead className="bg-slate-50 border-b border-slate-100">
+                  <tr>
+                    {['Week', 'Start Date', 'Draws', 'Pools', 'Winners', 'Total Payout', 'Avg Payout', 'SDE Exits', 'Types (R/A/B/S)'].map(h => (
+                      <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wide whitespace-nowrap">{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-50">
+                  {[...rows].reverse().map((r, i) => (
+                    <tr key={r.week_id} className={`hover:bg-violet-50/30 transition-colors ${i === 0 ? 'bg-violet-50/20' : ''}`}>
+                      <td className="px-4 py-3 font-mono font-bold text-violet-700 text-xs">{r.week_id}</td>
+                      <td className="px-4 py-3 text-xs text-slate-500">{r.week_start}</td>
+                      <td className="px-4 py-3 font-semibold text-slate-800">{r.draw_count}</td>
+                      <td className="px-4 py-3 text-slate-600">{r.pool_count}</td>
+                      <td className="px-4 py-3 font-semibold text-slate-800">{r.winner_count}</td>
+                      <td className="px-4 py-3 font-mono font-bold text-emerald-700">{INR_W(r.total_payout_inr)}</td>
+                      <td className="px-4 py-3 text-slate-500">{INR_W(r.avg_payout_inr)}</td>
+                      <td className="px-4 py-3">
+                        {r.total_sde_exits > 0
+                          ? <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-red-100 text-red-700 border border-red-200">{r.total_sde_exits} SDE</span>
+                          : <span className="text-slate-300 text-xs">—</span>}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-[11px] text-slate-500">
+                        <span className="text-emerald-600">{r.draw_types?.regular ?? 0}</span>
+                        <span className="text-slate-300 mx-0.5">/</span>
+                        <span className="text-blue-600">{r.draw_types?.type_a ?? 0}</span>
+                        <span className="text-slate-300 mx-0.5">/</span>
+                        <span className="text-amber-600">{r.draw_types?.type_b ?? 0}</span>
+                        <span className="text-slate-300 mx-0.5">/</span>
+                        <span className="text-red-600">{r.draw_types?.sde ?? 0}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* ── DRAW TYPES chart ── */}
+          {viewTab === 'draws' && (
+            <div className="p-6 space-y-4">
+              <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Draw Type Breakdown Per Week</p>
+              <div className="h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={chartDraws} margin={{top:4,right:8,left:-10,bottom:0}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+                    <XAxis dataKey="week" tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} interval="preserveStartEnd"/>
+                    <YAxis tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} axisLine={false}/>
+                    <Tooltip contentStyle={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,fontSize:11}} formatter={(v,n)=>[v,n]}/>
+                    <Legend wrapperStyle={{fontSize:11,color:'#64748b'}}/>
+                    <Bar dataKey="regular" stackId="a" fill="#10b981" name="Regular"  radius={[0,0,0,0]}/>
+                    <Bar dataKey="type_a"  stackId="a" fill="#3b82f6" name="Type A"   radius={[0,0,0,0]}/>
+                    <Bar dataKey="type_b"  stackId="a" fill="#f59e0b" name="Type B"   radius={[0,0,0,0]}/>
+                    <Bar dataKey="sde"     stackId="a" fill="#ef4444" name="SDE Exit" radius={[4,4,0,0]}/>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="grid grid-cols-4 gap-3 text-center">
+                {['regular','type_a','type_b','sde'].map((t,i) => {
+                  const total = rows.reduce((s,r) => s + (r.draw_types?.[t] ?? 0), 0)
+                  const color = ['text-emerald-700','text-blue-700','text-amber-700','text-red-700'][i]
+                  const bg    = ['bg-emerald-50','bg-blue-50','bg-amber-50','bg-red-50'][i]
+                  return (
+                    <div key={t} className={`${bg} rounded-xl py-3`}>
+                      <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider">{t.replace('_',' ')}</p>
+                      <p className={`text-2xl font-black ${color} tabular-nums`}>{total}</p>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ── PAYOUTS chart ── */}
+          {viewTab === 'payouts' && (
+            <div className="p-6 space-y-4">
+              <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Weekly Payout vs Deposits</p>
+              <div className="h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={chartPayouts} margin={{top:4,right:8,left:0,bottom:0}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+                    <XAxis dataKey="week" tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} interval="preserveStartEnd"/>
+                    <YAxis tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} axisLine={false} tickFormatter={v=>v>=1000?`₹${(v/1000).toFixed(0)}k`:`₹${v}`}/>
+                    <Tooltip contentStyle={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,fontSize:11}} formatter={v=>INR_W(v)}/>
+                    <Legend wrapperStyle={{fontSize:11,color:'#64748b'}}/>
+                    <Bar dataKey="deposits"    fill="#e0f2fe" stroke="#0284c7" strokeWidth={1} name="Total Deposits" radius={[3,3,0,0]}/>
+                    <Line dataKey="total_payout" stroke="#10b981" strokeWidth={2.5} dot={false} name="Total Payout" type="monotone"/>
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="grid grid-cols-3 gap-3 text-center">
+                {[
+                  { label:'Total Paid Out', val: rows.reduce((s,r)=>s+r.total_payout_inr,0), color:'text-emerald-700', bg:'bg-emerald-50' },
+                  { label:'Total Deposits', val: rows.reduce((s,r)=>s+r.total_deposits_inr,0), color:'text-blue-700', bg:'bg-blue-50' },
+                  { label:'Avg Weekly Payout', val: rows.length ? rows.reduce((s,r)=>s+r.total_payout_inr,0)/rows.length : 0, color:'text-violet-700', bg:'bg-violet-50' },
+                ].map(({label,val,color,bg}) => (
+                  <div key={label} className={`${bg} rounded-xl py-3`}>
+                    <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider">{label}</p>
+                    <p className={`text-xl font-black ${color} tabular-nums`}>{INR_W(val)}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── WIN LEVELS chart ── */}
+          {viewTab === 'levels' && (
+            <div className="p-6 space-y-4">
+              <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider">Winner Level Distribution Per Week</p>
+              <div className="h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={chartLevels} margin={{top:4,right:8,left:-10,bottom:0}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+                    <XAxis dataKey="week" tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} interval="preserveStartEnd"/>
+                    <YAxis tick={{fill:'#94a3b8',fontSize:10}} tickLine={false} axisLine={false}/>
+                    <Tooltip contentStyle={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,fontSize:11}}/>
+                    <Legend wrapperStyle={{fontSize:11,color:'#64748b'}}/>
+                    {['L1','L2','L3','L4','L5','L6'].map(lv => (
+                      <Bar key={lv} dataKey={lv} stackId="a" fill={LEVEL_COLORS[lv]}
+                        radius={lv==='L6'?[4,4,0,0]:[0,0,0,0]} name={lv}/>
+                    ))}
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="grid grid-cols-6 gap-2 text-center">
+                {['L1','L2','L3','L4','L5','L6'].map(lv => {
+                  const total = rows.reduce((s,r) => s + (r.winner_levels?.[lv] ?? 0), 0)
+                  return (
+                    <div key={lv} className="rounded-xl py-3" style={{ background: LEVEL_COLORS[lv] + '15', border: `1px solid ${LEVEL_COLORS[lv]}30` }}>
+                      <p className="text-[10px] font-bold text-slate-500 uppercase">{lv}</p>
+                      <p className="text-xl font-black tabular-nums" style={{ color: LEVEL_COLORS[lv] }}>{total}</p>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main page
@@ -887,12 +2313,29 @@ export default function Statistics() {
   const mainLoading = loading.main
 
   // ── Sub-tab navigation ────────────────────────────────────────────────────
+  // S-01 to S-08: Added new enhanced analytics sub-tabs
   const SUB_TABS = [
-    { id: 'overview',    label: 'Overview',          icon: BarChart3 },
-    { id: 'live_stats',  label: 'Live Stats',         icon: Activity  },
-    { id: 'level_map',   label: 'Level Map',          icon: Layers    },
-    { id: 'winners',     label: 'Winners Analytics',  icon: Target    },
-    { id: 'projections', label: 'Projections',        icon: TrendingUp },
+    { id: 'overview',       label: 'Overview',              icon: BarChart3    },
+    { id: 'weekly_pools',   label: 'Weekly Pool Reports',   icon: CalendarRange },
+    { id: 'live_stats',     label: 'Live Stats',            icon: Activity     },
+    { id: 'level_map',      label: 'Level Map',             icon: Layers       },
+    { id: 'winners',        label: 'Winners Analytics',     icon: Target       },
+    { id: 'projections',    label: 'Projections',           icon: TrendingUp   },
+    { id: 'pauses',         label: 'System Pauses',         icon: Clock        },
+    // S-01: LPI History
+    { id: 'lpi_history',    label: 'LPI History',           icon: Activity     },
+    // S-02: Financial Waterfall
+    { id: 'fin_waterfall',  label: 'Cash Waterfall',        icon: Calculator   },
+    // S-03: Winner Level Trend
+    { id: 'winner_trend',   label: 'Winner Trend',          icon: Award        },
+    // S-04: Referral Heatmap
+    { id: 'ref_heatmap',    label: 'Referral Heatmap',      icon: GitFork      },
+    // S-05: Brain 5 Forward Signal
+    { id: 'brain5_signal',  label: 'Brain 5 Signal',        icon: Cpu          },
+    // S-06: SDE Event Timeline
+    { id: 'sde_timeline',   label: 'SDE Timeline',          icon: Zap          },
+    // S-08: Alert Thresholds
+    { id: 'alert_thresh',   label: 'Alert Thresholds',      icon: AlertTriangle},
   ]
 
   // ── Early-return for analytics sub-tabs ───────────────────────────────────
@@ -923,10 +2366,26 @@ export default function Statistics() {
           ))}
         </div>
         {/* Panel content */}
-        {subTab === 'live_stats'   && <LiveStatsPanel   toast={toast} />}
-        {subTab === 'level_map'    && <LevelMapPanel    toast={toast} />}
-        {subTab === 'winners'      && <WinnersPanel     toast={toast} />}
-        {subTab === 'projections'  && <ProjectionsPanel toast={toast} />}
+        {subTab === 'weekly_pools'   && <WeeklyPoolReportsPanel toast={toast} />}
+        {subTab === 'live_stats'     && <LiveStatsPanel   toast={toast} />}
+        {subTab === 'level_map'      && <LevelMapPanel    toast={toast} />}
+        {subTab === 'winners'        && <WinnersPanel     toast={toast} />}
+        {subTab === 'projections'    && <ProjectionsPanel toast={toast} />}
+        {subTab === 'pauses'         && <PausesPanel      toast={toast} />}
+        {/* S-01: LPI History Chart */}
+        {subTab === 'lpi_history'    && <LpiHistoryPanel      toast={toast} />}
+        {/* S-02: Financial Waterfall */}
+        {subTab === 'fin_waterfall'  && <FinWaterfallPanel    toast={toast} />}
+        {/* S-03: Winner Level Trend */}
+        {subTab === 'winner_trend'   && <WinnerTrendPanel     toast={toast} />}
+        {/* S-04: Referral Heatmap */}
+        {subTab === 'ref_heatmap'    && <ReferralHeatmapPanel toast={toast} />}
+        {/* S-05: Brain 5 Forward Signal */}
+        {subTab === 'brain5_signal'  && <Brain5SignalPanel    toast={toast} />}
+        {/* S-06: SDE Event Timeline */}
+        {subTab === 'sde_timeline'   && <SdeTimelinePanel     toast={toast} />}
+        {/* S-08: Alert Thresholds */}
+        {subTab === 'alert_thresh'   && <AlertThreshPanel     toast={toast} />}
       </div>
     )
   }
@@ -936,10 +2395,10 @@ export default function Statistics() {
   // ─────────────────────────────────────────────────────────────────────────
 
   return (
-    <div className="p-8 space-y-8">
+    <motion.div {..._stagger} className="p-8 space-y-8">
 
       {/* ── Header ────────────────────────────────────────────────────────── */}
-      <div className="flex items-start justify-between">
+      <motion.div {..._fadeUp} className="flex items-start justify-between">
         <div>
           <h1 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
             <BarChart3 className="w-6 h-6 text-violet-600" />
@@ -957,10 +2416,10 @@ export default function Statistics() {
           <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
           Refresh All
         </button>
-      </div>
+      </motion.div>
 
       {/* Sub-tab nav (Overview tab active) */}
-      <div className="flex gap-0.5 border-b border-slate-200 overflow-x-auto pb-px">
+      <motion.div {..._fadeUp} className="flex gap-0.5 border-b border-slate-200 overflow-x-auto pb-px">
         {SUB_TABS.map(t => (
           <button key={t.id} onClick={() => setSubTab(t.id)}
             className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-semibold border-b-2 transition whitespace-nowrap ${
@@ -972,10 +2431,10 @@ export default function Statistics() {
             {t.label}
           </button>
         ))}
-      </div>
+      </motion.div>
 
       {/* ══ 1. SYSTEM LIQUIDITY  ·  ORGANIZER REVENUE ═══════════════════════ */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+      <motion.div {..._fadeUp} className="grid grid-cols-1 xl:grid-cols-3 gap-5">
 
         {/* ── A. System Liquidity (takes 2 of 3 columns on xl) ───────────── */}
         <div className="xl:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
@@ -1206,7 +2665,7 @@ export default function Statistics() {
           </div>
 
         </div>
-      </div>
+      </motion.div>
 
       {/* ══ 2. WEEKLY CASH FLOW HEALTH ════════════════════════════════════════ */}
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
@@ -2272,6 +3731,6 @@ export default function Statistics() {
         </SectionCard>
       </div>
 
-    </div>
+    </motion.div>
   )
 }

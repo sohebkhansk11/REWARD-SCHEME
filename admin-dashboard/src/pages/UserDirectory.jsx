@@ -1,9 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import {
   Users, Download, Upload, RefreshCw, Search,
   CheckCircle2, XCircle, AlertTriangle, ChevronUp, ChevronDown,
   Pencil, Trash2, IndianRupee,
 } from 'lucide-react'
+
+const _fadeUp  = { initial:{opacity:0,y:10}, animate:{opacity:1,y:0},
+                   transition:{duration:0.3,ease:[0.25,1,0.5,1]} }
+const _stagger = { animate:{ transition:{ staggerChildren:0.04 }}}
 import Spinner from '../components/Spinner'
 import StatusBadge from '../components/StatusBadge'
 import Modal from '../components/Modal'
@@ -50,12 +55,17 @@ function LevelDistBar({ users }) {
           </div>
         )}
       </div>
-      {/* Stacked progress bar */}
+      {/* Stacked progress bar — animated with framer-motion */}
       <div className="flex w-full h-2 rounded-full overflow-hidden gap-px">
         {byLevel.map(({ level, i, count }) => count > 0 && (
-          <div key={level} className={`${LVL_COLORS[i]} h-full`}
-               style={{ width: `${(count / total) * 100}%`, transition: 'width 0.6s ease' }}
-               title={`L${level}: ${count} (${((count / total) * 100).toFixed(1)}%)`} />
+          <motion.div
+            key={level}
+            className={`${LVL_COLORS[i]} h-full`}
+            initial={{ width: 0 }}
+            animate={{ width: `${(count / total) * 100}%` }}
+            transition={{ duration: 0.7, ease: [0.25, 1, 0.5, 1], delay: i * 0.05 }}
+            title={`L${level}: ${count} (${((count / total) * 100).toFixed(1)}%)`}
+          />
         ))}
       </div>
     </div>
@@ -157,8 +167,10 @@ export default function UserDirectory() {
 
   // ── Data ────────────────────────────────────────────────────────────────
   const [users,        setUsers]        = useState([])
+  const [totalCount,   setTotalCount]   = useState(0)    // X-Total-Count from backend
   const [loading,      setLoading]      = useState(true)
   const [refreshing,   setRefreshing]   = useState(false)
+  const [loadingMore,  setLoadingMore]  = useState(false)
   const [statusFilter, setStatusFilter] = useState('')
   const [rawSearch,    setRawSearch]    = useState('')   // immediate display value
   const [search,       setSearch]       = useState('')   // debounced filter value
@@ -168,6 +180,7 @@ export default function UserDirectory() {
   const [importing,    setImporting]    = useState(false)
   const [downloading,  setDownloading]  = useState(false)
   const [importResult, setImportResult] = useState(null)
+  const PAGE_SIZE = 2000   // matches getAdminUsers default limit
 
   // ── Edit modal state ────────────────────────────────────────────────────
   const [editTarget,  setEditTarget]  = useState(null)   // full user object
@@ -185,17 +198,37 @@ export default function UserDirectory() {
     if (!silent) setLoading(true)
     else setRefreshing(true)
     try {
-      const params = {}
+      const params = { limit: PAGE_SIZE, skip: 0 }
       if (statusFilter) params.status = statusFilter
       const res = await getAdminUsers(params)
       setUsers(res.data)
+      // X-Total-Count tells us how many matching users exist regardless of pagination
+      const hdr = res.headers?.['x-total-count']
+      setTotalCount(hdr ? parseInt(hdr, 10) : res.data.length)
     } catch (err) {
       toast(err.response?.data?.detail ?? 'Failed to load users', 'error')
     } finally {
       setLoading(false)
       setRefreshing(false)
     }
-  }, [statusFilter])
+  }, [statusFilter]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Load More (next page) ─────────────────────────────────────────────────
+  const loadMore = useCallback(async () => {
+    setLoadingMore(true)
+    try {
+      const params = { limit: PAGE_SIZE, skip: users.length }
+      if (statusFilter) params.status = statusFilter
+      const res = await getAdminUsers(params)
+      setUsers(prev => [...prev, ...res.data])
+      const hdr = res.headers?.['x-total-count']
+      if (hdr) setTotalCount(parseInt(hdr, 10))
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Failed to load more users', 'error')
+    } finally {
+      setLoadingMore(false)
+    }
+  }, [statusFilter, users.length]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { load() }, [load])
 
@@ -323,17 +356,21 @@ export default function UserDirectory() {
 
   // ════════════════════════════════════════════════════════════════════════════
   return (
-    <div className="p-8 space-y-6">
+    <motion.div {..._stagger} className="p-8 space-y-6">
 
       {/* ── Header ────────────────────────────────────────────────────────── */}
-      <div className="flex items-start justify-between gap-4">
+      <motion.div {..._fadeUp} className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
             <Users className="w-6 h-6 text-blue-600" />
             User Directory
           </h1>
           <p className="text-sm text-slate-400 mt-0.5">
-            {users.length} total · {statusCounts.Active ?? 0} active · {statusCounts.Waitlist ?? 0} waiting
+            Showing {users.length.toLocaleString('en-IN')}
+            {totalCount > users.length && (
+              <span className="text-amber-600 font-semibold"> of {totalCount.toLocaleString('en-IN')}</span>
+            )}
+            &nbsp;·&nbsp;{statusCounts.Active ?? 0} active · {statusCounts.Waitlist ?? 0} waiting
           </p>
         </div>
 
@@ -354,7 +391,7 @@ export default function UserDirectory() {
             {importing ? 'Importing…' : 'Bulk Import CSV'}
           </button>
         </div>
-      </div>
+      </motion.div>
 
       <ImportBanner result={importResult} onClose={() => setImportResult(null)} />
 
@@ -501,6 +538,22 @@ export default function UserDirectory() {
           </div>
         )}
       </div>
+
+      {/* ── Load More ──────────────────────────────────────────────────────── */}
+      {!loading && !search && users.length < totalCount && (
+        <div className="flex items-center justify-center gap-4 py-2">
+          <span className="text-sm text-slate-400">
+            Showing {users.length.toLocaleString('en-IN')} of {totalCount.toLocaleString('en-IN')} users
+          </span>
+          <button
+            onClick={loadMore}
+            disabled={loadingMore}
+            className="flex items-center gap-2 px-5 py-2 bg-white border border-slate-300 rounded-xl text-sm font-semibold text-slate-700 hover:bg-slate-50 shadow-sm disabled:opacity-50 transition"
+          >
+            {loadingMore ? <><Spinner className="w-4 h-4" />Loading…</> : <>Load {Math.min(PAGE_SIZE, totalCount - users.length).toLocaleString('en-IN')} more users</>}
+          </button>
+        </div>
+      )}
 
       {/* ══════════════════════════════════════════════════════════════════════
           EDIT USER MODAL
@@ -706,6 +759,6 @@ export default function UserDirectory() {
         )}
       </Modal>
 
-    </div>
+    </motion.div>
   )
 }

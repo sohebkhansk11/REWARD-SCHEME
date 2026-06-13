@@ -73,7 +73,8 @@ function WinnerAutopsyModal({ winner, onClose }) {
   if (!winner) return null
 
   const lvl      = winner.level_won ?? 1
-  const isSde    = (winner.draw_type ?? '').toLowerCase().includes('sde') || winner.targeted_early_exit
+  const drawTypeLower = (winner.draw_type ?? '').toLowerCase()
+  const isSde    = drawTypeLower.includes('sde') || winner.targeted_early_exit
   const isMerged = winner.journey_type === 'merged'
   const isRef    = winner.is_referred ?? false
   const exitDate = winner.draw_timestamp
@@ -161,7 +162,7 @@ function WinnerAutopsyModal({ winner, onClose }) {
             { l: 'Net Payout', v: `₹${Number(winner.net_payout_inr ?? 0).toLocaleString('en-IN')}`,  c: 'text-emerald-400' },
             { l: 'Net Profit', v: (netProfit >= 0 ? '+' : '') + `₹${netProfit.toLocaleString('en-IN')}`, c: netProfit >= 0 ? 'text-emerald-400' : 'text-red-400' },
             { l: 'Pool',       v: winner.pool_name ?? `#${winner.pool_id ?? '?'}`,   c: 'text-slate-300' },
-            { l: 'Draw Type',  v: (() => { const d = (winner.draw_type ?? '').toLowerCase(); return d.includes('sde') ? 'SDE Exit' : d === 'type_a' ? 'Type A' : d === 'type_b' ? 'Type B' : 'Regular' })(), c: isSde ? 'text-rose-400' : (winner.draw_type === 'type_a' ? 'text-cyan-400' : winner.draw_type === 'type_b' ? 'text-orange-400' : 'text-blue-400') },
+            { l: 'Draw Type',  v: drawTypeLower.includes('sde') ? 'SDE Exit' : drawTypeLower === 'type_a' ? 'Type A' : drawTypeLower === 'type_b' ? 'Type B' : 'Regular', c: isSde ? 'text-rose-400' : drawTypeLower === 'type_a' ? 'text-cyan-400' : drawTypeLower === 'type_b' ? 'text-orange-400' : 'text-blue-400' },
             { l: 'Entry',      v: isMerged ? 'Merge' : 'Direct',                     c: isMerged ? 'text-violet-400' : 'text-slate-400' },
           ].map(({ l, v, c }) => (
             <div key={l} className="bg-slate-800/80 rounded-xl p-2.5 text-center">

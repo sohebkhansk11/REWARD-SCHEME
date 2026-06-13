@@ -1,12 +1,12 @@
 from decimal import Decimal
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 from dataclasses import asdict
 
 from app.core.config import LATE_FEE_DAILY_INR
-from app.database import get_db
+from app.database import get_db, get_pool_status
 from app.models.user import UserStatus, WeeklyPaymentStatus
 from app.models.pool import Pool, PoolStatus
 from app.models.token import Token, TokenType, TokenStatus
@@ -19,6 +19,8 @@ from app.schemas.admin import (
     WaitlistCheckResponse,
     UpdateThresholdRequest,
     ThresholdResponse,
+    UpdateReferralRewardRequest,
+    ReferralRewardResponse,
 )
 from app.schemas.token import TokenResponse
 from app.services import tokens as svc_tokens
@@ -32,6 +34,231 @@ from app.core.security import require_admin_jwt
 # Every endpoint on this router requires a valid Admin JWT.
 # The JWT is validated by require_admin_jwt before the handler runs.
 router = APIRouter(tags=["Admin"], dependencies=[Depends(require_admin_jwt)])
+
+
+# ── System Health Watchdog ────────────────────────────────────────────────────
+
+@router.get("/admin/health")
+def get_system_health(db: Session = Depends(get_db)):
+    """
+    Real-time system health snapshot — called by the Diagnostics page every 30 s.
+
+    Returns:
+      db_reachable          — True if a test query succeeds within connect_timeout
+      db_pool               — Connection pool utilisation stats from SQLAlchemy
+      active_users          — Users in Active status (in pools)
+      waitlist_count        — Users waiting for pool assignment
+      pools_active          — Pools with status=Active
+      pools_paused          — Pools paused (SafeStopped / awaiting members)
+      pools_under_capacity  — Active+Paused pools with < 12 members
+      last_draw_at          — ISO timestamp of the most recent completed draw
+      last_pool_created_at  — ISO timestamp of the most recently created pool
+      checked_at            — ISO timestamp of this response
+    """
+    checked_at = datetime.now(timezone.utc).isoformat()
+
+    # ── Database connectivity check ───────────────────────────────────────────
+    db_reachable = False
+    db_error: str | None = None
+    try:
+        db.execute(text("SELECT 1"))
+        db_reachable = True
+    except Exception as exc:
+        db_error = str(exc)
+
+    # ── Pool stats ────────────────────────────────────────────────────────────
+    pool_status_snap = {}
+    try:
+        pool_status_snap = get_pool_status()
+    except Exception:
+        pass
+
+    # ── User & pool counts ────────────────────────────────────────────────────
+    active_users   = 0
+    waitlist_count = 0
+    pools_active   = 0
+    pools_paused   = 0
+    pools_under_cap = 0
+    last_draw_at: str | None   = None
+    last_pool_at:  str | None  = None
+
+    try:
+        active_users   = db.query(func.count(User.id)).filter(User.status == UserStatus.Active).scalar()   or 0
+        waitlist_count = db.query(func.count(User.id)).filter(User.status == UserStatus.Waitlist).scalar() or 0
+        pools_active   = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Active).scalar()   or 0
+        pools_paused   = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Paused_Awaiting_Members).scalar() or 0
+
+        # Count pools where active members < POOL_CAPACITY (12)
+        all_op_pools = (
+            db.query(Pool)
+            .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
+            .all()
+        )
+        for p in all_op_pools:
+            members_count = (
+                db.query(func.count(User.id))
+                .filter(User.current_pool_id == p.id, User.status == UserStatus.Active)
+                .scalar() or 0
+            )
+            if members_count < 12:
+                pools_under_cap += 1
+
+        # Last draw timestamp
+        from app.models.draw_history import DrawHistory
+        last_dh = (
+            db.query(DrawHistory.draw_timestamp)
+            .order_by(DrawHistory.draw_timestamp.desc())
+            .first()
+        )
+        if last_dh:
+            last_draw_at = last_dh[0].isoformat() if last_dh[0] else None
+
+        # Last pool created
+        last_p = (
+            db.query(Pool.created_at)
+            .order_by(Pool.created_at.desc())
+            .first()
+        )
+        if last_p and last_p[0]:
+            last_pool_at = last_p[0].isoformat()
+
+    except Exception:
+        pass   # partial data is still useful; db_reachable=False signals the root cause
+
+    # ── Capacity utilisation rating ───────────────────────────────────────────
+    # "critical" when DB pool is 80%+ full OR DB is unreachable
+    checked_out  = pool_status_snap.get("checked_out", 0)
+    total_cap    = pool_status_snap.get("total_capacity", 40)
+    utilisation  = round(checked_out / max(total_cap, 1) * 100, 1)
+    if not db_reachable:
+        health_rating = "critical"
+    elif utilisation >= 80:
+        health_rating = "warning"
+    elif utilisation >= 60:
+        health_rating = "caution"
+    else:
+        health_rating = "healthy"
+
+    return {
+        "checked_at":          checked_at,
+        "health_rating":       health_rating,
+        "db_reachable":        db_reachable,
+        "db_error":            db_error,
+        "db_pool":             pool_status_snap,
+        "db_pool_utilisation_pct": utilisation,
+        "active_users":        active_users,
+        "waitlist_count":      waitlist_count,
+        "pools_active":        pools_active,
+        "pools_paused":        pools_paused,
+        "pools_under_capacity": pools_under_cap,
+        "last_draw_at":        last_draw_at,
+        "last_pool_created_at": last_pool_at,
+    }
+
+
+# ── Pipeline Health ──────────────────────────────────────────────────────────
+
+@router.get("/admin/pipeline-health")
+def get_pipeline_health(db: Session = Depends(get_db)):
+    """
+    Comprehensive pipeline health snapshot — includes DB connection pool,
+    user/pool counts, injection task status, and data integrity last run.
+
+    Called by the Diagnostics page every 30 s.  More detailed than /admin/health.
+    """
+    from datetime import datetime, timezone as _tz
+    from app.database import get_pool_status as _gps
+    from app.models.pool import PoolStatus as _PS
+
+    checked_at = datetime.now(_tz.utc).isoformat()
+
+    # ── DB pool ───────────────────────────────────────────────────────────────
+    pool_snap: dict = {}
+    db_reachable = False
+    try:
+        db.execute(text("SELECT 1"))
+        db_reachable = True
+        pool_snap    = _gps()
+    except Exception as exc:
+        pool_snap    = {"error": str(exc)}
+
+    # ── User/pool counts ──────────────────────────────────────────────────────
+    try:
+        active_users   = db.query(func.count(User.id)).filter(User.status == UserStatus.Active).scalar()   or 0
+        waitlist_count = db.query(func.count(User.id)).filter(User.status == UserStatus.Waitlist).scalar() or 0
+        pools_active   = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Active).scalar()   or 0
+        pools_paused   = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Paused_Awaiting_Members).scalar() or 0
+
+        # Pools with fewer than 12 active members (under capacity)
+        all_op_pools = (
+            db.query(Pool)
+            .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
+            .all()
+        )
+        pools_under_cap = sum(
+            1 for p in all_op_pools
+            if (db.query(func.count(User.id))
+                .filter(User.current_pool_id == p.id, User.status == UserStatus.Active)
+                .scalar() or 0) < 12
+        )
+    except Exception:
+        active_users = waitlist_count = pools_active = pools_paused = pools_under_cap = None
+
+    # ── Last draw timestamp ───────────────────────────────────────────────────
+    last_draw_at: str | None = None
+    try:
+        from app.models.draw_history import DrawHistory
+        dh = db.query(DrawHistory.draw_timestamp).order_by(DrawHistory.draw_timestamp.desc()).first()
+        if dh and dh[0]: last_draw_at = dh[0].isoformat()
+    except Exception:
+        pass
+
+    # ── Last pool created ──────────────────────────────────────────────────────
+    last_pool_at: str | None = None
+    try:
+        lp = db.query(Pool.created_at).order_by(Pool.created_at.desc()).first()
+        if lp and lp[0]: last_pool_at = lp[0].isoformat()
+    except Exception:
+        pass
+
+    # ── Injection background tasks ─────────────────────────────────────────────
+    try:
+        from app.routers.dev import _INJECT_STATUS, _INJECT_LOCK
+        with _INJECT_LOCK:
+            running_injects = sum(1 for v in _INJECT_STATUS.values() if v.get("status") == "running")
+    except Exception:
+        running_injects = 0
+
+    # ── Data integrity last run ────────────────────────────────────────────────
+    # We don't persist the last-run time yet, so approximate from the scheduler log
+    integrity_last_run: str | None = None   # future: persist in SystemSettings
+
+    utilisation = round(
+        pool_snap.get("checked_out", 0) / max(pool_snap.get("total_capacity", 40), 1) * 100, 1
+    )
+    health_rating = (
+        "critical" if not db_reachable
+        else "warning" if utilisation >= 80
+        else "caution" if utilisation >= 60
+        else "healthy"
+    )
+
+    return {
+        "checked_at":              checked_at,
+        "health_rating":           health_rating,
+        "db_reachable":            db_reachable,
+        "db_pool":                 pool_snap,
+        "db_pool_utilisation_pct": utilisation,
+        "active_users":            active_users,
+        "waitlist_count":          waitlist_count,
+        "pools_active":            pools_active,
+        "pools_paused":            pools_paused,
+        "pools_under_capacity":    pools_under_cap,
+        "last_draw_at":            last_draw_at,
+        "last_pool_created_at":    last_pool_at,
+        "injection_tasks_running": running_injects,
+        "data_integrity_last_run": integrity_last_run,
+    }
 
 
 # ── Aggregate Stats ───────────────────────────────────────────────────────────
@@ -194,12 +421,16 @@ def get_threshold(db: Session = Depends(get_db)):
     before check_and_scale_waitlist() creates a new pool automatically.
     Default: 24.  Configurable via PUT /admin/settings/threshold.
     """
-    from app.services.settings import get_pool_threshold
-    threshold = get_pool_threshold(db)
+    from app.services.settings import get_pool_threshold, get_adaptive_threshold_info
+    threshold          = get_pool_threshold(db)
+    adaptive_info      = get_adaptive_threshold_info(db)
+    effective_threshold = adaptive_info["effective_threshold"]
     return ThresholdResponse(
-        pool_creation_threshold=threshold,
+        pool_creation_threshold=effective_threshold,
         message=(
-            f"Current threshold: {threshold} paid Waitlist members needed to auto-trigger a new pool."
+            f"Base threshold: {threshold}. "
+            f"Effective (adaptive): {effective_threshold}. "
+            f"{adaptive_info['note']}"
         ),
     )
 
@@ -251,6 +482,214 @@ def update_threshold(
             f"{new_val} paid Waitlist members before creating a new pool."
         ),
     )
+
+
+# ── Adaptive Threshold Info ───────────────────────────────────────────────────
+
+@router.get("/admin/settings/adaptive-threshold")
+def get_adaptive_threshold_detail(db: Session = Depends(get_db)):
+    """
+    POINT 7 — Return full adaptive threshold calculation with explanation.
+
+    Shows WHY the effective threshold differs from the admin-set base threshold.
+    Useful for diagnosing why new pools are (or aren't) forming.
+    """
+    from app.services.settings import get_adaptive_threshold_info
+    return get_adaptive_threshold_info(db)
+
+
+# ── System Settings — Configurable Referral Reward ───────────────────────────
+
+@router.get("/admin/settings/referral-reward", response_model=ReferralRewardResponse)
+def get_referral_reward_setting(db: Session = Depends(get_db)):
+    """
+    Return the current per-referral reward amount (INR).
+
+    This is the amount credited to a referrer's accumulated_referral_bonus_inr
+    each time a user they referred ENTERS an active pool (Rule 39).
+    Default: ₹250.  Configurable via PUT /admin/settings/referral-reward.
+    """
+    from app.services.settings import get_referral_reward
+    amount = get_referral_reward(db)
+    status_note = "Referral rewards DISABLED (₹0)." if amount == 0 else f"₹{amount} credited per qualifying pool entry."
+    return ReferralRewardResponse(
+        referral_reward_inr=amount,
+        message=status_note,
+    )
+
+
+@router.put("/admin/settings/referral-reward", response_model=ReferralRewardResponse)
+def update_referral_reward_setting(
+    body: UpdateReferralRewardRequest,
+    admin_username: str = Depends(require_admin_jwt),
+    db: Session = Depends(get_db),
+):
+    """
+    Update the per-referral reward amount.
+
+    Security gate: the admin's account password is required alongside
+    new_amount_inr.  The password is bcrypt-verified before the change is
+    persisted.  This prevents accidental changes to a financial parameter.
+
+    The new value takes effect immediately for every subsequent pool-entry
+    event — no server restart required (60-second cache, invalidated on save).
+
+    Setting to 0 disables referral rewards without any code change.
+    Referral count statistics are still tracked even at ₹0.
+    """
+    from app.models.admin import Admin as AdminModel
+    from app.services.settings import set_referral_reward
+
+    # ── Verify admin password ─────────────────────────────────────────────────
+    admin: AdminModel | None = (
+        db.query(AdminModel).filter(AdminModel.username == admin_username).first()
+    )
+    if not admin:
+        raise HTTPException(status_code=401, detail="Admin account not found — re-authenticate.")
+
+    dummy = "$2b$12$invalidhashplaceholderXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    stored = admin.hashed_password or dummy
+    from app.services.auth import verify_password
+    if not verify_password(body.admin_password, stored):
+        raise HTTPException(
+            status_code=401,
+            detail="Admin password verification failed. Referral reward was NOT changed.",
+        )
+
+    # ── Persist new reward ────────────────────────────────────────────────────
+    try:
+        new_val = set_referral_reward(db, body.new_amount_inr)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    status_note = (
+        "Referral rewards DISABLED — no bonus will be credited on future pool entries."
+        if new_val == 0 else
+        f"Referral reward updated to ₹{new_val}. "
+        "Credited immediately on next qualifying pool entry (Rule 39)."
+    )
+    return ReferralRewardResponse(
+        referral_reward_inr=new_val,
+        message=status_note,
+    )
+
+
+# ── SDE Extension II/III Check ────────────────────────────────────────────────
+
+@router.post("/admin/sde/run-extensions")
+def run_sde_extensions(db: Session = Depends(get_db)):
+    """
+    POINT 2+3 — Manually trigger SDE Extension II/III check and execution.
+
+    Scans ALL active pools for L5 (Ext-II) or L6 (Ext-III) members and runs
+    forced-exit draws for each.  Normally this runs automatically at the start
+    of execute_weekly_draw().  Use this endpoint if the weekly draw was skipped
+    or if L5/L6 members need to be cleared immediately.
+
+    Returns list of draws executed (if any).
+    """
+    from app.services.sde_engine import check_and_run_sde_extensions
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    iso = now.isocalendar()
+    week_id = f"{iso.year}-W{iso.week:02d}"
+
+    results = check_and_run_sde_extensions(db, week_id)
+    return {
+        "week_id":        week_id,
+        "draws_executed": len(results),
+        "draws": [
+            {
+                "pool_id":             r.pool_id,
+                "pool_name":           r.pool_name,
+                "draw_type":           r.draw_type,
+                "upper_winner":        {
+                    "level":      r.upper_winner_level,
+                    "payout_inr": float(r.upper_winner_payout),
+                },
+                "lower_winner":        {
+                    "level":      r.lower_winner_level,
+                    "payout_inr": float(r.lower_winner_payout),
+                },
+                "drawdown_projection": r.drawdown_projection,
+            }
+            for r in results
+        ],
+        "note": (
+            f"{len(results)} SDE Ext-II/III draw(s) executed. "
+            "L5/L6 members have been forced to exit their pools."
+            if results else
+            "No L5 or L6 members found across any active pools. System is healthy."
+        ),
+    }
+
+
+# ── Accelerated Dissolution ───────────────────────────────────────────────────
+
+@router.post("/admin/pools/{pool_id}/accelerated-dissolution")
+def trigger_accelerated_dissolution(
+    pool_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    POINT 5 — Trigger accelerated dissolution for a specific pool.
+
+    Used when a pool has ≥60% L4+ members and normal weekly draws are too slow
+    to clear the upper-tier backlog.  Both winners are drawn from L4+ tier.
+    A new relief pool is automatically created from waitlist if available.
+
+    Conditions checked:
+      • Pool must be Active
+      • Pool must not have drawn this week yet
+      • Pool must have ≥ 2 L4+ members
+
+    Returns the draw result and dissolution status.
+    """
+    from app.services.draw import run_accelerated_dissolution_draw, check_accelerated_dissolution
+    from app.models.pool import Pool as PoolModel
+
+    pool = db.query(PoolModel).filter(PoolModel.id == pool_id).first()
+    if not pool:
+        raise HTTPException(status_code=404, detail=f"Pool {pool_id} not found.")
+
+    # Show the current L4+ ratio alongside the result
+    from app.models.user import User as UserModel, UserStatus as US
+    members = db.query(UserModel).filter(
+        UserModel.current_pool_id == pool_id,
+        UserModel.status == US.Active,
+    ).all()
+    l4plus_count = sum(1 for m in members if m.current_level >= 4)
+    l4plus_ratio = l4plus_count / max(1, len(members))
+
+    try:
+        result = run_accelerated_dissolution_draw(db, pool_id, create_relief_pool=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {
+        "pool_id":         pool_id,
+        "pool_name":       pool.name,
+        "l4plus_ratio_pct": round(l4plus_ratio * 100, 1),
+        "winner_upper": {
+            "username":   result.winner_1.winner_username,
+            "level":      result.winner_1.winner_level,
+            "payout_inr": float(result.winner_1.net_payout_inr),
+        },
+        "winner_lower": {
+            "username":   result.winner_2.winner_username,
+            "level":      result.winner_2.winner_level,
+            "payout_inr": float(result.winner_2.net_payout_inr),
+        },
+        "relief_pool_created": result.relief_pool_id is not None,
+        "relief_pool_id":      result.relief_pool_id,
+        "pool_dissolved":      result.pool_dissolved,
+        "note": (
+            f"Pool dissolved — {len(members) - 2} members returned to waitlist for redistribution."
+            if result.pool_dissolved else
+            f"Accelerated draw complete — 2 L4+ members exited. Pool continues."
+        ),
+    }
 
 
 # ── Pool Settings (auto-creation toggle) ─────────────────────────────────────
@@ -427,11 +866,35 @@ def trigger_draw(pool_id: int, db: Session = Depends(get_db)):
 
 # ── Late Payment Penalties ────────────────────────────────────────────────────
 
+def _unique_penalty_code(db: Session, prefix: str) -> str:
+    """
+    Collision-safe token code generator for compliance penalty tokens.
+    Uses os.urandom via secrets — NOT the MT19937 PRNG.
+    Format: "{prefix}{6 uppercase alphanumeric chars}"  e.g. "LF-A3KZ9W"
+    """
+    import secrets, string
+    from app.crud.token import get_token_by_code
+    _alpha = string.ascii_uppercase + string.digits
+    while True:
+        code = prefix + "".join(secrets.choice(_alpha) for _ in range(6))
+        if not get_token_by_code(db, code):
+            return code
+
+
 @router.post("/admin/penalty/apply-daily")
 def apply_daily_penalty(db: Session = Depends(get_db)):
     """
     Admin: call once per day (Monday–Saturday) to accrue ₹50 on every Active
     member who has not yet paid for the current week.
+
+    For each penalised member:
+      1. Adds LATE_FEE_DAILY_INR (₹50) to user.late_fees_inr.
+      2. Creates an immutable Late_Fee token (Burned, ₹50) as a receipt.
+         This token represents confirmed cash that will be collected either
+         at grace payment (save-seat) or forfeited at elimination.
+
+    The Late_Fee token serves as the audit trail: the token ledger always
+    reflects the full late-fee liability, not just the user model field.
     """
     unpaid: list[User] = (
         db.query(User)
@@ -439,19 +902,50 @@ def apply_daily_penalty(db: Session = Depends(get_db)):
         .all()
     )
     if not unpaid:
-        return {"penalised_count": 0, "message": "No unpaid active members."}
+        return {"penalised_count": 0, "daily_fee_inr": LATE_FEE_DAILY_INR,
+                "message": "No unpaid active members."}
 
     from app.crud import user as crud_user
     from app.schemas.user import UserUpdate
+    from app.core.config import LATE_FEE_MAX_CAP_INR  # ₹500 cap
+
+    _fee_dec = Decimal(str(LATE_FEE_DAILY_INR))
+    _cap_dec = Decimal(str(LATE_FEE_MAX_CAP_INR))
+    tokens_created = 0
 
     for member in unpaid:
-        new_late = Decimal(str(member.late_fees_inr or 0)) + Decimal(str(LATE_FEE_DAILY_INR))
+        current_late = Decimal(str(member.late_fees_inr or 0))
+
+        # Respect the max cap — do not accrue past ₹500 total
+        if current_late >= _cap_dec:
+            continue   # already at cap, no new accrual or token
+
+        accrual = min(_fee_dec, _cap_dec - current_late)   # partial if near cap
+        new_late = current_late + accrual
         crud_user.update_user(db, member.id, UserUpdate(late_fees_inr=new_late))
 
+        # Create immutable Late_Fee token — receipt of this day's accrual
+        code = _unique_penalty_code(db, "LF-")
+        db.add(Token(
+            code      = code,
+            type      = TokenType.Late_Fee,
+            status    = TokenStatus.Burned,
+            value_inr = accrual,
+            user_id   = member.id,
+            pool_id   = member.current_pool_id,
+        ))
+        tokens_created += 1
+
+    db.commit()
     return {
-        "penalised_count": len(unpaid),
-        "daily_fee_inr": LATE_FEE_DAILY_INR,
-        "message": f"₹{LATE_FEE_DAILY_INR} penalty applied to {len(unpaid)} unpaid member(s).",
+        "penalised_count":   len(unpaid),
+        "tokens_created":    tokens_created,
+        "daily_fee_inr":     LATE_FEE_DAILY_INR,
+        "max_cap_inr":       LATE_FEE_MAX_CAP_INR,
+        "message": (
+            f"₹{LATE_FEE_DAILY_INR} penalty accrued on {len(unpaid)} unpaid member(s). "
+            f"{tokens_created} Late_Fee token(s) created as receipts."
+        ),
     }
 
 

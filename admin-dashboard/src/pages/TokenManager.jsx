@@ -1,6 +1,11 @@
 import { useState, useEffect, useCallback } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import { Copy, Check, Flame, Plus, Clock, AlertCircle, Download, RefreshCw, Filter, Trash2, KeyRound } from 'lucide-react'
 import Spinner from '../components/Spinner'
+
+const _fadeUp  = { initial:{opacity:0,y:10}, animate:{opacity:1,y:0},
+                   transition:{duration:0.3,ease:[0.25,1,0.5,1]} }
+const _stagger = { animate:{ transition:{ staggerChildren:0.04 }}}
 import StatusBadge from '../components/StatusBadge'
 import Modal from '../components/Modal'
 import { generateToken, burnToken, getAdminTokens, downloadTokensCSV, triggerDownload, adminDeleteToken } from '../api/client'
@@ -162,14 +167,14 @@ export default function TokenManager() {
   }
 
   return (
-    <div className="p-8 space-y-8">
+    <motion.div {..._stagger} className="p-8 space-y-8">
       {/* Header */}
-      <div>
+      <motion.div {..._fadeUp}>
         <h1 className="text-2xl font-bold text-slate-900">Token Manager</h1>
         <p className="text-sm text-slate-400 mt-0.5">Issue deposit tokens and settle winning withdrawals</p>
-      </div>
+      </motion.div>
 
-      <div className="grid grid-cols-2 gap-6">
+      <motion.div {..._fadeUp} className="grid grid-cols-2 gap-6">
         {/* ── Issue Deposit Token ─────────────────────────────── */}
         <div className="bg-white rounded-2xl shadow-sm border border-slate-100">
           <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-3">
@@ -277,10 +282,10 @@ export default function TokenManager() {
             )}
           </form>
         </div>
-      </div>
+      </motion.div>
 
       {/* ── Token Audit Ledger ───────────────────────────────────── */}
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-100">
+      <motion.div {..._fadeUp} className="bg-white rounded-2xl shadow-sm border border-slate-100">
         {/* Ledger header */}
         <div className="px-6 py-4 border-b border-slate-100 flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2 mr-auto">
@@ -361,8 +366,16 @@ export default function TokenManager() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-50">
-                {tokens.map(t => (
-                  <tr key={t.id} className={`transition-colors group hover:brightness-95 ${
+                <AnimatePresence initial={false}>
+                {tokens.map((t, _ti) => (
+                  <motion.tr
+                    key={t.id}
+                    layout
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, height: 0, overflow: 'hidden' }}
+                    transition={{ duration: 0.18, ease: [0.25, 1, 0.5, 1], delay: Math.min(_ti * 0.02, 0.2) }}
+                    className={`group hover:brightness-95 ${
                     t.status === 'Burned'           ? 'bg-emerald-50/40' :
                     t.status === 'Active'           ? 'bg-blue-50/30'    :
                     t.status === 'Rejected'         ? 'bg-red-50/30'     :
@@ -438,13 +451,14 @@ export default function TokenManager() {
                         Delete
                       </button>
                     </td>
-                  </tr>
+                  </motion.tr>
                 ))}
+                </AnimatePresence>
               </tbody>
             </table>
           </div>
         )}
-      </div>
+      </motion.div>
 
       {/* ══════════════════════════════════════════════════════════════════════
           DELETE TOKEN MODAL  (requires admin password)
@@ -551,6 +565,6 @@ export default function TokenManager() {
         )}
       </Modal>
 
-    </div>
+    </motion.div>
   )
 }

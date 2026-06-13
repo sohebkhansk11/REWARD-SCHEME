@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { LogOut, RefreshCw, Hexagon, Wifi, WifiOff } from 'lucide-react'
@@ -6,6 +6,7 @@ import Background from '../components/Background'
 import GlassCard from '../components/GlassCard'
 import CountdownTimer from '../components/CountdownTimer'
 import BottomNav from '../components/BottomNav'
+import FlashBanner from '../components/FlashBanner'
 import { useUser } from '../context/UserContext'
 import { getUser, getWaitlistRank } from '../api/client'
 
@@ -166,11 +167,15 @@ export default function Dashboard() {
   const nav      = useNavigate()
   const location = useLocation()    // key changes on every navigation — used as effect dep
 
-  const [apiOk,       setApiOk]       = useState(true)
-  const [refreshing,  setRefreshing]  = useState(false)
-  const [showVault,   setShowVault]   = useState(false)
-  const [rankData,    setRankData]    = useState(null)    // { rank, total_waiting, status, message }
-  const [rankLoading, setRankLoading] = useState(false)  // shows spinner / skeleton
+  const [apiOk,          setApiOk]          = useState(true)
+  const [refreshing,     setRefreshing]     = useState(false)
+  const [showVault,      setShowVault]      = useState(false)
+  const [rankData,       setRankData]       = useState(null)    // { rank, wl_number, total_waiting, status }
+  const [rankLoading,    setRankLoading]    = useState(false)
+  // IRCTC WL promotion tracking (Phase 4)
+  const [prevRank,       setPrevRank]       = useState(null)   // last known rank to detect promotions
+  const [promotedToast,  setPromotedToast]  = useState(null)   // "Promoted!" message
+  const promotedTimerRef = useRef(null)
 
   const fetchFresh = async (silent = false) => {
     if (!user?.id) return
@@ -189,7 +194,20 @@ export default function Dashboard() {
     setRankLoading(true)
     try {
       const res = await getWaitlistRank()
-      if (res.data?.rank != null) setRankData(res.data)
+      if (res.data?.rank != null) {
+        const newRank = res.data.rank
+        // Detect promotion (rank decreased since last poll)
+        if (prevRank !== null && newRank < prevRank) {
+          const promoted = prevRank - newRank
+          setPromotedToast(
+            `🎉 Promoted! ${res.data.wl_number ?? `WL-${newRank}`} ← WL-${prevRank} (+${promoted} spots)`
+          )
+          clearTimeout(promotedTimerRef.current)
+          promotedTimerRef.current = setTimeout(() => setPromotedToast(null), 5_000)
+        }
+        setPrevRank(newRank)
+        setRankData(res.data)
+      }
     } catch { /* non-fatal */ }
     finally { setRankLoading(false) }
   }
@@ -265,6 +283,9 @@ export default function Dashboard() {
           </motion.button>
         </div>
       </div>
+
+      {/* Flash Notification Banners — polled from backend every 60s */}
+      <FlashBanner />
 
       <div className="px-5 space-y-4">
         {/* Pool + Level card */}
@@ -343,31 +364,53 @@ export default function Dashboard() {
                   }}
                 >
                   <span className="text-[9px] font-mono tracking-[0.35em] text-white/25 uppercase mb-2">
-                    Queue Number
+                    Your Queue Number
                   </span>
 
-                  {/* The number itself — re-animates each time rank changes */}
+                  {/* IRCTC-style WL-XX hero — re-animates on rank change (Phase 4) */}
                   <motion.span
                     key={rankData.rank}
-                    className="text-8xl font-black tabular-nums leading-none"
+                    className="font-black tabular-nums leading-none"
                     style={{
+                      fontSize:   '4.5rem',   // slightly smaller than 8xl to fit WL-XX
                       color:      '#ffaa00',
                       textShadow: '0 0 28px rgba(255,170,0,0.65), 0 0 60px rgba(255,170,0,0.22)',
+                      letterSpacing: '-0.02em',
                     }}
                     initial={{ scale: 0.7, opacity: 0 }}
                     animate={{ scale: 1, opacity: 1 }}
                     transition={{ type: 'spring', stiffness: 280, damping: 22 }}
                   >
-                    #{rankData.rank}
+                    {rankData.wl_number ?? `WL-${rankData.rank}`}
                   </motion.span>
 
-                  <span className="mt-3 text-[12px] text-white/35 font-mono">
-                    of{' '}
-                    <strong className="text-white/55 font-semibold">
+                  <span className="mt-2 text-[10px] text-white/30 font-mono">
+                    Queue number of{' '}
+                    <strong className="text-white/50 font-semibold">
                       {rankData.total_waiting?.toLocaleString('en-IN') ?? '—'}
                     </strong>{' '}
-                    in queue
+                    waiting
                   </span>
+
+                  {/* "Promoted!" micro-toast */}
+                  <AnimatePresence>
+                    {promotedToast && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 8, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{   opacity: 0, y: -8, scale: 0.95 }}
+                        transition={{ duration: 0.3 }}
+                        className="mt-2 px-3 py-1.5 rounded-xl text-[10px] font-bold text-center"
+                        style={{
+                          background: 'rgba(0,255,136,0.12)',
+                          border:     '1px solid rgba(0,255,136,0.3)',
+                          color:      '#00ff88',
+                        }}
+                      >
+                        {promotedToast}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </div>
 
                 {/* Progress bar — shows how far along in the queue */}
@@ -394,13 +437,13 @@ export default function Dashboard() {
                   </div>
                 </div>
 
-                {/* Spec-exact helper text */}
+                {/* Helper text */}
                 <p
                   className="text-center text-[11px] leading-relaxed px-1"
                   style={{ color: 'rgba(255,255,255,0.3)' }}
                 >
-                  This number updates automatically in real-time as pools are formed
-                  on a First-Come, First-Serve basis.
+                  Your WL number updates automatically as members ahead enter pools.
+                  First-Come, First-Serve queue.
                 </p>
               </>
             )}

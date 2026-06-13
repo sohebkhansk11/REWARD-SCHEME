@@ -69,6 +69,33 @@ class User(Base):
     sde_required     = Column(Boolean, default=False, server_default="false", nullable=False)
     sde_flagged_week = Column(String(10), nullable=True)   # e.g. "2026-W24"
 
+    # ── Payment Compliance / Elimination Engine ───────────────────────────────
+    # Elimination flow:
+    #   Sunday draw → Monday payment window opens → Thursday 23:59 due date
+    #   → elimination_risk=True (unpaid past due) → grace window opens
+    #   → Sunday T-2H grace closes → eliminate all risk=True AND grace_active=False
+    #
+    # elimination_risk:  True once member has missed payment_due_days threshold.
+    #                    Set by POST /admin/penalty/apply-daily after due date.
+    #                    Cleared when they pay (weekly_payment_status → Paid).
+    # grace_active:      True when member has explicitly entered the grace window
+    #                    (admin confirms or auto-assigned after due date).
+    #                    Cleared at Sunday T-2H if grace_fee_paid=False.
+    # grace_expires_at:  UTC datetime when the grace period closes (Sunday T-2H).
+    #                    NULL when grace_active=False.
+    # grace_fee_paid:    True when ₹500 grace seat-save fee has been confirmed
+    #                    by admin via POST /admin/elimination/save-seat/{uid}.
+    #
+    # MIGRATION NOTE for existing databases:
+    #   ALTER TABLE users ADD COLUMN elimination_risk BOOLEAN NOT NULL DEFAULT false;
+    #   ALTER TABLE users ADD COLUMN grace_active BOOLEAN NOT NULL DEFAULT false;
+    #   ALTER TABLE users ADD COLUMN grace_expires_at TIMESTAMPTZ;
+    #   ALTER TABLE users ADD COLUMN grace_fee_paid BOOLEAN NOT NULL DEFAULT false;
+    elimination_risk = Column(Boolean, default=False, server_default="false", nullable=False)
+    grace_active     = Column(Boolean, default=False, server_default="false", nullable=False)
+    grace_expires_at = Column(DateTime(timezone=True), nullable=True)
+    grace_fee_paid   = Column(Boolean, default=False, server_default="false", nullable=False)
+
     pool   = relationship("Pool", back_populates="members")
     tokens = relationship("Token", foreign_keys="Token.user_id", back_populates="user", cascade="all, delete-orphan")
 

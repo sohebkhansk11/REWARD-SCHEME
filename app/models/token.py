@@ -10,6 +10,23 @@ class TokenType(str, enum.Enum):
     Withdraw          = "Withdraw"
     Referral          = "Referral"           # legacy — individual REF tokens (phase 1-3)
     Referral_Withdraw = "Referral_Withdraw"  # cumulative payout request (phase 5+) — requires DB migration
+    # ── Compliance Revenue Tokens ──────────────────────────────────────────────
+    # Late_Fee:   Immutable receipt created each time POST /admin/penalty/apply-daily
+    #             accrues ₹50 on an unpaid member.  One token per member per day.
+    #             Also created as a settlement receipt in confirm_grace_payment() when
+    #             the user finally pays their accumulated late fees.
+    #             Value = daily accrual amount (LATE_FEE_DAILY_INR, default ₹50),
+    #             or the full accumulated amount when created as settlement.
+    #             Code prefix: "LF-"
+    #             DB MIGRATION: ALTER TYPE tokentype ADD VALUE 'Late_Fee';
+    #
+    # Grace_Fee:  Immutable receipt created in confirm_grace_payment() when the admin
+    #             confirms a user has paid the ₹500 seat-save fee.
+    #             Value = grace_seat_save_fee_inr from system_settings (default ₹500).
+    #             Code prefix: "GF-"
+    #             DB MIGRATION: ALTER TYPE tokentype ADD VALUE 'Grace_Fee';
+    Late_Fee          = "Late_Fee"           # daily late-fee accrual receipt — requires DB migration
+    Grace_Fee         = "Grace_Fee"          # grace seat-save fee receipt (₹500) — requires DB migration
 
 
 class TokenStatus(str, enum.Enum):

@@ -18,9 +18,9 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Response
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -56,7 +56,18 @@ def _first_payment_map(db: Session) -> dict[int, datetime]:
     return {uid: ts for uid, ts in rows if uid is not None}
 
 
-def _build_list_item(user: User, first_payment_map: dict) -> dict:
+def _build_list_item(user: User, first_payment_map: dict, wl_rank_map: dict | None = None) -> dict:
+    """
+    Serialise a User ORM object to the AdminUserListItem response dict.
+
+    wl_rank_map: optional {user_id: int_rank} for Waitlist users.
+                 When provided, the `wl_position` field is populated as "WL-XX".
+                 When None, wl_position is skipped (null) for performance on large requests.
+    """
+    wl_position: str | None = None
+    if wl_rank_map is not None and user.id in wl_rank_map:
+        wl_position = f"WL-{wl_rank_map[user.id]:02d}"
+
     return {
         "id":                    user.id,
         "name":                  user.name,
@@ -70,6 +81,12 @@ def _build_list_item(user: User, first_payment_map: dict) -> dict:
         "join_date":             user.join_date,
         "first_payment_at":      first_payment_map.get(user.id),
         "referred_by_user_id":   user.referred_by_user_id,
+        # Phase 4: IRCTC-style WL position
+        "wl_position":           wl_position,
+        # Phase 1: compliance flags (safe fallback to False for legacy rows)
+        "sde_required":          bool(getattr(user, "sde_required",   False)),
+        "elimination_risk":      bool(getattr(user, "elimination_risk", False)),
+        "grace_active":          bool(getattr(user, "grace_active",    False)),
     }
 
 
@@ -77,15 +94,24 @@ def _build_list_item(user: User, first_payment_map: dict) -> dict:
 
 @router.get("/admin/users", response_model=list[AdminUserListItem])
 def list_users_admin(
+    response:        Response,
     status:          Optional[str] = Query(None, description="Active|Waitlist|Eliminated|Eliminated_Won"),
     current_pool_id: Optional[int] = Query(None),
-    skip:            int           = Query(0, ge=0),
-    limit:           int           = Query(200, ge=1, le=1000),
+    skip:            int           = Query(0,    ge=0),
+    limit:           int           = Query(2000, ge=1, le=5000),
     db: Session = Depends(get_db),
 ):
     """
-    Return all users with optional filters.
-    Includes `first_payment_at` derived from their earliest burned Deposit token.
+    Return users with optional filters — paginated via skip/limit.
+
+    Default limit raised to 2000 (from 200) and max to 5000 (from 1000) to
+    support large stress-test injections without front-end pagination overhead.
+    The frontend `getAdminUsers` sends limit=2000 by default; the "Load More"
+    button sends skip=N to fetch subsequent pages when user count exceeds 2000.
+
+    Response header X-Total-Count contains the total matching user count (no
+    pagination applied) so the frontend can display "Showing X of Y" and decide
+    whether to show the Load More button.
     """
     q = db.query(User)
 
@@ -101,10 +127,33 @@ def list_users_admin(
     if current_pool_id is not None:
         q = q.filter(User.current_pool_id == current_pool_id)
 
+    # Total count (same filters, no pagination) — used by frontend for Load More
+    total_count = q.with_entities(func.count(User.id)).scalar() or 0
+    response.headers["X-Total-Count"]                = str(total_count)
+    response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
+
     users = q.order_by(User.join_date).offset(skip).limit(limit).all()
 
     payment_map = _first_payment_map(db)
-    return [_build_list_item(u, payment_map) for u in users]
+
+    # ── Compute WL ranks for any Waitlist users in the result set ──────────────
+    # Uses a single SQL window-function query so it's O(1) extra round-trips
+    # regardless of how many waitlist users are returned.
+    # Only computed when the result set actually contains Waitlist users.
+    wl_rank_map: dict[int, int] = {}
+    waitlist_ids = [u.id for u in users if u.status == UserStatus.Waitlist]
+    if waitlist_ids:
+        rows = db.execute(
+            text(
+                "SELECT id, CAST(ROW_NUMBER() OVER (ORDER BY join_date ASC) AS INTEGER) AS rank "
+                "FROM users WHERE status = 'Waitlist'"
+            )
+        ).fetchall()
+        # Build full rank map then filter to the IDs we actually care about
+        full_rank = {r[0]: r[1] for r in rows}
+        wl_rank_map = {uid: full_rank[uid] for uid in waitlist_ids if uid in full_rank}
+
+    return [_build_list_item(u, payment_map, wl_rank_map) for u in users]
 
 
 # ── GET /admin/users/{user_id} ────────────────────────────────────────────────

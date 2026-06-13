@@ -16,8 +16,9 @@ or per-route:
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
+from sqlalchemy.orm import Session
 
-from app.services.auth import decode_jwt, decode_user_jwt
+from app.services.auth import decode_jwt, decode_user_jwt, verify_password
 
 # HTTPBearer extracts the token from the Authorization: Bearer <token> header.
 # auto_error=True means FastAPI returns 403 automatically if the header is absent.
@@ -59,3 +60,24 @@ def require_admin_jwt(
             detail=f"Admin authentication failed: {exc}",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+def verify_admin_password(db: Session, admin_username: str, password: str) -> bool:
+    """
+    Verify that `password` matches the stored bcrypt hash for `admin_username`.
+
+    Returns True on success.  Returns False (never raises) on mismatch so
+    callers can raise their own context-appropriate HTTP 403.
+
+    Always runs a bcrypt check (even with a dummy hash if the admin row is not
+    found) to prevent timing-based username enumeration attacks.
+    """
+    from app.models.admin import Admin  # local import avoids circular dependency
+
+    _DUMMY_HASH = "$2b$12$invalidhashplaceholderXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+    admin: Admin | None = (
+        db.query(Admin).filter(Admin.username == admin_username).first()
+    )
+    stored = (admin.hashed_password or _DUMMY_HASH) if admin else _DUMMY_HASH
+    return verify_password(password, stored)

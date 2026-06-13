@@ -4,7 +4,7 @@ import {
   XCircle, AlertTriangle, IndianRupee, Layers, Clock, Zap,
 } from 'lucide-react'
 import Spinner from '../components/Spinner'
-import { getStats, getAdminTokens, BASE_URL } from '../api/client'
+import { getStats, getAdminTokens, getPipelineHealth, BASE_URL } from '../api/client'
 import api from '../api/client'
 
 const INR = v =>
@@ -77,11 +77,12 @@ export default function Diagnostics() {
   const [dbDetail,    setDbDetail]    = useState(null)
 
   // ── Stats & liability ────────────────────────────────────────────────────
-  const [stats,       setStats]       = useState(null)
-  const [liability,   setLiability]   = useState(null)   // { witTotal, witCount, refTotal, refCount, depPending }
-  const [loading,     setLoading]     = useState(true)
-  const [lastChecked, setLastChecked] = useState(null)
-  const [countdown,   setCountdown]   = useState(REFRESH_INTERVAL)
+  const [stats,        setStats]        = useState(null)
+  const [liability,    setLiability]    = useState(null)   // { witTotal, witCount, refTotal, refCount, depPending }
+  const [pipeHealth,   setPipeHealth]   = useState(null)   // pipeline health snapshot
+  const [loading,      setLoading]      = useState(true)
+  const [lastChecked,  setLastChecked]  = useState(null)
+  const [countdown,    setCountdown]    = useState(REFRESH_INTERVAL)
   const countdownRef = useRef(null)
 
   // ── Run all checks ───────────────────────────────────────────────────────
@@ -136,6 +137,14 @@ export default function Diagnostics() {
         })
       } catch {
         setLiability(null)
+      }
+
+      // 4. Pipeline health — DB connection pool, injection tasks, data integrity
+      try {
+        const phRes = await getPipelineHealth()
+        setPipeHealth(phRes.data)
+      } catch {
+        setPipeHealth(null)
       }
     } finally {
       // Guaranteed to run even if an unexpected error escapes the inner try-catch blocks.
@@ -351,6 +360,54 @@ export default function Diagnostics() {
           )}
         </div>
       </div>
+
+      {/* ── Pipeline Health Card ─────────────────────────────────────────────── */}
+      {pipeHealth && (
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
+          <div className="flex items-center gap-2 mb-5">
+            <Activity className="w-4 h-4 text-violet-500" />
+            <h2 className="font-semibold text-slate-800">Pipeline Health</h2>
+            <span className="ml-auto text-[10px] font-mono text-slate-400">
+              {lastChecked?.toLocaleTimeString()}
+            </span>
+          </div>
+          {(() => {
+            const pool = pipeHealth.db_pool ?? {}
+            const totalCap  = pool.total_capacity ?? pool.pool_size ?? 40
+            const checkedOut = pool.checked_out ?? 0
+            const available  = Math.max(0, totalCap - checkedOut)
+            const injRunning = pipeHealth.injection_tasks_running ?? 0
+            const rows = [
+              { label: 'DB Connections Free',  value: available,                           accent: available < 4 ? 'text-red-600' : 'text-emerald-600' },
+              { label: 'DB Checked Out',        value: checkedOut,                          accent: checkedOut > 30 ? 'text-red-600' : 'text-blue-600' },
+              { label: 'Waitlist Queue',         value: pipeHealth.waitlist_count ?? '—',   accent: 'text-amber-600' },
+              { label: 'Active Users',           value: pipeHealth.active_users ?? '—',     accent: 'text-slate-700' },
+              { label: 'Active Pools',           value: pipeHealth.pools_active ?? '—',     accent: 'text-violet-600' },
+              { label: 'Under-Capacity Pools',   value: pipeHealth.pools_under_capacity ?? 0, accent: (pipeHealth.pools_under_capacity ?? 0) > 0 ? 'text-amber-600' : 'text-emerald-600' },
+              { label: 'BG Injection Tasks',     value: injRunning,                         accent: injRunning > 0 ? 'text-blue-500' : 'text-slate-400' },
+              { label: 'Utilisation',            value: `${pipeHealth.db_pool_utilisation_pct ?? 0}%`, accent: (pipeHealth.db_pool_utilisation_pct ?? 0) >= 80 ? 'text-red-600' : 'text-emerald-600' },
+            ]
+            return (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            {rows.map(({ label, value, accent }) => (
+              <div key={label} className="bg-slate-50 rounded-xl p-3 border border-slate-100">
+                <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider mb-1">{label}</p>
+                <p className={`text-lg font-black tabular-nums ${accent}`}>{value}</p>
+              </div>
+            ))}
+          </div>
+            )
+          })()}
+          {pipeHealth.last_draw_at && (
+            <p className="mt-3 text-xs text-slate-400">
+              Last draw: <span className="font-mono text-slate-600">{new Date(pipeHealth.last_draw_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}</span>
+              {pipeHealth.last_pool_created_at && (
+                <> &nbsp;·&nbsp; Last pool: <span className="font-mono text-slate-600">{new Date(pipeHealth.last_pool_created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}</span></>
+              )}
+            </p>
+          )}
+        </div>
+      )}
 
       {/* Response time chart (simple bar) */}
       {(apiLatency || dbLatency) && (

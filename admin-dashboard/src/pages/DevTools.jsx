@@ -1,16 +1,11 @@
 /**
  * DevTools.jsx — Developer Mode · God Mode Control Panel
  *
- * 9 sub-tabs:
- *  0. STRESS TEST   — AI Platform Stress-Tester (1–1,000 cycles)
+ * 4 tabs:
+ *  0. STRESS TEST   — AI Platform Stress-Tester (1–1,000 cycles) + Pre-Test Setup
  *  1. DRAW CONTROL  — Force Draw + Time-Travel + Date controls
  *  2. INJECTION     — User injection with date/time/cadence customization
- *  3. LIVE STATS    — Real-time production-grade statistics (dark theme)
- *  4. LEVEL MAP     — Visual pool-by-pool member level distribution
- *  5. WINNERS       — Level-wise winner analytics + amount distribution
- *  6. PROJECTIONS   — Next draw projections, pool formation forecasts
- *  7. CONTROLS      — Payment scenarios, auto-paid toggle, late %
- *  8. DANGER ZONE   — Database nuclear reset
+ *  3. DANGER ZONE   — Database nuclear reset
  *
  * All /dev/* calls authenticated via JWT request interceptor.
  */
@@ -22,7 +17,7 @@ import {
   IndianRupee, TrendingUp, GitMerge, ShieldAlert, BarChart3,
   DollarSign, Database, RefreshCw, Layers, Trophy, Target,
   Cpu, Settings, CalendarDays, Activity, ToggleLeft, ToggleRight,
-  Shuffle, ChevronRight,
+  Shuffle, ChevronRight, Download, TableProperties,
 } from 'lucide-react'
 import {
   AreaChart, Area, LineChart, Line, BarChart, Bar,
@@ -33,10 +28,9 @@ import {
 import Spinner from '../components/Spinner'
 import {
   forceDrawDev, simulateCycleDev, simulateUsersDev,
-  resetDataDev, advancedSimulationDev,
-  devLiveStats, devLevelMap, devWinnersAnalytics,
-  devProjection, devInjectTimed, devMarkAllPaid,
-  devSetPaymentScenario,
+  resetDataDev, advancedSimulationDev, realSimulationDev,
+  devInjectTimed, devMarkAllPaid,
+  devSetPaymentScenario, getInjectionStatus,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -236,21 +230,39 @@ function SimStatsGrid({ s }) {
         <p className="text-[10px] font-bold text-cyan-400 uppercase tracking-widest flex items-center gap-2 mb-3"><Cpu className="w-3.5 h-3.5" />Brain 5 SDE &amp; Draw Type Analytics</p>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           {[
-            { label:'L4 SDE Flaggings', value:sdeFlg, accent:'amber',  desc:'Members reaching L4' },
-            { label:'SDE Exits',        value:sdeEx,  accent:'rose',   desc:'Guaranteed L4 eliminations' },
-            { label:'Type A Draws',     value:typeA,  accent:'cyan',   desc:'LPI 14-25% routing' },
-            { label:'Type B Draws',     value:typeB,  accent:'orange', desc:'L1/L2 shortage fallback' },
+            { label:'L4 SDE Flaggings', value:sdeFlg,                                    accent:'amber',  desc:'Members reaching L4 — flagged for forced exit' },
+            { label:'SDE Exits',        value:sdeEx,                                     accent:'rose',   desc:'Total guaranteed SDE exits (L4+L5+L6)' },
+            { label:'L5 Ext-II Exits',  value:sh.total_l5_ext2_forced_exits??0,          accent:'orange', desc:'L5 members forced out before becoming L6' },
+            { label:'L6 Ext-III Exits', value:sh.total_l6_ext3_forced_exits??0,          accent:'purple', desc:'L6 members emergency forced exit' },
+            { label:'Type A Draws',     value:typeA,                                     accent:'cyan',   desc:'LPI 14-25% routing' },
+            { label:'Type B Draws',     value:typeB,                                     accent:'orange', desc:'L1/L2 shortage fallback' },
+            { label:'Accel Diss',       value:sh.total_accel_dissolution_events??0,      accent:'red',    desc:'≥60% L4+ → both winners from L4+' },
+            { label:'Draw Pauses',      value:(sh.total_draw_pauses_triggered??0),       accent:'amber',  desc:'Pools paused (safestop, under-capacity)' },
           ].map((c, i) => (
             <div key={i} className="border border-slate-700/60 bg-slate-800/40 rounded-xl p-3">
               <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider">{c.label}</p>
               <p className={`text-xl font-black tabular-nums mt-1 ${
-                c.accent==='amber'?'text-amber-400':c.accent==='rose'?'text-rose-400':c.accent==='cyan'?'text-cyan-400':'text-orange-400'
+                c.accent==='amber'?'text-amber-400':c.accent==='rose'?'text-rose-400':c.accent==='cyan'?'text-cyan-400':c.accent==='orange'?'text-orange-400':c.accent==='purple'?'text-purple-400':'text-red-400'
               }`}>{c.value}</p>
               <p className="text-[9px] text-slate-600 mt-0.5">{c.desc}</p>
             </div>
           ))}
         </div>
       </div>
+
+      {/* A-1: L5/L6 Escalation Explanation */}
+      {sh.l5_l6_escalation_explanation && (
+        <div className={`p-3 rounded-xl border text-xs ${
+          (sh.max_l5_count>0||sh.max_l6_count>0)
+            ? 'bg-red-950/30 border-red-800/50 text-red-300'
+            : 'bg-emerald-950/30 border-emerald-800/50 text-emerald-300'
+        }`}>
+          <p className="font-bold uppercase tracking-wider text-[10px] mb-1 opacity-70">
+            {(sh.max_l5_count>0||sh.max_l6_count>0) ? '⚠ Anti-Maturity Pressure Analysis (A-1)' : '✓ Anti-Maturity Health (A-1)'}
+          </p>
+          <p>{sh.l5_l6_escalation_explanation}</p>
+        </div>
+      )}
     </div>
   )
 }
@@ -390,24 +402,387 @@ function SimCharts({ logs }) {
   )
 }
 
+// ── CSV download helper ──────────────────────────────────────────────────────
+function downloadCSV(rows, filename) {
+  if (!rows?.length) return
+  const headers = Object.keys(rows[0])
+  const lines = [
+    headers.join(','),
+    ...rows.map(r => headers.map(h => {
+      const v = r[h]
+      if (v === null || v === undefined) return ''
+      const s = typeof v === 'object' ? JSON.stringify(v) : String(v)
+      return s.includes(',') ? `"${s.replace(/"/g,'""')}"` : s
+    }).join(','))
+  ]
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' })
+  const url  = URL.createObjectURL(blob)
+  const a    = document.createElement('a'); a.href = url; a.download = filename
+  document.body.appendChild(a); a.click(); document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+// ── Report Sub-Tabs ──────────────────────────────────────────────────────────
+const REPORT_TABS = [
+  { id: 'summary',    label: 'Summary',          short: 'Sum'  },
+  { id: 'weekly',     label: 'Weekly Report',     short: 'Wkly' },
+  { id: 'pools',      label: 'Pool Activity',     short: 'Pool' },
+  { id: 'draws',      label: 'Draw Analysis',     short: 'Draw' },
+  { id: 'cashflow',   label: 'Cash Flow',         short: 'Cash' },
+  { id: 'levels',     label: 'Level Progression', short: 'Lvl'  },
+]
+
+// ── Weekly Report Table ──────────────────────────────────────────────────────
+function WeeklyReportTable({ rows }) {
+  if (!rows?.length) return <p className="text-xs text-slate-500 p-4">No weekly data</p>
+  const cols = [
+    { key: 'week', label: 'Week' },
+    { key: 'week_start_date', label: 'Date' },
+    { key: 'users_joined', label: 'Joined' },
+    { key: 'active_users', label: 'Active' },
+    { key: 'waitlist_count', label: 'Waitlist' },
+    { key: 'pools_active', label: 'Pools' },
+    { key: 'lpi', label: 'LPI%' },
+    { key: 'draws_this_week', label: 'Draws' },
+    { key: 'late_payers', label: 'Late' },
+    { key: 'scenario', label: 'AI Phase' },
+  ]
+  return (
+    <div className="overflow-auto max-h-96 rounded-xl border border-slate-700/60">
+      <table className="w-full text-xs whitespace-nowrap">
+        <thead className="bg-slate-800 sticky top-0 z-10">
+          <tr>{cols.map(c=><th key={c.key} className="text-left px-3 py-2.5 text-slate-400 font-semibold">{c.label}</th>)}</tr>
+        </thead>
+        <tbody>
+          {rows.map((r,i)=>(
+            <tr key={r.week} className={`border-b border-slate-800/50 ${r.high_pressure_mode?'bg-red-950/20':'i%2===0?bg-slate-900:bg-slate-900/50'}`}>
+              {cols.map(c=>(
+                <td key={c.key} className={`px-3 py-2 ${c.key==='lpi'?(parseFloat(r.lpi)>=50?'text-red-400 font-bold':parseFloat(r.lpi)>=25?'text-orange-400':parseFloat(r.lpi)>=14?'text-amber-400':'text-emerald-400'):c.key==='scenario'?'text-cyan-300 text-[10px]':'text-slate-300'}`}>
+                  {c.key==='lpi'?`${r.lpi}%`:r[c.key]??'—'}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+// ── Pool Activity Chart ───────────────────────────────────────────────────────
+function PoolActivityChart({ logs }) {
+  if (!logs?.length) return null
+  const data = logs.map(l=>({ week:l.week, active:l.active_pools, pauses:l.pauses, merges:l.merges }))
+  return (
+    <div className="h-48">
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={data} margin={{top:4,right:8,left:0,bottom:0}}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+          <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+          <YAxis tick={{fill:'#64748b',fontSize:10}}/>
+          <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
+          <Area type="monotone" dataKey="active" stroke="#6366f1" fill="#6366f120" name="Active Pools" strokeWidth={1.5}/>
+          <Area type="monotone" dataKey="pauses" stroke="#f59e0b" fill="#f59e0b10" name="Pauses" strokeWidth={1.5}/>
+          <Area type="monotone" dataKey="merges" stroke="#10b981" fill="#10b98110" name="Merges" strokeWidth={1.5}/>
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
+// ── Level Progression Chart (A-1: full L5/L6 visibility) ─────────────────────
+function LevelProgressionChart({ weekly, logs }) {
+  if (!weekly?.length) return null
+
+  // Main stacked area data
+  const data = weekly.map(w=>({
+    week: w.week,
+    L1: w.level_distribution?.L1??0,
+    L2: w.level_distribution?.L2??0,
+    L3: w.level_distribution?.L3??0,
+    L4: w.level_distribution?.L4??0,
+    L5: w.level_distribution?.L5??w.l5_count??0,
+    L6: w.level_distribution?.L6??w.l6_count??0,
+    lpi: w.lpi??0,
+  }))
+
+  // Escalation events: compute per-cycle from cumulative weekly_detail fields
+  const escalData = weekly.map((w,i)=>{
+    const prev = i>0?weekly[i-1]:null
+    return {
+      week: w.week,
+      ext2_exits:  Math.max(0,(w.ext2_exits_this_week??0)-(prev?.ext2_exits_this_week??0)),
+      ext3_exits:  Math.max(0,(w.ext3_exits_this_week??0)-(prev?.ext3_exits_this_week??0)),
+      accel_diss:  Math.max(0,(w.accel_diss_this_week??0)-(prev?.accel_diss_this_week??0)),
+      pool_pauses: logs?.[i]?.pauses??0,
+      l5_count:    w.l5_count??w.level_distribution?.L5??0,
+      l6_count:    w.l6_count??w.level_distribution?.L6??0,
+    }
+  })
+
+  // Find weeks where L5/L6 actually appeared (for WHY table)
+  const escalWeeks = escalData.filter(w => w.l5_count>0 || w.l6_count>0 || w.ext2_exits>0 || w.ext3_exits>0 || w.accel_diss>0)
+
+  const LEVEL_COLORS = ['#64748b','#3b82f6','#8b5cf6','#f59e0b','#ef4444','#bf00ff']
+
+  return (
+    <div className="space-y-5">
+      {/* 1. Full stacked area — L1–L6 distribution */}
+      <div>
+        <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">Member Level Distribution (Proportional)</p>
+        <div className="h-48">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={data} margin={{top:4,right:8,left:0,bottom:0}} stackOffset="expand">
+              <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+              <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+              <YAxis tickFormatter={v=>`${(v*100).toFixed(0)}%`} tick={{fill:'#64748b',fontSize:10}}/>
+              <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}} formatter={(v,n)=>[v,n]}/>
+              <Legend wrapperStyle={{fontSize:10}}/>
+              {['L1','L2','L3','L4','L5','L6'].map((lv,i)=>(
+                <Area key={lv} type="monotone" dataKey={lv} stackId="1"
+                  stroke={LEVEL_COLORS[i]} fill={LEVEL_COLORS[i]+'40'} name={lv} strokeWidth={lv==='L5'||lv==='L6'?2:1}/>
+              ))}
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* 2. L5+L6 Anti-Maturity Pressure spike chart */}
+      <div>
+        <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">L5+L6 Anti-Maturity Pressure + LPI</p>
+        <div className="h-36">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={data} margin={{top:4,right:8,left:0,bottom:0}}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+              <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+              <YAxis tick={{fill:'#64748b',fontSize:10}}/>
+              <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
+              <Legend wrapperStyle={{fontSize:10}}/>
+              <Line type="monotone" dataKey="L5" stroke="#ef4444" strokeWidth={2.5} dot={false} name="L5 Active"/>
+              <Line type="monotone" dataKey="L6" stroke="#bf00ff" strokeWidth={2.5} dot={false} name="L6 Active"/>
+              <Line type="monotone" dataKey="lpi" stroke="#f59e0b" strokeWidth={1} strokeDasharray="4 2" dot={false} name="LPI%"/>
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* 3. Pool Pause Timeline + SDE Extension Events per week */}
+      <div>
+        <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider mb-2">Pool Pauses + SDE Extension Events Per Week</p>
+        <div className="h-36">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={escalData} margin={{top:4,right:8,left:0,bottom:0}}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+              <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+              <YAxis tick={{fill:'#64748b',fontSize:10}}/>
+              <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
+              <Legend wrapperStyle={{fontSize:10}}/>
+              <Bar dataKey="pool_pauses" fill="#f59e0b"  name="Pool Pauses"   radius={[2,2,0,0]}/>
+              <Bar dataKey="ext2_exits"  fill="#ef4444"  name="Ext-II (L5→exit)" radius={[2,2,0,0]}/>
+              <Bar dataKey="ext3_exits"  fill="#bf00ff"  name="Ext-III (L6→exit)" radius={[2,2,0,0]}/>
+              <Bar dataKey="accel_diss"  fill="#f97316"  name="Accel Diss"    radius={[2,2,0,0]}/>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* 4. A-1: WHY table — escalation event breakdown */}
+      {escalWeeks.length > 0 ? (
+        <div className="border border-red-900/50 bg-red-950/20 rounded-xl overflow-hidden">
+          <div className="px-4 py-2 border-b border-red-900/40">
+            <p className="text-[10px] font-bold text-red-400 uppercase tracking-widest">⚠ A-1 Anti-Maturity Escalation — WHY Members Reached L5/L6</p>
+            <p className="text-[9px] text-red-700 mt-0.5">
+              Escalation cause: Accelerated dissolution (≥60% L4+ pool) runs both winners from L4+.
+              Surviving L4 members advance +1 → reach L5. Ext-II catches them immediately next eligible draw.
+            </p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-[10px] whitespace-nowrap">
+              <thead className="bg-red-950/30">
+                <tr>
+                  {['Week','L5 Count','L6 Count','Ext-II Exits','Ext-III Exits','Accel Diss','Pool Pauses','Root Cause'].map(h=>(
+                    <th key={h} className="text-left px-3 py-2 text-slate-500 font-semibold">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {escalWeeks.slice(0,20).map(w=>(
+                  <tr key={w.week} className="border-t border-red-900/30">
+                    <td className="px-3 py-2 font-mono font-bold text-slate-400">{w.week}</td>
+                    <td className={`px-3 py-2 font-bold tabular-nums ${w.l5_count>0?'text-red-400':'text-slate-600'}`}>{w.l5_count}</td>
+                    <td className={`px-3 py-2 font-bold tabular-nums ${w.l6_count>0?'text-purple-400':'text-slate-600'}`}>{w.l6_count}</td>
+                    <td className="px-3 py-2 tabular-nums text-red-300">{w.ext2_exits}</td>
+                    <td className="px-3 py-2 tabular-nums text-purple-300">{w.ext3_exits}</td>
+                    <td className="px-3 py-2 tabular-nums text-orange-300">{w.accel_diss}</td>
+                    <td className={`px-3 py-2 tabular-nums ${w.pool_pauses>0?'text-amber-400':'text-slate-600'}`}>{w.pool_pauses}</td>
+                    <td className="px-3 py-2 text-slate-500">
+                      {w.accel_diss>0 ? 'Accel diss → L4 survivors → L5' :
+                       w.pool_pauses>0 ? 'Pool paused (under-capacity)' :
+                       w.ext2_exits>0 ? 'Ext-II cleared L5' :
+                       w.ext3_exits>0 ? 'Ext-III cleared L6' : '—'}
+                    </td>
+                  </tr>
+                ))}
+                {escalWeeks.length>20&&<tr><td colSpan={8} className="px-3 py-2 text-slate-600 text-center">…{escalWeeks.length-20} more weeks</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2 p-3 bg-emerald-950/30 border border-emerald-800/40 rounded-xl text-[10px] text-emerald-400">
+          <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0"/>
+          <span>✓ No L5/L6 escalation detected — SDE cleared all L4 members before advancement.</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Cash Flow Chart ──────────────────────────────────────────────────────────
+function CashFlowChart({ weekly }) {
+  if (!weekly?.length) return null
+  const data = weekly.map(w=>({ week:w.week, inflow:w.cash_inflow_inr??0, installments:w.installments_collected_inr??0, late_fees:w.late_fees_collected_inr??0 }))
+  return (
+    <div className="h-48">
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data} margin={{top:4,right:8,left:0,bottom:0}}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+          <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+          <YAxis tick={{fill:'#64748b',fontSize:10}} tickFormatter={v=>v>=1000?`₹${(v/1000).toFixed(0)}k`:`₹${v}`}/>
+          <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}} formatter={v=>INR(v)}/>
+          <Legend wrapperStyle={{fontSize:10}}/>
+          <Bar dataKey="inflow"       stackId="a" fill="#10b981" name="New Deposits" radius={[0,0,0,0]}/>
+          <Bar dataKey="installments" stackId="a" fill="#3b82f6" name="Installments" radius={[0,0,0,0]}/>
+          <Bar dataKey="late_fees"    stackId="a" fill="#f59e0b" name="Late Fees"    radius={[4,4,0,0]}/>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
+// ── Draw Analysis Chart ───────────────────────────────────────────────────────
+function DrawAnalysisChart({ weekly }) {
+  if (!weekly?.length) return null
+  // Compute per-week draw type breakdown from cumulative totals
+  const data = weekly.map((w,i)=>{
+    const prev = i>0?weekly[i-1]:null
+    const dt   = w.draw_type_breakdown??{}
+    const pdtA = prev?.draw_type_breakdown?.type_a??0
+    const pdtB = prev?.draw_type_breakdown?.type_b??0
+    const pdtS = prev?.draw_type_breakdown?.sde??0
+    const pdtR = prev?.draw_type_breakdown?.regular??0
+    return {
+      week:    w.week,
+      regular: Math.max(0,(dt.regular??0)-(pdtR)),
+      type_a:  Math.max(0,(dt.type_a??0)-(pdtA)),
+      type_b:  Math.max(0,(dt.type_b??0)-(pdtB)),
+      sde:     Math.max(0,(dt.sde??0)-(pdtS)),
+    }
+  })
+  return (
+    <div className="h-48">
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data} margin={{top:4,right:8,left:0,bottom:0}}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.4}/>
+          <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} interval="preserveStartEnd"/>
+          <YAxis tick={{fill:'#64748b',fontSize:10}}/>
+          <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
+          <Legend wrapperStyle={{fontSize:10}}/>
+          <Bar dataKey="regular" stackId="a" fill="#10b981" name="Regular"  radius={[0,0,0,0]}/>
+          <Bar dataKey="type_a"  stackId="a" fill="#3b82f6" name="Type A"   radius={[0,0,0,0]}/>
+          <Bar dataKey="type_b"  stackId="a" fill="#f59e0b" name="Type B"   radius={[0,0,0,0]}/>
+          <Bar dataKey="sde"     stackId="a" fill="#ef4444" name="SDE Exit" radius={[4,4,0,0]}/>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
 function StressTestTab({ toast }) {
-  const [cycles, setCycles] = useState(50)
-  const [lateFee, setLateFee] = useState(5.0)
+  const [cycles,       setCycles]       = useState(50)
+  // ── Engine Mode ────────────────────────────────────────────────────────────
+  // Real Engine: calls actual production services (draw, SDE, waitlist, Brain 2/3/5)
+  //   on an isolated in-memory SQLite DB with mocked time — ZERO logic duplication.
+  // Fast Preview: uses _AdvSimEngine (in-memory duplicate logic) — faster but may drift.
+  const [useRealEngine, setUseRealEngine] = useState(true)
+  // ── A/B/C Circular Late-Fee Parameters (A-2) ──────────────────────────────
+  // A — Elimination %: what % of unpaid members are eliminated (don't attempt grace)
+  // B — Late Fee Rate %: fee per day as % of ₹1000 deposit (min 5% = ₹50/day)
+  // C — Grace Saver %: of at-risk members, what % actually pay the grace fee
+  // Circular: B cost → affects C willingness → affects effective A elimination rate
+  const [elimPctA,  setElimPctA]  = useState(80.0)   // A: 0.05–100%
+  const [lateFeeB,  setLateFeeB]  = useState(5.0)    // B: 5–100% per day of deposit
+  const [gracePctC, setGracePctC] = useState(15.0)   // C: 0.05–100%
+  // late_users_ratio_pct: % of active members who miss the payment due date
   const [lateRatio, setLateRatio] = useState(2.0)
-  const [vol, setVol] = useState(false)
-  const [volMax, setVolMax] = useState(100)
-  const [rdr, setRdr] = useState(40.0)
-  const [running, setRunning] = useState(false)
-  const [result, setResult] = useState(null)
+  const [vol,       setVol]       = useState(false)
+  const [volMax,    setVolMax]    = useState(100)
+  const [rdr,       setRdr]       = useState(40.0)
+  // Real-engine–specific params
+  const [usersPerWeek,  setUsersPerWeek]  = useState(24)
+  const [initialUsers,  setInitialUsers]  = useState(24)
+  const [organicRatio,  setOrganicRatio]  = useState(60)   // %
+  // ── K-12 to K-17: Extended Injection Knobs ────────────────────────────────
+  const [inflowPattern,      setInflowPattern]      = useState('linear')
+  const [referralBurstWeek,  setReferralBurstWeek]  = useState(0)
+  const [paymentShockWeek,   setPaymentShockWeek]   = useState(0)
+  const [waitlistDropoutPct, setWaitlistDropoutPct] = useState(0)
+  const [organicDecayRate,   setOrganicDecayRate]   = useState(0)
+  const [simulationLabel,    setSimulationLabel]    = useState('')
+  const [showKnobs,          setShowKnobs]          = useState(false)
+  const [running,   setRunning]   = useState(false)
+  const [result,    setResult]    = useState(null)
   const [showSetup, setShowSetup] = useState(false)
+  const [showRealCfg, setShowRealCfg] = useState(false)
+  const [reportTab, setReportTab] = useState('summary')   // Phase 2-C report sub-tab
+
+  // Derived: effective elimination = those who fail + those in grace who don't pay
+  const effectiveElim = ((elimPctA / 100) + (1 - elimPctA / 100) * (1 - gracePctC / 100)) * 100
+  const lateFeeINR    = Math.round(lateFeeB / 100 * 1000)
 
   const run = async () => {
-    setRunning(true); setResult(null)
+    setRunning(true); setResult(null); setReportTab('summary')
     try {
-      const res = await advancedSimulationDev({ total_cycles:cycles, late_fee_pct:lateFee, late_users_ratio_pct:lateRatio, volatility_mode:vol, volatility_max_inflow:volMax, avg_rdr_pct:rdr })
+      let res
+      if (useRealEngine) {
+        // ── Real Engine: call actual production services ──────────────────────
+        res = await realSimulationDev({
+          weeks:                   cycles,
+          users_per_week:          usersPerWeek,
+          initial_users:           initialUsers,
+          organic_ratio:           organicRatio / 100.0,
+          late_users_ratio_pct:    lateRatio,
+          elim_pct_a:              elimPctA,
+          grace_saver_pct_c:       gracePctC,
+          volatility_mode:         vol,
+          volatility_max_inflow:   volMax,
+          // K-12 to K-17: Extended Injection Knobs
+          inflow_pattern:          inflowPattern,
+          referral_burst_week:     referralBurstWeek,
+          payment_shock_week:      paymentShockWeek,
+          waitlist_dropout_pct:    waitlistDropoutPct,
+          organic_decay_rate:      organicDecayRate / 100.0,
+          simulation_label:        simulationLabel || '',
+        })
+      } else {
+        // ── Fast Preview: legacy in-memory engine ─────────────────────────────
+        res = await advancedSimulationDev({
+          total_cycles:          cycles,
+          late_fee_pct:          lateFeeB,
+          late_users_ratio_pct:  lateRatio,
+          elim_pct_a:            elimPctA,
+          grace_saver_pct_c:     gracePctC,
+          volatility_mode:       vol,
+          volatility_max_inflow: volMax,
+          avg_rdr_pct:           rdr,
+        })
+      }
       setResult(res.data)
       const s = res.data.simulation_summary
-      toast(`Simulation complete — ${s.total_cycles_run} cycles · ${INR(s.final_virtual_liquidity_float)} liquidity`, 'success')
+      toast(
+        `${useRealEngine ? '🔬 Real Engine' : '⚡ Fast Preview'} — ${s.total_cycles_run} cycles · ${INR(s.final_virtual_liquidity_float)} liquidity`,
+        'success'
+      )
     } catch(err) {
       toast(err.response?.data?.detail ?? 'Simulation failed', 'error')
     } finally { setRunning(false) }
@@ -417,10 +792,33 @@ function StressTestTab({ toast }) {
     <div className="relative bg-slate-900 border border-slate-700/60 rounded-2xl overflow-hidden shadow-2xl shadow-violet-950/20">
       {running && <SimLockout/>}
       <div className="flex items-center gap-3 px-6 py-5 border-b border-slate-700/60 bg-gradient-to-r from-violet-950/50 via-slate-900/80 to-slate-900">
-        <div className="bg-violet-900/40 border border-violet-700/50 p-3 rounded-xl"><FlaskConical className="w-5 h-5 text-violet-400"/></div>
+        <div className={`p-3 rounded-xl border ${useRealEngine ? 'bg-emerald-900/40 border-emerald-700/50' : 'bg-violet-900/40 border-violet-700/50'}`}>
+          <FlaskConical className={`w-5 h-5 ${useRealEngine ? 'text-emerald-400' : 'text-violet-400'}`}/>
+        </div>
         <div className="flex-1">
-          <p className="font-extrabold text-slate-100 text-base leading-none">AI Platform Stress-Tester</p>
-          <p className="text-xs text-slate-500 mt-0.5">Isolated N-cycle engine · FIFO refill · Condensation · Draw safeguards</p>
+          <div className="flex items-center gap-2">
+            <p className="font-extrabold text-slate-100 text-base leading-none">AI Platform Stress-Tester</p>
+            {useRealEngine
+              ? <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-emerald-900/60 border border-emerald-700/60 text-emerald-300 uppercase tracking-wider">🔬 Real Engine</span>
+              : <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-violet-900/60 border border-violet-700/60 text-violet-300 uppercase tracking-wider">⚡ Fast Preview</span>
+            }
+          </div>
+          <p className="text-xs text-slate-500 mt-0.5">
+            {useRealEngine
+              ? 'Zero-duplication · Calls real production services · Isolated SQLite DB · Chronos time-travel'
+              : 'In-memory engine · FIFO refill · Condensation · Draw safeguards'}
+          </p>
+        </div>
+        {/* Engine toggle */}
+        <div className="flex items-center bg-slate-800/80 border border-slate-700/60 rounded-xl p-1 gap-1">
+          <button
+            onClick={() => setUseRealEngine(true)} disabled={running}
+            className={`text-[11px] font-bold px-3 py-1.5 rounded-lg transition-all ${useRealEngine ? 'bg-emerald-700 text-emerald-100 shadow-sm' : 'text-slate-400 hover:text-emerald-400'}`}
+          >🔬 Real</button>
+          <button
+            onClick={() => setUseRealEngine(false)} disabled={running}
+            className={`text-[11px] font-bold px-3 py-1.5 rounded-lg transition-all ${!useRealEngine ? 'bg-violet-700 text-violet-100 shadow-sm' : 'text-slate-400 hover:text-violet-400'}`}
+          >⚡ Fast</button>
         </div>
       </div>
       <div className="p-6 space-y-6">
@@ -441,13 +839,254 @@ function StressTestTab({ toast }) {
           <div className="flex justify-between text-[10px] text-slate-600 mt-1.5 select-none">
             {[1,250,500,750,1000].map(v=><button key={v} onClick={()=>!running&&setCycles(v)} disabled={running} className="hover:text-violet-400 transition-colors">{v.toLocaleString()}</button>)}
           </div>
-          {cycles>=500&&!running&&<p className="text-[11px] text-amber-400 flex items-center gap-1.5 mt-2"><AlertTriangle className="w-3.5 h-3.5"/>{cycles>=800?`${cycles} cycles — expect 45–90s`:`${cycles} cycles — expect 20–45s`}</p>}
+          {useRealEngine
+            ? cycles>=100&&!running&&<p className="text-[11px] text-amber-400 flex items-center gap-1.5 mt-2"><AlertTriangle className="w-3.5 h-3.5"/>{cycles>=150?`${cycles} weeks — real engine: expect 3–8 min`:`${cycles} weeks — real engine: expect 1–3 min`}</p>
+            : cycles>=500&&!running&&<p className="text-[11px] text-amber-400 flex items-center gap-1.5 mt-2"><AlertTriangle className="w-3.5 h-3.5"/>{cycles>=800?`${cycles} cycles — expect 45–90s`:`${cycles} cycles — expect 20–45s`}</p>
+          }
         </div>
 
-        {/* Late fee/ratio */}
-        <div className="grid grid-cols-2 gap-4">
-          <DevInput label="Late Fee %" hint="(e.g. 5 = ₹50 per defaulter)" type="number" min={0} step={0.5} value={lateFee} disabled={running} onChange={e=>setLateFee(Math.max(0,parseFloat(e.target.value)||0))}/>
-          <DevInput label="Late Users Ratio %" hint="(of active members)" type="number" min={0} max={100} step={0.5} value={lateRatio} disabled={running} onChange={e=>setLateRatio(Math.min(100,Math.max(0,parseFloat(e.target.value)||0)))}/>
+        {/* ── Real Engine Config (only visible when Real Engine is active) ──── */}
+        {useRealEngine && (
+          <div className="border border-emerald-800/50 rounded-xl overflow-hidden bg-emerald-950/10">
+            <button
+              onClick={() => setShowRealCfg(v => !v)}
+              className="w-full flex items-center justify-between px-4 py-3 bg-emerald-950/30 hover:bg-emerald-950/50 transition-colors"
+            >
+              <p className="text-xs font-bold text-emerald-400 uppercase tracking-widest flex items-center gap-2">
+                🔬 Real Engine — Load Configuration
+              </p>
+              <span className="text-emerald-600 text-xs">{showRealCfg ? '▲ collapse' : '▼ expand'}</span>
+            </button>
+            {showRealCfg && (
+              <div className="p-4 grid grid-cols-3 gap-4">
+                {/* Users per week */}
+                <div>
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                    Users / Week
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input type="number" min={0} max={2000} value={usersPerWeek} disabled={running}
+                      onChange={e => setUsersPerWeek(Math.max(0, parseInt(e.target.value) || 0))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40"
+                    />
+                    <span className="text-[10px] text-slate-500 whitespace-nowrap">users/wk</span>
+                  </div>
+                  <p className="text-[10px] text-slate-600 mt-1">New waitlist joins per week</p>
+                </div>
+                {/* Initial seed */}
+                <div>
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                    Seed Users
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input type="number" min={12} max={5000} value={initialUsers} disabled={running}
+                      onChange={e => setInitialUsers(Math.max(12, parseInt(e.target.value) || 12))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40"
+                    />
+                    <span className="text-[10px] text-slate-500 whitespace-nowrap">before W1</span>
+                  </div>
+                  <p className="text-[10px] text-slate-600 mt-1">Pre-seeded before week 1</p>
+                </div>
+                {/* Organic ratio */}
+                <div>
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                    Organic % <span className="text-slate-600 normal-case font-normal">(Brain 3 RDR)</span>
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input type="number" min={0} max={100} value={organicRatio} disabled={running}
+                      onChange={e => setOrganicRatio(Math.max(0, Math.min(100, parseInt(e.target.value) || 0)))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40"
+                    />
+                    <span className="text-[10px] text-slate-500">%</span>
+                  </div>
+                  <p className="text-[10px] text-slate-600 mt-1">100% = all organic, 0% = all referral</p>
+                </div>
+              </div>
+            )}
+            {/* Architecture note */}
+            <div className="px-4 pb-3">
+              <div className="bg-emerald-950/30 border border-emerald-900/50 rounded-lg p-2.5 text-[10px] text-emerald-400/70 leading-relaxed">
+                <span className="font-bold text-emerald-400">Zero-Duplication Guarantee:</span> This engine calls{' '}
+                <code className="text-emerald-300">draw.execute_weekly_draw()</code>,{' '}
+                <code className="text-emerald-300">sde_engine.run_sde_meta_pool()</code>,{' '}
+                <code className="text-emerald-300">waitlist.assign_waitlist_to_pools()</code>, and{' '}
+                <code className="text-emerald-300">brain5_lpi_engine</code> directly — on an isolated in-memory SQLite DB
+                with mocked time. Any rule change in production is reflected automatically.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── K-12 to K-17: Advanced Injection Knobs (collapsible) ─────────── */}
+        {useRealEngine && (
+          <div className="border border-cyan-800/40 rounded-xl overflow-hidden bg-cyan-950/10">
+            <button
+              onClick={() => setShowKnobs(v => !v)}
+              className="w-full flex items-center justify-between px-4 py-3 bg-cyan-950/20 hover:bg-cyan-950/40 transition-colors"
+            >
+              <p className="text-xs font-bold text-cyan-400 uppercase tracking-widest flex items-center gap-2">
+                🔬 K-12 to K-17 — Advanced Injection Knobs
+              </p>
+              <span className="text-cyan-600 text-xs">{showKnobs ? '▲ collapse' : '▼ expand'}</span>
+            </button>
+            {showKnobs && (
+              <div className="p-4 space-y-4">
+                {/* K-17: Simulation Label */}
+                <DevInput label="K-17 — Simulation Label" hint="(free text, for multi-run comparison)" type="text"
+                  placeholder="e.g. high-growth scenario" value={simulationLabel} disabled={running}
+                  onChange={e => setSimulationLabel(e.target.value)} />
+
+                {/* K-12: Inflow Pattern */}
+                <DevSelect label="K-12 — Inflow Pattern" hint="(shape of weekly new-user arrival curve)"
+                  value={inflowPattern} disabled={running} onChange={e => setInflowPattern(e.target.value)}>
+                  <option value="linear">Linear — constant users_per_week (default)</option>
+                  <option value="sine">Sine — ±50% oscillation, 12-week period</option>
+                  <option value="burst">Burst — 3× spike every 8th week, normal otherwise</option>
+                  <option value="step">Step — ramp 50%→150% of base over full run</option>
+                </DevSelect>
+
+                <div className="grid grid-cols-2 gap-4">
+                  {/* K-13: Referral burst week */}
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                      K-13 — Referral Burst Week <span className="text-slate-600 font-normal">(0=off)</span>
+                    </label>
+                    <input type="number" min={0} max={200} value={referralBurstWeek} disabled={running}
+                      onChange={e => setReferralBurstWeek(Math.max(0, parseInt(e.target.value)||0))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40" />
+                    <p className="text-[10px] text-slate-600 mt-0.5">2× referral surge on this week</p>
+                  </div>
+
+                  {/* K-14: Payment shock week */}
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                      K-14 — Payment Shock Week <span className="text-slate-600 font-normal">(0=off)</span>
+                    </label>
+                    <input type="number" min={0} max={200} value={paymentShockWeek} disabled={running}
+                      onChange={e => setPaymentShockWeek(Math.max(0, parseInt(e.target.value)||0))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40" />
+                    <p className="text-[10px] text-slate-600 mt-0.5">Late ratio spikes to 20% this week</p>
+                  </div>
+
+                  {/* K-15: Waitlist dropout */}
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                      K-15 — Waitlist Dropout % <span className="text-slate-600 font-normal">(0–50)</span>
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input type="number" min={0} max={50} step={0.5} value={waitlistDropoutPct} disabled={running}
+                        onChange={e => setWaitlistDropoutPct(Math.max(0, Math.min(50, parseFloat(e.target.value)||0)))}
+                        className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40" />
+                      <span className="text-[10px] text-slate-500">%</span>
+                    </div>
+                    <p className="text-[10px] text-slate-600 mt-0.5">% of waitlist who never enter pools</p>
+                  </div>
+
+                  {/* K-16: Organic decay rate */}
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                      K-16 — Organic Decay Rate <span className="text-slate-600 font-normal">(0–100%)</span>
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input type="number" min={0} max={100} step={0.5} value={organicDecayRate} disabled={running}
+                        onChange={e => setOrganicDecayRate(Math.max(0, Math.min(100, parseFloat(e.target.value)||0)))}
+                        className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40" />
+                      <span className="text-[10px] text-slate-500">%/wk</span>
+                    </div>
+                    <p className="text-[10px] text-slate-600 mt-0.5">Organic ratio decays by this % each week</p>
+                  </div>
+                </div>
+
+                {/* Active knobs summary */}
+                {(inflowPattern !== 'linear' || referralBurstWeek > 0 || paymentShockWeek > 0 || waitlistDropoutPct > 0 || organicDecayRate > 0 || simulationLabel) && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {inflowPattern !== 'linear' && <span className="px-2 py-0.5 bg-cyan-900/60 border border-cyan-700/60 rounded-full text-[10px] text-cyan-300 font-bold">K-12: {inflowPattern}</span>}
+                    {referralBurstWeek > 0 && <span className="px-2 py-0.5 bg-cyan-900/60 border border-cyan-700/60 rounded-full text-[10px] text-cyan-300 font-bold">K-13: burst wk{referralBurstWeek}</span>}
+                    {paymentShockWeek > 0 && <span className="px-2 py-0.5 bg-red-900/60 border border-red-700/60 rounded-full text-[10px] text-red-300 font-bold">K-14: shock wk{paymentShockWeek}</span>}
+                    {waitlistDropoutPct > 0 && <span className="px-2 py-0.5 bg-amber-900/60 border border-amber-700/60 rounded-full text-[10px] text-amber-300 font-bold">K-15: {waitlistDropoutPct}% dropout</span>}
+                    {organicDecayRate > 0 && <span className="px-2 py-0.5 bg-violet-900/60 border border-violet-700/60 rounded-full text-[10px] text-violet-300 font-bold">K-16: {organicDecayRate}%/wk decay</span>}
+                    {simulationLabel && <span className="px-2 py-0.5 bg-slate-700/80 border border-slate-600 rounded-full text-[10px] text-slate-300 font-bold">K-17: "{simulationLabel}"</span>}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── A/B/C Circular Late-Fee Parameters ───────────────────────────── */}
+        <div className="border border-slate-600/60 rounded-xl overflow-hidden">
+          <div className="px-4 py-3 bg-slate-800/60 border-b border-slate-700/60">
+            <p className="text-xs font-bold text-amber-400 uppercase tracking-widest flex items-center gap-2">
+              <ShieldAlert className="w-3.5 h-3.5"/>Circular Late-Fee Parameters A ⟷ B ⟷ C
+            </p>
+            <p className="text-[10px] text-slate-500 mt-0.5">These three parameters are co-related. Changing one affects the system's real effective elimination rate.</p>
+          </div>
+          <div className="p-4 space-y-5">
+            {/* Late payers ratio (who misses due date) */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs text-slate-300 font-semibold">Late Members % <span className="text-slate-500 font-normal">(of all active, miss due date)</span></label>
+                <div className="bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1 text-sm font-black text-slate-200">{lateRatio.toFixed(1)}%</div>
+              </div>
+              <input type="range" min={0} max={30} step={0.5} value={lateRatio} disabled={running}
+                onChange={e=>setLateRatio(parseFloat(e.target.value))}
+                className="w-full h-2 rounded-full appearance-none cursor-pointer accent-slate-400 disabled:opacity-40"
+                style={{background:`linear-gradient(to right,#94a3b8 ${lateRatio/30*100}%,#334155 ${lateRatio/30*100}%)`}}/>
+              <p className="text-[10px] text-slate-600 mt-1">Feeds into: A (direct elim pool) + C (grace period pool)</p>
+            </div>
+
+            {/* A — Elimination % */}
+            <div className="p-3 rounded-xl border border-red-900/50 bg-red-950/20">
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs font-bold text-red-300 uppercase tracking-wider">A — Elimination % <span className="text-red-500/60 font-normal normal-case">(skip grace, directly eliminated)</span></label>
+                <div className="bg-red-950 border border-red-800 rounded-lg px-2.5 py-1 text-sm font-black text-red-300">{elimPctA.toFixed(2)}%</div>
+              </div>
+              <input type="range" min={0.05} max={100} step={0.05} value={elimPctA} disabled={running}
+                onChange={e=>setElimPctA(parseFloat(e.target.value))}
+                className="w-full h-2 rounded-full appearance-none cursor-pointer disabled:opacity-40"
+                style={{background:`linear-gradient(to right,#ef4444 ${elimPctA}%,#334155 ${elimPctA}%)`}}/>
+              <div className="flex justify-between text-[10px] text-slate-600 mt-1 select-none"><span>0.05%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div>
+            </div>
+
+            {/* B — Late Fee Rate */}
+            <div className="p-3 rounded-xl border border-amber-900/50 bg-amber-950/20">
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs font-bold text-amber-300 uppercase tracking-wider">B — Late Fee Rate <span className="text-amber-500/60 font-normal normal-case">(% of ₹1000 deposit per day)</span></label>
+                <div className="flex items-center gap-1.5">
+                  <div className="bg-amber-950 border border-amber-800 rounded-lg px-2.5 py-1 text-sm font-black text-amber-300">{lateFeeB.toFixed(1)}%</div>
+                  <div className="text-[10px] text-amber-600 font-semibold">= ₹{lateFeeINR}/day</div>
+                </div>
+              </div>
+              <input type="range" min={5} max={100} step={0.5} value={lateFeeB} disabled={running}
+                onChange={e=>setLateFeeB(parseFloat(e.target.value))}
+                className="w-full h-2 rounded-full appearance-none cursor-pointer disabled:opacity-40"
+                style={{background:`linear-gradient(to right,#f59e0b ${(lateFeeB-5)/95*100}%,#334155 ${(lateFeeB-5)/95*100}%)`}}/>
+              <div className="flex justify-between text-[10px] text-slate-600 mt-1 select-none"><span>5% min (₹50/day)</span><span>50%</span><span>100% (₹1000/day)</span></div>
+              <p className="text-[10px] text-amber-700/80 mt-1">Higher B → fewer members attempt grace period (C↓ follows B↑)</p>
+            </div>
+
+            {/* C — Grace Saver % */}
+            <div className="p-3 rounded-xl border border-violet-900/50 bg-violet-950/20">
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs font-bold text-violet-300 uppercase tracking-wider">C — Grace Saver % <span className="text-violet-500/60 font-normal normal-case">(of at-risk, pay grace fee + late fee)</span></label>
+                <div className="bg-violet-950 border border-violet-800 rounded-lg px-2.5 py-1 text-sm font-black text-violet-300">{gracePctC.toFixed(2)}%</div>
+              </div>
+              <input type="range" min={0.05} max={100} step={0.05} value={gracePctC} disabled={running}
+                onChange={e=>setGracePctC(parseFloat(e.target.value))}
+                className="w-full h-2 rounded-full appearance-none cursor-pointer disabled:opacity-40"
+                style={{background:`linear-gradient(to right,#7c3aed ${gracePctC}%,#334155 ${gracePctC}%)`}}/>
+              <div className="flex justify-between text-[10px] text-slate-600 mt-1 select-none"><span>0.05%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div>
+            </div>
+
+            {/* Circular effect summary */}
+            <div className="flex items-center gap-3 p-3 bg-slate-800/60 rounded-xl border border-slate-700/40">
+              <div className="text-[10px] text-slate-400 flex-1 space-y-0.5">
+                <p>↳ <span className="text-red-400 font-bold">A={elimPctA.toFixed(1)}%</span> eliminated directly · remaining <span className="text-violet-400 font-bold">{(100-elimPctA).toFixed(1)}%</span> enter grace period</p>
+                <p>↳ Of grace-eligible: <span className="text-violet-400 font-bold">C={gracePctC.toFixed(1)}%</span> pay B=₹{lateFeeINR}/day + ₹500 seat fee → saved</p>
+                <p>↳ <span className="text-orange-400 font-bold">Effective total elim = {effectiveElim.toFixed(1)}%</span> of late payers ({(effectiveElim/100*lateRatio).toFixed(2)}% of all active)</p>
+              </div>
+            </div>
+          </div>
         </div>
 
         {/* Volatility */}
@@ -517,15 +1156,162 @@ function StressTestTab({ toast }) {
 
         {result&&!running&&(
           <div className="border-t border-slate-700/60 pt-6">
-            <div className="flex items-center gap-2 mb-1">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500"/>
-              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">Simulation Complete — {result.simulation_summary.total_cycles_run.toLocaleString()} cycles</p>
+            {/* Report header + download buttons */}
+            <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 flex-shrink-0"/>
+                <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
+                  Simulation Complete — {result.simulation_summary.total_cycles_run.toLocaleString()} cycles
+                </p>
+                {result.engine === 'real'
+                  ? <span className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-emerald-900/60 border border-emerald-700/60 text-emerald-300 uppercase tracking-wider">🔬 Real Engine</span>
+                  : <span className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-violet-900/60 border border-violet-700/60 text-violet-300 uppercase tracking-wider">⚡ Fast Preview</span>
+                }
+                {result.simulation_summary.simulation_label && result.simulation_summary.simulation_label !== 'default' && (
+                  <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-cyan-900/60 border border-cyan-700/60 text-cyan-300">
+                    K-17: "{result.simulation_summary.simulation_label}"
+                  </span>
+                )}
+                {result.simulation_summary.injection_knobs && (() => {
+                  const k = result.simulation_summary.injection_knobs
+                  const active = []
+                  if (k.inflow_pattern && k.inflow_pattern !== 'linear') active.push(`K-12:${k.inflow_pattern}`)
+                  if (k.referral_burst_week > 0) active.push(`K-13:wk${k.referral_burst_week}`)
+                  if (k.payment_shock_week > 0) active.push(`K-14:wk${k.payment_shock_week}`)
+                  if (k.waitlist_dropout_pct > 0) active.push(`K-15:${k.waitlist_dropout_pct}%drop`)
+                  if (k.organic_decay_rate > 0) active.push(`K-16:decay${(k.organic_decay_rate*100).toFixed(1)}%`)
+                  return active.map(tag => (
+                    <span key={tag} className="text-[8px] font-bold px-1.5 py-0.5 rounded-full bg-slate-700/80 border border-slate-600 text-slate-400">{tag}</span>
+                  ))
+                })()}
+              </div>
+              <div className="flex gap-2">
+                <button onClick={()=>downloadCSV(result.weekly_detail, `sim_weekly_${Date.now()}.csv`)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold bg-slate-800 border border-slate-600 rounded-lg text-slate-300 hover:bg-slate-700 transition">
+                  <Download className="w-3 h-3"/>CSV
+                </button>
+                <button onClick={()=>{
+                  const blob=new Blob([JSON.stringify(result,null,2)],{type:'application/json'})
+                  const url=URL.createObjectURL(blob); const a=document.createElement('a')
+                  a.href=url; a.download=`sim_report_${Date.now()}.json`
+                  document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url)
+                }} className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold bg-slate-800 border border-slate-600 rounded-lg text-slate-300 hover:bg-slate-700 transition">
+                  <Download className="w-3 h-3"/>JSON
+                </button>
+              </div>
             </div>
-            <SimStatsGrid s={result.simulation_summary}/>
-            <SystemHealth fm={result.simulation_summary.financial_metrics} sh={result.simulation_summary.system_health}/>
-            <LevelMatrix levelWise={result.simulation_summary.level_wise_metrics}/>
-            <SimCharts logs={result.cycle_logs}/>
-            <AiBrainCharts logs={result.cycle_logs}/>
+
+            {/* 6-tab report navigation */}
+            <div className="flex gap-1 flex-wrap mb-5">
+              {REPORT_TABS.map(t=>(
+                <button key={t.id} onClick={()=>setReportTab(t.id)}
+                  className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-colors ${
+                    reportTab===t.id
+                      ?'bg-violet-700 text-white'
+                      :'bg-slate-800 text-slate-400 border border-slate-700/60 hover:bg-slate-700/80'
+                  }`}>
+                  <span className="hidden sm:inline">{t.label}</span>
+                  <span className="sm:hidden">{t.short}</span>
+                </button>
+              ))}
+            </div>
+
+            {/* ── Tab: Summary ── */}
+            {reportTab==='summary'&&(
+              <div>
+                {/* L5/L6 peak warning strip */}
+                {result.simulation_summary.system_health?.max_l5_count>0&&(
+                  <div className="flex gap-2.5 p-3 mb-4 rounded-xl bg-red-950/30 border border-red-800/40 text-xs text-red-300">
+                    <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5"/>
+                    <span>
+                      <strong>Anti-Maturity Pressure Detected:</strong>&nbsp;
+                      L5 peak = {result.simulation_summary.system_health.max_l5_count},&nbsp;
+                      L6 peak = {result.simulation_summary.system_health.max_l6_count}.&nbsp;
+                      Longest high-LPI streak = {result.simulation_summary.system_health.max_high_lpi_streak_weeks} weeks.
+                      {result.simulation_summary.system_health.max_l6_count>=3&&' ⚠️ Pool pauses likely.'}
+                    </span>
+                  </div>
+                )}
+                <SimStatsGrid s={result.simulation_summary}/>
+                <SystemHealth fm={result.simulation_summary.financial_metrics} sh={result.simulation_summary.system_health}/>
+                <LevelMatrix levelWise={result.simulation_summary.level_wise_metrics}/>
+              </div>
+            )}
+
+            {/* ── Tab: Weekly Report ── */}
+            {reportTab==='weekly'&&(
+              <div>
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-xs text-slate-400">{result.weekly_detail?.length??0} weeks of data</p>
+                  <button onClick={()=>downloadCSV(result.weekly_detail, `sim_weekly_${Date.now()}.csv`)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold bg-slate-800 border border-slate-600 rounded-lg text-slate-300 hover:bg-slate-700 transition">
+                    <Download className="w-3 h-3"/>Export CSV
+                  </button>
+                </div>
+                <WeeklyReportTable rows={result.weekly_detail}/>
+              </div>
+            )}
+
+            {/* ── Tab: Pool Activity ── */}
+            {reportTab==='pools'&&(
+              <div>
+                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Active Pools · Pauses · Merges Per Week</p>
+                <PoolActivityChart logs={result.cycle_logs}/>
+                <div className="mt-4 grid grid-cols-3 gap-3">
+                  <StatPill label="Total Pools Formed" value={result.simulation_summary.total_pools_auto_scaled} accent="violet"/>
+                  <StatPill label="Total Condensations" value={result.simulation_summary.total_condensation_events} accent="amber"/>
+                  <StatPill label="Total Draw Pauses"  value={result.simulation_summary.total_draw_pauses_triggered} accent="red"/>
+                </div>
+              </div>
+            )}
+
+            {/* ── Tab: Draw Analysis ── */}
+            {reportTab==='draws'&&(
+              <div>
+                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Draw Type Breakdown Per Week</p>
+                <DrawAnalysisChart weekly={result.weekly_detail}/>
+                <div className="mt-4 grid grid-cols-4 gap-3">
+                  <StatPill label="Total Draws"  value={result.simulation_summary.total_winners_drawn/2} accent="blue"/>
+                  <StatPill label="SDE Exits"    value={result.simulation_summary.system_health?.total_sde_exits??0} accent="red"/>
+                  <StatPill label="Type A Draws" value={result.simulation_summary.system_health?.total_type_a_draws??0} accent="violet"/>
+                  <StatPill label="Type B Draws" value={result.simulation_summary.system_health?.total_type_b_draws??0} accent="amber"/>
+                </div>
+              </div>
+            )}
+
+            {/* ── Tab: Cash Flow ── */}
+            {reportTab==='cashflow'&&(
+              <div>
+                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Cash Inflow Breakdown Per Week</p>
+                <CashFlowChart weekly={result.weekly_detail}/>
+                <div className="mt-4 grid grid-cols-3 gap-3">
+                  <StatPill label="Total Collected" value={INR(result.simulation_summary.financial_metrics?.total_collected_inr??0)} accent="emerald"/>
+                  <StatPill label="Total Paid Out"  value={INR(result.simulation_summary.financial_metrics?.total_distributed_inr??0)} accent="red"/>
+                  <StatPill label="Net Float"       value={INR(result.simulation_summary.final_virtual_liquidity_float??0)} accent="blue"/>
+                </div>
+              </div>
+            )}
+
+            {/* ── Tab: Level Progression ── */}
+            {reportTab==='levels'&&(
+              <div>
+                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Member Level Distribution Over Time</p>
+                <LevelProgressionChart weekly={result.weekly_detail} logs={result.cycle_logs}/>
+                <div className="mt-4 grid grid-cols-3 gap-3">
+                  <StatPill label="L5 Peak" value={result.simulation_summary.system_health?.max_l5_count??0} accent={result.simulation_summary.system_health?.max_l5_count>0?'red':'slate'}/>
+                  <StatPill label="L6 Peak" value={result.simulation_summary.system_health?.max_l6_count??0} accent={result.simulation_summary.system_health?.max_l6_count>0?'red':'slate'}/>
+                  <StatPill label="High-LPI Streak" value={`${result.simulation_summary.system_health?.max_high_lpi_streak_weeks??0} wks`} accent={result.simulation_summary.system_health?.max_high_lpi_streak_weeks>=3?'amber':'slate'}/>
+                </div>
+              </div>
+            )}
+
+            {/* Classic charts always visible at bottom of Summary tab only */}
+            {reportTab==='summary'&&(
+              <>
+                <SimCharts logs={result.cycle_logs}/>
+                <AiBrainCharts logs={result.cycle_logs}/>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -688,6 +1474,32 @@ function InjectionTab({ toast }) {
   const [timedAutoPool, setTimedAutoPool] = useState(true)
   const [timedLoading, setTimedLoading] = useState(false)
   const [timedResult, setTimedResult] = useState(null)
+  // Background pool-formation polling
+  const [bgStatus, setBgStatus] = useState(null)   // null | {status, pools_formed, waitlist_remaining, error}
+  const [bgPrefix, setBgPrefix] = useState(null)   // prefix key to poll
+  const [bgPolling, setBgPolling] = useState(false)
+
+  // Auto-poll injection status while bg task is running (every 2s)
+  useEffect(() => {
+    if (!bgPrefix || bgStatus?.status === 'done' || bgStatus?.status === 'error') return
+    setBgPolling(true)
+    const id = setInterval(async () => {
+      try {
+        const res = await getInjectionStatus(bgPrefix)
+        setBgStatus(res.data)
+        if (res.data.status === 'done') {
+          toast(`Pool formation complete — ${res.data.pools_formed} pool(s) formed`, 'success')
+          setBgPolling(false)
+          clearInterval(id)
+        } else if (res.data.status === 'error') {
+          toast(`Pool formation error: ${res.data.error}`, 'error')
+          setBgPolling(false)
+          clearInterval(id)
+        }
+      } catch { /* ignore transient poll errors */ }
+    }, 2_000)
+    return () => { clearInterval(id); setBgPolling(false) }
+  }, [bgPrefix, bgStatus?.status]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleBulk = async () => {
     setLoading(true); setResult(null)
@@ -700,7 +1512,7 @@ function InjectionTab({ toast }) {
   }
 
   const handleTimed = async () => {
-    setTimedLoading(true); setTimedResult(null)
+    setTimedLoading(true); setTimedResult(null); setBgStatus(null); setBgPrefix(null)
     try {
       const params = {
         count: tCount,
@@ -712,7 +1524,14 @@ function InjectionTab({ toast }) {
       }
       const res = await devInjectTimed(params)
       setTimedResult(res.data)
-      toast(`${res.data.users_created} timed users injected`, 'success')
+      if (res.data.pool_formation === 'background' && res.data.status_key) {
+        // Large batch — pool formation running in background; start polling
+        setBgPrefix(res.data.status_key)
+        setBgStatus({ status: 'running', pools_formed: 0, waitlist_remaining: null, error: null })
+        toast(`${res.data.users_created.toLocaleString()} users injected — pool formation running…`, 'info')
+      } else {
+        toast(`${res.data.users_created.toLocaleString()} timed users injected`, 'success')
+      }
     } catch(err){ toast(err.response?.data?.detail??'Timed injection failed','error') }
     finally{ setTimedLoading(false) }
   }
@@ -778,12 +1597,38 @@ function InjectionTab({ toast }) {
             {timedResult&&<ResultBox>
               <div className="grid grid-cols-2 gap-3">
                 <StatPill label="Users Created" value={timedResult.users_created.toLocaleString('en-IN')} accent="cyan"/>
-                <StatPill label="Pools Formed"  value={timedResult.pools_formed} accent={timedResult.pools_formed>0?'blue':'slate'}/>
-                <StatPill label="Date From"      value={timedResult.date_from?new Date(timedResult.date_from).toLocaleDateString('en-IN'):'—'} accent="slate"/>
-                <StatPill label="Date To"        value={timedResult.date_to  ?new Date(timedResult.date_to  ).toLocaleDateString('en-IN'):'—'} accent="slate"/>
+                <StatPill label="Pools Formed"
+                  value={timedResult.pool_formation==='background' ? '…' : (timedResult.pools_formed??0)}
+                  accent={timedResult.pools_formed>0?'blue':'slate'}/>
+                <StatPill label="Date From" value={timedResult.date_from?new Date(timedResult.date_from).toLocaleDateString('en-IN'):'—'} accent="slate"/>
+                <StatPill label="Date To"   value={timedResult.date_to  ?new Date(timedResult.date_to  ).toLocaleDateString('en-IN'):'—'} accent="slate"/>
               </div>
               <p className="text-xs text-slate-400 mt-2 font-mono leading-relaxed">{timedResult.note}</p>
             </ResultBox>}
+
+            {/* Background pool-formation status banner */}
+            {bgStatus && (
+              <div className={`rounded-xl border px-4 py-3 text-xs font-mono ${
+                bgStatus.status === 'running' ? 'bg-amber-950/40 border-amber-700/50 text-amber-300' :
+                bgStatus.status === 'done'    ? 'bg-emerald-950/40 border-emerald-700/50 text-emerald-300' :
+                                                'bg-red-950/40 border-red-700/50 text-red-300'
+              }`}>
+                <div className="flex items-center gap-2">
+                  {bgStatus.status === 'running' && <Spinner className="w-3 h-3"/>}
+                  {bgStatus.status === 'done'    && <CheckCircle2 className="w-3.5 h-3.5"/>}
+                  {bgStatus.status === 'error'   && <XCircle className="w-3.5 h-3.5"/>}
+                  <span className="font-bold uppercase tracking-wider">{bgStatus.status}</span>
+                  {bgStatus.status === 'running' && <span className="text-amber-400 ml-1">— Pool formation in progress…</span>}
+                </div>
+                {bgStatus.status === 'done' && (
+                  <div className="mt-1.5 flex gap-4">
+                    <span>Pools formed: <span className="font-bold text-white">{bgStatus.pools_formed}</span></span>
+                    <span>Waitlist remaining: <span className="font-bold text-white">{(bgStatus.waitlist_remaining??'—').toLocaleString?.() ?? bgStatus.waitlist_remaining}</span></span>
+                  </div>
+                )}
+                {bgStatus.status === 'error' && <p className="mt-1 text-red-400">{bgStatus.error}</p>}
+              </div>
+            )}
           </div>
         </DevCard>
       </div>
@@ -792,496 +1637,9 @@ function InjectionTab({ toast }) {
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TAB 3 — LIVE STATS (production-grade real-time statistics, dark theme)
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── (LiveStatsTab, LevelMapTab, WinnersTab, ProjectionsTab removed — these
+//      tabs were consolidated into StressTestTab's 6-sub-tab report panel) ───
 
-const SCENARIO_BADGE = {
-  SUSTAINABLE_WAVE:'text-emerald-400 bg-emerald-950 border-emerald-800', BOOM_GOLDEN_CROSS:'text-blue-400 bg-blue-950 border-blue-800',
-  FLASH_FLOOD:'text-amber-400 bg-amber-950 border-amber-800', DRY_PHASE:'text-red-400 bg-red-950 border-red-800',
-  REFERRAL_LIFELINE:'text-violet-400 bg-violet-950 border-violet-800', NEUTRAL:'text-slate-400 bg-slate-800 border-slate-700',
-  VELOCITY_CLIFF:'text-orange-400 bg-orange-950 border-orange-800',
-}
-
-function LiveStatsTab({ toast }) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [refreshing, setRefreshing] = useState(false)
-  const [lastUp, setLastUp] = useState(null)
-
-  const fetch = useCallback(async (silent=false)=>{
-    if(!silent) setLoading(true); else setRefreshing(true)
-    try {
-      const res = await devLiveStats()
-      setData(res.data)
-      setLastUp(new Date())
-    } catch(err){ toast(err.response?.data?.detail??'Failed to load stats','error') }
-    finally{ setLoading(false); setRefreshing(false) }
-  },[toast])
-
-  useEffect(()=>{ fetch() },[fetch])
-
-  if(loading) return <div className="flex items-center justify-center h-64"><Spinner className="w-8 h-8 text-violet-400"/></div>
-  if(!data) return null
-
-  const lvlData = Object.entries(data.levels).map(([k,v])=>({ level:k, count:v }))
-  const LEVEL_COLORS = ['#94a3b8','#3b82f6','#8b5cf6','#f59e0b','#f97316','#ef4444']
-
-  return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <p className="text-xs text-slate-500">Last updated: {lastUp?.toLocaleTimeString()}</p>
-        <button onClick={()=>fetch(true)} disabled={refreshing} className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-xl text-xs text-slate-400 hover:text-slate-200 transition disabled:opacity-50">
-          <RefreshCw className={`w-3.5 h-3.5 ${refreshing?'animate-spin':''}`}/>Refresh
-        </button>
-      </div>
-
-      {/* User stats */}
-      <div>
-        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Users className="w-3.5 h-3.5"/>User Distribution</p>
-        <div className="grid grid-cols-5 gap-3">
-          <StatPill label="Active"    value={NUM(data.users.active)}    accent="emerald"/>
-          <StatPill label="Waitlist"  value={NUM(data.users.waitlist)}  accent="blue"/>
-          <StatPill label="Won"       value={NUM(data.users.won)}       accent="purple"/>
-          <StatPill label="Eliminated" value={NUM(data.users.unpaid)}  accent="red"/>
-          <StatPill label="Total"     value={NUM(data.users.total)}     accent="slate"/>
-        </div>
-      </div>
-
-      {/* Pools */}
-      <div>
-        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Layers className="w-3.5 h-3.5"/>Pool Overview</p>
-        <div className="grid grid-cols-4 gap-3">
-          <StatPill label="Active Pools"  value={data.pools.active}  accent="emerald"/>
-          <StatPill label="Paused Pools"  value={data.pools.paused}  accent="amber"/>
-          <StatPill label="Waiting"       value={data.pools.waiting} accent="blue"/>
-          <StatPill label="Total Pools"   value={data.pools.total}   accent="slate"/>
-        </div>
-      </div>
-
-      {/* Payment + LPI row */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div>
-          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><IndianRupee className="w-3.5 h-3.5"/>Weekly Payment Status</p>
-          <div className="bg-slate-800/40 border border-slate-700/50 rounded-2xl p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-slate-400">Paid members</span>
-              <span className="text-sm font-bold text-emerald-400">{NUM(data.payments.paid_in_pools)} ({data.payments.paid_pct}%)</span>
-            </div>
-            <div className="w-full h-3 bg-slate-700 rounded-full overflow-hidden">
-              <div className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-emerald-400 transition-all" style={{width:`${data.payments.paid_pct}%`}}/>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-slate-400">Unpaid members</span>
-              <span className="text-sm font-bold text-red-400">{NUM(data.payments.unpaid_in_pools)}</span>
-            </div>
-          </div>
-        </div>
-
-        <div>
-          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Cpu className="w-3.5 h-3.5"/>SDE / LPI State</p>
-          <div className="bg-slate-800/40 border border-slate-700/50 rounded-2xl p-4 grid grid-cols-2 gap-3">
-            <StatPill label="LPI"          value={`${data.sde.lpi}%`}          accent={data.sde.lpi>=25?'red':data.sde.lpi>=14?'amber':'emerald'}/>
-            <StatPill label="L4 Flagged"   value={data.sde.l4_flagged}          accent={data.sde.l4_flagged>0?'red':'slate'}/>
-            <StatPill label="AI Scenario"  value={data.ai.scenario.replace(/_/g,' ')} accent="purple"/>
-            <StatPill label="Velocity"     value={`${data.ai.velocity}/wk`}     accent="blue"/>
-          </div>
-        </div>
-      </div>
-
-      {/* Level distribution chart */}
-      <div>
-        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><BarChart3 className="w-3.5 h-3.5"/>Level Distribution (Active Members)</p>
-        <div className="bg-slate-800/40 border border-slate-700/50 rounded-2xl p-4">
-          <ResponsiveContainer width="100%" height={180}>
-            <BarChart data={lvlData} margin={{top:4,right:4,left:-20,bottom:4}}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.5} vertical={false}/>
-              <XAxis dataKey="level" tick={{fill:'#64748b',fontSize:11,fontWeight:700}} tickLine={false} axisLine={false}/>
-              <YAxis tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false} allowDecimals={false}/>
-              <RechartTooltip contentStyle={{background:'#1e293b',border:'1px solid #334155',borderRadius:8,fontSize:11}} labelStyle={{color:'#94a3b8'}}/>
-              <Bar dataKey="count" name="Members" radius={[4,4,0,0]} maxBarSize={40}>
-                {lvlData.map((e,i)=><Cell key={i} fill={LEVEL_COLORS[i%6]}/>)}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
-
-      {/* Financials */}
-      <div>
-        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><DollarSign className="w-3.5 h-3.5"/>Financial Snapshot</p>
-        <div className="grid grid-cols-3 gap-3">
-          <StatPill label="Total Collected" value={INR(data.financials.total_collected_inr)} accent="emerald"/>
-          <StatPill label="Total Paid Out"  value={INR(data.financials.total_paid_out_inr)}  accent="amber"/>
-          <StatPill label="Net Float"       value={INR(data.financials.net_float_inr)}        accent={data.financials.net_float_inr>=0?'cyan':'rose'}/>
-        </div>
-      </div>
-
-      {/* Recent draws */}
-      {data.draws.recent?.length>0&&(
-        <div>
-          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Activity className="w-3.5 h-3.5"/>Recent Draws ({data.draws.total} total · {data.draws.this_week} this week)</p>
-          <div className="overflow-x-auto rounded-xl border border-slate-700/60">
-            <table className="w-full text-xs whitespace-nowrap">
-              <thead className="bg-slate-800/80"><tr>{['Pool','Type','W1 Level','W1 Payout','W2 Level','W2 Payout','SDE','When'].map(h=><th key={h} className="text-left py-2.5 px-3 text-slate-400 text-[10px]">{h}</th>)}</tr></thead>
-              <tbody>
-                {data.draws.recent.map((d,i)=>(
-                  <tr key={d.draw_id} className={`border-b border-slate-800/60 ${i%2===0?'':'bg-slate-800/20'}`}>
-                    <td className="py-2.5 px-3 text-slate-300">#{d.pool_id}</td>
-                    <td className="py-2.5 px-3"><span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700 text-slate-300">{d.draw_type}</span></td>
-                    <td className="py-2.5 px-3"><span className="bg-purple-900/60 text-purple-300 px-1.5 py-0.5 rounded font-bold">L{d.w1_level}</span></td>
-                    <td className="py-2.5 px-3 text-emerald-400 font-bold">{INR(d.w1_payout)}</td>
-                    <td className="py-2.5 px-3"><span className="bg-purple-900/60 text-purple-300 px-1.5 py-0.5 rounded font-bold">L{d.w2_level}</span></td>
-                    <td className="py-2.5 px-3 text-emerald-400 font-bold">{INR(d.w2_payout)}</td>
-                    <td className="py-2.5 px-3">{d.sde?<span className="text-cyan-400 font-bold">SDE</span>:<span className="text-slate-600">—</span>}</td>
-                    <td className="py-2.5 px-3 text-slate-500">{d.timestamp?new Date(d.timestamp).toLocaleDateString('en-IN'):'—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TAB 4 — LEVEL MAP (visual pool-by-pool member level distribution)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const LEVEL_PILL = {
-  L1:'bg-slate-700 text-slate-300', L2:'bg-blue-900/80 text-blue-300',
-  L3:'bg-violet-900/80 text-violet-300', L4:'bg-amber-900/80 text-amber-300',
-  L5:'bg-orange-900/80 text-orange-300', L6:'bg-emerald-900/80 text-emerald-300',
-}
-
-function LevelMapTab({ toast }) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [filter, setFilter] = useState('all')  // all | l1 | l2 | l3 | l4
-  const [expanded, setExpanded] = useState(new Set())
-
-  const fetch = useCallback(async ()=>{
-    setLoading(true)
-    try{ const res=await devLevelMap(); setData(res.data) }
-    catch(err){ toast(err.response?.data?.detail??'Failed','error') }
-    finally{ setLoading(false) }
-  },[toast])
-
-  useEffect(()=>{ fetch() },[fetch])
-
-  const togglePool = id => setExpanded(prev=>{ const n=new Set(prev); n.has(id)?n.delete(id):n.add(id); return n })
-
-  if(loading) return <div className="flex items-center justify-center h-64"><Spinner className="w-8 h-8 text-violet-400"/></div>
-  if(!data) return null
-
-  const filteredPools = data.pools.filter(p=>{
-    if(filter==='all') return true
-    const lvlKey = filter.toUpperCase()
-    return (p.level_counts[lvlKey]||0) > 0
-  })
-
-  const summary = data.summary
-
-  return (
-    <div className="space-y-4">
-      {/* Summary row */}
-      <div className="grid grid-cols-7 gap-2">
-        {['L1','L2','L3','L4','L5','L6'].map((lk,i)=>(
-          <StatPill key={lk} label={lk} value={NUM(summary.by_level[lk]||0)} accent={['slate','blue','purple','amber','rose','emerald'][i]}/>
-        ))}
-        <StatPill label="Total Active" value={NUM(summary.total_active_members)} accent="slate"/>
-      </div>
-
-      {/* Filter + refresh */}
-      <div className="flex items-center gap-3">
-        <p className="text-[10px] text-slate-500 font-semibold uppercase tracking-widest">Show pools with:</p>
-        {['all','L1','L2','L3','L4'].map(f=>(
-          <button key={f} onClick={()=>setFilter(f.toLowerCase())}
-            className={`px-3 py-1.5 rounded-lg text-[11px] font-bold transition ${filter===f.toLowerCase()?'bg-violet-700 text-white':'bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-700'}`}>
-            {f==='all'?'All Pools':`${f} Members`}
-          </button>
-        ))}
-        <button onClick={fetch} className="ml-auto px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-[11px] text-slate-400 hover:text-slate-200 transition flex items-center gap-1.5">
-          <RefreshCw className="w-3 h-3"/>Refresh
-        </button>
-      </div>
-
-      <p className="text-[10px] text-slate-600">{filteredPools.length} of {data.pools.length} pools shown</p>
-
-      {/* Pool cards */}
-      {filteredPools.map(pool=>(
-        <div key={pool.id} className="bg-slate-900 border border-slate-700/60 rounded-2xl overflow-hidden">
-          {/* Pool header */}
-          <div className="flex items-center gap-3 px-5 py-3.5 cursor-pointer hover:bg-slate-800/40 transition" onClick={()=>togglePool(pool.id)}>
-            <ChevronRight className={`w-4 h-4 text-slate-500 flex-shrink-0 transition-transform ${expanded.has(pool.id)?'rotate-90':''}`}/>
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2">
-                <p className="font-bold text-slate-200 text-sm">{pool.name}</p>
-                <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border ${
-                  pool.status==='Active'?'bg-emerald-950 text-emerald-400 border-emerald-800':'bg-amber-950 text-amber-400 border-amber-800'
-                }`}>{pool.status}</span>
-                {pool.contains_l4&&<span className="text-[10px] px-2 py-0.5 rounded-full font-semibold bg-red-950 text-red-400 border border-red-800">⚠ L4 Flagged</span>}
-                {pool.draw_completed&&<span className="text-[10px] px-2 py-0.5 rounded-full font-semibold bg-blue-950 text-blue-400 border border-blue-800">Drawn</span>}
-              </div>
-              <p className="text-[10px] text-slate-500 mt-0.5">{pool.member_count}/12 members · {pool.pool_draw_type}</p>
-            </div>
-            {/* Level mini-bar */}
-            <div className="flex items-center gap-1">
-              {['L1','L2','L3','L4','L5','L6'].map((lk,i)=>{
-                const cnt = pool.level_counts[lk]||0
-                if(!cnt) return null
-                const colors=['#94a3b8','#3b82f6','#8b5cf6','#f59e0b','#f97316','#10b981']
-                return (
-                  <div key={lk} className="flex items-center gap-0.5">
-                    <span className="text-[9px] font-bold text-slate-500">{lk}</span>
-                    <span className="font-black text-xs" style={{color:colors[i]}}>{cnt}</span>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-
-          {/* Expanded member list */}
-          {expanded.has(pool.id)&&(
-            <div className="px-5 pb-4 pt-1">
-              <div className="grid grid-cols-1 gap-1">
-                {['L1','L2','L3','L4','L5','L6'].map(lk=>{
-                  const members = pool.members_by_level[lk]||[]
-                  if(!members.length) return null
-                  return (
-                    <div key={lk} className="flex items-start gap-3 py-2 border-t border-slate-800/60">
-                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded flex-shrink-0 mt-0.5 ${LEVEL_PILL[lk]}`}>{lk}</span>
-                      <div className="flex flex-wrap gap-1.5">
-                        {members.map(m=>(
-                          <div key={m.id} className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] border ${
-                            m.sde_required ? 'bg-red-950/60 border-red-800 text-red-300' :
-                            m.paid ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-300' :
-                            'bg-slate-800 border-slate-700 text-slate-400'
-                          }`}>
-                            <span className="font-mono font-semibold">@{m.username}</span>
-                            {m.sde_required&&<span className="text-red-400 font-black">SDE</span>}
-                            {!m.paid&&<span className="text-amber-400">UNPAID</span>}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-      ))}
-    </div>
-  )
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TAB 5 — WINNERS (level-wise analytics + amount distribution)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function WinnersTab({ toast }) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-
-  useEffect(()=>{
-    setLoading(true)
-    devWinnersAnalytics()
-      .then(r=>setData(r.data))
-      .catch(()=>toast('Failed to load winners','error'))
-      .finally(()=>setLoading(false))
-  },[toast])
-
-  if(loading) return <div className="flex items-center justify-center h-64"><Spinner className="w-8 h-8 text-violet-400"/></div>
-  if(!data) return null
-
-  const LEVEL_COLORS = ['#94a3b8','#3b82f6','#8b5cf6','#f59e0b','#f97316','#10b981']
-  const barData = data.by_level.map((d,i)=>({ level:`L${d.level}`, winners:d.winners, payout:d.total_payout_inr/1000, avg:d.avg_payout_inr/1000, fill:LEVEL_COLORS[i] }))
-
-  return (
-    <div className="space-y-6">
-      {/* Summary */}
-      <div className="grid grid-cols-4 gap-3">
-        <StatPill label="Total Winners"    value={NUM(data.summary.total_winners)}     accent="purple"/>
-        <StatPill label="Total Paid Out"   value={INR(data.summary.total_payout_inr)}  accent="amber"/>
-        <StatPill label="Avg Payout"       value={INR(data.summary.avg_payout_inr)}    accent="slate"/>
-        <StatPill label="SDE Exits"        value={NUM(data.summary.sde_exits)}         accent={data.summary.sde_exits>0?'cyan':'slate'}/>
-      </div>
-
-      {/* Bar chart — winners per level */}
-      <div>
-        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Trophy className="w-3.5 h-3.5"/>Winners per Level</p>
-        <div className="bg-slate-800/40 border border-slate-700/50 rounded-2xl p-4">
-          <ResponsiveContainer width="100%" height={200}>
-            <BarChart data={barData} margin={{top:4,right:4,left:-20,bottom:4}}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#334155" strokeOpacity={0.5} vertical={false}/>
-              <XAxis dataKey="level" tick={{fill:'#64748b',fontSize:11,fontWeight:700}} tickLine={false} axisLine={false}/>
-              <YAxis tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false} allowDecimals={false}/>
-              <RechartTooltip contentStyle={{background:'#1e293b',border:'1px solid #334155',borderRadius:8,fontSize:11}} labelStyle={{color:'#94a3b8'}} formatter={(v,n)=>[v,n==='payout'||n==='avg'?`₹${Number(v*1000).toLocaleString('en-IN')}`:v]}/>
-              <Legend wrapperStyle={{paddingTop:12,fontSize:11,color:'#94a3b8'}}/>
-              <Bar dataKey="winners" name="Winners" radius={[3,3,0,0]} maxBarSize={40}>{barData.map((e,i)=><Cell key={i} fill={e.fill}/>)}</Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
-
-      {/* Level-wise table */}
-      <div>
-        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><BarChart3 className="w-3.5 h-3.5"/>Level-Wise Distribution</p>
-        <div className="bg-slate-800/40 border border-slate-700/50 rounded-2xl overflow-hidden">
-          <table className="w-full text-xs">
-            <thead><tr className="border-b border-slate-700/60">{['Level','Winners','Total Payout','Avg Payout','SDE Winners','SDE %','% of Total'].map(h=>(
-              <th key={h} className="text-left px-4 py-3 text-[10px] font-semibold text-slate-500 uppercase tracking-widest">{h}</th>
-            ))}</tr></thead>
-            <tbody>
-              {data.by_level.map((d,i)=>{
-                const acc = LEVEL_ACCENT[`L${d.level}`] ?? LEVEL_ACCENT.L1
-                return (
-                  <tr key={d.level} className="border-b border-slate-700/30 hover:bg-slate-700/20 transition-colors">
-                    <td className="px-4 py-3"><span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold ${acc}`}>L{d.level}</span></td>
-                    <td className="px-4 py-3 tabular-nums text-slate-300 font-semibold">{NUM(d.winners)}</td>
-                    <td className="px-4 py-3 tabular-nums text-amber-400">{INR(d.total_payout_inr)}</td>
-                    <td className="px-4 py-3 tabular-nums text-slate-400">{INR(d.avg_payout_inr)}</td>
-                    <td className="px-4 py-3 tabular-nums text-cyan-400">{NUM(d.sde_winners)}</td>
-                    <td className="px-4 py-3 tabular-nums text-slate-500">{d.sde_pct}%</td>
-                    <td className="px-4 py-3 tabular-nums text-violet-300 font-semibold">{d.pct_of_total}%</td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Recent winners */}
-      {data.recent_winners?.length>0&&(
-        <div>
-          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Activity className="w-3.5 h-3.5"/>Recent Winners (last 20)</p>
-          <div className="overflow-x-auto rounded-xl border border-slate-700/60">
-            <table className="w-full text-xs whitespace-nowrap">
-              <thead className="bg-slate-800/80"><tr>{['Username','Level','Payout','Draw Type','SDE','Date'].map(h=><th key={h} className="text-left py-2.5 px-3 text-slate-400 text-[10px]">{h}</th>)}</tr></thead>
-              <tbody>
-                {data.recent_winners.map((w,i)=>(
-                  <tr key={`${w.draw_id}_${i}`} className={`border-b border-slate-800/60 ${i%2===0?'':'bg-slate-800/20'}`}>
-                    <td className="py-2.5 px-3 font-mono text-slate-300">@{w.username||'—'}</td>
-                    <td className="py-2.5 px-3"><span className="bg-purple-900/60 text-purple-300 px-1.5 py-0.5 rounded font-bold">L{w.level}</span></td>
-                    <td className="py-2.5 px-3 text-emerald-400 font-bold">{INR(w.payout_inr)}</td>
-                    <td className="py-2.5 px-3 text-[10px]"><span className="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded">{w.draw_type}</span></td>
-                    <td className="py-2.5 px-3">{w.sde?<span className="text-cyan-400 font-bold">SDE</span>:<span className="text-slate-600">—</span>}</td>
-                    <td className="py-2.5 px-3 text-slate-500">{w.timestamp?new Date(w.timestamp).toLocaleDateString('en-IN'):'—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TAB 6 — PROJECTIONS (next draw preview + pool formation forecast)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function ProjectionsTab({ toast }) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-
-  const fetch = useCallback(async ()=>{
-    setLoading(true)
-    try{ const r=await devProjection(); setData(r.data) }
-    catch(err){ toast(err.response?.data?.detail??'Failed','error') }
-    finally{ setLoading(false) }
-  },[toast])
-
-  useEffect(()=>{ fetch() },[fetch])
-
-  if(loading) return <div className="flex items-center justify-center h-64"><Spinner className="w-8 h-8 text-violet-400"/></div>
-  if(!data) return null
-
-  const t = data.totals
-
-  return (
-    <div className="space-y-6">
-      {/* Totals row */}
-      <div>
-        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Target className="w-3.5 h-3.5"/>Next Draw — Total Projections</p>
-        <div className="grid grid-cols-5 gap-3">
-          <StatPill label="Eligible Pools"   value={data.eligible_pools}                      accent="blue"/>
-          <StatPill label="Proj. Collection" value={INR(t.projected_collection_inr)}          accent="emerald"/>
-          <StatPill label="Proj. Payout"     value={INR(t.projected_payout_inr)}              accent="amber"/>
-          <StatPill label="Proj. Profit"     value={INR(t.projected_profit_inr)}              accent={t.projected_profit_inr>=0?'cyan':'rose'}/>
-          <StatPill label="Fee Income"       value={INR(t.fee_income_inr)}                     accent="purple"/>
-        </div>
-      </div>
-
-      {/* LPI post-draw */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div className="bg-slate-900 border border-slate-700/60 rounded-2xl p-4">
-          <p className="text-[10px] font-bold text-cyan-400 uppercase tracking-widest mb-3">LPI Projection (Post-Draw)</p>
-          <div className="grid grid-cols-2 gap-3">
-            <StatPill label="Current LPI"     value={`${data.post_draw_lpi.current_lpi}%`}   accent={data.post_draw_lpi.current_lpi>=25?'red':'emerald'}/>
-            <StatPill label="Est. Post-Draw"  value={`${data.post_draw_lpi.estimated_lpi}%`} accent={data.post_draw_lpi.estimated_lpi>=25?'amber':'emerald'}/>
-            <StatPill label="Current L4"      value={data.post_draw_lpi.current_l4}          accent="amber"/>
-            <StatPill label="New L4 After"    value={data.post_draw_lpi.total_new_l4_after}  accent={data.post_draw_lpi.total_new_l4_after>0?'red':'slate'}/>
-          </div>
-        </div>
-        <div className="bg-slate-900 border border-slate-700/60 rounded-2xl p-4">
-          <p className="text-[10px] font-bold text-violet-400 uppercase tracking-widest mb-3">Waitlist Pool Formation</p>
-          <div className="grid grid-cols-2 gap-3">
-            <StatPill label="Current Waitlist" value={data.waitlist_projection.current_waitlist} accent="blue"/>
-            <StatPill label="Threshold"         value={data.waitlist_projection.threshold}        accent="slate"/>
-            <StatPill label="Pools Can Form"    value={data.waitlist_projection.pools_can_form}   accent={data.waitlist_projection.pools_can_form>0?'emerald':'slate'}/>
-            <StatPill label="Remaining After"   value={data.waitlist_projection.waitlist_remaining} accent="slate"/>
-          </div>
-        </div>
-      </div>
-
-      {/* Per-pool projections */}
-      {data.pool_projections?.length>0&&(
-        <div>
-          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Layers className="w-3.5 h-3.5"/>Per-Pool Projections ({data.eligible_pools} eligible)</p>
-          <div className="overflow-x-auto rounded-xl border border-slate-700/60">
-            <table className="w-full text-xs whitespace-nowrap">
-              <thead className="bg-slate-800/80"><tr>{['Pool','Draw Type','Members','Lower Win','Upper Win','Proj. Payout','Collection','Profit','New L4+'].map(h=><th key={h} className="text-left py-2.5 px-3 text-slate-400 text-[10px]">{h}</th>)}</tr></thead>
-              <tbody>
-                {data.pool_projections.map((p,i)=>(
-                  <tr key={p.pool_id} className={`border-b border-slate-800/60 ${i%2===0?'':'bg-slate-800/20'}`}>
-                    <td className="py-2.5 px-3 font-bold text-slate-300">{p.pool_name}</td>
-                    <td className="py-2.5 px-3"><span className="text-[10px] bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded">{p.draw_type}</span></td>
-                    <td className="py-2.5 px-3 text-slate-400">{p.member_count}/12</td>
-                    <td className="py-2.5 px-3"><span className="bg-blue-900/60 text-blue-300 px-1.5 py-0.5 rounded font-bold">L{p.proj_lower_level}</span> <span className="text-slate-500 text-[10px]">{INR(p.proj_lower_payout)}</span></td>
-                    <td className="py-2.5 px-3"><span className="bg-amber-900/60 text-amber-300 px-1.5 py-0.5 rounded font-bold">L{p.proj_upper_level}</span> <span className="text-slate-500 text-[10px]">{INR(p.proj_upper_payout)}</span></td>
-                    <td className="py-2.5 px-3 text-amber-400 font-bold">{INR(p.proj_total_payout)}</td>
-                    <td className="py-2.5 px-3 text-emerald-400">{INR(p.proj_collection)}</td>
-                    <td className={`py-2.5 px-3 font-bold ${p.proj_profit>=0?'text-emerald-400':'text-red-400'}`}>{INR(p.proj_profit)}</td>
-                    <td className="py-2.5 px-3">{p.new_l4_after_draw>0?<span className="text-red-400 font-bold">+{p.new_l4_after_draw}</span>:<span className="text-slate-600">—</span>}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {data.eligible_pools===0&&(
-        <InfoBanner text="No eligible pools found. Pools need exactly 12 active members to be draw-eligible. Run Mass User Injection and fill vacancies first." accent="blue"/>
-      )}
-
-      <div className="flex justify-end">
-        <button onClick={fetch} className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-xl text-xs text-slate-400 hover:text-slate-200 transition">
-          <RefreshCw className="w-3 h-3"/>Refresh Projections
-        </button>
-      </div>
-    </div>
-  )
-}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1292,9 +1650,12 @@ function ControlsTab({ toast }) {
   const [masterPaidLoading, setMasterPaidLoading] = useState(false)
   const [masterPaidResult, setMasterPaidResult] = useState(null)
   // Payment scenario
+  // NOTE: lateFeeInr was removed (Phase 2-B) — it conflicted with the stress-test
+  // engine's late_fee_pct parameter.  Pre-Test Setup applies a fixed ₹50 default fee
+  // when applyLateFee=true.  The stress-test engine controls simulation-level late fees
+  // independently via its own "Late Fee %" and "Late Users Ratio %" controls.
   const [paidPct, setPaidPct] = useState(100)
   const [applyLateFee, setApplyLateFee] = useState(false)
-  const [lateFeeInr, setLateFeeInr] = useState(50)
   const [elimPct, setElimPct] = useState(0)
   const [scenarioLoading, setScenarioLoading] = useState(false)
   const [scenarioResult, setScenarioResult] = useState(null)
@@ -1312,7 +1673,14 @@ function ControlsTab({ toast }) {
   const handleScenario = async () => {
     setScenarioLoading(true); setScenarioResult(null)
     try {
-      const res = await devSetPaymentScenario({ paid_pct:paidPct, apply_late_fee:applyLateFee, late_fee_inr:lateFeeInr, eliminate_unpaid_pct:elimPct })
+      // late_fee_inr uses fixed ₹50 default when applyLateFee=true
+      // (the field is kept in the API for backward-compat but hidden from this UI)
+      const res = await devSetPaymentScenario({
+        paid_pct:             paidPct,
+        apply_late_fee:       applyLateFee,
+        late_fee_inr:         applyLateFee ? 50 : 0,
+        eliminate_unpaid_pct: elimPct,
+      })
       setScenarioResult(res.data)
       toast(res.data.message, paidPct<50?'warning':'success')
     } catch(err){ toast(err.response?.data?.detail??'Failed','error') }
@@ -1321,6 +1689,14 @@ function ControlsTab({ toast }) {
 
   return (
     <div className="space-y-6">
+      {/* Scope clarification banner */}
+      <div className="flex gap-2.5 p-3.5 rounded-xl bg-blue-950/30 border border-blue-800/40 text-xs text-blue-300 leading-relaxed">
+        <Info className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+        <span><strong>Pre-Test Setup</strong> writes to the live DB before the stress-test runs.
+        &nbsp;The Stress-Test engine's own <em>Late Fee %</em> and <em>Late Users Ratio %</em> controls
+        affect the in-memory simulation engine independently — they don't touch the DB.</span>
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
         {/* Master Paid Toggle */}
@@ -1347,7 +1723,7 @@ function ControlsTab({ toast }) {
         </DevCard>
 
         {/* Payment Scenario */}
-        <DevCard icon={Settings} iconBg="bg-blue-900/40 border border-blue-700/50" iconColor="text-blue-400" title="Payment Scenario" subtitle="Configure paid/unpaid/elimination ratios for testing">
+        <DevCard icon={Settings} iconBg="bg-blue-900/40 border border-blue-700/50" iconColor="text-blue-400" title="Payment Scenario" subtitle="Set DB payment state (paid %, late fees, elimination) before running">
           <div className="space-y-4">
             {/* Paid % slider */}
             <div>
@@ -1364,28 +1740,39 @@ function ControlsTab({ toast }) {
               </div>
             </div>
 
-            {/* Late fee */}
+            {/* Late fee toggle — no amount input (uses fixed ₹50 default) */}
             <div className={`rounded-xl border p-3.5 cursor-pointer select-none transition-colors ${applyLateFee?'bg-amber-950/30 border-amber-700/60':'bg-slate-800/50 border-slate-700/50'}`} onClick={()=>setApplyLateFee(v=>!v)}>
-              <div className="flex items-center justify-between mb-2">
-                <p className={`text-xs font-semibold ${applyLateFee?'text-amber-300':'text-slate-300'}`}>Apply Late Fee</p>
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className={`text-xs font-semibold ${applyLateFee?'text-amber-300':'text-slate-300'}`}>Apply Late Fee to Unpaid</p>
+                  <p className="text-[10px] text-slate-500 mt-0.5">Creates ₹50/member late-fee tokens for all unpaid members</p>
+                </div>
                 <Toggle checked={applyLateFee} onChange={()=>{}} label="Apply late fee"/>
               </div>
-              {applyLateFee&&<div className="mt-2" onClick={e=>e.stopPropagation()}>
-                <DevInput label="Late Fee Amount (₹)" type="number" min={0} step={10} value={lateFeeInr} onChange={e=>setLateFeeInr(Math.max(0,parseFloat(e.target.value)||0))}/>
-              </div>}
             </div>
 
-            {/* Elimination % */}
+            {/* Elimination % — granular 0.05–100% range (Phase 2-B) */}
             <div>
               <div className="flex items-center justify-between mb-2">
-                <label className="text-xs text-slate-400 font-medium">Eliminate Unpaid % <span className="text-slate-600">(of unpaid members)</span></label>
-                <div className={`border rounded-lg px-2.5 py-1 text-sm font-black ${elimPct>0?'bg-red-950 border-red-800 text-red-300':'bg-slate-800 border-slate-600 text-slate-500'}`}>{elimPct}%</div>
+                <label className="text-xs text-slate-400 font-medium">
+                  Eliminate Unpaid %&nbsp;<span className="text-slate-600">(of unpaid members)</span>
+                </label>
+                <div className={`border rounded-lg px-2.5 py-1 text-sm font-black tabular-nums ${
+                  elimPct>0?'bg-red-950 border-red-800 text-red-300':'bg-slate-800 border-slate-600 text-slate-500'
+                }`}>{elimPct.toFixed(2)}%</div>
               </div>
-              <input type="range" min={0} max={100} step={5} value={elimPct} onChange={e=>setElimPct(parseInt(e.target.value))}
+              {/* Fine-grained 0.05% steps — allows testing "eliminate 1 in 2000 members" */}
+              <input type="range" min={0} max={100} step={0.05} value={elimPct}
+                onChange={e=>setElimPct(parseFloat(e.target.value))}
                 className="w-full h-2 rounded-full appearance-none cursor-pointer"
-                style={{background:elimPct>0?`linear-gradient(to right,#ef4444 ${elimPct}%,#334155 ${elimPct}%)`:`linear-gradient(to right,#334155 0%,#334155 100%)`}}
+                style={{background:elimPct>0
+                  ?`linear-gradient(to right,#ef4444 ${elimPct}%,#334155 ${elimPct}%)`
+                  :`linear-gradient(to right,#334155 0%,#334155 100%)`}}
               />
-              {elimPct>0&&<InfoBanner text={`${elimPct}% of unpaid members will be permanently eliminated (Eliminated_Unpaid status). This cannot be undone without a DB reset.`} accent="red"/>}
+              <div className="flex justify-between text-[10px] text-slate-600 mt-1 select-none">
+                <span>0.05%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
+              </div>
+              {elimPct>0&&<InfoBanner text={`${elimPct.toFixed(2)}% of unpaid members will be permanently eliminated. This cannot be undone without a DB reset.`} accent="red"/>}
             </div>
 
             <button onClick={handleScenario} disabled={scenarioLoading}

@@ -82,8 +82,11 @@ export const eliminateUnpaid   = () => api.post('/admin/penalty/eliminate-unpaid
 export const getUsers = (params) => api.get('/users/', { params: { limit: 500, ...params } })
 
 // ── Admin User Directory ──────────────────────────────────────────────────────
+// Default limit 2000 — backend now supports up to 5000.  UserDirectory
+// renders with a "Load More" pattern; this covers even large stress-test
+// injections (2000+ users) in a single fetch without pagination overhead.
 export const getAdminUsers  = (params) =>
-  api.get('/admin/users', { params: { limit: 500, ...params } })
+  api.get('/admin/users', { params: { limit: 2000, ...params } })
 
 export const getAdminUser   = (userId) => api.get(`/admin/users/${userId}`)
 
@@ -219,6 +222,45 @@ export const advancedSimulationDev = (params) =>
     timeout: 120_000,   // 120 s — sufficient for 1000-cycle in-memory run
   })
 
+/**
+ * POST /dev/real-simulation — Zero-duplication Real-Strategy Stress-Test Engine
+ *
+ * Calls the ACTUAL production services (draw, SDE, waitlist, Brain 2/3/5) on an
+ * isolated in-memory SQLite database with mocked time (Chronos Engine).
+ *
+ * DRY guarantee: any rule change in production is automatically reflected.
+ * Returns the same schema as advancedSimulationDev for full frontend compatibility.
+ *
+ * @param {Object} params
+ * @param {number}  params.weeks                  1–200 (weekly draw cycles)
+ * @param {number}  params.users_per_week          new users per week (0–2000)
+ * @param {number}  params.initial_users           seed users before week 1 (≥12)
+ * @param {number}  params.organic_ratio           0.0–1.0 (Brain 3 RDR feed)
+ * @param {number}  params.late_users_ratio_pct    % who miss payment per week
+ * @param {number}  params.elim_pct_a              A: % of late payers directly eliminated
+ * @param {number}  params.grace_saver_pct_c       C: % of grace-eligible who survive
+ * @param {boolean} params.volatility_mode         random weekly inflow
+ * @param {number}  params.volatility_max_inflow   max inflow in volatility mode
+ * @param {string}  params.inflow_pattern          K-12: linear|sine|burst|step
+ * @param {number}  params.referral_burst_week     K-13: week for 2× referral surge (0=off)
+ * @param {number}  params.payment_shock_week      K-14: week for payment shock (0=off)
+ * @param {number}  params.waitlist_dropout_pct    K-15: % of waitlist who drop out (0–50)
+ * @param {number}  params.organic_decay_rate      K-16: weekly organic ratio decay (0–1)
+ * @param {string}  params.simulation_label        K-17: label for multi-run comparison
+ */
+export const realSimulationDev = (params) =>
+  api.post('/dev/real-simulation', params, {
+    timeout: 600_000,   // 10 min — real DB ops per cycle are slower than in-memory
+  })
+
+/** GET /admin/draw/live-stream — Server-Sent Events for real-time draw monitoring (U-05) */
+export const getDrawLiveStream = (token) => {
+  const url = `${BASE_URL}/admin/draw/live-stream`
+  // Uses fetch-event-source pattern: returns a URL + headers so callers can
+  // use @microsoft/fetch-event-source or eventsource-parser with auth.
+  return { url, headers: { Authorization: `Bearer ${token}` } }
+}
+
 // ── Winners History & AI Snapshot ────────────────────────────────────────────
 
 /**
@@ -282,6 +324,62 @@ export const getDrawCountdown = () =>
 export const getBrain5Lpi = () =>
   api.get('/admin/stats/brain5-lpi')
 
+/** GET /admin/health — System health watchdog: DB pool, user/pool counts, last draw */
+export const getSystemHealth = () =>
+  api.get('/admin/health')
+
+/** GET /admin/pipeline-health — Full pipeline health: DB pool + injection tasks + integrity */
+export const getPipelineHealth = () =>
+  api.get('/admin/pipeline-health')
+
+// ── Payment Compliance & Elimination Engine ────────────────────────────────────
+
+/** GET /admin/elimination/settings — all 8 elimination config settings */
+export const getEliminationSettings = () =>
+  api.get('/admin/elimination/settings')
+
+/** PUT /admin/elimination/settings — update settings (admin password required) */
+export const updateEliminationSettings = (data) =>
+  api.put('/admin/elimination/settings', data)
+
+/** GET /admin/elimination/late-payers — all unpaid active members */
+export const getLatePayers = (params = {}) =>
+  api.get('/admin/elimination/late-payers', { params })
+
+/** GET /admin/elimination/at-risk — members past due date, not in grace */
+export const getAtRiskUsers = (params = {}) =>
+  api.get('/admin/elimination/at-risk', { params })
+
+/** GET /admin/elimination/grace-period — members in grace period window */
+export const getGracePeriodUsers = () =>
+  api.get('/admin/elimination/grace-period')
+
+/** GET /admin/elimination/history — EliminationEvent audit log */
+export const getEliminationHistory = (params = {}) =>
+  api.get('/admin/elimination/history', { params })
+
+/** POST /admin/elimination/mark-at-risk — flag all unpaid-past-due users */
+export const markAtRisk = () =>
+  api.post('/admin/elimination/mark-at-risk')
+
+/** POST /admin/elimination/grant-grace/:uid — move user to grace period */
+export const grantGracePeriod = (uid, hours = 48) =>
+  api.post(`/admin/elimination/grant-grace/${uid}`, { hours_until_expiry: hours })
+
+/** POST /admin/elimination/save-seat/:uid — confirm grace payment received */
+export const saveSeat = (uid, adminPassword, notes = undefined) =>
+  api.post(`/admin/elimination/save-seat/${uid}`, {
+    admin_password: adminPassword,
+    ...(notes ? { notes } : {}),
+  })
+
+/** POST /admin/elimination/execute — run elimination cycle */
+export const executeElimination = (adminPassword, dryRun = false) =>
+  api.post('/admin/elimination/execute', {
+    admin_password: adminPassword,
+    dry_run: dryRun,
+  })
+
 // ── Developer Mode — new analytics endpoints ──────────────────────────────────
 
 /** GET /dev/live-stats — Combined real-time statistics for dev panel */
@@ -300,9 +398,16 @@ export const devWinnersAnalytics = () =>
 export const devProjection = () =>
   api.get('/dev/projection')
 
-/** POST /dev/inject-timed — Inject users with custom date/time distribution */
+/** POST /dev/inject-timed — Inject users with custom date/time distribution.
+ *  Pool formation now runs in background for count > 100; response returns
+ *  immediately (~1s).  Poll getInjectionStatus(prefix) for pool-formation progress.
+ */
 export const devInjectTimed = (params) =>
-  api.post('/dev/inject-timed', params, { timeout: 60_000 })
+  api.post('/dev/inject-timed', params, { timeout: 120_000 })
+
+/** GET /dev/injection-status?prefix=<prefix> — Poll background pool-formation status */
+export const getInjectionStatus = (prefix) =>
+  api.get('/dev/injection-status', { params: { prefix } })
 
 /** POST /dev/mark-all-paid — Master paid toggle for all active pool members */
 export const devMarkAllPaid = () =>
@@ -311,6 +416,22 @@ export const devMarkAllPaid = () =>
 /** POST /dev/set-payment-scenario — Set paid/late/elimination percentages */
 export const devSetPaymentScenario = (params) =>
   api.post('/dev/set-payment-scenario', params)
+
+/** GET /admin/stats/pause-calendar — rolling 90-day system pause heatmap */
+export const getPauseCalendar = () =>
+  api.get('/admin/stats/pause-calendar')
+
+/** GET /admin/stats/weekly-pool-reports — per-week draw & pool activity report */
+export const getWeeklyPoolReports = (weeks = 24) =>
+  api.get('/admin/stats/weekly-pool-reports', { params: { weeks } })
+
+/** GET /admin/stats/referral-trend — weekly RDR% trend for S-04 Referral Heatmap */
+export const getReferralTrend = (weeks = 52) =>
+  api.get('/admin/stats/referral-trend', { params: { weeks } })
+
+/** GET /admin/stats/winner-level-trend — weekly winner level breakdown for S-03 panel */
+export const getWinnerLevelTrend = (weeks = 24) =>
+  api.get('/admin/stats/winner-level-trend', { params: { weeks } })
 
 // ── System Settings ───────────────────────────────────────────────────────────
 

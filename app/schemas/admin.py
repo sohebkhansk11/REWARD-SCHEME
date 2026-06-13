@@ -77,6 +77,14 @@ class AdminUserListItem(BaseModel):
     referred_by_user_id:            Optional[int]
     total_referrals_count:          int     = 0
     accumulated_referral_bonus_inr: Decimal = Decimal("0")
+    # Phase 4: IRCTC-style dynamic waitlist position
+    # Null for Active/Eliminated users; "WL-60" string for Waitlist users.
+    # Computed via ROW_NUMBER() window function — always live, never stale.
+    wl_position:                    Optional[str] = None   # e.g. "WL-60" | null
+    # Compliance flags (Phase 1)
+    sde_required:                   bool    = False
+    elimination_risk:               bool    = False
+    grace_active:                   bool    = False
 
     model_config = {"from_attributes": True}
 
@@ -175,6 +183,27 @@ class ThresholdResponse(BaseModel):
     """Response body for GET / PUT /admin/settings/threshold."""
     pool_creation_threshold: int
     message:                 str
+
+
+class UpdateReferralRewardRequest(BaseModel):
+    """PUT /admin/settings/referral-reward — change the per-referral reward amount."""
+    new_amount_inr: int = Field(
+        ..., ge=0, le=10000,
+        description=(
+            "Per-referral reward credited in INR when a referred user enters an active pool "
+            "(Rule 39).  Range: 0 (disabled) – ₹10,000.  Default: ₹250."
+        ),
+    )
+    admin_password: str = Field(
+        ...,
+        description="Current admin account password — required to authorise this financial change.",
+    )
+
+
+class ReferralRewardResponse(BaseModel):
+    """Response body for GET / PUT /admin/settings/referral-reward."""
+    referral_reward_inr: int
+    message:             str
 
 
 class DeleteUserResponse(BaseModel):

@@ -10,8 +10,13 @@ from app.models.weekly_draw_state import WeeklyDrawState
 from app.models.sde_session       import SDESession, SDECheckpoint
 from app.models.system_lock       import SystemLock
 
+# ── Phase 1: Elimination & Grace Period engine ────────────────────────────────
+from app.models.elimination_event import EliminationEvent, EliminationReason
+
 __all__ = [
     "Pool", "User", "Token", "Admin", "SystemSettings", "DrawHistory",
     # SDE architecture
     "WeeklyDrawState", "SDESession", "SDECheckpoint", "SystemLock",
+    # Elimination engine
+    "EliminationEvent", "EliminationReason",
 ]

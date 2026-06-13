@@ -26,7 +26,9 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+import threading
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, insert as sa_insert, text
 from sqlalchemy.orm import Session
@@ -49,6 +51,23 @@ router = APIRouter(
     tags=["Developer Mode"],
     dependencies=[Depends(require_dev_mode)],
 )
+
+# ── Injection Background Task Registry ───────────────────────────────────────
+# Tracks the status of timed-injection pool-formation jobs that run after the
+# HTTP response is returned.  Keyed by `prefix` (unique per injection call).
+# Thread-safe via threading.Lock since FastAPI may serve concurrent requests.
+#
+# Schema per entry:
+#   {
+#     "status":       "running" | "done" | "error",
+#     "pools_formed": int,
+#     "waitlist_remaining": int,
+#     "error":        str | None,
+#     "started_at":   datetime ISO,
+#     "finished_at":  datetime ISO | None,
+#   }
+_INJECT_STATUS: dict[str, dict] = {}
+_INJECT_LOCK   = threading.Lock()
 
 # Rows per executemany batch — keeps individual SQL statements a manageable size
 _BULK_BATCH = 5_000
@@ -646,24 +665,7 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
         db.execute(sa_insert(Token), token_rows[start : start + _BULK_BATCH])
     db.commit()
 
-    # ── Auto-form pools ───────────────────────────────────────────────────────
-    pools_formed = 0
-    if body.auto_pool:
-        # Step 1: fill existing pool vacancies before creating new pools.
-        # This fixes any under-capacity active pools (e.g. after eliminations)
-        # regardless of the AUTO_POOL_CREATION_ENABLED toggle state.
-        fill_pool_vacancies(db)
-
-        # Step 2: create new pools while ≥ NEW_POOL_INTAKE paid members remain.
-        # Use manual_create_pool (ignores the toggle) so this dev tool works
-        # whether auto-creation is ON or OFF.
-        while True:
-            new_pool = manual_create_pool(db)
-            if not new_pool:
-                break
-            pools_formed += 1
-
-    # ── Count remaining waitlist users ────────────────────────────────────────
+    # ── Count remaining waitlist users (before pool formation) ───────────────
     waitlist_remaining = (
         db.query(User)
         .filter(User.status == UserStatus.Waitlist)
@@ -672,20 +674,90 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
-    live_threshold = get_pool_threshold(db)
-    if pools_formed:
+    # ── Auto-form pools — runs in BACKGROUND to avoid HTTP timeout ────────────
+    #
+    # CRITICAL FIX: the while-True pool formation loop was previously executed
+    # synchronously inside this HTTP handler.  For large injections (10,000+
+    # users → 800+ pools), the loop could run for 30–120 s, causing:
+    #   1. HTTP client timeout → connection closed, but thread keeps running.
+    #   2. Abandoned thread holds DB connections → subsequent requests starve.
+    #
+    # Fix: the _INJECT_STATUS dict and _INJECT_LOCK were ALREADY DEFINED for this
+    # purpose (lines 55–70 in this file) but were never wired up.  We now:
+    #   • Immediately return HTTP 200 with the prefix (job ID).
+    #   • Spawn pool formation in a daemon thread so the HTTP connection closes.
+    #   • Poll via GET /dev/injection-status/{prefix} to track progress.
+    #
+    # Thread safety: _INJECT_LOCK guards all reads/writes to _INJECT_STATUS.
+    # The background thread opens its own DB session (SessionLocal()) rather
+    # than reusing the request session (which closes when the handler returns).
+
+    if body.auto_pool:
+        # Register job as "running" BEFORE spawning so poll can see it instantly
+        with _INJECT_LOCK:
+            _INJECT_STATUS[prefix] = {
+                "status":             "running",
+                "pools_formed":       0,
+                "waitlist_remaining": waitlist_remaining,
+                "error":              None,
+                "started_at":         datetime.now(timezone.utc).isoformat(),
+                "finished_at":        None,
+            }
+
+        def _bg_pool_formation(job_prefix: str) -> None:
+            """
+            Background pool-formation job.  Runs in a daemon thread.
+            Opens its own DB session — the request session has already closed.
+            """
+            from app.database import SessionLocal
+            bg_db = SessionLocal()
+            pools_formed_bg = 0
+            try:
+                fill_pool_vacancies(bg_db)
+                while True:
+                    new_pool = manual_create_pool(bg_db)
+                    if not new_pool:
+                        break
+                    pools_formed_bg += 1
+
+                wl_remaining_bg = (
+                    bg_db.query(User)
+                    .filter(User.status == UserStatus.Waitlist)
+                    .count()
+                )
+                with _INJECT_LOCK:
+                    _INJECT_STATUS[job_prefix].update({
+                        "status":             "done",
+                        "pools_formed":       pools_formed_bg,
+                        "waitlist_remaining": wl_remaining_bg,
+                        "finished_at":        datetime.now(timezone.utc).isoformat(),
+                    })
+            except Exception as exc:
+                with _INJECT_LOCK:
+                    _INJECT_STATUS[job_prefix].update({
+                        "status":    "error",
+                        "error":     str(exc),
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                    })
+            finally:
+                bg_db.close()
+
+        import threading as _th
+        t = _th.Thread(target=_bg_pool_formation, args=(prefix,), daemon=True)
+        t.start()
+
         note = (
             f"{len(user_ids)} users + {len(user_ids)} DEP tokens created "
-            f"(sequential join_dates, bcrypt passwords). "
-            f"{pools_formed} pool(s) auto-formed. "
-            f"{waitlist_remaining} users still on waitlist — "
-            f"run POST /dev/force-draw to draw from the new pool(s)."
+            f"({elapsed_ms} ms). Pool formation running in background — "
+            f"poll GET /dev/injection-status/{prefix} for progress."
         )
+        pool_formation_info = "background"
     else:
+        pool_formation_info = "skipped"
         note = (
             f"{len(user_ids)} users + {len(user_ids)} DEP tokens created "
             f"(sequential join_dates, bcrypt passwords). "
-            f"No pools formed yet (threshold: {live_threshold} paid waitlist users needed). "
+            f"auto_pool=False — no pool formation triggered. "
             f"Call POST /admin/waitlist/check when ready."
         )
 
@@ -693,11 +765,60 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
         users_created=len(user_ids),
         dep_tokens_created=len(user_ids),
         prefix=prefix,
-        pools_formed=pools_formed,
+        pools_formed=0,           # always 0 in response — formation is async now
         waitlist_remaining=waitlist_remaining,
         elapsed_ms=elapsed_ms,
         note=note,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dev/injection-status/{prefix}
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/injection-status/{prefix}")
+def injection_status(prefix: str):
+    """
+    Poll the background pool-formation job started by POST /dev/simulate-users.
+
+    Returns the current status of the job keyed by `prefix` (returned in the
+    simulate-users response).
+
+    Status values:
+      "running"  — pool formation in progress
+      "done"     — completed successfully
+      "error"    — failed; see `error` field for details
+
+    The _INJECT_STATUS dict is process-local — it is NOT persisted across
+    server restarts.  If the server restarts mid-job, the status entry will
+    be absent and this endpoint returns 404.
+
+    Usage pattern:
+      POST /dev/simulate-users  → prefix=dev_user_1234_...
+      loop:  GET /dev/injection-status/{prefix}  every 2s
+             break when status == "done" or "error"
+    """
+    with _INJECT_LOCK:
+        entry = _INJECT_STATUS.get(prefix)
+
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No injection job found for prefix '{prefix}'. "
+                "The server may have restarted, or auto_pool=False was used."
+            ),
+        )
+
+    return {
+        "prefix":             prefix,
+        "status":             entry["status"],
+        "pools_formed":       entry["pools_formed"],
+        "waitlist_remaining": entry["waitlist_remaining"],
+        "error":              entry["error"],
+        "started_at":         entry["started_at"],
+        "finished_at":        entry["finished_at"],
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -861,13 +982,35 @@ class AdvancedSimRequest(BaseModel):
         ..., ge=1, le=1000,
         description="Number of consecutive weekly cycles to simulate (1–1000)",
     )
+    # ── B parameter: Late Fee Rate (% of ₹1000 deposit per day) ──────────────
     late_fee_pct: float = Field(
-        5.0, ge=0.0,
-        description="Late fee as % of the ₹1,000 weekly installment",
+        5.0, ge=5.0,
+        description=(
+            "B parameter: Late fee per day as % of ₹1,000 deposit (minimum 5% = ₹50/day). "
+            "Higher B → fewer members attempt grace period (C decreases as B increases)."
+        ),
     )
+    # ── Late defaulters ratio (feeds A + C pool) ──────────────────────────────
     late_users_ratio_pct: float = Field(
         2.0, ge=0.0, le=100.0,
-        description="Percentage of active pool members defaulting on payment each cycle",
+        description="% of active pool members who miss the payment due date each cycle",
+    )
+    # ── A parameter: Direct Elimination % ────────────────────────────────────
+    elim_pct_a: float = Field(
+        80.0, ge=0.05, le=100.0,
+        description=(
+            "A parameter: % of late members who are directly eliminated (skip grace period). "
+            "Remaining (100-A)% enter the grace period and are eligible for C."
+        ),
+    )
+    # ── C parameter: Grace Saver % ────────────────────────────────────────────
+    grace_saver_pct_c: float = Field(
+        15.0, ge=0.05, le=100.0,
+        description=(
+            "C parameter: % of grace-eligible members who actually pay the grace fee "
+            "(seat-save fee + accumulated late fees). "
+            "Circular: B cost reduces C willingness; lower B → higher C."
+        ),
     )
     volatility_mode: bool = Field(
         False,
@@ -985,6 +1128,7 @@ class _AdvSimEngine:
         self.n_scaled    = 0
         self.n_condensed = 0
         self.n_paused    = 0
+        self._elim = 0        # total eliminations across all cycles (A-path + grace-expired)
         self._dep  = Decimal("0")
         self._pay  = Decimal("0")
         self._late = Decimal("0")
@@ -1001,6 +1145,28 @@ class _AdvSimEngine:
         self.n_sde_exits:    int = 0   # SDE-guaranteed exits executed
         self.n_type_a_draws: int = 0   # Type A draw executions (LPI 14-25%)
         self.n_type_b_draws: int = 0   # Type B draw executions (L1/L2 shortage)
+
+        # ── L5/L6 peak tracking (Anti-Maturity pressure metrics) ──────────────
+        # Tracks the maximum L5 and L6 member counts seen in any single cycle.
+        # Used by the Stress Test panel to show heavy pressure accumulation.
+        self._max_l5:        int = 0   # peak L5 member count across all cycles
+        self._max_l6:        int = 0   # peak L6 member count across all cycles
+        self._high_lpi_streak: int = 0   # consecutive cycles with LPI > 40%
+        self._max_high_lpi_streak: int = 0   # longest high-LPI streak seen
+
+        # ── SDE Extension event counters (A-1: WHY members reach L5/L6) ────────
+        # l5_escalation_events: times an L5 member was found in a pool (Ext-II draw)
+        # l6_escalation_events: times an L6 member was found in a pool (Ext-III draw)
+        # accel_diss_events:    times accelerated dissolution triggered (≥60% L4+)
+        # Escalation root cause: accelerated dissolution surviving L4s advance → L5
+        self._l5_escalation_events:   int = 0
+        self._l6_escalation_events:   int = 0
+        self._accel_diss_events:       int = 0
+
+        # ── Weekly detail log (for Master Weekly Report, Phase 2-C) ──────────
+        # Each element is a rich per-cycle record emitted by run_cycle().
+        # Stored here so the endpoint can return it alongside simulation_summary.
+        self.weekly_detail: list[dict] = []
 
         self.logs: list[dict] = []
         self._ins:  list[dict] = []   # pending DB-insert buffer
@@ -1097,24 +1263,92 @@ class _AdvSimEngine:
         self._inflow_history.append(n)  # record for velocity calculations
         return n
 
-    # ── Step B — Ratio Penalty Application ────────────────────────────────────
+    # ── Step B — Ratio Penalty Application (A/B/C Circular Model) ──────────────
 
-    def step_b(self, late_fee_pct: float, late_ratio_pct: float) -> int:
+    def step_b(
+        self,
+        late_fee_pct:      float,
+        late_ratio_pct:    float,
+        elim_pct_a:        float = 80.0,
+        grace_saver_pct_c: float = 15.0,
+    ) -> dict:
         """
-        Randomly select late_ratio_pct% of active pool members, mark them
-        Late (unpaid this week), and accumulate the virtual penalty.
+        Circular A/B/C late-payment model:
+
+        A (elim_pct_a):        % of late members directly eliminated (skip grace period).
+        B (late_fee_pct):      Late fee per day as % of ₹1000 deposit. Minimum 5% = ₹50/day.
+                               Higher B → fewer members attempt grace (C follows B inversely).
+        C (grace_saver_pct_c): % of grace-eligible members who actually pay the grace fee.
+
+        Flow:
+          1. Select late_ratio_pct% of active pool members as "late".
+          2. Of those: A% are directly eliminated (they skip grace entirely).
+          3. Remaining (100-A)% enter grace period.
+          4. Of grace-eligible: C% pay grace fee + late fees → seat saved.
+          5. Remaining grace-eligible who don't pay → also eliminated.
+
+        Revenue:
+          - Late fees collected = C% of grace-eligible * daily fee * avg_days_late
+          - Grace seat-save fee (₹500 proxy) collected from C%
+
+        Returns dict of {n_late, n_direct_elim, n_grace_eligible, n_grace_saved, n_grace_elim}
         """
         pool_mbrs = [u for u in self._users.values()
                      if u.alive and u.pool_sid is not None]
-        n_late    = int(len(pool_mbrs) * late_ratio_pct / 100.0)
+        n_pool    = len(pool_mbrs)
+        n_late    = int(n_pool * late_ratio_pct / 100.0)
         if not n_late:
-            return 0
-        late_sel  = random.sample(pool_mbrs, min(n_late, len(pool_mbrs)))
-        fee_each  = _S_DEP * Decimal(str(late_fee_pct)) / Decimal("100")
+            return {"n_late": 0, "n_direct_elim": 0, "n_grace_eligible": 0,
+                    "n_grace_saved": 0, "n_grace_elim": 0}
+
+        late_sel      = random.sample(pool_mbrs, min(n_late, len(pool_mbrs)))
+        n_actual_late = len(late_sel)
+
+        # B — Late fee accumulation (proxy: 3 days late on average)
+        avg_days_late = 3.0
+        fee_each      = _S_DEP * Decimal(str(late_fee_pct)) / Decimal("100") * Decimal(str(avg_days_late))
+        grace_seat_fee = Decimal("500")  # proxy for ₹500 grace seat-save fee
+
         for u in late_sel:
-            u.late      = True
-            self._late += fee_each
-        return len(late_sel)
+            u.late = True
+
+        # A — Direct elimination
+        n_direct_elim   = max(0, int(n_actual_late * elim_pct_a / 100.0))
+        direct_elim_sel = late_sel[:n_direct_elim]
+        grace_eligible  = late_sel[n_direct_elim:]
+
+        # Eliminate directly (A path)
+        for u in direct_elim_sel:
+            u.alive = False
+            self._elim += 1
+            # Late fees are forfeited — NOT collected (user never paid)
+
+        # C — Grace period saving
+        n_grace_elg   = len(grace_eligible)
+        n_grace_saved = max(0, int(n_grace_elg * grace_saver_pct_c / 100.0))
+        grace_saved   = grace_eligible[:n_grace_saved]
+        grace_elim    = grace_eligible[n_grace_saved:]
+
+        # Grace savers: collect late fees + grace seat-save fee (REVENUE)
+        for u in grace_saved:
+            u.late  = False   # paid, seat saved
+            u.paid  = True
+            self._late      += fee_each          # late fee collected (B parameter)
+            self._late      += grace_seat_fee    # seat-save fee also collected as revenue
+
+        # Grace non-payers: eliminated
+        for u in grace_elim:
+            u.alive = False
+            self._elim += 1
+            # Forfeited: late fees NOT collected
+
+        return {
+            "n_late":          n_actual_late,
+            "n_direct_elim":   n_direct_elim,
+            "n_grace_eligible":n_grace_elg,
+            "n_grace_saved":   n_grace_saved,
+            "n_grace_elim":    len(grace_elim),
+        }
 
     # ── Step C — Auto Billing + Weekly Installment Collection ────────────────
 
@@ -1269,16 +1503,24 @@ class _AdvSimEngine:
 
     def step_e(self) -> tuple[int, int]:
         """
-        Architecture-accurate draw router — mirrors Brain 5 production logic.
+        Architecture-accurate draw router — mirrors ALL Brain 5 production logic.
 
-        For each Active pool with exactly 12 members, the draw type is chosen:
-          1. SDE draw  : pool has sde_required members → oldest L4 exits guaranteed
-          2. Type A    : LPI 14–25% + L3/L4 present + L1/L2 available
-          3. Type B    : LPI ≥ 14% + L3/L4 present + NO L1/L2 (shortage)
-          4. Regular   : default — L1-3 lower / L4-6 upper; edge-case L1-3 only
+        Faithfully implements the FULL decision tree (same rules/thresholds as production):
+          0. SDE Ext-III: L6 member found → both winners from L6 tier (upper) + L1-L5 (lower)
+             → guaranteed L6 forced exit; runs BEFORE any other draw type
+          1. SDE Ext-II:  L5 member found → both winners: upper=L5, lower=L1-L4
+             → guaranteed L5 forced exit; runs after Ext-III check
+          2. SDE draw:    sde_required (L4) → oldest L4 exits guaranteed; lower=L1-L2 preferred
+          3. Accelerated dissolution: ≥60% L4+ → both winners from L4+; dissolve if <8 remain
+          4. Type A draw: LPI 14–25% + L3/L4 + L1/L2 available
+          5. Type B draw: LPI ≥ 14% + L3/L4 + NO L1/L2 (shortage)
+          6. Regular draw: L1-3 lower / L4-6 upper (default)
 
-        After each draw: survivors advance +1 level; new L4 arrivals are
-        flagged sde_required=True to guarantee their exit in a future draw.
+        L5/L6 escalation tracking (A-1: WHY members reach L5/L6):
+          Members reach L5/L6 when SDE is unable to process them due to:
+            - Pool being paused (insufficient members)
+            - Insufficient lower-tier members to match with the L4 for SDE
+          The simulation now runs Ext-II/III to catch these cases BEFORE they accumulate.
         """
         draws = new_pauses = 0
         lpi   = self._calc_lpi()
@@ -1289,7 +1531,13 @@ class _AdvSimEngine:
         ):
             members = self._mbrs(pool.sid)
 
-            # ── Safestop ──────────────────────────────────────────────────────
+            # ── Safestop — pool must have exactly POOL_CAPACITY (12) members to draw ─
+            # Members only advance level when they survive a draw.
+            # Under-capacity pools never draw, so members inside cannot advance.
+            # L5/L6 escalation therefore only occurs via accelerated dissolution:
+            #   → pool with ≥60% L4+ draws both winners from L4+
+            #   → surviving L4 members advance +1 → L5
+            #   → Ext-II then forces L5 exit in the following eligible cycle.
             if len(members) != _S_CAP:
                 pool.paused = True
                 new_pauses += 1
@@ -1301,16 +1549,58 @@ class _AdvSimEngine:
             l1_l2    = [m for m in members if 1 <= m.level <= 2]
             l3       = [m for m in members if m.level == 3]
             l4       = [m for m in members if m.level == 4]
+            l5       = [m for m in members if m.level == 5]
+            l6       = [m for m in members if m.level == 6]
             l1_l3    = [m for m in members if 1 <= m.level <= 3]
+            l1_l4    = [m for m in members if 1 <= m.level <= 4]
+            l1_l5    = [m for m in members if 1 <= m.level <= 5]
             l4_l6    = [m for m in members if 4 <= m.level <= 6]
+            l4_plus_ratio = len(l4_l6) / max(len(members), 1)
 
             w1 = w2 = None
+            draw_tag = "regular"
 
-            if sde_mbrs:
-                # ── SDE Draw: oldest sde_required member guaranteed exit ───────
-                # Upper winner = first (oldest) SDE-flagged L4 member
-                # Lower winner = L1/L2 preferred, fall through to L1-3 or any non-SDE
-                upper  = sde_mbrs[0]
+            # ── SDE Ext-III: L6 found — both winners from L6 (upper) + L1-L5 (lower) ──
+            if l6:
+                upper = random.choice(l6)
+                lowers = [m for m in l1_l5 if m.sid != upper.sid]
+                if not lowers:
+                    lowers = [m for m in members if m.sid != upper.sid]
+                if lowers:
+                    w2 = upper
+                    w1 = random.choice(lowers)
+                    draw_tag = "sde"
+                    self.n_sde_exits += 1
+                    self._l6_escalation_events += 1   # Ext-III: L6 forced exit
+
+            # ── SDE Ext-II: L5 found — both winners: upper=L5, lower=L1-L4 ──────────
+            elif l5:
+                upper = random.choice(l5)
+                lowers = [m for m in l1_l4 if m.sid != upper.sid]
+                if not lowers:
+                    lowers = [m for m in l1_l3 if m.sid != upper.sid]
+                if not lowers:
+                    lowers = [m for m in members if m.sid != upper.sid]
+                if lowers:
+                    w2 = upper
+                    w1 = random.choice(lowers)
+                    draw_tag = "sde"
+                    self.n_sde_exits += 1
+                    self._l5_escalation_events += 1   # Ext-II: L5 forced exit
+
+            # ── Accelerated Dissolution: ≥60% L4+ → both winners from L4+ ─────────
+            elif l4_plus_ratio >= 0.60 and len(l4_l6) >= 2:
+                w1 = random.choice(l4_l6)
+                l4_l6_remaining = [m for m in l4_l6 if m.sid != w1.sid]
+                if l4_l6_remaining:
+                    w2 = random.choice(l4_l6_remaining)
+                    draw_tag = "sde"
+                    self.n_sde_exits += 1
+                    self._accel_diss_events += 1   # Accel dissolution: ≥60% L4+ triggered
+
+            # ── SDE Draw: sde_required L4 member guaranteed exit ─────────────────────
+            elif sde_mbrs:
+                upper  = sde_mbrs[0]      # oldest SDE-flagged L4 member
                 lowers = [m for m in l1_l2 if m.sid != upper.sid]
                 if not lowers:
                     lowers = [m for m in l1_l3 if m.sid != upper.sid]
@@ -1320,6 +1610,7 @@ class _AdvSimEngine:
                     pool.paused = True; new_pauses += 1; self.n_paused += 1; continue
                 w1 = random.choice(lowers)
                 w2 = upper
+                draw_tag = "sde"
                 self.n_sde_exits += 1
 
             elif lpi >= 14.0 and (l3 or l4):
@@ -1329,11 +1620,13 @@ class _AdvSimEngine:
                     w2   = random.choice(upper_pool)
                     avail = [m for m in l1_l2 if m.sid != w2.sid]
                     w1   = random.choice(avail) if avail else random.choice(l1_l2)
+                    draw_tag = "type_a"
                     self.n_type_a_draws += 1
                 elif l3 and l4:
                     # ── Type B: L3 lower, L4 upper (L1/L2 shortage) ───────────
                     w1 = random.choice(l3)
                     w2 = random.choice(l4)
+                    draw_tag = "type_b"
                     self.n_type_b_draws += 1
                 else:
                     # Degenerate: not enough tiered members — regular fallback
@@ -1414,30 +1707,138 @@ class _AdvSimEngine:
         )
         momentum   = velocity - prev_vel
 
-        # ── Execute cycle ────────────────────────────────────────────────────
-        self.step_a(cycle, req.volatility_mode, req.volatility_max_inflow, base, hpw)
-        self.step_b(req.late_fee_pct, req.late_users_ratio_pct)
-        self.step_c()
-        _, merges = self.step_d(ts, rdr_pct)
-        _, pauses = self.step_e()
+        # ── Pre-draw level snapshot ──────────────────────────────────────────
+        # Count active pool members at each level before the draw executes.
+        level_counts_pre: dict[str, int] = {f"L{l}": 0 for l in range(1, 7)}
+        for u in self._users.values():
+            if u.alive and u.pool_sid is not None:
+                key = f"L{min(u.level, 6)}"
+                level_counts_pre[key] = level_counts_pre.get(key, 0) + 1
 
-        active_n = sum(1 for p in self._pools.values() if not p.dissolved and not p.paused)
+        # Track L5/L6 peaks for Anti-Maturity pressure metrics
+        l5_this = level_counts_pre.get("L5", 0)
+        l6_this = level_counts_pre.get("L6", 0)
+        if l5_this > self._max_l5: self._max_l5 = l5_this
+        if l6_this > self._max_l6: self._max_l6 = l6_this
+
+        # ── Execute cycle (A/B/C circular late-fee model) ───────────────────
+        n_joined  = self.step_a(cycle, req.volatility_mode, req.volatility_max_inflow, base, hpw)
+        late_info = self.step_b(
+            late_fee_pct      = req.late_fee_pct,
+            late_ratio_pct    = req.late_users_ratio_pct,
+            elim_pct_a        = getattr(req, "elim_pct_a",        80.0),
+            grace_saver_pct_c = getattr(req, "grace_saver_pct_c", 15.0),
+        )
+        n_late = late_info["n_late"]
+        self.step_c()
+        condensed, merges = self.step_d(ts, rdr_pct)
+        draws_this_cycle, pauses = self.step_e()
+
+        # ── Post-draw state ──────────────────────────────────────────────────
+        lpi_post   = self._calc_lpi()
+        active_n   = sum(1 for p in self._pools.values() if not p.dissolved and not p.paused)
+        paused_n   = sum(1 for p in self._pools.values() if not p.dissolved and p.paused)
+        total_pools = sum(1 for p in self._pools.values() if not p.dissolved)
+
+        # LPI streak tracking for "heavy pressure mode"
+        if lpi_post > 40.0:
+            self._high_lpi_streak += 1
+            if self._high_lpi_streak > self._max_high_lpi_streak:
+                self._max_high_lpi_streak = self._high_lpi_streak
+        else:
+            self._high_lpi_streak = 0
+
+        # Post-draw level distribution (after winners exit + new members join)
+        level_counts_post: dict[str, int] = {f"L{l}": 0 for l in range(1, 7)}
+        for u in self._users.values():
+            if u.alive and u.pool_sid is not None:
+                key = f"L{min(u.level, 6)}"
+                level_counts_post[key] = level_counts_post.get(key, 0) + 1
+
+        # Financial snapshot this cycle
+        cash_inflow_this  = n_joined * float(_S_DEP)    # new deposits
+        # Weekly installments collected (approximated from active members × 1000)
+        total_active_in_pools = sum(level_counts_post.values())
+        installments_this  = total_active_in_pools * float(_S_DEP)
+        late_fees_this     = n_late * float(_S_DEP) * (req.late_fee_pct / 100.0) if n_late else 0.0
+
+        # Randomised join timestamps for realistic week representation
+        # Join dates are distributed across the week via Gaussian (σ=2 days)
+        week_start_iso = ts.date().isoformat()
+
+        # ── Append to cycle_logs (backward-compatible lean log) ──────────────
         self.logs.append({
-            "week":           cycle,
-            "active_pools":   active_n,
-            "waitlist_count": len(self._wl),
-            "pauses":         pauses,
-            "merges":         merges,
-            "momentum_value": round(momentum, 3),
-            "rdr_value":      round(rdr_pct,  1),
-            "scenario":       scenario,
-            "phase":          phase,
-            "burn_rate":      burn_rate,
+            "week":               cycle,
+            "active_pools":       active_n,
+            "waitlist_count":     len(self._wl),
+            "pauses":             pauses,
+            "merges":             merges,
+            "momentum_value":     round(momentum, 3),
+            "rdr_value":          round(rdr_pct,  1),
+            "scenario":           scenario,
+            "phase":              phase,
+            "burn_rate":          burn_rate,
             "velocity":           round(velocity, 2),
-            "lpi":                round(self._calc_lpi(), 1),
+            "lpi":                round(lpi_post, 1),
             "sde_exits_total":    self.n_sde_exits,
             "type_a_draws_total": self.n_type_a_draws,
             "type_b_draws_total": self.n_type_b_draws,
+            # Extended L5/L6 pressure data
+            "l5_count":           l5_this,
+            "l6_count":           l6_this,
+            "high_pressure_mode": lpi_post > 40.0,
+        })
+
+        # ── Append to weekly_detail (Master Weekly Report, Phase 2-C) ────────
+        self.weekly_detail.append({
+            "week":             cycle,
+            "week_start_date":  week_start_iso,
+            # Inflow
+            "users_joined":     n_joined,
+            # Counts
+            "active_users":     sum(1 for u in self._users.values() if u.alive and u.pool_sid is not None),
+            "waitlist_count":   len(self._wl),
+            "pools_active":     active_n,
+            "pools_paused":     paused_n,
+            "pools_total":      total_pools,
+            "pools_formed_this_week":  max(0, total_pools - (len(self.logs) > 1 and self.logs[-2].get("active_pools", 0) or 0) - paused_n),
+            "pools_merged_this_week":  merges,
+            # Level distribution
+            "level_distribution": {**level_counts_post},
+            "l5_count":           l5_this,
+            "l6_count":           l6_this,
+            # LPI & draw intelligence
+            "lpi":                round(lpi_post, 2),
+            "high_pressure_mode": lpi_post > 40.0,
+            "draws_this_week":    draws_this_cycle,
+            "draw_type_breakdown": {
+                "regular": max(0, draws_this_cycle - self.n_type_a_draws - self.n_type_b_draws - self.n_sde_exits),
+                "type_a":  self.n_type_a_draws,
+                "type_b":  self.n_type_b_draws,
+                "sde":     self.n_sde_exits,
+            },
+            # Payment stats (A/B/C breakdown)
+            "late_payers":              n_late,
+            "direct_eliminated":        late_info.get("n_direct_elim",    0),
+            "grace_eligible":           late_info.get("n_grace_eligible", 0),
+            "grace_saved":              late_info.get("n_grace_saved",    0),
+            "grace_eliminated":         late_info.get("n_grace_elim",     0),
+            "late_fees_collected_inr":  round(late_fees_this, 2),
+            # A-1: Why members reach L5/L6 — SDE extension events this cycle
+            "ext2_exits_this_week":     self._l5_escalation_events,  # cumulative: frontend diffs
+            "ext3_exits_this_week":     self._l6_escalation_events,
+            "accel_diss_this_week":     self._accel_diss_events,
+            "condensation_events": condensed,
+            # Financials (approximate per-cycle)
+            "cash_inflow_inr":    round(cash_inflow_this, 2),
+            "installments_collected_inr": round(installments_this, 2),
+            "total_inflow_inr":   round(cash_inflow_this + installments_this + late_fees_this, 2),
+            # AI/market signals
+            "scenario":           scenario,
+            "phase":              phase,
+            "velocity":           round(velocity, 2),
+            "momentum":           round(momentum, 3),
+            "rdr_pct":            round(rdr_pct, 1),
         })
 
     # ── Response helpers ──────────────────────────────────────────────────────
@@ -1501,6 +1902,18 @@ class _AdvSimEngine:
             }
 
         # ── System health counters ─────────────────────────────────────────────
+        # ── L5/L6 peak timeline (Anti-Maturity pressure) ──────────────────────
+        # Peak counts per cycle for the Level Progression chart
+        l5_by_week = [log.get("l5_count", 0) for log in self.logs]
+        l6_by_week = [log.get("l6_count", 0) for log in self.logs]
+
+        # Pool pause timeline (used by Pool Activity tab)
+        pauses_by_week = [log.get("pauses", 0) for log in self.logs]
+
+        l5_escalation_events = self._l5_escalation_events
+        l6_escalation_events = self._l6_escalation_events
+        accel_diss_events    = self._accel_diss_events
+
         system_health = {
             "total_members_injected":        self.n_created,
             "total_direct_pool_assignments": self.direct_assignments,
@@ -1514,10 +1927,32 @@ class _AdvSimEngine:
             "sde_exit_rate_pct": round(
                 self.n_sde_exits / max(self.n_winners, 1) * 100, 1
             ),
+            # Anti-Maturity pressure metrics (Phase 2-A / A-1)
+            "max_l5_count":                 self._max_l5,
+            "max_l6_count":                 self._max_l6,
+            "max_high_lpi_streak_weeks":    self._max_high_lpi_streak,
+            "l5_peak_by_week":              l5_by_week,
+            "l6_peak_by_week":              l6_by_week,
+            "pauses_by_week":               pauses_by_week,
+            # SDE Extension events (Ext-II = L5 forced exit, Ext-III = L6 forced exit)
+            "total_l5_ext2_forced_exits":   l5_escalation_events,
+            "total_l6_ext3_forced_exits":   l6_escalation_events,
+            "total_accel_dissolution_events": accel_diss_events,
+            # A-1: WHY members reach L5/L6 explanation
+            "l5_l6_escalation_explanation": (
+                f"L5 members appeared {l5_escalation_events} times (Ext-II draws executed). "
+                f"L6 members appeared {l6_escalation_events} times (Ext-III draws executed). "
+                + (
+                    "Root cause: SDE failed to clear L4 before advancement when pools were paused "
+                    f"or under-capacity. {self.n_paused} pool pauses prevented timely SDE processing."
+                    if (l5_escalation_events + l6_escalation_events) > 0
+                    else "No L5/L6 escalation — SDE cleared all L4 members in time."
+                )
+            ),
         }
 
         return {
-            # ── Backward-compatible original 8 keys ───────────────────────────
+            # ── Backward-compatible original 8 keys ─────────��─────────────────
             "total_cycles_run":              len(self.logs),
             "total_simulated_users_created": self.n_created,
             "total_winners_drawn":           self.n_winners,
@@ -1526,6 +1961,8 @@ class _AdvSimEngine:
             "total_draw_pauses_triggered":   self.n_paused,
             "total_late_fees_collected_inr": late_fees,
             "final_virtual_liquidity_float": net_profit,
+            # ── Elimination tracking (BUG-1 fix: self._elim now initialized) ──
+            "total_eliminations":            self._elim,
             # ── God Mode extended sections ────────────────────────────────────
             "financial_metrics": {
                 "total_collected_inr":            total_collected,
@@ -1618,6 +2055,7 @@ def advanced_simulation(
         return {
             "simulation_summary": summ,
             "cycle_logs":         engine.logs,
+            "weekly_detail":      engine.weekly_detail,   # Phase 2-C Master Weekly Report
         }
 
     except Exception:
@@ -2131,8 +2569,130 @@ class TimedInjectRequest(BaseModel):
     auto_pool:          bool  = Field(True,                  description="Auto-trigger pool formation after creation.")
 
 
+def _build_join_dates(
+    body: "TimedInjectRequest",
+    anchor: datetime,
+    count: int,
+) -> list[datetime]:
+    """
+    Compute the sorted list of join_date timestamps for a timed injection.
+    Extracted here so it can be unit-tested independently of the endpoint.
+    """
+    join_dates: list[datetime] = []
+
+    if body.spread_days == 0:
+        # All users at the anchor datetime, sequential minutes apart
+        for i in range(count):
+            join_dates.append(anchor + timedelta(minutes=i))
+
+    elif body.daily_count and body.spread_days > 0:
+        # Daily cadence: daily_count per day for spread_days days
+        for day in range(body.spread_days):
+            day_base = anchor - timedelta(days=(body.spread_days - 1 - day))
+            for j in range(body.daily_count):
+                if len(join_dates) >= count:
+                    break
+                minute_offset = random.randint(0, 1439) if body.randomize_dates else j
+                join_dates.append(day_base + timedelta(minutes=minute_offset))
+            if len(join_dates) >= count:
+                break
+        # Pad to count if daily_count × spread_days < count
+        while len(join_dates) < count:
+            join_dates.append(anchor - timedelta(minutes=random.randint(0, body.spread_days * 1440)))
+
+    elif body.randomize_dates:
+        # Random scatter within the spread window
+        spread_minutes = body.spread_days * 24 * 60
+        for i in range(count):
+            offset = random.randint(0, max(1, spread_minutes))
+            join_dates.append(anchor - timedelta(minutes=offset) + timedelta(seconds=i))
+
+    else:
+        # Linear spread: evenly spaced across the window
+        if count == 1 or body.spread_days == 0:
+            join_dates = [anchor + timedelta(minutes=i) for i in range(count)]
+        else:
+            interval = (body.spread_days * 24 * 60) / (count - 1)
+            for i in range(count):
+                join_dates.append(anchor - timedelta(minutes=interval * (count - 1 - i)))
+
+    return sorted(join_dates)[:count]   # FIFO order guaranteed
+
+
+def _background_pool_formation(prefix: str) -> None:
+    """
+    Background task: form pools from the users just injected.
+
+    Runs AFTER the HTTP response is returned to the client.  This prevents
+    HTTP timeouts on large batches (2000+ users → 10–30 s pool-formation loop).
+
+    Uses a fresh DB session so it doesn't compete with the request-scoped
+    session that has already closed.  Status is written to _INJECT_STATUS so
+    clients can poll GET /dev/injection-status?prefix=<prefix>.
+    """
+    from app.database import SessionLocal as _SL   # local import avoids circular
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    with _INJECT_LOCK:
+        _INJECT_STATUS[prefix] = {
+            "status":            "running",
+            "pools_formed":      0,
+            "waitlist_remaining": None,
+            "error":             None,
+            "started_at":        started_at,
+            "finished_at":       None,
+        }
+
+    db = _SL()
+    try:
+        pools_formed = 0
+        fill_pool_vacancies(db)
+        while True:
+            new_pool = manual_create_pool(db)
+            if not new_pool:
+                break
+            pools_formed += 1
+
+        wl_remaining = (
+            db.query(func.count(User.id))
+            .filter(User.status == UserStatus.Waitlist)
+            .scalar() or 0
+        )
+
+        with _INJECT_LOCK:
+            _INJECT_STATUS[prefix].update({
+                "status":            "done",
+                "pools_formed":      pools_formed,
+                "waitlist_remaining": wl_remaining,
+                "finished_at":       datetime.now(timezone.utc).isoformat(),
+            })
+        _logger_sim.info(
+            "inject-timed background: prefix=%s  pools_formed=%d  wl_remaining=%d",
+            prefix, pools_formed, wl_remaining,
+        )
+
+    except Exception as exc:
+        _logger_sim.error("inject-timed background FAILED: prefix=%s  error=%s", prefix, exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        with _INJECT_LOCK:
+            _INJECT_STATUS[prefix].update({
+                "status":    "error",
+                "error":     str(exc),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+    finally:
+        db.close()
+
+
 @router.post("/inject-timed")
-def dev_inject_timed(body: TimedInjectRequest, db: Session = Depends(get_db)):
+def dev_inject_timed(
+    body: TimedInjectRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """
     Inject users with fully-customizable date/time distribution.
 
@@ -2141,8 +2701,27 @@ def dev_inject_timed(body: TimedInjectRequest, db: Session = Depends(get_db)):
       • Random spread: each user gets a random date within the last N days
       • Daily cadence: daily_count users per day for spread_days days
 
-    This lets you simulate realistic historical member growth with accurate
-    temporal spacing so FIFO ordering is meaningful.
+    IMPORTANT DESIGN CHANGE (pool formation is now asynchronous):
+    ──────────────────────────────────────────────────────────────
+    For large batches (200+ users) the pool-formation loop (fill vacancies →
+    manual_create_pool loop) takes 5–30 seconds.  Executing it inline blocked
+    the HTTP response and caused:
+      1. The browser to show a timeout / request-failed error.
+      2. All subsequent API calls to queue behind the blocking operation,
+         exhausting the connection pool and making ALL buttons fail.
+
+    Fix: user rows + DEP tokens are committed synchronously (fast, ~200 ms for
+    2000 users).  The pool-formation loop is handed off to FastAPI's
+    BackgroundTasks which run AFTER the HTTP response is sent.  The client
+    receives an immediate 200 with:
+      {
+        "users_created": N,
+        "pool_formation": "background",
+        "status_key": prefix
+      }
+    Poll GET /dev/injection-status?prefix=<prefix> to get live pool-formation
+    progress.  The admin Dashboard's "Check Waitlist Threshold" button will
+    also catch any missed formations.
     """
     import time as _time
 
@@ -2164,45 +2743,7 @@ def dev_inject_timed(body: TimedInjectRequest, db: Session = Depends(get_db)):
         anchor = datetime.now(timezone.utc)
 
     # ── Build join_date list ──────────────────────────────────────────────────
-    join_dates: list[datetime] = []
-
-    if body.spread_days == 0:
-        # All users at the anchor datetime, sequential minutes apart
-        for i in range(count):
-            join_dates.append(anchor + timedelta(minutes=i))
-
-    elif body.daily_count and body.spread_days > 0:
-        # Daily cadence: daily_count per day for spread_days days
-        for day in range(body.spread_days):
-            day_base = anchor - timedelta(days=(body.spread_days - 1 - day))
-            for j in range(body.daily_count):
-                if len(join_dates) >= count:
-                    break
-                minute_offset = random.randint(0, 1439) if body.randomize_dates else j
-                join_dates.append(day_base + timedelta(minutes=minute_offset))
-            if len(join_dates) >= count:
-                break
-        # Pad to count if daily_count * spread_days < count
-        while len(join_dates) < count:
-            join_dates.append(anchor - timedelta(minutes=random.randint(0, body.spread_days * 1440)))
-
-    elif body.randomize_dates:
-        # Random scatter within the spread window
-        spread_minutes = body.spread_days * 24 * 60
-        for i in range(count):
-            offset = random.randint(0, max(1, spread_minutes))
-            join_dates.append(anchor - timedelta(minutes=offset) + timedelta(seconds=i))
-
-    else:
-        # Linear spread: evenly spaced across the window
-        if count == 1 or body.spread_days == 0:
-            join_dates = [anchor + timedelta(minutes=i) for i in range(count)]
-        else:
-            interval = (body.spread_days * 24 * 60) / (count - 1)
-            for i in range(count):
-                join_dates.append(anchor - timedelta(minutes=interval * (count - 1 - i)))
-
-    join_dates = sorted(join_dates)[:count]   # FIFO order guaranteed
+    join_dates = _build_join_dates(body, anchor, count)
 
     # ── Build user rows ───────────────────────────────────────────────────────
     hashed_pw = _get_dev_pw_hash()
@@ -2242,6 +2783,10 @@ def dev_inject_timed(body: TimedInjectRequest, db: Session = Depends(get_db)):
         ).fetchall()
     ]
 
+    if not user_ids:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Bulk user insert produced no rows — check DB constraints.")
+
     codes: set[str] = set()
     while len(codes) < len(user_ids):
         codes.update(f"DEP-{secrets.token_hex(4).upper()}" for _ in range(len(user_ids) - len(codes)))
@@ -2260,43 +2805,127 @@ def dev_inject_timed(body: TimedInjectRequest, db: Session = Depends(get_db)):
     ]
     for start in range(0, len(token_rows), _BULK_BATCH):
         db.execute(sa_insert(Token), token_rows[start:start + _BULK_BATCH])
-    db.commit()
+    db.commit()   # ← HTTP response can now return; pool formation continues below
 
-    # ── Auto-pool formation ───────────────────────────────────────────────────
-    pools_formed = 0
-    if body.auto_pool:
-        fill_pool_vacancies(db)
-        while True:
-            new_pool = manual_create_pool(db)
-            if not new_pool:
-                break
-            pools_formed += 1
-
-    wl_remaining = db.query(func.count(User.id)).filter(User.status == UserStatus.Waitlist).scalar() or 0
+    # ── Pool formation: schedule as background task ───────────────────────────
+    # For small counts (≤ 100 users) run inline — background overhead not worth it.
+    # For large counts run in background so the HTTP response returns immediately.
+    date_from    = join_dates[0].isoformat() if join_dates else None
+    date_to      = join_dates[-1].isoformat() if join_dates else None
     elapsed_ms   = int((time.perf_counter() - t0) * 1000)
 
-    # Date range summary
-    date_from = join_dates[0].isoformat() if join_dates else None
-    date_to   = join_dates[-1].isoformat() if join_dates else None
+    if body.auto_pool:
+        if count <= 100:
+            # ── Inline (small batch — fast) ───────────────────────────────────
+            pools_formed = 0
+            fill_pool_vacancies(db)
+            while True:
+                new_pool = manual_create_pool(db)
+                if not new_pool:
+                    break
+                pools_formed += 1
+            wl_remaining = (
+                db.query(func.count(User.id))
+                .filter(User.status == UserStatus.Waitlist)
+                .scalar() or 0
+            )
+            return {
+                "users_created":      len(user_ids),
+                "dep_tokens_created": len(user_ids),
+                "pools_formed":       pools_formed,
+                "pool_formation":     "inline",
+                "waitlist_remaining": wl_remaining,
+                "elapsed_ms":         elapsed_ms,
+                "date_from":          date_from,
+                "date_to":            date_to,
+                "spread_days":        body.spread_days,
+                "randomized":         body.randomize_dates,
+                "daily_cadence":      body.daily_count,
+                "prefix":             prefix,
+                "status_key":         None,
+                "note": (
+                    f"{len(user_ids)} timed users created (inline pool formation). "
+                    f"{pools_formed} pool(s) formed. {wl_remaining} on waitlist."
+                ),
+            }
+        else:
+            # ── Background (large batch — avoids HTTP timeout) ─────────────────
+            background_tasks.add_task(_background_pool_formation, prefix)
+            return {
+                "users_created":      len(user_ids),
+                "dep_tokens_created": len(user_ids),
+                "pools_formed":       None,
+                "pool_formation":     "background",
+                "waitlist_remaining": None,
+                "elapsed_ms":         elapsed_ms,
+                "date_from":          date_from,
+                "date_to":            date_to,
+                "spread_days":        body.spread_days,
+                "randomized":         body.randomize_dates,
+                "daily_cadence":      body.daily_count,
+                "prefix":             prefix,
+                "status_key":         prefix,
+                "note": (
+                    f"{len(user_ids)} users + DEP tokens committed. "
+                    f"Pool formation running in background — "
+                    f"poll GET /dev/injection-status?prefix={prefix} for progress."
+                ),
+            }
+    else:
+        wl_remaining = (
+            db.query(func.count(User.id))
+            .filter(User.status == UserStatus.Waitlist)
+            .scalar() or 0
+        )
+        return {
+            "users_created":      len(user_ids),
+            "dep_tokens_created": len(user_ids),
+            "pools_formed":       0,
+            "pool_formation":     "skipped",
+            "waitlist_remaining": wl_remaining,
+            "elapsed_ms":         elapsed_ms,
+            "date_from":          date_from,
+            "date_to":            date_to,
+            "spread_days":        body.spread_days,
+            "randomized":         body.randomize_dates,
+            "daily_cadence":      body.daily_count,
+            "prefix":             prefix,
+            "status_key":         None,
+            "note": (
+                f"{len(user_ids)} timed users created (auto_pool=false). "
+                f"Call POST /admin/waitlist/check to form pools manually."
+            ),
+        }
 
-    return {
-        "users_created":    len(user_ids),
-        "dep_tokens_created": len(user_ids),
-        "pools_formed":     pools_formed,
-        "waitlist_remaining": wl_remaining,
-        "elapsed_ms":       elapsed_ms,
-        "date_from":        date_from,
-        "date_to":          date_to,
-        "spread_days":      body.spread_days,
-        "randomized":       body.randomize_dates,
-        "daily_cadence":    body.daily_count,
-        "prefix":           prefix,
-        "note": (
-            f"{len(user_ids)} timed users created — "
-            f"join dates from {date_from} to {date_to}.  "
-            f"{pools_formed} pool(s) formed.  {wl_remaining} on waitlist."
-        ),
-    }
+
+@router.get("/injection-status")
+def dev_injection_status(prefix: str):
+    """
+    Poll the status of a background pool-formation job started by POST /dev/inject-timed.
+
+    Returns the current state:
+      • status = "running"  — pool formation is in progress
+      • status = "done"     — complete; pools_formed and waitlist_remaining filled
+      • status = "error"    — background task raised an exception; see error field
+      • status = "unknown"  — prefix not found (job hasn't started or expired from memory)
+
+    The in-memory registry holds at most ~1000 entries (one per injection call since
+    server start).  On server restart all entries are lost — check pool counts directly
+    via GET /pools/ to verify formation completed.
+    """
+    with _INJECT_LOCK:
+        entry = _INJECT_STATUS.get(prefix)
+
+    if entry is None:
+        return {
+            "prefix": prefix,
+            "status": "unknown",
+            "message": (
+                "No background task found for this prefix. "
+                "Either it hasn't started, the server was restarted, or this prefix is invalid."
+            ),
+        }
+    return {"prefix": prefix, **entry}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2421,3 +3050,133 @@ def dev_set_payment_scenario(body: PaymentScenarioRequest, db: Session = Depends
             f"({eliminated} eliminated, {late_tokens} late-fee tokens)."
         ),
     }
+
+
+# =============================================================================
+# POST /dev/real-simulation
+# =============================================================================
+#
+# Zero-duplication stress-test harness.
+#
+# Unlike /dev/advanced-simulation (which has its own _AdvSimEngine with
+# duplicated in-memory logic), this endpoint calls the REAL production services
+# on an isolated in-memory SQLite database with mocked time.
+#
+# Architecture:
+#   ChronosEngine  — patches datetime.now() across all production modules
+#   SimulationDB   — isolated SQLite with all production tables (zero schema dup)
+#   MassLoadInjector — creates synthetic users, manages payment state
+#   RealSimEngine  — calls real services in exact weekly chronological order:
+#     a. inject_week()         — new waitlist users
+#     b. auto_pay_active()     — mark active members Paid
+#     c. apply_abc_model()     — A/B/C late-fee + elimination
+#     d. flag_l4_members()     — catch-up L4 flagging
+#     e. run_sde_meta_pool()   — SDE guaranteed L4 exits
+#     f. assign_waitlist_to_pools() — refill after SDE
+#     g. execute_weekly_draw() — draw all remaining eligible pools
+#     h. post_draw_cleanup()   — reset weekly flags
+#
+# DRY contract: any rule change in production is automatically reflected.
+# =============================================================================
+
+class RealSimRequest(BaseModel):
+    weeks:              int   = Field(52,   ge=1,    le=200,
+                                      description="Number of weekly draw cycles to simulate.")
+    users_per_week:     int   = Field(24,   ge=0,    le=2000,
+                                      description="New users injected into waitlist each week.")
+    initial_users:      int   = Field(24,   ge=12,   le=5000,
+                                      description="Seed users created before week 1 draw.")
+    organic_ratio:      float = Field(0.6,  ge=0.0,  le=1.0,
+                                      description="Fraction of new users who join organically (Brain 3 RDR feed).")
+    late_users_ratio_pct: float = Field(2.0, ge=0.0, le=100.0,
+                                        description="% of active members who miss payment each week.")
+    elim_pct_a:         float = Field(80.0, ge=0.05, le=100.0,
+                                      description="A — % of late payers directly eliminated (skip grace).")
+    grace_saver_pct_c:  float = Field(15.0, ge=0.05, le=100.0,
+                                      description="C — % of grace-eligible late payers who pay and survive.")
+    volatility_mode:    bool  = Field(False,
+                                      description="When True, weekly inflow is random 0–volatility_max.")
+    volatility_max_inflow: int = Field(100, ge=5,
+                                       description="Maximum random weekly inflow in volatility mode.")
+    start_year:         int   = Field(2024, ge=2020, le=2040,
+                                      description="ISO year for simulated week 1 (affects Brain 2 timestamps).")
+    start_week:         int   = Field(1,    ge=1,    le=52,
+                                      description="ISO week number for simulated week 1.")
+    # ── K-12 to K-17: Extended Injection Knobs ────────────────────────────────
+    inflow_pattern:     str   = Field("linear",
+                                      description="K-12: Inflow pattern: linear|sine|burst|step.")
+    referral_burst_week: int  = Field(0, ge=0, le=200,
+                                      description="K-13: Week to inject a 2× referral surge (0=disabled).")
+    payment_shock_week: int   = Field(0, ge=0, le=200,
+                                      description="K-14: Week to inject a payment shock (0=disabled).")
+    waitlist_dropout_pct: float = Field(0.0, ge=0.0, le=50.0,
+                                        description="K-15: % of waitlist who drop out before pool entry.")
+    organic_decay_rate: float = Field(0.0, ge=0.0, le=1.0,
+                                      description="K-16: Weekly organic join rate decay (0=none).")
+    simulation_label:   str   = Field("",
+                                      description="K-17: Free-text label for multi-run comparison.")
+
+
+@router.post("/real-simulation")
+def run_real_simulation(
+    body: RealSimRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Real-Strategy Stress-Test Engine.
+
+    Calls ACTUAL production services (draw, SDE, waitlist, Brain 2/3/5)
+    on an isolated in-memory SQLite database with mocked time.
+
+    Guarantees:
+      - Zero logic duplication: all math lives in production services
+      - Chronos Engine: datetime.now() mocked globally across 7 modules
+      - SimulationDB: isolated SQLite — production DB never touched
+      - Same response schema as /dev/advanced-simulation for frontend compatibility
+
+    Use this for architecture validation, bottleneck discovery, and stress testing.
+    Use /dev/advanced-simulation for fast parameter sweeps (< 1 second per 100 cycles).
+    """
+    from app.services.real_simulation import RealSimEngine
+
+    engine = RealSimEngine(
+        weeks                = body.weeks,
+        users_per_week       = body.users_per_week,
+        initial_users        = body.initial_users,
+        organic_ratio        = body.organic_ratio,
+        late_ratio           = body.late_users_ratio_pct / 100.0,
+        elim_pct_a           = body.elim_pct_a,
+        grace_pct_c          = body.grace_saver_pct_c,
+        volatility_mode      = body.volatility_mode,
+        volatility_max       = body.volatility_max_inflow,
+        start_year           = body.start_year,
+        start_week           = body.start_week,
+        # K-12 to K-17: Extended Injection Knobs
+        inflow_pattern       = body.inflow_pattern,
+        referral_burst_week  = body.referral_burst_week,
+        payment_shock_week   = body.payment_shock_week,
+        waitlist_dropout_pct = body.waitlist_dropout_pct,
+        organic_decay_rate   = body.organic_decay_rate,
+        simulation_label     = body.simulation_label,
+    )
+
+    _logger_sim.info(
+        "RealSim START  weeks=%d  upw=%d  init=%d  late=%.1f%%  A=%.1f%%  C=%.1f%%  vol=%s",
+        body.weeks, body.users_per_week, body.initial_users,
+        body.late_users_ratio_pct, body.elim_pct_a, body.grace_saver_pct_c,
+        body.volatility_mode,
+    )
+
+    result = engine.run()
+
+    s = result["simulation_summary"]
+    _logger_sim.info(
+        "RealSim DONE  weeks=%d  users=%d  winners=%d  pauses=%d  liquidity=%.0f",
+        body.weeks,
+        s.get("total_simulated_users_created", 0),
+        s.get("total_winners_drawn", 0),
+        s.get("total_draw_pauses_triggered", 0),
+        s.get("final_virtual_liquidity_float", 0),
+    )
+
+    return result

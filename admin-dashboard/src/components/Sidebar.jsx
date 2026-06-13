@@ -1,5 +1,5 @@
 import { NavLink, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, Key, Users, UserSearch, Shield, Dot, LogOut, Activity, BarChart3, Terminal, Gift, Settings, Trophy, Cpu, Monitor, Waves } from 'lucide-react'
+import { LayoutDashboard, Key, Users, UserSearch, Shield, Dot, LogOut, Activity, BarChart3, Terminal, Gift, Settings, Trophy, Cpu, Monitor, Waves, ShieldAlert } from 'lucide-react'
 import { BASE_URL } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 
@@ -18,6 +18,8 @@ const NAV = [
   { to: '/draw-engine',          icon: Cpu,        label: 'Draw Engine'       },
   { to: '/winning-ledger',   icon: Trophy,         label: 'Winning Ledger'   },
   { to: '/referrals',        icon: Gift,            label: 'Referral Payouts' },
+  // Payment Compliance — elimination & grace period engine (Phase 1)
+  { to: '/payment-compliance', icon: ShieldAlert, label: 'Payment Compliance' },
   { to: '/diagnostics', icon: Activity,        label: 'Diagnostics'    },
   { to: '/settings',    icon: Settings,        label: 'System Settings' },
   // Conditionally append the Dev Tools entry — never shown in production builds

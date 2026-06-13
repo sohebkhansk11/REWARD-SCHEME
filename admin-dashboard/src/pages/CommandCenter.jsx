@@ -16,11 +16,19 @@
  */
 
 import { useState, useEffect, useCallback } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import {
   Cpu, Activity, Target, AlertTriangle, TrendingUp, TrendingDown,
   RefreshCw, Zap, Shield, Users, IndianRupee, Terminal,
   Crosshair, Radio, Network, Layers, BarChart3, Clock, Waves,
 } from 'lucide-react'
+
+// ── Framer-motion variants — shared across all Command Center modules ─────────
+const _fadeUp   = { initial:{opacity:0,y:14}, animate:{opacity:1,y:0}, exit:{opacity:0,y:8},
+                    transition:{duration:0.36,ease:[0.25,1,0.5,1]} }
+const _stagger  = { animate:{ transition:{ staggerChildren:0.07 }}}
+const _scaleIn  = { initial:{opacity:0,scale:0.93}, animate:{opacity:1,scale:1},
+                    transition:{duration:0.3,ease:[0.25,1,0.5,1]} }
 import {
   ResponsiveContainer, ComposedChart, Area, Line,
   XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine,
@@ -89,13 +97,16 @@ function LpiThermometer({ lpi = 0 }) {
         <rect x="27" y={tubeTop} width="16" height={tubeH}
               rx="8" fill="none" stroke="#1e293b" strokeWidth="1.5"/>
 
-        {/* Fill bar */}
-        <rect
-          x="29.5" y={fillY} width="11" height={Math.max(fillH, 2)}
+        {/* Fill bar — framer-motion spring animation on LPI change */}
+        <motion.rect
+          x="29.5"
+          width="11"
           rx={fillH > 12 ? 5 : 2}
           fill={color}
-          style={{ filter: glow, transition: 'y 0.9s ease, height 0.9s ease' }}
-          className={lpi >= 50 ? 'animate-pulse' : lpi >= 25 ? '' : ''}
+          style={{ filter: glow }}
+          animate={{ y: fillY, height: Math.max(fillH, 2), fill: color }}
+          transition={{ type: 'spring', stiffness: 60, damping: 18, mass: 1.2 }}
+          className={lpi >= 50 ? 'animate-pulse' : ''}
         />
 
         {/* Bulb */}
@@ -481,10 +492,19 @@ function AntiMaturityGrid({ users = [] }) {
               </td>
             </tr>
           )}
+          <AnimatePresence initial={false}>
           {rows.map((u, i) => {
             const isTarget = u.current_level === 4
             return (
-              <tr key={u.id ?? i} className={`border-b border-slate-800/50 ${isTarget ? 'bg-red-950/15' : ''}`}>
+              <motion.tr
+                key={u.id ?? i}
+                layout
+                initial={{ opacity: 0, x: -12 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 12, height: 0 }}
+                transition={{ duration: 0.22, ease: [0.25, 1, 0.5, 1] }}
+                className={`border-b border-slate-800/50 ${isTarget ? 'bg-red-950/15' : ''}`}
+              >
                 <td className="px-3 py-2.5">
                   <span className={`font-medium text-xs ${isTarget ? 'text-white' : 'text-slate-300'}`}>
                     @{u.username ?? u.user_username ?? '—'}
@@ -507,9 +527,13 @@ function AntiMaturityGrid({ users = [] }) {
                 </td>
                 <td className="px-3 py-2.5 text-center">
                   {isTarget ? (
-                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-black bg-rose-950/60 text-rose-300 border border-rose-800/50">
+                    <motion.span
+                      animate={{ opacity: [1, 0.5, 1] }}
+                      transition={{ duration: 1.6, repeat: Infinity }}
+                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-black bg-rose-950/60 text-rose-300 border border-rose-800/50"
+                    >
                       <Crosshair className="w-2.5 h-2.5"/>TARGET LOCKED
-                    </span>
+                    </motion.span>
                   ) : (
                     <span className="text-[10px] text-amber-500/70">Candidate</span>
                   )}
@@ -519,9 +543,10 @@ function AntiMaturityGrid({ users = [] }) {
                     {isTarget ? 'Next Sunday' : '~1–2 draws'}
                   </span>
                 </td>
-              </tr>
+              </motion.tr>
             )
           })}
+          </AnimatePresence>
         </tbody>
       </table>
 
@@ -628,12 +653,15 @@ export default function CommandCenter() {
   const pools = poolData?.pools ?? []
 
   return (
-    <div className={`p-6 space-y-6 transition-all duration-500 ${
-      isFlashFlood ? 'ring-2 ring-amber-500/40 rounded-2xl' : ''
-    }`}>
+    <motion.div
+      {..._stagger}
+      className={`p-6 space-y-6 transition-all duration-500 ${
+        isFlashFlood ? 'ring-2 ring-amber-500/40 rounded-2xl' : ''
+      }`}
+    >
 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
-      <div className="flex items-start justify-between">
+      <motion.div {..._fadeUp} className="flex items-start justify-between">
         <div>
           <h1 className="text-xl font-bold text-white flex items-center gap-2.5">
             <div className={`p-2 rounded-xl ${isFlashFlood ? 'bg-amber-500/20 animate-pulse' : 'bg-violet-900/40'}`}>
@@ -658,10 +686,10 @@ export default function CommandCenter() {
           <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`}/>
           Refresh All
         </button>
-      </div>
+      </motion.div>
 
       {/* ══ MODULE 1: TELEMETRY HUD ══════════════════════════════════════════ */}
-      <div className="grid grid-cols-12 gap-5">
+      <motion.div {..._fadeUp} className="grid grid-cols-12 gap-5">
 
         {/* LPI Thermometer — tall left column */}
         <div className="col-span-2">
@@ -729,9 +757,10 @@ export default function CommandCenter() {
             </div>
           </DarkCard>
         </div>
-      </div>
+      </motion.div>
 
       {/* ══ MODULE 2-A: BRAIN 1 & 4 TOPOLOGY MAP ════════════════════════════ */}
+      <motion.div {..._fadeUp}>
       <DarkCard title="Brain 1 & 4 — Hydraulic Topology Map"
         icon={Network} iconColor="text-blue-400"
         badge={condensationActive ? { label: 'CONDENSATION', cls: 'bg-red-950/60 text-red-400 border border-red-800/50 animate-pulse' } : null}
@@ -754,9 +783,10 @@ export default function CommandCenter() {
           </div>
         </div>
       </DarkCard>
+      </motion.div>
 
       {/* ══ MODULE 2-B + 2-C ═════════════════════════════════════════════════ */}
-      <div className="grid grid-cols-2 gap-5">
+      <motion.div {..._fadeUp} className="grid grid-cols-2 gap-5">
 
         {/* Brain 2 & 3 Scatterplot */}
         <DarkCard title="Brain 2 & 3 — Hype Scatterplot"
@@ -800,11 +830,11 @@ export default function CommandCenter() {
             ) : <AntiMaturityGrid users={l3l4Users}/>}
           </div>
         </DarkCard>
-      </div>
+      </motion.div>
 
       {/* ── AI Brain Status Footer ────────────────────────────────────────── */}
       {!loading && lpiData && (
-        <div className="grid grid-cols-5 gap-3">
+        <motion.div {..._fadeUp} className="grid grid-cols-5 gap-3">
           {[
             { l: 'LPI', v: `${lpi.toFixed(1)}%`, sub: 'Pressure Index',      c: lpi > 50 ? 'text-red-400' : lpi > 25 ? 'text-orange-400' : 'text-emerald-400' },
             { l: 'L4 Targets', v: fI(lpiData.l4_flagged_count), sub: 'Queued for SDE', c: fI(lpiData.l4_flagged_count) > 0 ? 'text-rose-400' : 'text-slate-500' },
@@ -818,8 +848,8 @@ export default function CommandCenter() {
               <p className="text-[9px] text-slate-600 mt-0.5">{sub}</p>
             </div>
           ))}
-        </div>
+        </motion.div>
       )}
-    </div>
+    </motion.div>
   )
 }

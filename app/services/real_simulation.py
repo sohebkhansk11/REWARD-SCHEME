@@ -1418,7 +1418,13 @@ class RealSimEngine:
                     )
                 ).scalar() or Decimal("0")
 
-                total_collected = Decimal(str(total_users_created * 1000))
+                # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # FIX: was total_users_created×1000 = initial deposits only (wrong).
+                # Correct value is the sum of weekly installments actually collected.
+                total_collected = sum(
+                    Decimal(str(w.get("installments_collected_inr", 0)))
+                    for w in weekly_detail
+                )
                 net_profit      = total_collected - total_payout
                 avg_lpi         = round(
                     sum(w["lpi"] for w in weekly_detail) / max(len(weekly_detail), 1), 2,

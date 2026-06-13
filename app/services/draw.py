@@ -413,17 +413,21 @@ def run_dual_draw(
                     member.id, member.username, week_id,
                 )
 
-            crud_user.update_user(
-                db,
-                member_id,
-                UserUpdate(
-                    current_level=new_level,
-                    weekly_payment_status=WeeklyPaymentStatus.Unpaid,
-                    # Atomically set SDE flag if this member just hit L4
-                    sde_required=(True if reaching_l4 else None),
-                    sde_flagged_week=(week_id if reaching_l4 else None),
-                ),
-            )
+            # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # BUG FIX: sde_required=(True if reaching_l4 else None) wrote NULL to a
+            # NOT NULL column for every non-L4 level advance → IntegrityError every
+            # pool draw → 0 draws in simulation (and silently in production).
+            # FIX: Only include sde_required/sde_flagged_week when member IS reaching L4.
+            # update_user uses model_dump(exclude_unset=True), so omitting these fields
+            # leaves the existing column value completely untouched.
+            _upd: dict = {
+                "current_level":         new_level,
+                "weekly_payment_status": WeeklyPaymentStatus.Unpaid,
+            }
+            if reaching_l4:
+                _upd["sde_required"]     = True
+                _upd["sde_flagged_week"] = week_id
+            crud_user.update_user(db, member_id, UserUpdate(**_upd))
 
     # If any survivor reached L4, mark the pool as containing a flagged L4 member.
     # This sets contains_flagged_l4=True in the SAME transaction as the flag itself.
@@ -1072,15 +1076,16 @@ def run_accelerated_dissolution_draw(
             reaching_l4  = (new_level == 4)
             if reaching_l4:
                 new_l4_flagged = True
-            crud_user.update_user(
-                db, member_id,
-                UserUpdate(
-                    current_level         = new_level,
-                    weekly_payment_status = WeeklyPaymentStatus.Unpaid,
-                    sde_required          = (True    if reaching_l4 else None),
-                    sde_flagged_week      = (week_id if reaching_l4 else None),
-                ),
-            )
+            # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Same NULL-write bug fix — see comment at the run_dual_draw survivor loop above.
+            _upd: dict = {
+                "current_level":         new_level,
+                "weekly_payment_status": WeeklyPaymentStatus.Unpaid,
+            }
+            if reaching_l4:
+                _upd["sde_required"]     = True
+                _upd["sde_flagged_week"] = week_id
+            crud_user.update_user(db, member_id, UserUpdate(**_upd))
 
     if new_l4_flagged:
         pool.contains_flagged_l4 = True

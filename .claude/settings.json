@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git status *)",
+      "Bash(git log *)",
+      "Bash(git diff *)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "timeout": 60,
+            "statusMessage": "Auto-committing and pushing changes...",
+            "command": "Set-Location 'C:\\Users\\amosd\\Downloads\\REWARD SCHEME'; $st = git status --porcelain 2>$null; if ($st) { git add -A; $mf = '.git\\COMMIT_MSG.txt'; if (-not (Test-Path $mf)) { \"auto: session update $(Get-Date -Format 'yyyy-MM-dd HH:mm')\" | Out-File $mf -Encoding utf8 }; git commit -F $mf; git push origin main; Remove-Item $mf -ErrorAction SilentlyContinue }"
+          }
+        ]
+      }
+    ]
+  }
+}

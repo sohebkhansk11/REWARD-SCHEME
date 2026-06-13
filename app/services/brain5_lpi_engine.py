@@ -390,9 +390,16 @@ def redistribute_multi_l4_pools(db: Session) -> list[PoolRedistribution]:
     if not overflow_members:
         return []  # no redistribution needed
 
-    # Find receiver pools: Active pools with 0 L4-flagged members
+    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # BUG FIX: original query had no capacity check — a receiver pool already at
+    # POOL_CAPACITY members would become capacity+1 after the move.  The candidate
+    # loop in execute_weekly_draw then pauses it (actual≠12) and Phase 1 skips it
+    # (vacancy=-1), creating a permanent Paused+over-capacity deadlock that stops
+    # all draws in that pool forever.
+    # Fix: pre-compute live active counts and exclude pools already at capacity.
+    from app.core.config import POOL_CAPACITY as _RPOOL_CAP
     occupied_pool_ids = set(pool_l4_counts.keys())
-    receiver_pools: list[Pool] = (
+    _all_receivers: list[Pool] = (
         db.query(Pool)
         .filter(
             Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]),
@@ -402,6 +409,23 @@ def redistribute_multi_l4_pools(db: Session) -> list[PoolRedistribution]:
         .order_by(Pool.id.asc())
         .all()
     )
+    _recv_ids = [p.id for p in _all_receivers]
+    _recv_counts: dict[int, int] = {}
+    if _recv_ids:
+        for _row in (
+            db.query(User.current_pool_id, func.count(User.id))
+            .filter(
+                User.current_pool_id.in_(_recv_ids),
+                User.status == UserStatus.Active,
+            )
+            .group_by(User.current_pool_id)
+            .all()
+        ):
+            _recv_counts[_row[0]] = _row[1]
+    # Only pools with room for one more member are valid receivers
+    receiver_pools: list[Pool] = [
+        p for p in _all_receivers if _recv_counts.get(p.id, 0) < _RPOOL_CAP
+    ]
 
     redistributions: list[PoolRedistribution] = []
     receiver_idx = 0

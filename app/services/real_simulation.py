@@ -633,6 +633,92 @@ class MassLoadInjector:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 3.5 FINANCE MANAGER HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fm_reset_payment_cycle(db: Session) -> None:
+    """
+    Finance Manager — Step 0: Reset ALL Active pool members to Unpaid at the
+    start of each week's payment cycle.
+
+    WHY: inject_week() creates users with weekly_payment_status=Paid.
+    apply_abc_model() then calls random.sample(active, n_late) to pick late
+    payers, but if everyone is already Paid the selection is still valid.
+    However auto_pay_installments() ONLY processes Unpaid members to create
+    weekly DEP tokens.  Without this reset, auto_pay_installments is a no-op
+    (everyone is Paid), so installments_collected_inr stays ₹0 forever.
+
+    After this reset:
+      1. auto_pay_installments creates one DEP token per member (Unpaid→Paid).
+         This gives the correct weekly installment revenue in CSV.
+      2. apply_abc_model (Thursday) marks late_ratio% back to Unpaid and
+         processes A/B/C paths — giving accurate compliance metrics.
+    """
+    from app.models.user import User as _U, UserStatus as _US, WeeklyPaymentStatus as _WPS
+    db.query(_U).filter(_U.status == _US.Active).update(
+        {"weekly_payment_status": _WPS.Unpaid},
+        synchronize_session=False,
+    )
+    db.commit()
+
+
+def _fm_enforce_pool_capacity(db: Session) -> int:
+    """
+    Finance Manager — Due-Date Enforcement: After apply_abc_model eliminates
+    members, pools may have fewer than POOL_CAPACITY Active members.
+
+    The problem: eliminated members leave their pool in Active status with
+    fewer than 12 members.  assign_waitlist_to_pools Phase 1 only fills
+    Paused_Awaiting_Members pools — it ignores Active pools.  So the vacancy
+    is NOT filled until execute_weekly_draw runs, which:
+      (a) Pauses the under-capacity Active pool
+      (b) Calls assign_waitlist_to_pools internally
+      (c) Phase 1 then fills it
+    BUT by then, the pool has already been SKIPPED for this week's draw.
+
+    Fix: Before T-2H (draw preparation), proactively:
+      1. Find every Active pool with < POOL_CAPACITY actual members
+      2. Set those pools to Paused_Awaiting_Members
+      3. Call assign_waitlist_to_pools → Phase 1 fills them from waitlist
+      4. They return to Active (with 12 members) before draw preparation runs
+
+    This mirrors production: eliminations happen Thursday, waitlist fills by
+    Saturday, every pool has 12 members when T-2H draw prep fires.
+
+    Returns: count of pools that were paused+refilled.
+    """
+    from app.models.pool import Pool as _Pool, PoolStatus as _PS
+    from app.models.user import User as _User, UserStatus as _US
+    from app.core.config import POOL_CAPACITY as _PC
+    from app.services.waitlist import assign_waitlist_to_pools
+
+    candidate = db.query(_Pool).filter(_Pool.status == _PS.Active).all()
+
+    paused_count = 0
+    for pool in candidate:
+        actual = (
+            db.query(_User)
+            .filter(_User.current_pool_id == pool.id, _User.status == _US.Active)
+            .count()
+        )
+        if actual < _PC:
+            pool.status  = _PS.Paused_Awaiting_Members
+            paused_count += 1
+
+    if paused_count > 0:
+        try:
+            db.commit()
+            assign_waitlist_to_pools(db)
+            db.commit()
+        except Exception as _e:
+            _logger.warning("_fm_enforce_pool_capacity: refill failed: %s", _e)
+            try: db.rollback()
+            except Exception: pass
+
+    return paused_count
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 4. METRICS COLLECTOR — Read Real DB State After Each Week
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -957,6 +1043,9 @@ class RealSimEngine:
                     iso     = sunday_midnight.isocalendar()
                     week_id = f"{iso.year}-W{iso.week:02d}"
 
+                    # Track pools formed THIS week (p2 pools only — new pool creation)
+                    _week_p2_start = total_p2_pools
+
                     # ── a. Inject new users (Monday morning) ─────────────────
                     chronos.jump_to(monday_morning)
 
@@ -1040,11 +1129,39 @@ class RealSimEngine:
                                 week_num, n_drop, len(wl_all),
                             )
 
-                    # ── b. Auto-pay all active pool members (U-08 weekly DEP tokens)
+                    # ── b. Finance Manager: Reset payment cycle (Monday morning)
+                    #
+                    # WHY: All members start each week owing a payment.  Without this
+                    # reset, every member's weekly_payment_status stays Paid from the
+                    # previous week — auto_pay_installments() finds 0 Unpaid members
+                    # and creates 0 DEP tokens, keeping installments_collected_inr=0
+                    # forever.  By resetting to Unpaid here we force auto_pay to create
+                    # one DEP token per active member per week (the weekly installment).
+                    _fm_reset_payment_cycle(db)
+
+                    # ── b.2 Auto-pay all active pool members (U-08 weekly DEP tokens)
+                    # Now that every member is Unpaid, auto_pay marks them Paid and
+                    # creates one WK-prefixed DEP token per member — the installment
+                    # receipt.  apply_abc_model (Thursday) will re-mark late_ratio% as
+                    # Unpaid and process them through the A/B/C compliance paths.
                     injector.auto_pay_installments(db, week_num=week_num)
                     db.commit()
 
-                    # ── c. Apply A/B/C compliance model ─────────────────────
+                    # ── c. Thursday 23:59 — Payment due date: Apply A/B/C compliance
+                    #
+                    # Time-travel to Thursday 23:59 (T-3d from Sunday draw).
+                    # This is the production due-date cutoff: any member who hasn't
+                    # paid by this moment is flagged as late and enters A/B/C processing.
+                    #
+                    # Timeline:
+                    #   Monday  00:01 (above)  — payment due, DEP tokens created
+                    #   Thursday 23:59 (now)   — due date: A eliminated, B late-fee,
+                    #                            C grace saves seat
+                    #   Saturday 22:00 (T-2H)  — draw preparation with FULL pools
+                    #   Sunday   00:00 (T-0)   — draw executes
+                    thursday_2359 = monday_morning + timedelta(days=3, hours=23, minutes=59)
+                    chronos.jump_to(thursday_2359)
+
                     # K-14: Payment shock — spike late_ratio for the shock week
                     effective_late = self.late_ratio
                     if self.payment_shock_week > 0 and week_num == self.payment_shock_week:
@@ -1062,6 +1179,26 @@ class RealSimEngine:
                     total_elim        += compliance["n_elim"]
                     total_grace_saved += compliance["n_saved"]
                     total_late_fee_rev += compliance["late_fee_revenue_inr"]
+
+                    # ── c.5 Finance Manager: Enforce pool capacity before T-2H ─
+                    #
+                    # apply_abc_model eliminated some members.  Their pools are still
+                    # Active (not Paused) so assign_waitlist_to_pools Phase 1 won't
+                    # refill the vacancies.  Without this step, execute_weekly_draw
+                    # would find an Active pool with < 12 members → pause it mid-draw
+                    # → no draw for that pool this week.
+                    #
+                    # Fix: Proactively pause every under-capacity Active pool and call
+                    # assign_waitlist_to_pools so Phase 1 fills them from waitlist.
+                    # By T-2H, every pool is back to 12 members and eligible to draw.
+                    if compliance.get("n_elim", 0) > 0:
+                        _fm_paused = _fm_enforce_pool_capacity(db)
+                        if _fm_paused:
+                            _logger.info(
+                                "Week %d: Finance Manager enforced capacity — "
+                                "%d pool(s) paused+refilled before T-2H.",
+                                week_num, _fm_paused,
+                            )
 
                     # ── d. T-2H: Call start_draw_preparation() ────────────────
                     # This is the REAL T-2H production service.  It:
@@ -1203,6 +1340,8 @@ class RealSimEngine:
                         cumulative_ext3  = cumul_ext3,
                         cumulative_accel = cumul_accel,
                     )
+                    # Real per-week pools-formed count (Phase 2 new pool creation)
+                    metrics["pools_formed"] = total_p2_pools - _week_p2_start
                     weekly_detail.append(metrics)
 
                     cycle_logs.append({

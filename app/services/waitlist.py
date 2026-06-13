@@ -376,10 +376,19 @@ def assign_waitlist_to_pools(db: Session) -> dict:
                 # Explicit created_at offsets guarantee deterministic ordering for Phase 3.
                 pool_rows = [
                     {
-                        "name":          pool_names[i],
-                        "status":        PoolStatus.Active,
-                        "total_members": POOL_CAPACITY,
-                        "created_at":    now + timedelta(microseconds=i),
+                        "name":                   pool_names[i],
+                        "status":                 PoolStatus.Active,
+                        "total_members":          POOL_CAPACITY,
+                        "created_at":             now + timedelta(microseconds=i),
+                        # CRITICAL: must be explicitly False in bulk INSERT.
+                        # SQLite uses server_default="false" (the string 'false') when
+                        # this column is omitted.  SQLAlchemy Boolean reads 'false' via
+                        # Python's bool() → True (non-empty string is truthy).
+                        # That causes execute_weekly_draw to sde_skip ALL new pools
+                        # (draw_completed_this_week check at line 677), producing 0
+                        # draws every week until post_draw_cleanup corrects the flag.
+                        "draw_completed_this_week": False,
+                        "pool_draw_type":           None,
                     }
                     for i in range(pools_to_make)
                 ]

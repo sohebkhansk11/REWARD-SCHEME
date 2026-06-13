@@ -531,8 +531,9 @@ function SimCharts({ logs }) {
             <YAxis yAxisId="right" orientation="right" tick={{fill:'#a855f7',fontSize:11}} tickLine={false} axisLine={false}/>
             <RechartTooltip content={<_SimTooltip/>}/>
             <Legend wrapperStyle={{paddingTop:16,fontSize:11,color:'#94a3b8'}}/>
+            {/* D1 FIX: active_pools → pools_active (matches _snapshot return key) */}
             <Area yAxisId="left" type="monotone" dataKey="waitlist_count" name="Waitlist" stroke="#06b6d4" strokeWidth={2} fill="url(#gWL)" dot={false}/>
-            <Area yAxisId="right" type="monotone" dataKey="active_pools" name="Active Pools" stroke="#a855f7" strokeWidth={2} fill="url(#gPL)" dot={false}/>
+            <Area yAxisId="right" type="monotone" dataKey="pools_active" name="Active Pools" stroke="#a855f7" strokeWidth={2} fill="url(#gPL)" dot={false}/>
           </AreaChart>
         </ResponsiveContainer>
       </div>
@@ -610,7 +611,16 @@ function WeeklyReportTable({ rows }) {
 // ── Pool Activity Chart ───────────────────────────────────────────────────────
 function PoolActivityChart({ logs }) {
   if (!logs?.length) return null
-  const data = logs.map(l=>({ week:l.week, active:l.active_pools, pauses:l.pauses, merges:l.merges }))
+  // D2 FIX [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // Switched from cycle_logs (week/pauses/draws/inflow only) to weekly_detail which
+  // carries pools_active, pools_paused, pools_formed from the _snapshot() return.
+  // Field renames: active_pools→pools_active, pauses→pools_paused, merges→pools_formed
+  const data = logs.map(l=>({
+    week:   l.week,
+    active: l.pools_active  ?? 0,
+    pauses: l.pools_paused  ?? 0,
+    formed: l.pools_formed  ?? 0,
+  }))
   return (
     <div className="h-48">
       <ResponsiveContainer width="100%" height="100%">
@@ -620,8 +630,8 @@ function PoolActivityChart({ logs }) {
           <YAxis tick={{fill:'#64748b',fontSize:10}}/>
           <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
           <Area type="monotone" dataKey="active" stroke="#6366f1" fill="#6366f120" name="Active Pools" strokeWidth={1.5}/>
-          <Area type="monotone" dataKey="pauses" stroke="#f59e0b" fill="#f59e0b10" name="Pauses" strokeWidth={1.5}/>
-          <Area type="monotone" dataKey="merges" stroke="#10b981" fill="#10b98110" name="Merges" strokeWidth={1.5}/>
+          <Area type="monotone" dataKey="pauses" stroke="#f59e0b" fill="#f59e0b10" name="Paused Pools" strokeWidth={1.5}/>
+          <Area type="monotone" dataKey="formed" stroke="#10b981" fill="#10b98110" name="Pools Formed" strokeWidth={1.5}/>
         </AreaChart>
       </ResponsiveContainer>
     </div>
@@ -801,21 +811,22 @@ function CashFlowChart({ weekly }) {
 // ── Draw Analysis Chart ───────────────────────────────────────────────────────
 function DrawAnalysisChart({ weekly }) {
   if (!weekly?.length) return null
-  // Compute per-week draw type breakdown from cumulative totals
-  const data = weekly.map((w,i)=>{
-    const prev = i>0?weekly[i-1]:null
-    const dt   = w.draw_type_breakdown??{}
-    const pdtA = prev?.draw_type_breakdown?.type_a??0
-    const pdtB = prev?.draw_type_breakdown?.type_b??0
-    const pdtS = prev?.draw_type_breakdown?.sde??0
-    const pdtR = prev?.draw_type_breakdown?.regular??0
-    return {
-      week:    w.week,
-      regular: Math.max(0,(dt.regular??0)-(pdtR)),
-      type_a:  Math.max(0,(dt.type_a??0)-(pdtA)),
-      type_b:  Math.max(0,(dt.type_b??0)-(pdtB)),
-      sde:     Math.max(0,(dt.sde??0)-(pdtS)),
-    }
+  // D3 FIX [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // draw_type_breakdown was never populated in _snapshot() so all bars were zero.
+  // Derive per-week counts from cumulative fields already present in weekly_detail:
+  //   accel_diss_this_week  — cumulative accelerated dissolution draws (SDE-Accel)
+  //   ext2_exits_this_week  — cumulative SDE Ext-II draws
+  //   ext3_exits_this_week  — cumulative SDE Ext-III draws
+  //   draws_this_week       — total draws this week (regular + all SDE types)
+  // Per-week value = current_cumulative - previous_cumulative (delta decode).
+  const data = weekly.map((w, i) => {
+    const prev      = i > 0 ? weekly[i - 1] : null
+    const accel     = Math.max(0, (w.accel_diss_this_week ?? 0) - (prev?.accel_diss_this_week ?? 0))
+    const ext2      = Math.max(0, (w.ext2_exits_this_week  ?? 0) - (prev?.ext2_exits_this_week  ?? 0))
+    const ext3      = Math.max(0, (w.ext3_exits_this_week  ?? 0) - (prev?.ext3_exits_this_week  ?? 0))
+    const sde_total = accel + ext2 + ext3
+    const regular   = Math.max(0, (w.draws_this_week ?? 0) - sde_total)
+    return { week: w.week, regular, accel, ext2, ext3 }
   })
   return (
     <div className="h-48">
@@ -826,10 +837,10 @@ function DrawAnalysisChart({ weekly }) {
           <YAxis tick={{fill:'#64748b',fontSize:10}}/>
           <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
           <Legend wrapperStyle={{fontSize:10}}/>
-          <Bar dataKey="regular" stackId="a" fill="#10b981" name="Regular"  radius={[0,0,0,0]}/>
-          <Bar dataKey="type_a"  stackId="a" fill="#3b82f6" name="Type A"   radius={[0,0,0,0]}/>
-          <Bar dataKey="type_b"  stackId="a" fill="#f59e0b" name="Type B"   radius={[0,0,0,0]}/>
-          <Bar dataKey="sde"     stackId="a" fill="#ef4444" name="SDE Exit" radius={[4,4,0,0]}/>
+          <Bar dataKey="regular" stackId="a" fill="#10b981" name="Regular"       radius={[0,0,0,0]}/>
+          <Bar dataKey="accel"   stackId="a" fill="#3b82f6" name="SDE Accel"     radius={[0,0,0,0]}/>
+          <Bar dataKey="ext2"    stackId="a" fill="#f59e0b" name="SDE Ext-II"    radius={[0,0,0,0]}/>
+          <Bar dataKey="ext3"    stackId="a" fill="#ef4444" name="SDE Ext-III"   radius={[4,4,0,0]}/>
         </BarChart>
       </ResponsiveContainer>
     </div>
@@ -1562,7 +1573,8 @@ function StressTestTab({ toast }) {
                 {reportTab==='pools'&&(
                   <div>
                     <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Active Pools · Pauses · Merges Per Week</p>
-                    <PoolActivityChart logs={result.cycle_logs}/>
+                    {/* D2 FIX: weekly_detail has pools_active/pools_paused/pools_formed */}
+                    <PoolActivityChart logs={result.weekly_detail}/>
                     <div className="mt-4 grid grid-cols-3 gap-3">
                       <StatPill label="Total Pools Formed" value={result.simulation_summary.total_pools_auto_scaled} accent="violet"/>
                       <StatPill label="Total Condensations" value={result.simulation_summary.total_condensation_events} accent="amber"/>
@@ -1614,7 +1626,10 @@ function StressTestTab({ toast }) {
                 {/* Classic charts at bottom of Summary tab only */}
                 {reportTab==='summary'&&(
                   <>
-                    <SimCharts logs={result.cycle_logs}/>
+                    {/* D1 FIX [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        SimCharts now receives weekly_detail (has pools_active, waitlist_count)
+                        instead of cycle_logs (which only has week/pauses/draws/inflow). */}
+                    <SimCharts logs={result.weekly_detail}/>
                     <AiBrainCharts logs={result.cycle_logs}/>
                   </>
                 )}

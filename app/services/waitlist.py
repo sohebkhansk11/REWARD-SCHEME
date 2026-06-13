@@ -495,12 +495,11 @@ def assign_waitlist_to_pools(db: Session) -> dict:
     # ── Safeguard (c): draw window lock check (BUG 9 FIX) ────────────────────
     # Defer the import to avoid circular dependency at module load time.
     from app.models.system_lock import SystemLock
-    from datetime import datetime, timezone as _tz
     draw_lock = (
         db.query(SystemLock)
         .filter(
             SystemLock.lock_name == "draw_engine",
-            SystemLock.expires_at > datetime.now(_tz.utc),
+            SystemLock.expires_at > datetime.now(timezone.utc),
         )
         .first()
     )

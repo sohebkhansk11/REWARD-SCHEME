@@ -590,6 +590,18 @@ def execute_weekly_draw(
             .count()
         )
         if actual == POOL_CAPACITY:
+            # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Defensive recovery: a Paused pool already at capacity has vacancy=0 so
+            # Phase 1 never refills it, and run_dual_draw rejects it (status≠Active),
+            # creating a permanent deadlock.  Restore to Active here so the draw runs.
+            if pool.status == PoolStatus.Paused_Awaiting_Members:
+                pool.status = PoolStatus.Active
+                db.flush()
+                _logger.info(
+                    "execute_weekly_draw: ♻  %s was Paused but has %d/%d members — "
+                    "restored to Active for draw.",
+                    pool.name, actual, POOL_CAPACITY,
+                )
             eligible.append(pool)
         elif pool.status == PoolStatus.Active:
             # Draw protection: Active pool with < 12 members — pause it

@@ -784,7 +784,19 @@ function StressTestTab({ toast }) {
         'success'
       )
     } catch(err) {
-      toast(err.response?.data?.detail ?? 'Simulation failed', 'error')
+      const status = err.response?.status
+      const raw    = err.response?.data?.detail ?? err.message ?? 'Unknown error'
+      const detail = typeof raw === 'string' ? raw.slice(0, 300) : JSON.stringify(raw).slice(0, 300)
+      const msg =
+        status === 401 ? 'Session expired — re-login and try again.' :
+        status === 403 ? 'Dev mode disabled on server (ENABLE_DEV_MODE must be true).' :
+        status === 504 ? 'Server timeout — reduce weeks or users_per_week and retry.' :
+        status === 500 ? `Server error (500): ${detail}` :
+        status === 422 ? `Validation: ${detail}` :
+        `Simulation failed (HTTP ${status ?? 'network'}): ${detail}`
+      console.error('[Simulation]', status, err.response?.data)
+      toast(msg, 'error')
+      setResult({ _error: true, _msg: msg, _status: status })
     } finally { setRunning(false) }
   }
 
@@ -1156,8 +1168,24 @@ function StressTestTab({ toast }) {
 
         {result&&!running&&(
           <div className="border-t border-slate-700/60 pt-6">
-            {/* Report header + download buttons */}
-            <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+
+            {/* ── Error panel — shown when simulation throws ─────────────────── */}
+            {result._error && (
+              <div className="mb-4 p-4 bg-red-950/40 border border-red-800/50 rounded-xl text-sm text-red-300 space-y-2">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-red-500 flex-shrink-0"/>
+                  <p className="font-bold text-red-400 uppercase tracking-wide text-xs">Simulation Error (HTTP {result._status ?? 'network'})</p>
+                </div>
+                <p className="text-xs text-red-300 font-mono leading-relaxed break-all">{result._msg}</p>
+                <p className="text-[10px] text-slate-500 mt-1">
+                  Common causes: 500 = server bug / DB migration not run / self._elim crash (fixed in latest push) ·
+                  403 = ENABLE_DEV_MODE not set · 504 = timeout (reduce weeks)
+                </p>
+              </div>
+            )}
+
+            {/* Report header + download buttons (only when simulation succeeded) */}
+            {!result._error && <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
               <div className="flex items-center gap-2 flex-wrap">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 flex-shrink-0"/>
                 <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
@@ -1199,117 +1227,120 @@ function StressTestTab({ toast }) {
                   <Download className="w-3 h-3"/>JSON
                 </button>
               </div>
-            </div>
+            </div>}
 
-            {/* 6-tab report navigation */}
-            <div className="flex gap-1 flex-wrap mb-5">
-              {REPORT_TABS.map(t=>(
-                <button key={t.id} onClick={()=>setReportTab(t.id)}
-                  className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-colors ${
-                    reportTab===t.id
-                      ?'bg-violet-700 text-white'
-                      :'bg-slate-800 text-slate-400 border border-slate-700/60 hover:bg-slate-700/80'
-                  }`}>
-                  <span className="hidden sm:inline">{t.label}</span>
-                  <span className="sm:hidden">{t.short}</span>
-                </button>
-              ))}
-            </div>
+            {/* 6-tab report navigation + all tab content — only when no error */}
+            {!result._error && (
+              <>
+                <div className="flex gap-1 flex-wrap mb-5">
+                  {REPORT_TABS.map(t=>(
+                    <button key={t.id} onClick={()=>setReportTab(t.id)}
+                      className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-colors ${
+                        reportTab===t.id
+                          ?'bg-violet-700 text-white'
+                          :'bg-slate-800 text-slate-400 border border-slate-700/60 hover:bg-slate-700/80'
+                      }`}>
+                      <span className="hidden sm:inline">{t.label}</span>
+                      <span className="sm:hidden">{t.short}</span>
+                    </button>
+                  ))}
+                </div>
 
-            {/* ── Tab: Summary ── */}
-            {reportTab==='summary'&&(
-              <div>
-                {/* L5/L6 peak warning strip */}
-                {result.simulation_summary.system_health?.max_l5_count>0&&(
-                  <div className="flex gap-2.5 p-3 mb-4 rounded-xl bg-red-950/30 border border-red-800/40 text-xs text-red-300">
-                    <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5"/>
-                    <span>
-                      <strong>Anti-Maturity Pressure Detected:</strong>&nbsp;
-                      L5 peak = {result.simulation_summary.system_health.max_l5_count},&nbsp;
-                      L6 peak = {result.simulation_summary.system_health.max_l6_count}.&nbsp;
-                      Longest high-LPI streak = {result.simulation_summary.system_health.max_high_lpi_streak_weeks} weeks.
-                      {result.simulation_summary.system_health.max_l6_count>=3&&' ⚠️ Pool pauses likely.'}
-                    </span>
+                {/* ── Tab: Summary ── */}
+                {reportTab==='summary'&&(
+                  <div>
+                    {result.simulation_summary.system_health?.max_l5_count>0&&(
+                      <div className="flex gap-2.5 p-3 mb-4 rounded-xl bg-red-950/30 border border-red-800/40 text-xs text-red-300">
+                        <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5"/>
+                        <span>
+                          <strong>Anti-Maturity Pressure Detected:</strong>&nbsp;
+                          L5 peak = {result.simulation_summary.system_health.max_l5_count},&nbsp;
+                          L6 peak = {result.simulation_summary.system_health.max_l6_count}.&nbsp;
+                          Longest high-LPI streak = {result.simulation_summary.system_health.max_high_lpi_streak_weeks} weeks.
+                          {result.simulation_summary.system_health.max_l6_count>=3&&' ⚠️ Pool pauses likely.'}
+                        </span>
+                      </div>
+                    )}
+                    <SimStatsGrid s={result.simulation_summary}/>
+                    <SystemHealth fm={result.simulation_summary.financial_metrics} sh={result.simulation_summary.system_health}/>
+                    <LevelMatrix levelWise={result.simulation_summary.level_wise_metrics}/>
                   </div>
                 )}
-                <SimStatsGrid s={result.simulation_summary}/>
-                <SystemHealth fm={result.simulation_summary.financial_metrics} sh={result.simulation_summary.system_health}/>
-                <LevelMatrix levelWise={result.simulation_summary.level_wise_metrics}/>
-              </div>
-            )}
 
-            {/* ── Tab: Weekly Report ── */}
-            {reportTab==='weekly'&&(
-              <div>
-                <div className="flex items-center justify-between mb-3">
-                  <p className="text-xs text-slate-400">{result.weekly_detail?.length??0} weeks of data</p>
-                  <button onClick={()=>downloadCSV(result.weekly_detail, `sim_weekly_${Date.now()}.csv`)}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold bg-slate-800 border border-slate-600 rounded-lg text-slate-300 hover:bg-slate-700 transition">
-                    <Download className="w-3 h-3"/>Export CSV
-                  </button>
-                </div>
-                <WeeklyReportTable rows={result.weekly_detail}/>
-              </div>
-            )}
+                {/* ── Tab: Weekly Report ── */}
+                {reportTab==='weekly'&&(
+                  <div>
+                    <div className="flex items-center justify-between mb-3">
+                      <p className="text-xs text-slate-400">{result.weekly_detail?.length??0} weeks of data</p>
+                      <button onClick={()=>downloadCSV(result.weekly_detail, `sim_weekly_${Date.now()}.csv`)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold bg-slate-800 border border-slate-600 rounded-lg text-slate-300 hover:bg-slate-700 transition">
+                        <Download className="w-3 h-3"/>Export CSV
+                      </button>
+                    </div>
+                    <WeeklyReportTable rows={result.weekly_detail}/>
+                  </div>
+                )}
 
-            {/* ── Tab: Pool Activity ── */}
-            {reportTab==='pools'&&(
-              <div>
-                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Active Pools · Pauses · Merges Per Week</p>
-                <PoolActivityChart logs={result.cycle_logs}/>
-                <div className="mt-4 grid grid-cols-3 gap-3">
-                  <StatPill label="Total Pools Formed" value={result.simulation_summary.total_pools_auto_scaled} accent="violet"/>
-                  <StatPill label="Total Condensations" value={result.simulation_summary.total_condensation_events} accent="amber"/>
-                  <StatPill label="Total Draw Pauses"  value={result.simulation_summary.total_draw_pauses_triggered} accent="red"/>
-                </div>
-              </div>
-            )}
+                {/* ── Tab: Pool Activity ── */}
+                {reportTab==='pools'&&(
+                  <div>
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Active Pools · Pauses · Merges Per Week</p>
+                    <PoolActivityChart logs={result.cycle_logs}/>
+                    <div className="mt-4 grid grid-cols-3 gap-3">
+                      <StatPill label="Total Pools Formed" value={result.simulation_summary.total_pools_auto_scaled} accent="violet"/>
+                      <StatPill label="Total Condensations" value={result.simulation_summary.total_condensation_events} accent="amber"/>
+                      <StatPill label="Total Draw Pauses"  value={result.simulation_summary.total_draw_pauses_triggered} accent="red"/>
+                    </div>
+                  </div>
+                )}
 
-            {/* ── Tab: Draw Analysis ── */}
-            {reportTab==='draws'&&(
-              <div>
-                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Draw Type Breakdown Per Week</p>
-                <DrawAnalysisChart weekly={result.weekly_detail}/>
-                <div className="mt-4 grid grid-cols-4 gap-3">
-                  <StatPill label="Total Draws"  value={result.simulation_summary.total_winners_drawn/2} accent="blue"/>
-                  <StatPill label="SDE Exits"    value={result.simulation_summary.system_health?.total_sde_exits??0} accent="red"/>
-                  <StatPill label="Type A Draws" value={result.simulation_summary.system_health?.total_type_a_draws??0} accent="violet"/>
-                  <StatPill label="Type B Draws" value={result.simulation_summary.system_health?.total_type_b_draws??0} accent="amber"/>
-                </div>
-              </div>
-            )}
+                {/* ── Tab: Draw Analysis ── */}
+                {reportTab==='draws'&&(
+                  <div>
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Draw Type Breakdown Per Week</p>
+                    <DrawAnalysisChart weekly={result.weekly_detail}/>
+                    <div className="mt-4 grid grid-cols-4 gap-3">
+                      <StatPill label="Total Draws"  value={result.simulation_summary.total_winners_drawn/2} accent="blue"/>
+                      <StatPill label="SDE Exits"    value={result.simulation_summary.system_health?.total_sde_exits??0} accent="red"/>
+                      <StatPill label="Type A Draws" value={result.simulation_summary.system_health?.total_type_a_draws??0} accent="violet"/>
+                      <StatPill label="Type B Draws" value={result.simulation_summary.system_health?.total_type_b_draws??0} accent="amber"/>
+                    </div>
+                  </div>
+                )}
 
-            {/* ── Tab: Cash Flow ── */}
-            {reportTab==='cashflow'&&(
-              <div>
-                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Cash Inflow Breakdown Per Week</p>
-                <CashFlowChart weekly={result.weekly_detail}/>
-                <div className="mt-4 grid grid-cols-3 gap-3">
-                  <StatPill label="Total Collected" value={INR(result.simulation_summary.financial_metrics?.total_collected_inr??0)} accent="emerald"/>
-                  <StatPill label="Total Paid Out"  value={INR(result.simulation_summary.financial_metrics?.total_distributed_inr??0)} accent="red"/>
-                  <StatPill label="Net Float"       value={INR(result.simulation_summary.final_virtual_liquidity_float??0)} accent="blue"/>
-                </div>
-              </div>
-            )}
+                {/* ── Tab: Cash Flow ── */}
+                {reportTab==='cashflow'&&(
+                  <div>
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Cash Inflow Breakdown Per Week</p>
+                    <CashFlowChart weekly={result.weekly_detail}/>
+                    <div className="mt-4 grid grid-cols-3 gap-3">
+                      <StatPill label="Total Collected" value={INR(result.simulation_summary.financial_metrics?.total_collected_inr??0)} accent="emerald"/>
+                      <StatPill label="Total Paid Out"  value={INR(result.simulation_summary.financial_metrics?.total_distributed_inr??0)} accent="red"/>
+                      <StatPill label="Net Float"       value={INR(result.simulation_summary.final_virtual_liquidity_float??0)} accent="blue"/>
+                    </div>
+                  </div>
+                )}
 
-            {/* ── Tab: Level Progression ── */}
-            {reportTab==='levels'&&(
-              <div>
-                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Member Level Distribution Over Time</p>
-                <LevelProgressionChart weekly={result.weekly_detail} logs={result.cycle_logs}/>
-                <div className="mt-4 grid grid-cols-3 gap-3">
-                  <StatPill label="L5 Peak" value={result.simulation_summary.system_health?.max_l5_count??0} accent={result.simulation_summary.system_health?.max_l5_count>0?'red':'slate'}/>
-                  <StatPill label="L6 Peak" value={result.simulation_summary.system_health?.max_l6_count??0} accent={result.simulation_summary.system_health?.max_l6_count>0?'red':'slate'}/>
-                  <StatPill label="High-LPI Streak" value={`${result.simulation_summary.system_health?.max_high_lpi_streak_weeks??0} wks`} accent={result.simulation_summary.system_health?.max_high_lpi_streak_weeks>=3?'amber':'slate'}/>
-                </div>
-              </div>
-            )}
+                {/* ── Tab: Level Progression ── */}
+                {reportTab==='levels'&&(
+                  <div>
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Member Level Distribution Over Time</p>
+                    <LevelProgressionChart weekly={result.weekly_detail} logs={result.cycle_logs}/>
+                    <div className="mt-4 grid grid-cols-3 gap-3">
+                      <StatPill label="L5 Peak" value={result.simulation_summary.system_health?.max_l5_count??0} accent={result.simulation_summary.system_health?.max_l5_count>0?'red':'slate'}/>
+                      <StatPill label="L6 Peak" value={result.simulation_summary.system_health?.max_l6_count??0} accent={result.simulation_summary.system_health?.max_l6_count>0?'red':'slate'}/>
+                      <StatPill label="High-LPI Streak" value={`${result.simulation_summary.system_health?.max_high_lpi_streak_weeks??0} wks`} accent={result.simulation_summary.system_health?.max_high_lpi_streak_weeks>=3?'amber':'slate'}/>
+                    </div>
+                  </div>
+                )}
 
-            {/* Classic charts always visible at bottom of Summary tab only */}
-            {reportTab==='summary'&&(
-              <>
-                <SimCharts logs={result.cycle_logs}/>
-                <AiBrainCharts logs={result.cycle_logs}/>
+                {/* Classic charts at bottom of Summary tab only */}
+                {reportTab==='summary'&&(
+                  <>
+                    <SimCharts logs={result.cycle_logs}/>
+                    <AiBrainCharts logs={result.cycle_logs}/>
+                  </>
+                )}
               </>
             )}
           </div>

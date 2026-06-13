@@ -11,6 +11,23 @@ import Modal from '../components/Modal'
 import { generateToken, burnToken, getAdminTokens, downloadTokensCSV, triggerDownload, adminDeleteToken } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
+// ── Token type colour palette (extended for Late_Fee + Grace_Fee) ──────────────
+function TypeBadge({ type }) {
+  const cfg = {
+    Deposit:           'bg-blue-100 text-blue-700',
+    Withdraw:          'bg-violet-100 text-violet-700',
+    Referral:          'bg-teal-100 text-teal-700',
+    Referral_Withdraw: 'bg-cyan-100 text-cyan-700',
+    Late_Fee:          'bg-amber-100 text-amber-700',
+    Grace_Fee:         'bg-orange-100 text-orange-700',
+  }
+  return (
+    <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${cfg[type] ?? 'bg-slate-100 text-slate-600'}`}>
+      {type?.replace('_',' ')}
+    </span>
+  )
+}
+
 function fmtDate(iso) {
   if (!iso) return '—'
   return new Date(iso).toLocaleString('en-IN', {
@@ -68,6 +85,7 @@ export default function TokenManager() {
   const [typeFilter,      setTypeFilter]      = useState('')
   const [statusFilter,    setStatusFilter]    = useState('')
   const [downloading,     setDownloading]     = useState(false)
+  const [loadError,       setLoadError]       = useState(null)   // visible fetch error
 
   // Delete token modal
   const [delToken,     setDelToken]     = useState(null)   // token object
@@ -76,17 +94,30 @@ export default function TokenManager() {
   const [pwVisible,    setPwVisible]    = useState(false)
 
   const loadTokens = useCallback(async (silent = false) => {
-    if (!silent) setTokensLoading(true)
+    if (!silent) { setTokensLoading(true); setLoadError(null) }
     else setTokensRefreshing(true)
     try {
       const params = {}
       if (typeFilter)   params.type   = typeFilter
       if (statusFilter) params.status = statusFilter
       const res = await getAdminTokens(params)
-      setTokens(res.data)
-    } catch { /* ignore */ }
+      // Backend returns a JSON array directly
+      const items = Array.isArray(res.data) ? res.data : (res.data?.items ?? [])
+      setTokens(items)
+      setLoadError(null)
+    } catch (err) {
+      const status  = err.response?.status
+      const detail  = err.response?.data?.detail ?? err.message ?? 'Unknown error'
+      const msg =
+        status === 401 ? 'Session expired — please log in again.' :
+        status === 500 ? `Server error: ${detail}` :
+        status === 422 ? `Invalid filter: ${detail}` :
+        `Failed to load tokens (${status ?? 'network'}): ${detail}`
+      setLoadError(msg)
+      if (!silent) toast(msg, 'error')
+    }
     finally { setTokensLoading(false); setTokensRefreshing(false) }
-  }, [typeFilter, statusFilter])
+  }, [typeFilter, statusFilter, toast])
 
   useEffect(() => { loadTokens() }, [loadTokens])
 
@@ -294,21 +325,23 @@ export default function TokenManager() {
             <span className="text-xs text-slate-400">{tokens.length} tokens</span>
           </div>
 
-          {/* Type filter — chip buttons */}
+          {/* Type filter — chip buttons (all 6 token types) */}
           <div className="flex items-center gap-1 flex-wrap">
             {[
-              { value: '',                   label: 'All'     },
-              { value: 'Deposit',            label: 'DEP'     },
-              { value: 'Withdraw',           label: 'WIT'     },
-              { value: 'Referral',           label: 'REF'     },
-              { value: 'Referral_Withdraw',  label: 'REF-WIT' },
-            ].map(({ value, label }) => (
+              { value: '',                   label: 'All',     active: 'bg-blue-600 border-blue-600 text-white'     },
+              { value: 'Deposit',            label: 'DEP',     active: 'bg-blue-600 border-blue-600 text-white'     },
+              { value: 'Withdraw',           label: 'WIT',     active: 'bg-violet-600 border-violet-600 text-white' },
+              { value: 'Referral',           label: 'REF',     active: 'bg-teal-600 border-teal-600 text-white'     },
+              { value: 'Referral_Withdraw',  label: 'REF-WIT', active: 'bg-cyan-600 border-cyan-600 text-white'     },
+              { value: 'Late_Fee',           label: 'LF',      active: 'bg-amber-500 border-amber-500 text-white'   },
+              { value: 'Grace_Fee',          label: 'GF',      active: 'bg-orange-500 border-orange-500 text-white' },
+            ].map(({ value, label, active }) => (
               <button
                 key={value}
                 onClick={() => setTypeFilter(value)}
                 className={`px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors ${
                   typeFilter === value
-                    ? 'bg-blue-600 text-white border-blue-600'
+                    ? active
                     : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
                 }`}
               >
@@ -350,10 +383,22 @@ export default function TokenManager() {
           </button>
         </div>
 
+        {/* Error banner — shows when backend call fails */}
+        {loadError && (
+          <div className="mx-6 mt-4 flex items-start gap-2.5 p-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
+            <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-500" />
+            <div>
+              <p className="font-semibold">Failed to load tokens</p>
+              <p className="text-xs text-red-500 mt-0.5">{loadError}</p>
+              <button onClick={() => loadTokens()} className="text-xs text-red-600 underline mt-1">Retry</button>
+            </div>
+          </div>
+        )}
+
         {/* Ledger table */}
         {tokensLoading ? (
           <div className="flex justify-center py-10"><Spinner /></div>
-        ) : tokens.length === 0 ? (
+        ) : loadError ? null : tokens.length === 0 ? (
           <div className="py-12 text-center text-slate-400 text-sm">No tokens match the current filters.</div>
         ) : (
           <div className="overflow-x-auto">
@@ -389,13 +434,7 @@ export default function TokenManager() {
 
                     {/* Type badge */}
                     <td className="px-4 py-3">
-                      <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
-                        t.type === 'Deposit'  ? 'bg-blue-100 text-blue-700' :
-                        t.type === 'Withdraw' ? 'bg-violet-100 text-violet-700' :
-                        'bg-teal-100 text-teal-700'
-                      }`}>
-                        {t.type}
-                      </span>
+                      <TypeBadge type={t.type} />
                     </td>
 
                     {/* Value */}
@@ -491,11 +530,7 @@ export default function TokenManager() {
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-slate-500">Type</span>
-                <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
-                  delToken.type === 'Deposit'  ? 'bg-blue-100 text-blue-700' :
-                  delToken.type === 'Withdraw' ? 'bg-violet-100 text-violet-700' :
-                  'bg-teal-100 text-teal-700'
-                }`}>{delToken.type}</span>
+                <TypeBadge type={delToken.type} />
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-slate-500">Value</span>

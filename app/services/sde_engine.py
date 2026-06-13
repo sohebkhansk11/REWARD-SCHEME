@@ -878,7 +878,7 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-@_dc
+@dataclass
 class SDEExt2DrawResult:
     """Result of one SDE Extension II draw (L5 forced exit)."""
     pool_id:                 int

@@ -3136,8 +3136,33 @@ def run_real_simulation(
 
     Use this for architecture validation, bottleneck discovery, and stress testing.
     Use /dev/advanced-simulation for fast parameter sweeps (< 1 second per 100 cycles).
+
+    ── Server-side timeout guard ─────────────────────────────────────────────────
+    Cloud deployments (Render free tier) have a 60-second HTTP proxy timeout.
+    Each real-engine week costs ≈ 2–5 s on a shared-CPU instance.
+    Hard cap: 15 weeks on cloud.  Use /dev/advanced-simulation for longer runs.
     """
     from app.services.real_simulation import RealSimEngine
+
+    # ── Timeout guard: Render free tier proxy cuts the connection at 60 s ────────
+    # Real engine takes ≈ 2–5 s/week on shared CPU → 15 weeks ≈ 30–75 s.
+    # Anything above 15 weeks will likely time out and produce a "Network Error"
+    # with no response body.  The fast /dev/advanced-simulation handles 200 cycles
+    # in < 1 second and has no timeout risk — use it for larger parameter sweeps.
+    REAL_ENGINE_MAX_WEEKS_CLOUD = 15
+    if body.weeks > REAL_ENGINE_MAX_WEEKS_CLOUD:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Real Engine is limited to {REAL_ENGINE_MAX_WEEKS_CLOUD} weeks on this "
+                f"server to prevent HTTP proxy timeout (you requested {body.weeks} weeks). "
+                f"Options: (1) reduce to ≤ {REAL_ENGINE_MAX_WEEKS_CLOUD} weeks, OR "
+                f"(2) use Fast Preview (POST /dev/advanced-simulation) which handles "
+                f"1000 cycles with no timeout risk. "
+                f"Real Engine is for architecture validation; Fast Preview is for "
+                f"large-scale financial projections."
+            ),
+        )
 
     engine = RealSimEngine(
         weeks                = body.weeks,

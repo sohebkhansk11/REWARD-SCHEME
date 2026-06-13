@@ -65,13 +65,53 @@ function CodeDisplay({ code }) {
   )
 }
 
+// ── Issuable token types — admin can only manually generate these three ────────
+// Withdraw (WIT) = auto-created by draw engine
+// Referral (REF) = auto-created when referred user enters Active Pool (Rule 39)
+// Referral_Withdraw (RW) = auto-created for eligible members by payout engine
+const ISSUABLE_TYPES = [
+  {
+    value:       'Deposit',
+    label:       'Deposit (DEP)',
+    prefix:      'DEP-',
+    color:       'text-blue-700',
+    defaultAmt:  '1000',
+    hint:        'Entry deposit token for a new user. Redeemed to move user from registration to Waitlist.',
+  },
+  {
+    value:       'Late_Fee',
+    label:       'Late Fee (LF)',
+    prefix:      'LF-',
+    color:       'text-amber-600',
+    defaultAmt:  '50',
+    hint:        'Manual late-fee token issued for payment compliance. Burnt when cash is collected from member.',
+  },
+  {
+    value:       'Grace_Fee',
+    label:       'Grace Fee (GF)',
+    prefix:      'GF-',
+    color:       'text-orange-600',
+    defaultAmt:  '500',
+    hint:        'Grace period seat-save fee token (₹500). Issued when admin confirms grace payment received.',
+  },
+]
+
 export default function TokenManager() {
   const toast = useToast()
 
-  // Generate panel
-  const [genAmount, setGenAmount] = useState('1000')
+  // Generate panel — type selector + amount
+  const [genType,    setGenType]    = useState('Deposit')
+  const [genAmount,  setGenAmount]  = useState('1000')
   const [genLoading, setGenLoading] = useState(false)
-  const [lastCode, setLastCode] = useState(null)
+  const [lastCode,   setLastCode]   = useState(null)
+
+  // When type changes, auto-update default amount
+  const handleTypeChange = (val) => {
+    setGenType(val)
+    const t = ISSUABLE_TYPES.find(x => x.value === val)
+    if (t) setGenAmount(t.defaultAmt)
+    setLastCode(null)
+  }
 
   // Burn panel
   const [burnCode, setBurnCode] = useState('')
@@ -141,12 +181,14 @@ export default function TokenManager() {
     e.preventDefault()
     const amount = parseFloat(genAmount)
     if (!amount || amount <= 0) { toast('Enter a valid amount', 'warning'); return }
+    if (!genType) { toast('Select a token type', 'warning'); return }
     setGenLoading(true)
     setLastCode(null)
     try {
-      const res = await generateToken('Deposit', amount)
+      const res = await generateToken(genType, amount)
       setLastCode(res.data.code)
-      toast(`Token ${res.data.code} generated`, 'success')
+      const typeLabel = ISSUABLE_TYPES.find(t => t.value === genType)?.label ?? genType
+      toast(`${typeLabel} token ${res.data.code} generated`, 'success')
       loadTokens()
     } catch (err) {
       toast(err.response?.data?.detail ?? 'Generation failed', 'error')
@@ -206,18 +248,62 @@ export default function TokenManager() {
       </motion.div>
 
       <motion.div {..._fadeUp} className="grid grid-cols-2 gap-6">
-        {/* ── Issue Deposit Token ─────────────────────────────── */}
+        {/* ── Issue Token ────────────────────────────────────────── */}
         <div className="bg-white rounded-2xl shadow-sm border border-slate-100">
           <div className="px-6 py-4 border-b border-slate-100 flex items-center gap-3">
             <div className="bg-blue-50 p-2 rounded-lg">
               <Plus className="w-4 h-4 text-blue-600" />
             </div>
             <div>
-              <h2 className="font-semibold text-slate-800">Issue Deposit Token</h2>
-              <p className="text-xs text-slate-400">Creates a one-time redemption code for a user</p>
+              <h2 className="font-semibold text-slate-800">Issue Token</h2>
+              <p className="text-xs text-slate-400">Generate a one-time admin token code</p>
             </div>
           </div>
           <form onSubmit={handleGenerate} className="p-6 space-y-5">
+
+            {/* ── Token type selector ──────────────────────────────── */}
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
+                Token Type
+              </label>
+              <div className="space-y-2">
+                {ISSUABLE_TYPES.map(t => (
+                  <label
+                    key={t.value}
+                    className={`flex items-start gap-3 p-3 rounded-xl border-2 cursor-pointer transition-all ${
+                      genType === t.value
+                        ? 'border-blue-500 bg-blue-50'
+                        : 'border-slate-200 hover:border-slate-300 bg-white'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="tokenType"
+                      value={t.value}
+                      checked={genType === t.value}
+                      onChange={() => handleTypeChange(t.value)}
+                      className="mt-0.5 accent-blue-600 flex-shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <p className={`text-sm font-bold ${genType === t.value ? 'text-blue-700' : 'text-slate-700'}`}>
+                        {t.label}
+                      </p>
+                      <p className="text-xs text-slate-400 mt-0.5 leading-snug">{t.hint}</p>
+                    </div>
+                  </label>
+                ))}
+              </div>
+              {/* Auto-generated types notice */}
+              <div className="mt-3 flex items-start gap-2 p-2.5 bg-slate-50 border border-slate-200 rounded-xl">
+                <AlertCircle className="w-3.5 h-3.5 text-slate-400 flex-shrink-0 mt-0.5" />
+                <p className="text-[11px] text-slate-400 leading-snug">
+                  <span className="font-semibold text-slate-500">Auto-generated (not issuable here):</span>
+                  {' '}WIT tokens are created by the draw engine · REF tokens by Rule 39 · REF-WIT by the referral payout engine
+                </p>
+              </div>
+            </div>
+
+            {/* ── Face value ───────────────────────────────────────── */}
             <div>
               <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
                 Face Value (₹)
@@ -231,19 +317,28 @@ export default function TokenManager() {
                   value={genAmount}
                   onChange={e => setGenAmount(e.target.value)}
                   className="w-full pl-7 pr-4 py-2.5 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
-                  placeholder="1000"
+                  placeholder={ISSUABLE_TYPES.find(t => t.value === genType)?.defaultAmt ?? '1000'}
                 />
               </div>
-              <p className="mt-1.5 text-xs text-slate-400">Standard deposit is ₹1,000</p>
+              <p className="mt-1.5 text-xs text-slate-400">
+                {genType === 'Deposit'   && 'Standard entry deposit is ₹1,000'}
+                {genType === 'Late_Fee'  && 'Daily late fee: ₹50/day, max ₹500'}
+                {genType === 'Grace_Fee' && 'Grace period seat-save fee is ₹500'}
+              </p>
             </div>
 
+            {/* ── Generate button ──────────────────────────────────── */}
             <button
               type="submit"
               disabled={genLoading}
-              className="w-full flex items-center justify-center gap-2 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold text-sm shadow-sm shadow-blue-200 disabled:opacity-60 transition"
+              className={`w-full flex items-center justify-center gap-2 py-3 text-white rounded-xl font-semibold text-sm shadow-sm disabled:opacity-60 transition ${
+                genType === 'Deposit'   ? 'bg-blue-600   hover:bg-blue-700   shadow-blue-200'  :
+                genType === 'Late_Fee'  ? 'bg-amber-500  hover:bg-amber-600  shadow-amber-200' :
+                                          'bg-orange-500 hover:bg-orange-600 shadow-orange-200'
+              }`}
             >
               {genLoading ? <Spinner className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
-              Generate Token
+              Generate {ISSUABLE_TYPES.find(t => t.value === genType)?.label ?? ''} Token
             </button>
 
             {lastCode && <CodeDisplay code={lastCode} />}

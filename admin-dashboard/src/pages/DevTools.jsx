@@ -746,8 +746,10 @@ function StressTestTab({ toast }) {
       let res
       if (useRealEngine) {
         // ── Real Engine: call actual production services ──────────────────────
+        // Hard-cap at 15 weeks client-side to match backend limit (Render timeout guard)
+        const realWeeks = Math.min(cycles, 15)
         res = await realSimulationDev({
-          weeks:                   cycles,
+          weeks:                   realWeeks,
           users_per_week:          usersPerWeek,
           initial_users:           initialUsers,
           organic_ratio:           organicRatio / 100.0,
@@ -834,27 +836,73 @@ function StressTestTab({ toast }) {
         </div>
       </div>
       <div className="p-6 space-y-6">
-        {/* Cycles slider */}
+        {/* Cycles slider — Real Engine capped at 15; Fast Preview up to 1000 */}
         <div>
           <div className="flex items-center justify-between mb-3">
             <label className="text-xs font-bold text-slate-300 uppercase tracking-wider">Test Rounds (Weeks)</label>
-            <div className="flex items-center gap-1.5 bg-violet-950/60 border border-violet-700/60 rounded-xl px-3 py-1.5">
-              <span className="text-xl font-black text-violet-200 tabular-nums">{cycles.toLocaleString()}</span>
+            <div className={`flex items-center gap-1.5 rounded-xl px-3 py-1.5 border ${
+              useRealEngine
+                ? 'bg-emerald-950/60 border-emerald-700/60'
+                : 'bg-violet-950/60 border-violet-700/60'
+            }`}>
+              <span className={`text-xl font-black tabular-nums ${useRealEngine ? 'text-emerald-200' : 'text-violet-200'}`}>
+                {Math.min(cycles, useRealEngine ? 15 : 1000).toLocaleString()}
+              </span>
               <span className="text-[10px] text-slate-500 font-semibold">cycles</span>
             </div>
           </div>
-          <input type="range" min={1} max={1000} step={1} value={cycles} disabled={running}
-            onChange={e=>setCycles(parseInt(e.target.value))}
-            className="w-full h-2 rounded-full appearance-none cursor-pointer accent-violet-500 disabled:opacity-40"
-            style={{background:`linear-gradient(to right,#7c3aed ${cycles/10}%,#334155 ${cycles/10}%)`}}
-          />
-          <div className="flex justify-between text-[10px] text-slate-600 mt-1.5 select-none">
-            {[1,250,500,750,1000].map(v=><button key={v} onClick={()=>!running&&setCycles(v)} disabled={running} className="hover:text-violet-400 transition-colors">{v.toLocaleString()}</button>)}
-          </div>
-          {useRealEngine
-            ? cycles>=100&&!running&&<p className="text-[11px] text-amber-400 flex items-center gap-1.5 mt-2"><AlertTriangle className="w-3.5 h-3.5"/>{cycles>=150?`${cycles} weeks — real engine: expect 3–8 min`:`${cycles} weeks — real engine: expect 1–3 min`}</p>
-            : cycles>=500&&!running&&<p className="text-[11px] text-amber-400 flex items-center gap-1.5 mt-2"><AlertTriangle className="w-3.5 h-3.5"/>{cycles>=800?`${cycles} cycles — expect 45–90s`:`${cycles} cycles — expect 20–45s`}</p>
-          }
+
+          {useRealEngine ? (
+            /* ── Real Engine: hard cap 15 weeks (Render 60s proxy timeout) ── */
+            <>
+              <input type="range" min={1} max={15} step={1}
+                value={Math.min(cycles, 15)} disabled={running}
+                onChange={e => setCycles(parseInt(e.target.value))}
+                className="w-full h-2 rounded-full appearance-none cursor-pointer accent-emerald-500 disabled:opacity-40"
+                style={{background:`linear-gradient(to right,#059669 ${Math.min(cycles,15)/15*100}%,#334155 ${Math.min(cycles,15)/15*100}%)`}}
+              />
+              <div className="flex justify-between text-[10px] text-slate-600 mt-1.5 select-none">
+                {[1,3,5,8,12,15].map(v=>(
+                  <button key={v} onClick={()=>!running&&setCycles(v)} disabled={running}
+                    className="hover:text-emerald-400 transition-colors">{v}</button>
+                ))}
+              </div>
+              <div className="mt-3 flex items-start gap-2 p-2.5 rounded-xl border border-emerald-800/50 bg-emerald-950/20">
+                <AlertTriangle className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5"/>
+                <p className="text-[11px] text-emerald-300 leading-snug">
+                  <span className="font-bold">Real Engine: max 15 weeks</span> — calls actual production services per week.
+                  Cloud proxy timeout = 60 s.{' '}
+                  <button onClick={()=>!running&&(setUseRealEngine(false),setCycles(Math.max(cycles,50)))}
+                    className="underline text-emerald-400 hover:text-emerald-200 font-bold transition-colors">
+                    Switch to ⚡ Fast Preview
+                  </button>{' '}
+                  for 1–1,000 cycles with no timeout risk.
+                </p>
+              </div>
+            </>
+          ) : (
+            /* ── Fast Preview: 1–1000 cycles ──────────────────────────────── */
+            <>
+              <input type="range" min={1} max={1000} step={1}
+                value={cycles} disabled={running}
+                onChange={e=>setCycles(parseInt(e.target.value))}
+                className="w-full h-2 rounded-full appearance-none cursor-pointer accent-violet-500 disabled:opacity-40"
+                style={{background:`linear-gradient(to right,#7c3aed ${cycles/10}%,#334155 ${cycles/10}%)`}}
+              />
+              <div className="flex justify-between text-[10px] text-slate-600 mt-1.5 select-none">
+                {[1,250,500,750,1000].map(v=>(
+                  <button key={v} onClick={()=>!running&&setCycles(v)} disabled={running}
+                    className="hover:text-violet-400 transition-colors">{v.toLocaleString()}</button>
+                ))}
+              </div>
+              {cycles>=500&&!running&&(
+                <p className="text-[11px] text-amber-400 flex items-center gap-1.5 mt-2">
+                  <AlertTriangle className="w-3.5 h-3.5"/>
+                  {cycles>=800?`${cycles} cycles — expect 45–90s`:`${cycles} cycles — expect 20–45s`}
+                </p>
+              )}
+            </>
+          )}
         </div>
 
         {/* ── Real Engine Config (only visible when Real Engine is active) ──── */}

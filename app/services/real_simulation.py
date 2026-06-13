@@ -1288,8 +1288,14 @@ class RealSimEngine:
                     except ValueError as exc:
                         # No eligible pools this week — normal at start
                         _logger.info("Week %d: no eligible pools — %s", week_num, exc)
+                    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # Upgraded from _logger.warning (message only) to _logger.error with
+                    # exc_info=True so the full stack trace is captured when the draw cycle
+                    # itself aborts. Also added draw_abort_error to cycle_logs for
+                    # frontend visibility in the simulation report.
                     except Exception as exc:
-                        _logger.warning("Week %d draw error: %s", week_num, exc)
+                        _logger.error("Week %d draw ABORT: %s", week_num, exc, exc_info=True)
+                        cycle_logs.append({"week": week_num, "draw_abort_error": str(exc)})
                         try: db.rollback()
                         except Exception: pass
 

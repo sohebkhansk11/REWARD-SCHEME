@@ -274,21 +274,31 @@ class MassLoadInjector:
 
         return new_users
 
-    def auto_pay_installments(self, db: Session, week_num: int = 0) -> int:
+    def auto_pay_installments(
+        self,
+        db:       Session,
+        week_num: int = 0,
+        skip_ids: "set[int] | None" = None,
+    ) -> int:
         """
-        U-08: Mark ALL Active pool members as Paid AND create one weekly
+        U-08: Mark non-late Active members as Paid and create one weekly
         Burned DEP token per member — making total_collected_inr financially
         accurate for multi-week simulations.
 
-        Without U-08: a 52-week run with 100 active members shows
-            total_collected_inr = ₹1,00,000 (only initial deposits)
-        With U-08:    same run shows
-            total_collected_inr = ₹52,00,000 (initial + 52 weekly payments)
+        SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        FIX A2: Added skip_ids parameter — Type B late-fee holders (Unpaid but NOT
+        eliminated) are excluded from auto-pay so their WK token is NOT created.
+        This ensures installments_collected_inr reflects only members who genuinely
+        paid this week, not all Active members.
+
+        skip_ids  : set of user.id values returned by apply_abc_model() as
+                    "type_b_ids" — these members are Unpaid by design and must not
+                    receive a WK installment token until they pay in a future week.
 
         Token code format: WK{week:04d}U{uid:010d} — deterministic, unique per
         member per week, collision-safe without a DB lookup loop.
 
-        Returns count of members who were Unpaid (= new tokens created).
+        Returns count of members who were paid (= new tokens created).
         """
         from app.models.user  import User, UserStatus, WeeklyPaymentStatus
         from app.models.token import Token, TokenType, TokenStatus
@@ -302,6 +312,10 @@ class MassLoadInjector:
             )
             .all()
         )
+
+        # Exclude Type B late-fee holders — they are Unpaid by design this week
+        if skip_ids:
+            unpaid = [m for m in unpaid if m.id not in skip_ids]
 
         if not unpaid:
             return 0
@@ -454,6 +468,7 @@ class MassLoadInjector:
 
         _empty = {
             "n_late": 0, "n_elim": 0, "n_saved": 0,
+            "n_type_b": 0, "type_b_ids": set(),
             "late_fee_revenue_inr": 0, "grace_fee_revenue_inr": 0,
             "total_compliance_revenue_inr": 0, "week_id": week_id,
         }
@@ -501,10 +516,27 @@ class MassLoadInjector:
 
         db.flush()
 
-        # ── Step 3: Split into A (direct elim) and grace pool ─────────────────
-        n_direct_elim = max(0, int(n_late * (elim_pct_a / 100.0)))
-        direct_elim   = late_batch[:n_direct_elim]
-        grace_pool    = late_batch[n_direct_elim:]
+        # ── Step 3: Split late_batch into A / C / B buckets ──────────────────
+        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # FIX A1: Correct A/B/C proportions — each bucket is a fraction of ALL
+        # late payers, not a cascading fraction-of-a-fraction.
+        #
+        #   A (elim_pct_a%)   — direct elimination, no grace
+        #   C (grace_pct_c%)  — grace period: seat saved, Paid after grace+late fee
+        #   B (remainder %)   — late fee accrued (Step 2 already), stay Unpaid in pool
+        #
+        # Previous code treated C as "% of the non-A remainder", making it
+        # effectively much smaller and silently eliminating all Type B members.
+        # With elim_pct_a=80 / grace_pct_c=15: old code eliminated 97% of late
+        # payers; correct model eliminates exactly 80%.
+        n_direct_elim  = max(0, int(n_late * (elim_pct_a  / 100.0)))
+        n_grace        = max(0, int(n_late * (grace_pct_c  / 100.0)))
+        # Clamp: A + C must never exceed n_late (rounding guard)
+        n_grace        = min(n_grace, max(0, n_late - n_direct_elim))
+
+        direct_elim    = late_batch[:n_direct_elim]
+        grace_savers   = late_batch[n_direct_elim : n_direct_elim + n_grace]
+        type_b_members = late_batch[n_direct_elim + n_grace:]   # late fee, stay Unpaid
 
         # ── Step 4: A path — direct elimination + EliminationEvent ───────────
         total_late_fee_rev   = _zero
@@ -537,12 +569,13 @@ class MassLoadInjector:
 
         db.flush()
 
-        # ── Step 5: Grace pool — C savers keep seat, rest eliminated ─────────
-        n_saved = max(0, int(len(grace_pool) * (grace_pct_c / 100.0)))
-        grace_savers  = grace_pool[:n_saved]
-        grace_expired = grace_pool[n_saved:]
+        # ── Step 5: C path — grace savers pay grace+late fee, seat saved ────────
+        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # grace_savers already computed in Step 3 (n_grace of ALL late, not non-A).
+        # Removed grace_expired elimination: Type B members (remainder) are NOT
+        # eliminated — they stay Active+Unpaid and are handled in Step 5b below.
+        n_saved = len(grace_savers)
 
-        # C path: savers pay grace fee + late fees
         for m in grace_savers:
             late_fees_on_member = Decimal(str(m.late_fees_inr or 0))
 
@@ -571,7 +604,7 @@ class MassLoadInjector:
             ))
             total_grace_fee_rev += _grace_fee
 
-            # Clear elimination flags — seat saved
+            # Clear elimination flags — seat saved, mark Paid
             m.grace_fee_paid          = True
             m.grace_active            = False
             m.elimination_risk        = False
@@ -580,33 +613,12 @@ class MassLoadInjector:
 
         db.flush()
 
-        # Failed grace — eliminate + EliminationEvent
-        for m in grace_expired:
-            late_fees_on_member = Decimal(str(m.late_fees_inr or 0))
-            total_ev = Decimal("1000") + late_fees_on_member + _grace_fee
-
-            db.add(EliminationEvent(
-                user_id                   = m.id,
-                username_snapshot         = m.username,
-                user_level_at_elimination = m.current_level,
-                pool_id                   = m.current_pool_id,
-                pool_name_snapshot        = f"Pool-{m.current_pool_id}" if m.current_pool_id else "Unknown",
-                draw_week_id              = week_id,
-                reason                    = EliminationReason.grace_expired,
-                late_fees_forfeited       = late_fees_on_member,
-                seat_save_fee             = _grace_fee,   # entered grace but didn't pay
-                deposit_forfeited         = Decimal("1000"),
-                total_forfeited           = total_ev,
-                was_in_grace_period       = True,
-            ))
-
-            m.status          = UserStatus.Eliminated
-            m.current_pool_id = None
-            m.late_fees_inr   = _zero
-            m.grace_active    = False
-            m.grace_expires_at = None
-            n_total_elim     += 1
-
+        # ── Step 5b: B path — late fee already accrued (Step 2); stay Unpaid ──
+        # Type B members remain Active in their pool with weekly_payment_status=Unpaid.
+        # They receive no WK installment token this week (auto_pay will skip them).
+        # They may pay next week if not selected as late again.
+        for m in type_b_members:
+            m.elimination_risk = True   # surface as at-risk in UI
         db.flush()
 
         # ── Step 6: Refill vacancies via real production waitlist engine ──────
@@ -625,6 +637,8 @@ class MassLoadInjector:
             "n_late":                       n_late,
             "n_elim":                       n_total_elim,
             "n_saved":                      n_saved,
+            "n_type_b":                     len(type_b_members),
+            "type_b_ids":                   {m.id for m in type_b_members},
             "late_fee_revenue_inr":         float(total_late_fee_rev),
             "grace_fee_revenue_inr":        float(total_grace_fee_rev),
             "total_compliance_revenue_inr": float(total_compliance),
@@ -800,7 +814,12 @@ def _snapshot(
         "active_users":       active_users,
         "waitlist_count":     waitlist_count,
         "pools_active":       pools_active,
-        "pools_paused":       pools_paused + pauses_this_week,
+        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # FIX C: Removed + pauses_this_week — pools_paused is a live DB COUNT of
+        # Paused_Awaiting_Members pools AFTER Phase-1 refill has already run inside
+        # execute_weekly_draw().  Adding pauses_this_week double-counted pools that
+        # were paused mid-draw but immediately refilled back to Active by Phase 1.
+        "pools_paused":       pools_paused,
         "pools_formed":       0,
         "draws_this_week":    draws_this_week,
         "winners_this_week":  draws_this_week * 2,
@@ -1131,32 +1150,38 @@ class RealSimEngine:
 
                     # ── b. Finance Manager: Reset payment cycle (Monday morning)
                     #
-                    # WHY: All members start each week owing a payment.  Without this
-                    # reset, every member's weekly_payment_status stays Paid from the
-                    # previous week — auto_pay_installments() finds 0 Unpaid members
-                    # and creates 0 DEP tokens, keeping installments_collected_inr=0
-                    # forever.  By resetting to Unpaid here we force auto_pay to create
-                    # one DEP token per active member per week (the weekly installment).
-                    _fm_reset_payment_cycle(db)
+                    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # FIX A3: Corrected FM payment-cycle order.
+                    #
+                    # OLD (wrong) order:
+                    #   Monday — reset ALL → Unpaid
+                    #   Monday — auto_pay ALL → Paid + WK tokens (even future late payers!)
+                    #   Thursday — apply_abc → re-mark n_late% Unpaid (tokens already issued!)
+                    #
+                    # NEW (correct) order:
+                    #   Monday    — reset ALL → Unpaid
+                    #   Thursday  — apply_abc → A eliminated, B late-fee stays Unpaid,
+                    #                           C grace saved → Paid
+                    #   Thursday  — auto_pay(skip_ids=type_b_ids) → non-late Unpaid → Paid
+                    #
+                    # Effect: WK installment tokens are only created for members who
+                    # ACTUALLY paid this week.  installments_collected_inr is now correct.
 
-                    # ── b.2 Auto-pay all active pool members (U-08 weekly DEP tokens)
-                    # Now that every member is Unpaid, auto_pay marks them Paid and
-                    # creates one WK-prefixed DEP token per member — the installment
-                    # receipt.  apply_abc_model (Thursday) will re-mark late_ratio% as
-                    # Unpaid and process them through the A/B/C compliance paths.
-                    injector.auto_pay_installments(db, week_num=week_num)
+                    # ── b. Finance Manager: Reset payment cycle (Monday morning) ──
+                    # All Active members start the week Unpaid (they owe this week's ₹1000).
+                    _fm_reset_payment_cycle(db)
                     db.commit()
 
-                    # ── c. Thursday 23:59 — Payment due date: Apply A/B/C compliance
+                    # ── c. Thursday 23:59 — Payment due date: Apply A/B/C compliance ──
                     #
                     # Time-travel to Thursday 23:59 (T-3d from Sunday draw).
-                    # This is the production due-date cutoff: any member who hasn't
-                    # paid by this moment is flagged as late and enters A/B/C processing.
+                    # Production due-date cutoff: late members enter A/B/C processing.
                     #
                     # Timeline:
-                    #   Monday  00:01 (above)  — payment due, DEP tokens created
+                    #   Monday  00:01 (above)  — reset to Unpaid
                     #   Thursday 23:59 (now)   — due date: A eliminated, B late-fee,
-                    #                            C grace saves seat
+                    #                            C grace saves seat → Paid
+                    #   Thursday 23:59 (below) — FM auto-pays remaining non-late members
                     #   Saturday 22:00 (T-2H)  — draw preparation with FULL pools
                     #   Sunday   00:00 (T-0)   — draw executes
                     thursday_2359 = monday_morning + timedelta(days=3, hours=23, minutes=59)
@@ -1179,6 +1204,17 @@ class RealSimEngine:
                     total_elim        += compliance["n_elim"]
                     total_grace_saved += compliance["n_saved"]
                     total_late_fee_rev += compliance["late_fee_revenue_inr"]
+
+                    # ── c.2 FM: Auto-pay non-late members (U-08 weekly DEP tokens) ──
+                    # Now that A/B/C has run, we know which members are Type B (Unpaid
+                    # late-fee holders).  auto_pay skips them and pays everyone else.
+                    # This ensures WK tokens reflect only genuine installment payments.
+                    injector.auto_pay_installments(
+                        db,
+                        week_num = week_num,
+                        skip_ids = compliance.get("type_b_ids", set()),
+                    )
+                    db.commit()
 
                     # ── c.5 Finance Manager: Enforce pool capacity before T-2H ─
                     #

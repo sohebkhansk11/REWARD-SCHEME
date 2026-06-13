@@ -398,13 +398,22 @@ def run_dual_draw(
     for member_id in surviving_ids:
         member = crud_user.get_user(db, member_id)
         if member and member.status == UserStatus.Active and member.current_pool_id == pool_id:
-            new_level = min(member.current_level + 1, 6)
+            # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # FIX B: Payment gate — only PAID survivors advance a level.
+            # Type B late-fee holders (weekly_payment_status=Unpaid) retain their
+            # current_level; reaching_l4 is forced False to prevent a spurious
+            # sde_required flag on a member at L4 who simply didn't pay this week.
+            if member.weekly_payment_status == WeeklyPaymentStatus.Paid:
+                new_level   = min(member.current_level + 1, 6)
+                reaching_l4 = (new_level == 4)
+            else:
+                new_level   = member.current_level   # no advancement for unpaid
+                reaching_l4 = False
 
             # ANTI-MATURITY PROTOCOL — ATOMIC L4 FLAG (BUG 1 / REAL-TIME FLAGGING):
             # If this member just advanced to L4, set sde_required=True in the
             # SAME database write as the level change.  This is a hard guarantee —
             # there is no window between "member is L4" and "member is flagged".
-            reaching_l4 = (new_level == 4)
             if reaching_l4:
                 new_l4_flagged = True
                 _logger.info(
@@ -413,13 +422,6 @@ def run_dual_draw(
                     member.id, member.username, week_id,
                 )
 
-            # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
-            # BUG FIX: sde_required=(True if reaching_l4 else None) wrote NULL to a
-            # NOT NULL column for every non-L4 level advance → IntegrityError every
-            # pool draw → 0 draws in simulation (and silently in production).
-            # FIX: Only include sde_required/sde_flagged_week when member IS reaching L4.
-            # update_user uses model_dump(exclude_unset=True), so omitting these fields
-            # leaves the existing column value completely untouched.
             _upd: dict = {
                 "current_level":         new_level,
                 "weekly_payment_status": WeeklyPaymentStatus.Unpaid,
@@ -1072,12 +1074,19 @@ def run_accelerated_dissolution_draw(
     for member_id in surviving_ids:
         member = crud_user.get_user(db, member_id)
         if member and member.status == UserStatus.Active and member.current_pool_id == pool_id:
-            new_level    = min(member.current_level + 1, 6)
-            reaching_l4  = (new_level == 4)
+            # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # FIX B (accelerated dissolution survivor loop): same payment gate as
+            # run_dual_draw — Unpaid survivors do not advance level, reaching_l4
+            # forced False to prevent spurious sde_required on existing L4 holders.
+            if member.weekly_payment_status == WeeklyPaymentStatus.Paid:
+                new_level   = min(member.current_level + 1, 6)
+                reaching_l4 = (new_level == 4)
+            else:
+                new_level   = member.current_level
+                reaching_l4 = False
+
             if reaching_l4:
                 new_l4_flagged = True
-            # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
-            # Same NULL-write bug fix — see comment at the run_dual_draw survivor loop above.
             _upd: dict = {
                 "current_level":         new_level,
                 "weekly_payment_status": WeeklyPaymentStatus.Unpaid,

@@ -248,10 +248,44 @@ export const advancedSimulationDev = (params) =>
  * @param {number}  params.organic_decay_rate      K-16: weekly organic ratio decay (0–1)
  * @param {string}  params.simulation_label        K-17: label for multi-run comparison
  */
+/**
+ * POST /dev/real-simulation — Start background Real-Engine simulation job.
+ *
+ * Returns { job_id, status:"queued", total_weeks, message } immediately
+ * (< 200 ms).  No long HTTP hold — the engine runs in a daemon thread.
+ * Poll getRealSimStatus(jobId) every 3 s for live progress.
+ * Fetch getRealSimResult(jobId) when status == "done".
+ *
+ * Replaces the old realSimulationDev() which had a 600-second timeout and
+ * was killed by Render's 60-second proxy timeout on runs > 12 weeks.
+ */
+export const startRealSimulation = (params) =>
+  api.post('/dev/real-simulation', params, {
+    timeout: 15_000,   // 15 s — only needs to register the job and start the thread
+  })
+
+/** @deprecated Use startRealSimulation() + polling instead. */
 export const realSimulationDev = (params) =>
   api.post('/dev/real-simulation', params, {
-    timeout: 600_000,   // 10 min — real DB ops per cycle are slower than in-memory
+    timeout: 15_000,   // kept for backwards-compat; now returns job_id, not result
   })
+
+/**
+ * GET /dev/real-simulation-status/{jobId}
+ * Returns { job_id, status, current_week, total_weeks, percent, error_*, ... }
+ * Call every 3 s while status is "queued" or "running".
+ */
+export const getRealSimStatus = (jobId) =>
+  api.get(`/dev/real-simulation-status/${jobId}`, { timeout: 10_000 })
+
+/**
+ * GET /dev/real-simulation-result/{jobId}
+ * Returns the full simulation result dict (same schema as advancedSimulationDev).
+ * Only call after getRealSimStatus() returns status == "done".
+ * Returns 202 if still running, 500 with debugger info if failed.
+ */
+export const getRealSimResult = (jobId) =>
+  api.get(`/dev/real-simulation-result/${jobId}`, { timeout: 30_000 })
 
 /** GET /admin/draw/live-stream — Server-Sent Events for real-time draw monitoring (U-05) */
 export const getDrawLiveStream = (token) => {

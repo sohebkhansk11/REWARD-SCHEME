@@ -69,6 +69,30 @@ router = APIRouter(
 _INJECT_STATUS: dict[str, dict] = {}
 _INJECT_LOCK   = threading.Lock()
 
+# ── Real Simulation Background Job Registry ───────────────────────────────────
+# Tracks RealSimEngine jobs started by POST /dev/real-simulation.
+# Keyed by job_id (unique per simulation call).  Thread-safe via _SIM_LOCK.
+#
+# Schema per entry:
+#   {
+#     "status":           "queued" | "running" | "done" | "error",
+#     "current_week":     int,
+#     "total_weeks":      int,
+#     "percent":          float,
+#     "result":           dict | None,        — full response when done
+#     "error_message":    str | None,
+#     "error_type":       str | None,         — exception class name
+#     "error_traceback":  str | None,         — full traceback string (debugger)
+#     "error_file":       str | None,         — file where exception occurred
+#     "error_line":       int | None,         — line number
+#     "error_func":       str | None,         — function/method name
+#     "error_source":     str | None,         — source line text
+#     "started_at":       datetime ISO,
+#     "finished_at":      datetime ISO | None,
+#   }
+_SIM_STATUS: dict[str, dict] = {}
+_SIM_LOCK   = threading.Lock()
+
 # Rows per executemany batch — keeps individual SQL statements a manageable size
 _BULK_BATCH = 5_000
 
@@ -3056,7 +3080,9 @@ def dev_set_payment_scenario(body: PaymentScenarioRequest, db: Session = Depends
 
 
 # =============================================================================
-# POST /dev/real-simulation
+# POST /dev/real-simulation   (background job)
+# GET  /dev/real-simulation-status/{job_id}
+# GET  /dev/real-simulation-result/{job_id}
 # =============================================================================
 #
 # Zero-duplication stress-test harness.
@@ -3065,22 +3091,130 @@ def dev_set_payment_scenario(body: PaymentScenarioRequest, db: Session = Depends
 # duplicated in-memory logic), this endpoint calls the REAL production services
 # on an isolated in-memory SQLite database with mocked time.
 #
+# Background job pattern (solves Render 60-second proxy timeout):
+#   POST  → starts daemon thread, returns {"job_id": "..."} in < 200 ms
+#   GET status/{job_id} → live progress (week N/total, %)
+#   GET result/{job_id} → full result dict when status == "done"
+#
 # Architecture:
 #   ChronosEngine  — patches datetime.now() across all production modules
 #   SimulationDB   — isolated SQLite with all production tables (zero schema dup)
 #   MassLoadInjector — creates synthetic users, manages payment state
 #   RealSimEngine  — calls real services in exact weekly chronological order:
-#     a. inject_week()         — new waitlist users
-#     b. auto_pay_active()     — mark active members Paid
-#     c. apply_abc_model()     — A/B/C late-fee + elimination
-#     d. flag_l4_members()     — catch-up L4 flagging
-#     e. run_sde_meta_pool()   — SDE guaranteed L4 exits
-#     f. assign_waitlist_to_pools() — refill after SDE
-#     g. execute_weekly_draw() — draw all remaining eligible pools
-#     h. post_draw_cleanup()   — reset weekly flags
+#     a. inject_week()         — new waitlist users + DEP tokens
+#     b. auto_pay_installments() — all Active members marked Paid (U-08)
+#     c. apply_abc_model()     — A/B/C late-fee + elimination + grace
+#     d. start_draw_preparation() — acquires lock, flags L4, runs SDE meta-pool
+#     e. execute_weekly_draw() — Ext-II/III pre-pass + all pool draws
+#     f. post_draw_cleanup()   — reset weekly flags, release lock
+#     g. auto_settle_referral_rw() — RW token auto-settlement (U-09)
 #
 # DRY contract: any rule change in production is automatically reflected.
+#
+# Debugger: on exception the background worker captures:
+#   error_type, error_message, error_file, error_line, error_func,
+#   error_source (exact source line), error_traceback (full stack).
 # =============================================================================
+
+
+def _background_real_simulation(job_id: str, params: dict) -> None:
+    """
+    Daemon-thread worker for POST /dev/real-simulation.
+
+    Runs RealSimEngine in an isolated SQLite database.  Writes live progress
+    to _SIM_STATUS[job_id] after every completed week via progress_callback so
+    the frontend can display "Week N / total (X%)" while the job runs.
+
+    On any exception, captures full traceback + exact failure location
+    (file path, line number, function name, source line text) so the
+    Debugger Panel in DevTools can display the precise failure site without
+    the developer needing to read server logs.
+
+    The caller must register a "queued" entry in _SIM_STATUS before calling
+    threading.Thread.start() to avoid a race between the poll endpoint and
+    the worker's first status write.
+    """
+    import traceback as _tb_mod
+    from app.services.real_simulation import RealSimEngine
+
+    def _on_week(week_num: int, total_weeks: int, _metrics: dict) -> None:
+        """Called by RealSimEngine after each week completes."""
+        pct = round(week_num / max(total_weeks, 1) * 100.0, 1)
+        with _SIM_LOCK:
+            _SIM_STATUS[job_id].update({
+                "status":       "running",
+                "current_week": week_num,
+                "total_weeks":  total_weeks,
+                "percent":      pct,
+            })
+
+    # Flip from "queued" → "running" immediately so the status endpoint
+    # never returns "queued" after the thread has already started.
+    with _SIM_LOCK:
+        _SIM_STATUS[job_id]["status"] = "running"
+
+    try:
+        engine = RealSimEngine(
+            weeks                = params["weeks"],
+            users_per_week       = params["users_per_week"],
+            initial_users        = params["initial_users"],
+            organic_ratio        = params["organic_ratio"],
+            late_ratio           = params["late_ratio"],
+            elim_pct_a           = params["elim_pct_a"],
+            grace_pct_c          = params["grace_pct_c"],
+            volatility_mode      = params["volatility_mode"],
+            volatility_max       = params["volatility_max"],
+            start_year           = params["start_year"],
+            start_week           = params["start_week"],
+            inflow_pattern       = params["inflow_pattern"],
+            referral_burst_week  = params["referral_burst_week"],
+            payment_shock_week   = params["payment_shock_week"],
+            waitlist_dropout_pct = params["waitlist_dropout_pct"],
+            organic_decay_rate   = params["organic_decay_rate"],
+            simulation_label     = params["simulation_label"],
+        )
+
+        result = engine.run(progress_callback=_on_week)
+
+        with _SIM_LOCK:
+            _SIM_STATUS[job_id].update({
+                "status":       "done",
+                "current_week": params["weeks"],
+                "total_weeks":  params["weeks"],
+                "percent":      100.0,
+                "result":       result,
+                "finished_at":  datetime.now(timezone.utc).isoformat(),
+            })
+
+        _logger_sim.info(
+            "RealSim DONE  job_id=%s  weeks=%d  users=%d  winners=%d",
+            job_id,
+            params["weeks"],
+            result.get("simulation_summary", {}).get("total_simulated_users_created", 0),
+            result.get("simulation_summary", {}).get("total_winners_drawn", 0),
+        )
+
+    except Exception as exc:
+        # ── Full traceback capture for the DevTools Debugger Panel ────────────
+        tb_frames = _tb_mod.extract_tb(exc.__traceback__)
+        tb_string = "".join(_tb_mod.format_tb(exc.__traceback__))
+        # Most-recent (innermost) frame is where the exception was raised
+        last = tb_frames[-1] if tb_frames else None
+
+        with _SIM_LOCK:
+            _SIM_STATUS[job_id].update({
+                "status":          "error",
+                "error_message":   str(exc),
+                "error_type":      type(exc).__name__,
+                "error_traceback": tb_string,
+                "error_file":      last.filename if last else None,
+                "error_line":      last.lineno   if last else None,
+                "error_func":      last.name     if last else None,
+                "error_source":    (last.line or "").strip() if last else None,
+                "finished_at":     datetime.now(timezone.utc).isoformat(),
+            })
+
+        _logger_sim.exception("RealSim FAILED  job_id=%s", job_id)
 
 class RealSimRequest(BaseModel):
     weeks:              int   = Field(52,   ge=1,    le=200,
@@ -3121,94 +3255,206 @@ class RealSimRequest(BaseModel):
 
 
 @router.post("/real-simulation")
-def run_real_simulation(
-    body: RealSimRequest,
-    db: Session = Depends(get_db),
-):
+def run_real_simulation(body: RealSimRequest):
     """
-    Real-Strategy Stress-Test Engine.
+    Real-Strategy Stress-Test Engine — Background Job Mode.
 
     Calls ACTUAL production services (draw, SDE, waitlist, Brain 2/3/5)
-    on an isolated in-memory SQLite database with mocked time.
+    on an isolated in-memory SQLite database with mocked time (ChronosEngine).
+
+    Returns {"job_id": "..."} IMMEDIATELY (< 200 ms) and runs the simulation
+    in a background daemon thread.  No HTTP proxy timeout possible — this
+    endpoint returns before any heavy work starts.
 
     Guarantees:
       - Zero logic duplication: all math lives in production services
       - Chronos Engine: datetime.now() mocked globally across 7 modules
       - SimulationDB: isolated SQLite — production DB never touched
-      - Same response schema as /dev/advanced-simulation for frontend compatibility
+      - Injector + Loader: MassLoadInjector creates real users with DEP tokens
+      - Time-travel: ChronosEngine advances clock week-by-week per user inflow
+        timestamps and weekly draw schedule (Mon–Sun cycle, T-2H, T-0H, T+5m)
+      - A/B/C compliance: apply_abc_model() → Late_Fee/Grace_Fee tokens,
+        EliminationEvent records, waitlist refill after eliminations
+      - Payment engine: auto_pay_installments() marks all active members Paid
+        per week; referral RW settlement (U-09) runs post-draw
 
-    Use this for architecture validation, bottleneck discovery, and stress testing.
-    Use /dev/advanced-simulation for fast parameter sweeps (< 1 second per 100 cycles).
+    Flow:
+      POST /dev/real-simulation          → { job_id, status:"queued", total_weeks }
+      GET  /dev/real-simulation-status/{job_id}  → { status, current_week, total_weeks, percent, ... }
+      GET  /dev/real-simulation-result/{job_id}  → full result (only when status=="done")
 
-    ── Server-side timeout guard ─────────────────────────────────────────────────
-    Cloud deployments (Render free tier) have a 60-second HTTP proxy timeout.
-    Each real-engine week costs ≈ 2–5 s on a shared-CPU instance.
-    Hard cap: 15 weeks on cloud.  Use /dev/advanced-simulation for longer runs.
+    Debugger: on any failure, error_file, error_line, error_func, error_source
+    and full error_traceback are available in the status endpoint.
+
+    No cap on weeks — simulation CAN take time (like MetaTrader strategy tester).
+    1–200 weeks supported.
     """
-    from app.services.real_simulation import RealSimEngine
+    job_id = str(uuid.uuid4())
 
-    # ── Timeout guard: Render free tier proxy cuts the connection at 60 s ────────
-    # Real engine takes ≈ 2–5 s/week on shared CPU.
-    # Budget:  60 s proxy limit  –  5 s serialisation overhead  =  55 s for computation.
-    # Worst case 5 s/week → 55 ÷ 5 = 11 weeks.  Safety margin → cap at 8 weeks.
-    #   8 weeks × 5 s/week  = 40 s  → well within the 60 s window in ALL conditions.
-    #   15 weeks × 5 s/week = 75 s  → over limit on slower instances → Network Error.
-    # The fast /dev/advanced-simulation handles 1000 cycles in < 1 s — always use
-    # that for stress-testing.  Real Engine is for architecture-correctness validation.
-    REAL_ENGINE_MAX_WEEKS_CLOUD = 8
-    if body.weeks > REAL_ENGINE_MAX_WEEKS_CLOUD:
+    params = {
+        "weeks":                body.weeks,
+        "users_per_week":       body.users_per_week,
+        "initial_users":        body.initial_users,
+        "organic_ratio":        body.organic_ratio,
+        "late_ratio":           body.late_users_ratio_pct / 100.0,
+        "elim_pct_a":           body.elim_pct_a,
+        "grace_pct_c":          body.grace_saver_pct_c,
+        "volatility_mode":      body.volatility_mode,
+        "volatility_max":       body.volatility_max_inflow,
+        "start_year":           body.start_year,
+        "start_week":           body.start_week,
+        "inflow_pattern":       body.inflow_pattern,
+        "referral_burst_week":  body.referral_burst_week,
+        "payment_shock_week":   body.payment_shock_week,
+        "waitlist_dropout_pct": body.waitlist_dropout_pct,
+        "organic_decay_rate":   body.organic_decay_rate,
+        "simulation_label":     body.simulation_label,
+    }
+
+    # Register "queued" BEFORE thread.start() — eliminates race with poll endpoint
+    with _SIM_LOCK:
+        _SIM_STATUS[job_id] = {
+            "status":           "queued",
+            "current_week":     0,
+            "total_weeks":      body.weeks,
+            "percent":          0.0,
+            "result":           None,
+            "error_message":    None,
+            "error_type":       None,
+            "error_traceback":  None,
+            "error_file":       None,
+            "error_line":       None,
+            "error_func":       None,
+            "error_source":     None,
+            "started_at":       datetime.now(timezone.utc).isoformat(),
+            "finished_at":      None,
+        }
+
+    thread = threading.Thread(
+        target=_background_real_simulation,
+        args=(job_id, params),
+        daemon=True,
+        name=f"real-sim-{job_id[:8]}",
+    )
+    thread.start()
+
+    _logger_sim.info(
+        "RealSim QUEUED  job_id=%s  weeks=%d  upw=%d  init=%d  late=%.1f%%  A=%.1f%%  C=%.1f%%",
+        job_id, body.weeks, body.users_per_week, body.initial_users,
+        body.late_users_ratio_pct, body.elim_pct_a, body.grace_saver_pct_c,
+    )
+
+    return {
+        "job_id":      job_id,
+        "status":      "queued",
+        "total_weeks": body.weeks,
+        "message": (
+            f"Simulation queued — {body.weeks} weeks, "
+            f"{body.users_per_week} users/week, {body.initial_users} seed users. "
+            f"Poll GET /dev/real-simulation-status/{job_id} for live progress."
+        ),
+    }
+
+
+@router.get("/real-simulation-status/{job_id}")
+def real_sim_status(job_id: str):
+    """
+    Poll the live progress of a background Real-Engine simulation.
+
+    Status values:
+      "queued"  — thread registered, not yet started
+      "running" — engine executing; current_week and percent update each week
+      "done"    — completed successfully; fetch full result via /real-simulation-result/{job_id}
+      "error"   — exception raised; error_* fields populated for the Debugger Panel
+
+    The status registry is process-local (in-memory dict).  Server restart clears
+    all entries.  If 404 is returned, the server was restarted mid-simulation.
+    """
+    with _SIM_LOCK:
+        entry = dict(_SIM_STATUS.get(job_id, {}))
+
+    if not entry:
         raise HTTPException(
-            status_code=422,
+            status_code=404,
             detail=(
-                f"Real Engine is limited to {REAL_ENGINE_MAX_WEEKS_CLOUD} weeks on this "
-                f"server to prevent HTTP proxy timeout (you requested {body.weeks} weeks). "
-                f"Real Engine runs actual production services (draw, SDE, waitlist, Brain 2/3/5) "
-                f"at ≈ 2–5 s/week on shared CPU — even {REAL_ENGINE_MAX_WEEKS_CLOUD+1}+ weeks "
-                f"risk hitting the 60 s Render proxy limit. "
-                f"Use Fast Preview (POST /dev/advanced-simulation) for 1–1,000-cycle "
-                f"statistical stress-testing (A/B/C model, lateRatio, elimPct) with no timeout. "
-                f"Real Engine is for architecture validation only, not load testing."
+                f"No simulation job found for job_id='{job_id}'. "
+                "The server may have restarted, clearing the in-memory registry. "
+                "Re-run the simulation from the Dev Tools panel."
             ),
         )
 
-    engine = RealSimEngine(
-        weeks                = body.weeks,
-        users_per_week       = body.users_per_week,
-        initial_users        = body.initial_users,
-        organic_ratio        = body.organic_ratio,
-        late_ratio           = body.late_users_ratio_pct / 100.0,
-        elim_pct_a           = body.elim_pct_a,
-        grace_pct_c          = body.grace_saver_pct_c,
-        volatility_mode      = body.volatility_mode,
-        volatility_max       = body.volatility_max_inflow,
-        start_year           = body.start_year,
-        start_week           = body.start_week,
-        # K-12 to K-17: Extended Injection Knobs
-        inflow_pattern       = body.inflow_pattern,
-        referral_burst_week  = body.referral_burst_week,
-        payment_shock_week   = body.payment_shock_week,
-        waitlist_dropout_pct = body.waitlist_dropout_pct,
-        organic_decay_rate   = body.organic_decay_rate,
-        simulation_label     = body.simulation_label,
-    )
+    return {
+        "job_id":          job_id,
+        "status":          entry["status"],
+        "current_week":    entry["current_week"],
+        "total_weeks":     entry["total_weeks"],
+        "percent":         entry["percent"],
+        "started_at":      entry["started_at"],
+        "finished_at":     entry["finished_at"],
+        # ── Debugger fields — only populated when status == "error" ──────────
+        "error_message":   entry.get("error_message"),
+        "error_type":      entry.get("error_type"),
+        "error_file":      entry.get("error_file"),
+        "error_line":      entry.get("error_line"),
+        "error_func":      entry.get("error_func"),
+        "error_source":    entry.get("error_source"),
+        "error_traceback": entry.get("error_traceback"),
+    }
 
-    _logger_sim.info(
-        "RealSim START  weeks=%d  upw=%d  init=%d  late=%.1f%%  A=%.1f%%  C=%.1f%%  vol=%s",
-        body.weeks, body.users_per_week, body.initial_users,
-        body.late_users_ratio_pct, body.elim_pct_a, body.grace_saver_pct_c,
-        body.volatility_mode,
-    )
 
-    result = engine.run()
+@router.get("/real-simulation-result/{job_id}")
+def real_sim_result(job_id: str):
+    """
+    Fetch the full simulation result after status == "done".
 
-    s = result["simulation_summary"]
-    _logger_sim.info(
-        "RealSim DONE  weeks=%d  users=%d  winners=%d  pauses=%d  liquidity=%.0f",
-        body.weeks,
-        s.get("total_simulated_users_created", 0),
-        s.get("total_winners_drawn", 0),
-        s.get("total_draw_pauses_triggered", 0),
-        s.get("final_virtual_liquidity_float", 0),
-    )
+    Returns 202 if still running (with current progress in the detail message),
+    500 if the simulation failed (with full debugger info),
+    404 if the job_id is unknown (server restart cleared the registry).
 
-    return result
+    The result dict schema is identical to /dev/advanced-simulation so the
+    DevTools 6-tab report sub-nav renders without any frontend changes.
+    """
+    with _SIM_LOCK:
+        entry = dict(_SIM_STATUS.get(job_id, {}))
+
+    if not entry:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No simulation job found for job_id='{job_id}'. Server may have restarted.",
+        )
+
+    status = entry["status"]
+
+    if status == "running":
+        raise HTTPException(
+            status_code=202,
+            detail=(
+                f"Simulation still running — "
+                f"week {entry['current_week']}/{entry['total_weeks']} "
+                f"({entry['percent']:.1f}%). "
+                f"Poll GET /dev/real-simulation-status/{job_id} and retry when status=='done'."
+            ),
+        )
+
+    if status == "queued":
+        raise HTTPException(
+            status_code=202,
+            detail=f"Simulation is queued but has not started yet. Poll status endpoint.",
+        )
+
+    if status == "error":
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_message":   entry.get("error_message"),
+                "error_type":      entry.get("error_type"),
+                "error_file":      entry.get("error_file"),
+                "error_line":      entry.get("error_line"),
+                "error_func":      entry.get("error_func"),
+                "error_source":    entry.get("error_source"),
+                "error_traceback": entry.get("error_traceback"),
+            },
+        )
+
+    # status == "done"
+    return entry["result"]

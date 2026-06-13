@@ -868,9 +868,14 @@ class RealSimEngine:
             base = datetime.fromisocalendar(year, 52, 7)
         return base.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
 
-    def run(self) -> dict:
+    def run(self, progress_callback=None) -> dict:
         """
         Execute the full simulation.
+
+        progress_callback: optional callable(week_num: int, total_weeks: int, metrics: dict)
+            Called after each week completes.  Used by background-task mode for live
+            progress reporting.  Any exception raised by the callback is swallowed so
+            it cannot abort the simulation.
 
         Returns a dict with the SAME structure as the legacy _AdvSimEngine so
         existing frontend charts work without modification.
@@ -1176,6 +1181,13 @@ class RealSimEngine:
                         "prep_ok":   prep_ok,
                         "compliance": compliance,
                     })
+
+                    # ── Live progress callback (background-task mode) ──────────
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(week_num, self.weeks, metrics)
+                        except Exception:
+                            pass   # never abort simulation due to callback error
 
                     max_lpi      = max(max_lpi, metrics["lpi"])
                     max_active   = max(max_active, metrics["active_users"])

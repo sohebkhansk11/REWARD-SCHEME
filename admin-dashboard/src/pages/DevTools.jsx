@@ -28,7 +28,8 @@ import {
 import Spinner from '../components/Spinner'
 import {
   forceDrawDev, simulateCycleDev, simulateUsersDev,
-  resetDataDev, advancedSimulationDev, realSimulationDev,
+  resetDataDev, advancedSimulationDev,
+  startRealSimulation, getRealSimStatus, getRealSimResult,
   devInjectTimed, devMarkAllPaid,
   devSetPaymentScenario, getInjectionStatus,
 } from '../api/client'
@@ -168,30 +169,167 @@ function _SimTooltip({ active, payload, label }) {
   )
 }
 
-function SimLockout() {
+function SimLockout({ progress = null, isRealEngine = false }) {
+  // progress: { week: number, total: number, percent: number } | null
+  const showProgress = isRealEngine && progress && progress.total > 0
   return (
     <div className="absolute inset-0 z-30 flex flex-col items-center justify-center backdrop-blur-md bg-black/60 rounded-2xl">
       <div className="relative w-20 h-20 mb-6">
         <svg className="w-20 h-20 animate-spin" style={{ animationDuration: '1.4s' }} viewBox="0 0 80 80" fill="none">
-          <circle cx="40" cy="40" r="34" stroke="#7c3aed" strokeWidth="5" strokeOpacity="0.15" />
-          <circle cx="40" cy="40" r="34" stroke="#7c3aed" strokeWidth="5" strokeDasharray="53 160" strokeLinecap="round" />
+          <circle cx="40" cy="40" r="34" stroke={isRealEngine ? '#059669' : '#7c3aed'} strokeWidth="5" strokeOpacity="0.15" />
+          <circle cx="40" cy="40" r="34" stroke={isRealEngine ? '#059669' : '#7c3aed'} strokeWidth="5" strokeDasharray="53 160" strokeLinecap="round" />
         </svg>
         <svg className="absolute inset-0 w-20 h-20 animate-spin" style={{ animationDuration: '0.9s', animationDirection: 'reverse' }} viewBox="0 0 80 80" fill="none">
-          <circle cx="40" cy="40" r="26" stroke="#06b6d4" strokeWidth="3" strokeDasharray="32 132" strokeLinecap="round" />
+          <circle cx="40" cy="40" r="26" stroke={isRealEngine ? '#34d399' : '#06b6d4'} strokeWidth="3" strokeDasharray="32 132" strokeLinecap="round" />
         </svg>
-        <div className="absolute inset-0 flex items-center justify-center"><FlaskConical className="w-7 h-7 text-violet-300" /></div>
+        <div className="absolute inset-0 flex items-center justify-center"><FlaskConical className={`w-7 h-7 ${isRealEngine ? 'text-emerald-300' : 'text-violet-300'}`} /></div>
       </div>
-      <p className="text-white font-extrabold text-lg text-center mb-2 tracking-tight">AI Stress-Testing Engine running…</p>
-      <div className="text-slate-400 text-sm text-center max-w-xs leading-relaxed px-4 space-y-1">
-        <p>Executing deep algorithmic evaluation up to 1,000 rounds.</p>
-        <p>Calibrating system liquidity limits.</p>
-      </div>
-      <p className="text-violet-400 text-xs font-bold mt-5 flex items-center gap-2">
-        <span className="w-2 h-2 bg-violet-400 rounded-full animate-pulse block" />Please do not refresh.
+
+      <p className="text-white font-extrabold text-lg text-center mb-1 tracking-tight">
+        {isRealEngine ? '🔬 Real Engine running…' : 'AI Stress-Testing Engine running…'}
+      </p>
+
+      {showProgress ? (
+        /* ── Real Engine live progress bar ─────────────────────────────── */
+        <div className="w-72 mt-4 px-4">
+          <div className="flex justify-between items-center mb-2">
+            <span className="text-xs text-slate-400">
+              Week <span className="font-bold text-emerald-300">{progress.week}</span>
+              {' '}/ {progress.total}
+            </span>
+            <span className="text-sm font-black tabular-nums text-emerald-400">
+              {progress.percent.toFixed(1)}%
+            </span>
+          </div>
+          <div className="h-2.5 bg-slate-700/80 rounded-full overflow-hidden border border-slate-600/50">
+            <div
+              className="h-full rounded-full transition-all duration-700 ease-out"
+              style={{
+                width: `${Math.max(2, progress.percent)}%`,
+                background: 'linear-gradient(90deg, #059669 0%, #34d399 100%)',
+                boxShadow: '0 0 8px rgba(52,211,153,0.5)',
+              }}
+            />
+          </div>
+          <p className="text-emerald-400 text-[11px] text-center mt-2 font-semibold">
+            {progress.percent < 100
+              ? 'Real strategy engine processing weekly cycles…'
+              : 'Finalising results…'}
+          </p>
+          <p className="text-slate-500 text-[10px] text-center mt-1">
+            Inject → Payment → A/B/C → Draw → SDE — each week runs real production services
+          </p>
+        </div>
+      ) : isRealEngine ? (
+        /* Real Engine — no progress yet (still queued) */
+        <div className="text-slate-400 text-sm text-center max-w-xs leading-relaxed px-4 space-y-1 mt-3">
+          <p className="text-emerald-400 font-semibold">Starting simulation engine…</p>
+          <p>Preparing isolated SQLite DB + ChronosEngine time-travel.</p>
+        </div>
+      ) : (
+        /* Fast Preview */
+        <div className="text-slate-400 text-sm text-center max-w-xs leading-relaxed px-4 space-y-1 mt-2">
+          <p>Executing deep algorithmic evaluation up to 1,000 rounds.</p>
+          <p>Calibrating system liquidity limits.</p>
+        </div>
+      )}
+
+      <p className={`text-xs font-bold mt-5 flex items-center gap-2 ${isRealEngine ? 'text-emerald-400' : 'text-violet-400'}`}>
+        <span className={`w-2 h-2 rounded-full animate-pulse block ${isRealEngine ? 'bg-emerald-400' : 'bg-violet-400'}`} />
+        Please do not refresh — simulation running in background.
       </p>
     </div>
   )
 }
+
+// ── Simulation Error Debugger Panel ─────────────────────────────────────────
+// Renders when result._error is true.  If result._debugger is populated
+// (Real Engine background job), it shows the exact file, line, function and
+// source line alongside a collapsible full traceback.
+function SimErrorDebugger({ result }) {
+  const [showTrace, setShowTrace] = useState(false)
+  const d = result._debugger ?? null
+
+  return (
+    <div className="mb-5 rounded-xl border border-red-800/60 bg-red-950/30 overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-4 py-3 bg-red-950/50 border-b border-red-800/40">
+        <XCircle className="w-4 h-4 text-red-500 flex-shrink-0"/>
+        <p className="font-bold text-red-400 uppercase tracking-wide text-xs flex-1">
+          Simulation Error {result._status ? `(HTTP ${result._status})` : '(Network)'}
+        </p>
+        {d && (
+          <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-red-900/60 border border-red-700/60 text-red-300 uppercase">
+            🔍 Debugger
+          </span>
+        )}
+      </div>
+
+      <div className="p-4 space-y-3">
+        {/* Error message */}
+        <p className="text-xs text-red-300 font-mono leading-relaxed break-all">{result._msg}</p>
+
+        {/* Exact location — only when Real Engine provides debugger info */}
+        {d && (
+          <div className="space-y-2">
+            {/* Exception type + location grid */}
+            <div className="grid grid-cols-2 gap-2 text-[11px]">
+              <div className="bg-slate-900/60 border border-slate-700/60 rounded-lg p-2.5">
+                <p className="text-slate-500 text-[9px] font-bold uppercase tracking-wider mb-1">Exception Type</p>
+                <p className="text-amber-400 font-mono font-bold">{d.error_type ?? '—'}</p>
+              </div>
+              <div className="bg-slate-900/60 border border-slate-700/60 rounded-lg p-2.5">
+                <p className="text-slate-500 text-[9px] font-bold uppercase tracking-wider mb-1">Function</p>
+                <p className="text-cyan-400 font-mono font-bold">{d.error_func ?? '—'}</p>
+              </div>
+              <div className="bg-slate-900/60 border border-slate-700/60 rounded-lg p-2.5 col-span-2">
+                <p className="text-slate-500 text-[9px] font-bold uppercase tracking-wider mb-1">File : Line</p>
+                <p className="text-emerald-400 font-mono text-[11px] break-all">
+                  {d.error_file
+                    ? <>{d.error_file.replace(/.*[/\\]app[/\\]/, 'app/')} <span className="text-slate-400">:</span> <span className="text-white font-black">{d.error_line}</span></>
+                    : '—'
+                  }
+                </p>
+              </div>
+              {d.error_source && (
+                <div className="bg-slate-900/80 border border-amber-800/50 rounded-lg p-2.5 col-span-2">
+                  <p className="text-slate-500 text-[9px] font-bold uppercase tracking-wider mb-1">Source Line</p>
+                  <p className="text-amber-300 font-mono text-xs break-all">{d.error_source}</p>
+                </div>
+              )}
+            </div>
+
+            {/* Full traceback — collapsible */}
+            {d.error_traceback && (
+              <div>
+                <button
+                  onClick={() => setShowTrace(v => !v)}
+                  className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 hover:text-slate-200 transition-colors uppercase tracking-wider"
+                >
+                  <ChevronRight className={`w-3 h-3 transition-transform duration-200 ${showTrace ? 'rotate-90' : ''}`}/>
+                  {showTrace ? 'Hide Full Traceback' : 'Show Full Traceback'}
+                </button>
+                {showTrace && (
+                  <pre className="mt-2 p-3 bg-black/50 border border-slate-700/50 rounded-lg text-[10px] text-slate-400 font-mono overflow-x-auto whitespace-pre-wrap break-all leading-relaxed">
+                    {d.error_traceback}
+                  </pre>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Common causes hint */}
+        <p className="text-[10px] text-slate-600 border-t border-slate-800 pt-2">
+          Common causes: 500 = server bug (check traceback above) ·
+          403 = ENABLE_DEV_MODE not set on server ·
+          Network = Render restarted (rare in background mode)
+        </p>
+      </div>
+    </div>
+  )
+}
+
 
 function SimStatsGrid({ s }) {
   const cond   = s.total_condensation_events
@@ -730,26 +868,112 @@ function StressTestTab({ toast }) {
   const [organicDecayRate,   setOrganicDecayRate]   = useState(0)
   const [simulationLabel,    setSimulationLabel]    = useState('')
   const [showKnobs,          setShowKnobs]          = useState(false)
-  const [running,   setRunning]   = useState(false)
-  const [result,    setResult]    = useState(null)
-  const [showSetup, setShowSetup] = useState(false)
-  const [showRealCfg, setShowRealCfg] = useState(false)
-  const [reportTab, setReportTab] = useState('summary')   // Phase 2-C report sub-tab
+  const [running,       setRunning]       = useState(false)
+  const [result,        setResult]        = useState(null)
+  const [showSetup,     setShowSetup]     = useState(false)
+  const [showRealCfg,   setShowRealCfg]   = useState(false)
+  const [reportTab,     setReportTab]     = useState('summary')   // Phase 2-C report sub-tab
+  // ── Real Engine background job state ──────────────────────────────────────
+  const [simJobId,      setSimJobId]      = useState(null)  // UUID returned by POST /dev/real-simulation
+  const [simProgress,   setSimProgress]   = useState({ week: 0, total: 0, percent: 0 })
+  const [simDebugger,   setSimDebugger]   = useState(null)  // debugger info on error
 
   // Derived: effective elimination = those who fail + those in grace who don't pay
   const effectiveElim = ((elimPctA / 100) + (1 - elimPctA / 100) * (1 - gracePctC / 100)) * 100
   const lateFeeINR    = Math.round(lateFeeB / 100 * 1000)
 
+  // ── Real Engine polling ────────────────────────────────────────────────────
+  // Polls every 3 s while simJobId is set and running is true.
+  // Clears simJobId and sets running=false when job completes or fails.
+  useEffect(() => {
+    if (!simJobId || !running) return
+
+    let cancelled = false
+
+    const poll = async () => {
+      if (cancelled) return
+      try {
+        const statusRes = await getRealSimStatus(simJobId)
+        const { status, current_week, total_weeks, percent } = statusRes.data
+
+        if (!cancelled) {
+          setSimProgress({ week: current_week ?? 0, total: total_weeks ?? 0, percent: percent ?? 0 })
+        }
+
+        if (status === 'done') {
+          // Fetch and store the full result
+          try {
+            const resultRes = await getRealSimResult(simJobId)
+            if (!cancelled) {
+              setResult(resultRes.data)
+              const s = resultRes.data.simulation_summary ?? {}
+              toast(
+                `🔬 Real Engine — ${s.total_cycles_run ?? total_weeks} weeks · ${INR(s.final_virtual_liquidity_float)} liquidity`,
+                'success'
+              )
+            }
+          } catch (resultErr) {
+            if (!cancelled) {
+              const msg = `Result fetch failed: ${resultErr.message}`
+              toast(msg, 'error')
+              setResult({ _error: true, _msg: msg, _status: resultErr.response?.status })
+            }
+          } finally {
+            if (!cancelled) { setRunning(false); setSimJobId(null) }
+          }
+
+        } else if (status === 'error') {
+          const d = statusRes.data
+          const debugInfo = {
+            error_message:   d.error_message,
+            error_type:      d.error_type,
+            error_file:      d.error_file,
+            error_line:      d.error_line,
+            error_func:      d.error_func,
+            error_source:    d.error_source,
+            error_traceback: d.error_traceback,
+          }
+          if (!cancelled) {
+            setSimDebugger(debugInfo)
+            const loc = d.error_file
+              ? `${d.error_file.split(/[/\\]/).pop()}:${d.error_line}`
+              : 'unknown location'
+            const msg = `Real Engine failed (${d.error_type ?? 'Error'}) at ${loc}: ${d.error_message ?? 'unknown'}`
+            toast(msg, 'error')
+            setResult({ _error: true, _msg: msg, _status: 500, _debugger: debugInfo })
+            setRunning(false)
+            setSimJobId(null)
+          }
+        }
+      } catch (pollErr) {
+        // Transient network error during poll — don't abort, just log
+        console.warn('[SimPoll] transient error:', pollErr.message)
+      }
+    }
+
+    const interval = setInterval(poll, 3_000)
+    poll() // immediate first check without waiting 3 s
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [simJobId, running]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const run = async () => {
-    setRunning(true); setResult(null); setReportTab('summary')
-    try {
-      let res
-      if (useRealEngine) {
-        // ── Real Engine: call actual production services ──────────────────────
-        // Hard-cap at 15 weeks client-side to match backend limit (Render timeout guard)
-        const realWeeks = Math.min(cycles, 15)
-        res = await realSimulationDev({
-          weeks:                   realWeeks,
+    setRunning(true)
+    setResult(null)
+    setReportTab('summary')
+    setSimDebugger(null)
+    setSimProgress({ week: 0, total: cycles, percent: 0 })
+
+    if (useRealEngine) {
+      // ── Real Engine: background job mode ────────────────────────────────────
+      // POST returns job_id immediately — no Render proxy timeout possible.
+      // Polling useEffect drives progress; calls setRunning(false) when done.
+      try {
+        const jobRes = await startRealSimulation({
+          weeks:                   cycles,
           users_per_week:          usersPerWeek,
           initial_users:           initialUsers,
           organic_ratio:           organicRatio / 100.0,
@@ -766,45 +990,65 @@ function StressTestTab({ toast }) {
           organic_decay_rate:      organicDecayRate / 100.0,
           simulation_label:        simulationLabel || '',
         })
-      } else {
-        // ── Fast Preview: legacy in-memory engine ─────────────────────────────
-        res = await advancedSimulationDev({
-          total_cycles:          cycles,
-          late_fee_pct:          lateFeeB,
-          late_users_ratio_pct:  lateRatio,
-          elim_pct_a:            elimPctA,
-          grace_saver_pct_c:     gracePctC,
-          volatility_mode:       vol,
-          volatility_max_inflow: volMax,
-          avg_rdr_pct:           rdr,
-        })
+        setSimJobId(jobRes.data.job_id)
+        // setRunning stays true — polling useEffect clears it when job completes
+      } catch (startErr) {
+        const status = startErr.response?.status
+        const raw    = startErr.response?.data?.detail ?? startErr.message ?? 'Unknown error'
+        const detail = typeof raw === 'string' ? raw.slice(0, 300) : JSON.stringify(raw).slice(0, 300)
+        const msg =
+          status === 401 ? 'Session expired — re-login and try again.' :
+          status === 403 ? 'Dev mode disabled on server (ENABLE_DEV_MODE must be true).' :
+          status === 422 ? `Validation error: ${detail}` :
+          `Failed to start simulation (HTTP ${status ?? 'network'}): ${detail}`
+        console.error('[Simulation start]', status, startErr.response?.data)
+        toast(msg, 'error')
+        setResult({ _error: true, _msg: msg, _status: status })
+        setRunning(false)
       }
+      return   // do NOT fall through — polling handles the rest
+    }
+
+    // ── Fast Preview: synchronous in-memory engine ──────────────────────────
+    try {
+      const res = await advancedSimulationDev({
+        total_cycles:          cycles,
+        late_fee_pct:          lateFeeB,
+        late_users_ratio_pct:  lateRatio,
+        elim_pct_a:            elimPctA,
+        grace_saver_pct_c:     gracePctC,
+        volatility_mode:       vol,
+        volatility_max_inflow: volMax,
+        avg_rdr_pct:           rdr,
+      })
       setResult(res.data)
       const s = res.data.simulation_summary
       toast(
-        `${useRealEngine ? '🔬 Real Engine' : '⚡ Fast Preview'} — ${s.total_cycles_run} cycles · ${INR(s.final_virtual_liquidity_float)} liquidity`,
+        `⚡ Fast Preview — ${s.total_cycles_run} cycles · ${INR(s.final_virtual_liquidity_float)} liquidity`,
         'success'
       )
-    } catch(err) {
+    } catch (err) {
       const status = err.response?.status
       const raw    = err.response?.data?.detail ?? err.message ?? 'Unknown error'
       const detail = typeof raw === 'string' ? raw.slice(0, 300) : JSON.stringify(raw).slice(0, 300)
       const msg =
         status === 401 ? 'Session expired — re-login and try again.' :
         status === 403 ? 'Dev mode disabled on server (ENABLE_DEV_MODE must be true).' :
-        status === 504 ? 'Server timeout — reduce weeks or users_per_week and retry.' :
+        status === 504 ? 'Server timeout — reduce cycles and retry.' :
         status === 500 ? `Server error (500): ${detail}` :
         status === 422 ? `Validation: ${detail}` :
         `Simulation failed (HTTP ${status ?? 'network'}): ${detail}`
       console.error('[Simulation]', status, err.response?.data)
       toast(msg, 'error')
       setResult({ _error: true, _msg: msg, _status: status })
-    } finally { setRunning(false) }
+    } finally {
+      setRunning(false)
+    }
   }
 
   return (
     <div className="relative bg-slate-900 border border-slate-700/60 rounded-2xl overflow-hidden shadow-2xl shadow-violet-950/20">
-      {running && <SimLockout/>}
+      {running && <SimLockout progress={simProgress} isRealEngine={useRealEngine}/>}
       <div className="flex items-center gap-3 px-6 py-5 border-b border-slate-700/60 bg-gradient-to-r from-violet-950/50 via-slate-900/80 to-slate-900">
         <div className={`p-3 rounded-xl border ${useRealEngine ? 'bg-emerald-900/40 border-emerald-700/50' : 'bg-violet-900/40 border-violet-700/50'}`}>
           <FlaskConical className={`w-5 h-5 ${useRealEngine ? 'text-emerald-400' : 'text-violet-400'}`}/>
@@ -846,37 +1090,34 @@ function StressTestTab({ toast }) {
                 : 'bg-violet-950/60 border-violet-700/60'
             }`}>
               <span className={`text-xl font-black tabular-nums ${useRealEngine ? 'text-emerald-200' : 'text-violet-200'}`}>
-                {Math.min(cycles, useRealEngine ? 15 : 1000).toLocaleString()}
+                {Math.min(cycles, useRealEngine ? 200 : 1000).toLocaleString()}
               </span>
               <span className="text-[10px] text-slate-500 font-semibold">cycles</span>
             </div>
           </div>
 
           {useRealEngine ? (
-            /* ── Real Engine: hard cap 15 weeks (Render 60s proxy timeout) ── */
+            /* ── Real Engine: 1–200 weeks — background job, no proxy timeout ── */
             <>
-              <input type="range" min={1} max={15} step={1}
-                value={Math.min(cycles, 15)} disabled={running}
+              <input type="range" min={1} max={200} step={1}
+                value={Math.min(cycles, 200)} disabled={running}
                 onChange={e => setCycles(parseInt(e.target.value))}
                 className="w-full h-2 rounded-full appearance-none cursor-pointer accent-emerald-500 disabled:opacity-40"
-                style={{background:`linear-gradient(to right,#059669 ${Math.min(cycles,15)/15*100}%,#334155 ${Math.min(cycles,15)/15*100}%)`}}
+                style={{background:`linear-gradient(to right,#059669 ${Math.min(cycles,200)/200*100}%,#334155 ${Math.min(cycles,200)/200*100}%)`}}
               />
               <div className="flex justify-between text-[10px] text-slate-600 mt-1.5 select-none">
-                {[1,3,5,8,12,15].map(v=>(
+                {[8,15,24,52,100,200].map(v=>(
                   <button key={v} onClick={()=>!running&&setCycles(v)} disabled={running}
                     className="hover:text-emerald-400 transition-colors">{v}</button>
                 ))}
               </div>
               <div className="mt-3 flex items-start gap-2 p-2.5 rounded-xl border border-emerald-800/50 bg-emerald-950/20">
-                <AlertTriangle className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5"/>
+                <Activity className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5"/>
                 <p className="text-[11px] text-emerald-300 leading-snug">
-                  <span className="font-bold">Real Engine: max 15 weeks</span> — calls actual production services per week.
-                  Cloud proxy timeout = 60 s.{' '}
-                  <button onClick={()=>!running&&(setUseRealEngine(false),setCycles(Math.max(cycles,50)))}
-                    className="underline text-emerald-400 hover:text-emerald-200 font-bold transition-colors">
-                    Switch to ⚡ Fast Preview
-                  </button>{' '}
-                  for 1–1,000 cycles with no timeout risk.
+                  <span className="font-bold">Real Engine — background job mode.</span>{' '}
+                  Runs in a daemon thread; no HTTP proxy timeout. Live week progress shown while running.
+                  Each week calls real production services (draw, SDE, waitlist, A/B/C, Brain 2/3/5).
+                  52 weeks ≈ 2–4 min on shared CPU.
                 </p>
               </div>
             </>
@@ -1217,20 +1458,8 @@ function StressTestTab({ toast }) {
         {result&&!running&&(
           <div className="border-t border-slate-700/60 pt-6">
 
-            {/* ── Error panel — shown when simulation throws ─────────────────── */}
-            {result._error && (
-              <div className="mb-4 p-4 bg-red-950/40 border border-red-800/50 rounded-xl text-sm text-red-300 space-y-2">
-                <div className="flex items-center gap-2">
-                  <AlertTriangle className="w-4 h-4 text-red-500 flex-shrink-0"/>
-                  <p className="font-bold text-red-400 uppercase tracking-wide text-xs">Simulation Error (HTTP {result._status ?? 'network'})</p>
-                </div>
-                <p className="text-xs text-red-300 font-mono leading-relaxed break-all">{result._msg}</p>
-                <p className="text-[10px] text-slate-500 mt-1">
-                  Common causes: 500 = server bug / DB migration not run / self._elim crash (fixed in latest push) ·
-                  403 = ENABLE_DEV_MODE not set · 504 = timeout (reduce weeks)
-                </p>
-              </div>
-            )}
+            {/* ── Error panel + Debugger ─────────────────────────────────────── */}
+            {result._error && <SimErrorDebugger result={result} />}
 
             {/* Report header + download buttons (only when simulation succeeded) */}
             {!result._error && <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
@@ -1581,12 +1810,24 @@ function InjectionTab({ toast }) {
   }, [bgPrefix, bgStatus?.status]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleBulk = async () => {
-    setLoading(true); setResult(null)
+    setLoading(true); setResult(null); setBgStatus(null); setBgPrefix(null)
     try {
       const res = await simulateUsersDev(count, autoPool)
       setResult(res.data)
-      toast(`${res.data.users_created.toLocaleString()} users injected`, 'success')
-    } catch(err){ toast(err.response?.data?.detail??'Injection failed','error') }
+      // When auto_pool=true, pool formation runs in background — start polling.
+      // The response always has pools_formed=0 because formation is async;
+      // the `prefix` field is the job key to poll.
+      if (autoPool && res.data.prefix) {
+        setBgPrefix(res.data.prefix)
+        setBgStatus({ status: 'running', pools_formed: 0, waitlist_remaining: null, error: null })
+        toast(
+          `${res.data.users_created.toLocaleString()} users injected — pool formation running in background…`,
+          'info'
+        )
+      } else {
+        toast(`${res.data.users_created.toLocaleString()} users injected`, 'success')
+      }
+    } catch(err) { toast(err.response?.data?.detail ?? 'Injection failed', 'error') }
     finally{ setLoading(false) }
   }
 

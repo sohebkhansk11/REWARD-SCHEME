@@ -793,6 +793,20 @@ def execute_weekly_draw(
             db.rollback()
             _logger.warning("execute_weekly_draw: ✗ %s skipped — %s", pool.name, exc)
             skipped.append(pool.name)
+        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # DIAGNOSIS: Non-ValueError exceptions from run_dual_draw() (e.g. IntegrityError,
+        # AttributeError) were bypassing the except ValueError handler and aborting the
+        # ENTIRE execute_weekly_draw() call silently — simulation logged only a one-line
+        # warning with no traceback, making root cause invisible.
+        # FIX: Catch all exceptions here so one bad pool doesn't kill the draw cycle.
+        # Each pool failure is now logged with full traceback (exc_info=True).
+        except Exception as exc:
+            db.rollback()
+            _logger.error(
+                "execute_weekly_draw: ✗ %s UNEXPECTED ERROR (non-ValueError) — %s",
+                pool.name, exc, exc_info=True,
+            )
+            skipped.append(pool.name)
 
     _logger.info(
         "execute_weekly_draw: %d pool(s) drawn, %d skipped. "

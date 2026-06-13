@@ -1454,7 +1454,10 @@ class RealSimEngine:
                         "max_high_lpi_streak_weeks":     0,
                         "l5_peak_by_week":               [w["l5_count"] for w in weekly_detail],
                         "l6_peak_by_week":               [w["l6_count"] for w in weekly_detail],
-                        "pauses_by_week":                [c["pauses"] for c in cycle_logs],
+                        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        # Use .get() so partial cycle_log entries (e.g. draw_abort_error
+                        # entries that have no "pauses" key) don't crash aggregation.
+                        "pauses_by_week":                [c.get("pauses", 0) for c in cycle_logs],
                         "total_l5_ext2_forced_exits":    final_ext2,
                         "total_l6_ext3_forced_exits":    final_ext3,
                         "total_accel_dissolution_events": final_accel,

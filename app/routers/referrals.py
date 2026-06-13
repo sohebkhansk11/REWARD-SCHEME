@@ -41,6 +41,37 @@ router = APIRouter(tags=["Referral Payouts"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GET /users/referral-reward-info  (public — no auth required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/users/referral-reward-info")
+def get_referral_reward_info(db: Session = Depends(get_db)):
+    """
+    Public endpoint — returns the current per-referral reward amount.
+    No authentication required.
+
+    Used by the user-app Referral page to display:
+      "Earn ₹{referral_reward_inr} when your friend enters an active pool."
+
+    The value reflects the live admin-configured amount in real-time.
+    A value of 0 means referral rewards are currently disabled.
+    """
+    from app.services.settings import get_referral_reward
+    reward = get_referral_reward(db)
+    return {
+        "referral_reward_inr":  reward,
+        "payout_threshold_inr": int(_PAYOUT_THRESHOLD_INR),
+        "rewards_enabled":      reward > 0,
+        "rule":                 "Rule 39 — reward is credited when your referred friend enters an active pool, not at registration.",
+        "note": (
+            f"Share your referral code. You earn ₹{reward} each time a friend you referred enters a pool."
+            if reward > 0 else
+            "Referral rewards are currently disabled. Check back soon."
+        ),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -8,6 +8,7 @@ DEPOSIT_AMOUNT_INR:  int = 1000
 PAYOUT_FEE_INR:      int = 500    # deducted from gross before payout
 REFERRAL_REWARD_INR: int = 250    # REF token issued when referred user enters Active Pool
 LATE_FEE_DAILY_INR:  int = 50     # accrues each day a member is Unpaid after Sunday
+LATE_FEE_MAX_CAP_INR: int = 500   # maximum total late fee a member can accumulate (caps after 10 days)
 
 # Per-level payouts: level → (gross_inr, net_inr after ₹500 fee)
 # L5 / L6 are edge-case only (admin override / extreme scenarios).

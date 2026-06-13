@@ -19,6 +19,8 @@ from app.schemas.admin import (
     WaitlistCheckResponse,
     UpdateThresholdRequest,
     ThresholdResponse,
+    UpdateReferralRewardRequest,
+    ReferralRewardResponse,
 )
 from app.schemas.token import TokenResponse
 from app.services import tokens as svc_tokens
@@ -496,6 +498,82 @@ def get_adaptive_threshold_detail(db: Session = Depends(get_db)):
     return get_adaptive_threshold_info(db)
 
 
+# ── System Settings — Configurable Referral Reward ───────────────────────────
+
+@router.get("/admin/settings/referral-reward", response_model=ReferralRewardResponse)
+def get_referral_reward_setting(db: Session = Depends(get_db)):
+    """
+    Return the current per-referral reward amount (INR).
+
+    This is the amount credited to a referrer's accumulated_referral_bonus_inr
+    each time a user they referred ENTERS an active pool (Rule 39).
+    Default: ₹250.  Configurable via PUT /admin/settings/referral-reward.
+    """
+    from app.services.settings import get_referral_reward
+    amount = get_referral_reward(db)
+    status_note = "Referral rewards DISABLED (₹0)." if amount == 0 else f"₹{amount} credited per qualifying pool entry."
+    return ReferralRewardResponse(
+        referral_reward_inr=amount,
+        message=status_note,
+    )
+
+
+@router.put("/admin/settings/referral-reward", response_model=ReferralRewardResponse)
+def update_referral_reward_setting(
+    body: UpdateReferralRewardRequest,
+    admin_username: str = Depends(require_admin_jwt),
+    db: Session = Depends(get_db),
+):
+    """
+    Update the per-referral reward amount.
+
+    Security gate: the admin's account password is required alongside
+    new_amount_inr.  The password is bcrypt-verified before the change is
+    persisted.  This prevents accidental changes to a financial parameter.
+
+    The new value takes effect immediately for every subsequent pool-entry
+    event — no server restart required (60-second cache, invalidated on save).
+
+    Setting to 0 disables referral rewards without any code change.
+    Referral count statistics are still tracked even at ₹0.
+    """
+    from app.models.admin import Admin as AdminModel
+    from app.services.settings import set_referral_reward
+
+    # ── Verify admin password ─────────────────────────────────────────────────
+    admin: AdminModel | None = (
+        db.query(AdminModel).filter(AdminModel.username == admin_username).first()
+    )
+    if not admin:
+        raise HTTPException(status_code=401, detail="Admin account not found — re-authenticate.")
+
+    dummy = "$2b$12$invalidhashplaceholderXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    stored = admin.hashed_password or dummy
+    from app.services.auth import verify_password
+    if not verify_password(body.admin_password, stored):
+        raise HTTPException(
+            status_code=401,
+            detail="Admin password verification failed. Referral reward was NOT changed.",
+        )
+
+    # ── Persist new reward ────────────────────────────────────────────────────
+    try:
+        new_val = set_referral_reward(db, body.new_amount_inr)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    status_note = (
+        "Referral rewards DISABLED — no bonus will be credited on future pool entries."
+        if new_val == 0 else
+        f"Referral reward updated to ₹{new_val}. "
+        "Credited immediately on next qualifying pool entry (Rule 39)."
+    )
+    return ReferralRewardResponse(
+        referral_reward_inr=new_val,
+        message=status_note,
+    )
+
+
 # ── SDE Extension II/III Check ────────────────────────────────────────────────
 
 @router.post("/admin/sde/run-extensions")
@@ -788,11 +866,35 @@ def trigger_draw(pool_id: int, db: Session = Depends(get_db)):
 
 # ── Late Payment Penalties ────────────────────────────────────────────────────
 
+def _unique_penalty_code(db: Session, prefix: str) -> str:
+    """
+    Collision-safe token code generator for compliance penalty tokens.
+    Uses os.urandom via secrets — NOT the MT19937 PRNG.
+    Format: "{prefix}{6 uppercase alphanumeric chars}"  e.g. "LF-A3KZ9W"
+    """
+    import secrets, string
+    from app.crud.token import get_token_by_code
+    _alpha = string.ascii_uppercase + string.digits
+    while True:
+        code = prefix + "".join(secrets.choice(_alpha) for _ in range(6))
+        if not get_token_by_code(db, code):
+            return code
+
+
 @router.post("/admin/penalty/apply-daily")
 def apply_daily_penalty(db: Session = Depends(get_db)):
     """
     Admin: call once per day (Monday–Saturday) to accrue ₹50 on every Active
     member who has not yet paid for the current week.
+
+    For each penalised member:
+      1. Adds LATE_FEE_DAILY_INR (₹50) to user.late_fees_inr.
+      2. Creates an immutable Late_Fee token (Burned, ₹50) as a receipt.
+         This token represents confirmed cash that will be collected either
+         at grace payment (save-seat) or forfeited at elimination.
+
+    The Late_Fee token serves as the audit trail: the token ledger always
+    reflects the full late-fee liability, not just the user model field.
     """
     unpaid: list[User] = (
         db.query(User)
@@ -800,19 +902,50 @@ def apply_daily_penalty(db: Session = Depends(get_db)):
         .all()
     )
     if not unpaid:
-        return {"penalised_count": 0, "message": "No unpaid active members."}
+        return {"penalised_count": 0, "daily_fee_inr": LATE_FEE_DAILY_INR,
+                "message": "No unpaid active members."}
 
     from app.crud import user as crud_user
     from app.schemas.user import UserUpdate
+    from app.core.config import LATE_FEE_MAX_CAP_INR  # ₹500 cap
+
+    _fee_dec = Decimal(str(LATE_FEE_DAILY_INR))
+    _cap_dec = Decimal(str(LATE_FEE_MAX_CAP_INR))
+    tokens_created = 0
 
     for member in unpaid:
-        new_late = Decimal(str(member.late_fees_inr or 0)) + Decimal(str(LATE_FEE_DAILY_INR))
+        current_late = Decimal(str(member.late_fees_inr or 0))
+
+        # Respect the max cap — do not accrue past ₹500 total
+        if current_late >= _cap_dec:
+            continue   # already at cap, no new accrual or token
+
+        accrual = min(_fee_dec, _cap_dec - current_late)   # partial if near cap
+        new_late = current_late + accrual
         crud_user.update_user(db, member.id, UserUpdate(late_fees_inr=new_late))
 
+        # Create immutable Late_Fee token — receipt of this day's accrual
+        code = _unique_penalty_code(db, "LF-")
+        db.add(Token(
+            code      = code,
+            type      = TokenType.Late_Fee,
+            status    = TokenStatus.Burned,
+            value_inr = accrual,
+            user_id   = member.id,
+            pool_id   = member.current_pool_id,
+        ))
+        tokens_created += 1
+
+    db.commit()
     return {
-        "penalised_count": len(unpaid),
-        "daily_fee_inr": LATE_FEE_DAILY_INR,
-        "message": f"₹{LATE_FEE_DAILY_INR} penalty applied to {len(unpaid)} unpaid member(s).",
+        "penalised_count":   len(unpaid),
+        "tokens_created":    tokens_created,
+        "daily_fee_inr":     LATE_FEE_DAILY_INR,
+        "max_cap_inr":       LATE_FEE_MAX_CAP_INR,
+        "message": (
+            f"₹{LATE_FEE_DAILY_INR} penalty accrued on {len(unpaid)} unpaid member(s). "
+            f"{tokens_created} Late_Fee token(s) created as receipts."
+        ),
     }
 
 

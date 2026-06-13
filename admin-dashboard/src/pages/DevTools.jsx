@@ -722,6 +722,14 @@ function StressTestTab({ toast }) {
   const [usersPerWeek,  setUsersPerWeek]  = useState(24)
   const [initialUsers,  setInitialUsers]  = useState(24)
   const [organicRatio,  setOrganicRatio]  = useState(60)   // %
+  // ── K-12 to K-17: Extended Injection Knobs ────────────────────────────────
+  const [inflowPattern,      setInflowPattern]      = useState('linear')
+  const [referralBurstWeek,  setReferralBurstWeek]  = useState(0)
+  const [paymentShockWeek,   setPaymentShockWeek]   = useState(0)
+  const [waitlistDropoutPct, setWaitlistDropoutPct] = useState(0)
+  const [organicDecayRate,   setOrganicDecayRate]   = useState(0)
+  const [simulationLabel,    setSimulationLabel]    = useState('')
+  const [showKnobs,          setShowKnobs]          = useState(false)
   const [running,   setRunning]   = useState(false)
   const [result,    setResult]    = useState(null)
   const [showSetup, setShowSetup] = useState(false)
@@ -739,15 +747,22 @@ function StressTestTab({ toast }) {
       if (useRealEngine) {
         // ── Real Engine: call actual production services ──────────────────────
         res = await realSimulationDev({
-          weeks:                cycles,
-          users_per_week:       usersPerWeek,
-          initial_users:        initialUsers,
-          organic_ratio:        organicRatio / 100.0,
-          late_users_ratio_pct: lateRatio,
-          elim_pct_a:           elimPctA,
-          grace_saver_pct_c:    gracePctC,
-          volatility_mode:      vol,
-          volatility_max_inflow: volMax,
+          weeks:                   cycles,
+          users_per_week:          usersPerWeek,
+          initial_users:           initialUsers,
+          organic_ratio:           organicRatio / 100.0,
+          late_users_ratio_pct:    lateRatio,
+          elim_pct_a:              elimPctA,
+          grace_saver_pct_c:       gracePctC,
+          volatility_mode:         vol,
+          volatility_max_inflow:   volMax,
+          // K-12 to K-17: Extended Injection Knobs
+          inflow_pattern:          inflowPattern,
+          referral_burst_week:     referralBurstWeek,
+          payment_shock_week:      paymentShockWeek,
+          waitlist_dropout_pct:    waitlistDropoutPct,
+          organic_decay_rate:      organicDecayRate / 100.0,
+          simulation_label:        simulationLabel || '',
         })
       } else {
         // ── Fast Preview: legacy in-memory engine ─────────────────────────────
@@ -902,6 +917,102 @@ function StressTestTab({ toast }) {
           </div>
         )}
 
+        {/* ── K-12 to K-17: Advanced Injection Knobs (collapsible) ─────────── */}
+        {useRealEngine && (
+          <div className="border border-cyan-800/40 rounded-xl overflow-hidden bg-cyan-950/10">
+            <button
+              onClick={() => setShowKnobs(v => !v)}
+              className="w-full flex items-center justify-between px-4 py-3 bg-cyan-950/20 hover:bg-cyan-950/40 transition-colors"
+            >
+              <p className="text-xs font-bold text-cyan-400 uppercase tracking-widest flex items-center gap-2">
+                🔬 K-12 to K-17 — Advanced Injection Knobs
+              </p>
+              <span className="text-cyan-600 text-xs">{showKnobs ? '▲ collapse' : '▼ expand'}</span>
+            </button>
+            {showKnobs && (
+              <div className="p-4 space-y-4">
+                {/* K-17: Simulation Label */}
+                <DevInput label="K-17 — Simulation Label" hint="(free text, for multi-run comparison)" type="text"
+                  placeholder="e.g. high-growth scenario" value={simulationLabel} disabled={running}
+                  onChange={e => setSimulationLabel(e.target.value)} />
+
+                {/* K-12: Inflow Pattern */}
+                <DevSelect label="K-12 — Inflow Pattern" hint="(shape of weekly new-user arrival curve)"
+                  value={inflowPattern} disabled={running} onChange={e => setInflowPattern(e.target.value)}>
+                  <option value="linear">Linear — constant users_per_week (default)</option>
+                  <option value="sine">Sine — ±50% oscillation, 12-week period</option>
+                  <option value="burst">Burst — 3× spike every 8th week, normal otherwise</option>
+                  <option value="step">Step — ramp 50%→150% of base over full run</option>
+                </DevSelect>
+
+                <div className="grid grid-cols-2 gap-4">
+                  {/* K-13: Referral burst week */}
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                      K-13 — Referral Burst Week <span className="text-slate-600 font-normal">(0=off)</span>
+                    </label>
+                    <input type="number" min={0} max={200} value={referralBurstWeek} disabled={running}
+                      onChange={e => setReferralBurstWeek(Math.max(0, parseInt(e.target.value)||0))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40" />
+                    <p className="text-[10px] text-slate-600 mt-0.5">2× referral surge on this week</p>
+                  </div>
+
+                  {/* K-14: Payment shock week */}
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                      K-14 — Payment Shock Week <span className="text-slate-600 font-normal">(0=off)</span>
+                    </label>
+                    <input type="number" min={0} max={200} value={paymentShockWeek} disabled={running}
+                      onChange={e => setPaymentShockWeek(Math.max(0, parseInt(e.target.value)||0))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40" />
+                    <p className="text-[10px] text-slate-600 mt-0.5">Late ratio spikes to 20% this week</p>
+                  </div>
+
+                  {/* K-15: Waitlist dropout */}
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                      K-15 — Waitlist Dropout % <span className="text-slate-600 font-normal">(0–50)</span>
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input type="number" min={0} max={50} step={0.5} value={waitlistDropoutPct} disabled={running}
+                        onChange={e => setWaitlistDropoutPct(Math.max(0, Math.min(50, parseFloat(e.target.value)||0)))}
+                        className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40" />
+                      <span className="text-[10px] text-slate-500">%</span>
+                    </div>
+                    <p className="text-[10px] text-slate-600 mt-0.5">% of waitlist who never enter pools</p>
+                  </div>
+
+                  {/* K-16: Organic decay rate */}
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                      K-16 — Organic Decay Rate <span className="text-slate-600 font-normal">(0–100%)</span>
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input type="number" min={0} max={100} step={0.5} value={organicDecayRate} disabled={running}
+                        onChange={e => setOrganicDecayRate(Math.max(0, Math.min(100, parseFloat(e.target.value)||0)))}
+                        className="w-full bg-slate-800 border border-slate-600 rounded-lg px-2.5 py-1.5 text-sm text-slate-200 font-bold disabled:opacity-40" />
+                      <span className="text-[10px] text-slate-500">%/wk</span>
+                    </div>
+                    <p className="text-[10px] text-slate-600 mt-0.5">Organic ratio decays by this % each week</p>
+                  </div>
+                </div>
+
+                {/* Active knobs summary */}
+                {(inflowPattern !== 'linear' || referralBurstWeek > 0 || paymentShockWeek > 0 || waitlistDropoutPct > 0 || organicDecayRate > 0 || simulationLabel) && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {inflowPattern !== 'linear' && <span className="px-2 py-0.5 bg-cyan-900/60 border border-cyan-700/60 rounded-full text-[10px] text-cyan-300 font-bold">K-12: {inflowPattern}</span>}
+                    {referralBurstWeek > 0 && <span className="px-2 py-0.5 bg-cyan-900/60 border border-cyan-700/60 rounded-full text-[10px] text-cyan-300 font-bold">K-13: burst wk{referralBurstWeek}</span>}
+                    {paymentShockWeek > 0 && <span className="px-2 py-0.5 bg-red-900/60 border border-red-700/60 rounded-full text-[10px] text-red-300 font-bold">K-14: shock wk{paymentShockWeek}</span>}
+                    {waitlistDropoutPct > 0 && <span className="px-2 py-0.5 bg-amber-900/60 border border-amber-700/60 rounded-full text-[10px] text-amber-300 font-bold">K-15: {waitlistDropoutPct}% dropout</span>}
+                    {organicDecayRate > 0 && <span className="px-2 py-0.5 bg-violet-900/60 border border-violet-700/60 rounded-full text-[10px] text-violet-300 font-bold">K-16: {organicDecayRate}%/wk decay</span>}
+                    {simulationLabel && <span className="px-2 py-0.5 bg-slate-700/80 border border-slate-600 rounded-full text-[10px] text-slate-300 font-bold">K-17: "{simulationLabel}"</span>}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* ── A/B/C Circular Late-Fee Parameters ───────────────────────────── */}
         <div className="border border-slate-600/60 rounded-xl overflow-hidden">
           <div className="px-4 py-3 bg-slate-800/60 border-b border-slate-700/60">
@@ -1047,8 +1158,8 @@ function StressTestTab({ toast }) {
           <div className="border-t border-slate-700/60 pt-6">
             {/* Report header + download buttons */}
             <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
-              <div className="flex items-center gap-2">
-                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500"/>
+              <div className="flex items-center gap-2 flex-wrap">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 flex-shrink-0"/>
                 <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
                   Simulation Complete — {result.simulation_summary.total_cycles_run.toLocaleString()} cycles
                 </p>
@@ -1056,6 +1167,23 @@ function StressTestTab({ toast }) {
                   ? <span className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-emerald-900/60 border border-emerald-700/60 text-emerald-300 uppercase tracking-wider">🔬 Real Engine</span>
                   : <span className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-violet-900/60 border border-violet-700/60 text-violet-300 uppercase tracking-wider">⚡ Fast Preview</span>
                 }
+                {result.simulation_summary.simulation_label && result.simulation_summary.simulation_label !== 'default' && (
+                  <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-cyan-900/60 border border-cyan-700/60 text-cyan-300">
+                    K-17: "{result.simulation_summary.simulation_label}"
+                  </span>
+                )}
+                {result.simulation_summary.injection_knobs && (() => {
+                  const k = result.simulation_summary.injection_knobs
+                  const active = []
+                  if (k.inflow_pattern && k.inflow_pattern !== 'linear') active.push(`K-12:${k.inflow_pattern}`)
+                  if (k.referral_burst_week > 0) active.push(`K-13:wk${k.referral_burst_week}`)
+                  if (k.payment_shock_week > 0) active.push(`K-14:wk${k.payment_shock_week}`)
+                  if (k.waitlist_dropout_pct > 0) active.push(`K-15:${k.waitlist_dropout_pct}%drop`)
+                  if (k.organic_decay_rate > 0) active.push(`K-16:decay${(k.organic_decay_rate*100).toFixed(1)}%`)
+                  return active.map(tag => (
+                    <span key={tag} className="text-[8px] font-bold px-1.5 py-0.5 rounded-full bg-slate-700/80 border border-slate-600 text-slate-400">{tag}</span>
+                  ))
+                })()}
               </div>
               <div className="flex gap-2">
                 <button onClick={()=>downloadCSV(result.weekly_detail, `sim_weekly_${Date.now()}.csv`)}

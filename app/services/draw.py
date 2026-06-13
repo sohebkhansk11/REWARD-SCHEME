@@ -65,8 +65,14 @@ from app.schemas.pool import PoolUpdate
 
 def _credit_referral_bonus(db: Session, referrer_id: int) -> None:
     """
-    Add REFERRAL_REWARD_INR to the referrer's accumulated_referral_bonus_inr
-    and increment their total_referrals_count.
+    Add the admin-configured referral reward to the referrer's
+    accumulated_referral_bonus_inr and increment their total_referrals_count.
+
+    The reward amount is read from the system_settings DB table via
+    get_referral_reward(db) — default ₹250 (REFERRAL_REWARD_INR).
+    An admin can change it live via PUT /admin/settings/referral-reward.
+    A value of 0 means rewards are temporarily disabled; the count is still
+    incremented so referral statistics remain accurate.
 
     Called when a referred user ENTERS AN ACTIVE POOL (Rule 39) — never at
     registration.  No individual token is generated; the balance accumulates
@@ -74,14 +80,21 @@ def _credit_referral_bonus(db: Session, referrer_id: int) -> None:
     POST /users/request-referral-payout.
     Caller is responsible for db.commit().
     """
+    # Deferred import — avoids a module-level circular dependency chain.
+    from app.services.settings import get_referral_reward
+
     referrer: User | None = db.query(User).filter(User.id == referrer_id).first()
     if not referrer:
         return
-    referrer.total_referrals_count          = (referrer.total_referrals_count or 0) + 1
-    referrer.accumulated_referral_bonus_inr = (
-        Decimal(str(referrer.accumulated_referral_bonus_inr or 0))
-        + Decimal(str(REFERRAL_REWARD_INR))
-    )
+
+    reward = get_referral_reward(db)   # live DB value, 60-second cache
+
+    referrer.total_referrals_count = (referrer.total_referrals_count or 0) + 1
+    if reward > 0:
+        referrer.accumulated_referral_bonus_inr = (
+            Decimal(str(referrer.accumulated_referral_bonus_inr or 0))
+            + Decimal(str(reward))
+        )
     # Caller is responsible for db.commit()
 
 
@@ -120,6 +133,10 @@ class MassDrawResult:
     skipped_pools:   list[str] = field(default_factory=list)   # errored mid-draw
     paused_pools:    list[str] = field(default_factory=list)   # Active pools with < 12 — paused
     sde_pre_drawn:   list[str] = field(default_factory=list)   # pools drawn by SDE pre-draw
+    # U-02: EngineEvent trace — one immutable record per draw sub-step.
+    # Callers can inspect this to verify LPI monotonicity (CON-2 proof) and
+    # diagnose why each pool was routed to a specific draw type.
+    event_trace:     list = field(default_factory=list)        # list[EngineEvent]
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -483,23 +500,31 @@ def execute_weekly_draw(
     """
     Global Mass Draw — the production Sunday-draw entry point.
 
-    Algorithm
-    ---------
-    1. Fetch ALL Active pools whose actual member count == POOL_CAPACITY (12).
-       Ordered by pool.id ASC for deterministic processing.
-    2. Optionally mark every unpaid member Paid before drawing
-       (used by the dev Force-Draw tool to avoid validation failures).
-    3. For each eligible pool run run_dual_draw(..., skip_waitlist_fill=True).
-       This removes 2 winners and does NOT pull inline replacements, so each
-       pool drops from 12 → 10 members.
-    4. After ALL pools have been drawn, call assign_waitlist_to_pools() ONCE:
-       Phase 1 — fills all 2×N vacancies across all pools (oldest pool first).
-       Phase 2 — creates new pools if remaining waitlist >= threshold.
+    Algorithm (Circular Engine Update — U-02/U-03/U-04 integrated)
+    ---------------------------------------------------------------
+    0. SDE Extension II/III pre-pass — clear any L5/L6 members first.
+    1. Read an ATOMIC system snapshot via get_system_snapshot_atomic(db).
+       This establishes the baseline LPI and draw-type routing for the cycle.
+    2. Fetch ALL Active pools whose actual member count == POOL_CAPACITY (12).
+    3. Optionally mark every unpaid member Paid.
+    4. For each eligible pool:
+       a. Re-evaluation gate (U-03): re-read LPI snapshot after each draw.
+          If LPI shifted ≥ MIN_LPI_DELTA from the previous snapshot, re-decide
+          the next pool's draw_type.  Cap at MAX_REEVALS to prevent thrashing.
+       b. Convergence guard (U-04): LPI is monotonically non-increasing within
+          a single cycle (proof: only L4 exits and fills occur → both reduce LPI).
+          Belt-and-suspenders: MIN_LPI_DELTA=0.5, MAX_REEVALS=3.
+       c. Record an EngineEvent for every sub-step (U-02).
+    5. Single combined FIFO refill after ALL draws.
 
     Raises ValueError if no eligible full pools are found.
-    Returns MassDrawResult with per-pool draw traces + combined refill summary.
+    Returns MassDrawResult with per-pool draw traces, event_trace, and refill summary.
     """
     from app.services.waitlist import assign_waitlist_to_pools
+    from app.services.engine_snapshot import (
+        get_system_snapshot_atomic, MIN_LPI_DELTA, MAX_REEVALS,
+        _evt,
+    )
 
     # ── 0. SDE Extension II/III pre-pass — clear any L5/L6 members FIRST ───────
     #
@@ -623,10 +648,27 @@ def execute_weekly_draw(
                 total_auto_paid, len(eligible),
             )
 
+    # ── U-01: Establish atomic LPI baseline before any draws ─────────────────
+    # Read all brain metrics in one transaction-consistent snapshot.
+    # This prevents stale cross-reads between Brain 2 velocity and Brain 5 LPI.
+    try:
+        lpi_snapshot = get_system_snapshot_atomic(db)
+        prev_lpi     = lpi_snapshot.lpi
+        reeval_count = 0
+        _logger.info(
+            "execute_weekly_draw: ⚡ Atomic snapshot — LPI=%.2f%% L4=%d scenario=%s",
+            prev_lpi, lpi_snapshot.l4, lpi_snapshot.scenario,
+        )
+    except Exception as snap_exc:
+        _logger.warning("execute_weekly_draw: snapshot failed, using fallback — %s", snap_exc)
+        prev_lpi     = 0.0
+        reeval_count = 0
+
     # ── 3. Draw every eligible pool — no inline replacement, no intermediate fill
     draw_results: list[DrawResult] = []
     skipped:      list[str]        = []
     sde_skipped:  list[str]        = []   # pools already handled by SDE pre-draw
+    event_trace:  list             = []   # U-02: EngineEvent list
 
     for pool in eligible:
         # BUG 7 FIX: skip any pool that SDE (or a previous draw attempt) already
@@ -640,10 +682,74 @@ def execute_weekly_draw(
             )
             continue
 
+        # U-03: Re-evaluation gate — re-read LPI before assigning draw type
+        # This ensures each pool uses a current (not stale) LPI reading.
+        # Gate fires if LPI shifted ≥ MIN_LPI_DELTA since last measurement.
+        try:
+            if reeval_count < MAX_REEVALS:
+                fresh_snap = get_system_snapshot_atomic(db)
+                lpi_delta  = abs(fresh_snap.lpi - prev_lpi)
+                if lpi_delta >= MIN_LPI_DELTA:
+                    # LPI shifted meaningfully — re-decide draw type for this pool
+                    reeval_count += 1
+                    new_draw_type = fresh_snap.pool_type_decision
+                    event_trace.append(_evt(
+                        event_type     = "lpi_reeval",
+                        pool_id        = pool.id,
+                        pool_name      = pool.name,
+                        draw_type_used = new_draw_type,
+                        lpi_before     = prev_lpi,
+                        lpi_after      = fresh_snap.lpi,
+                        reeval_count   = reeval_count,
+                        note           = (
+                            f"LPI shifted {lpi_delta:.2f}pp — re-routed to {new_draw_type}. "
+                            f"Re-eval #{reeval_count}/{MAX_REEVALS}."
+                        ),
+                    ))
+                    _logger.info(
+                        "execute_weekly_draw: ⟲ LPI re-eval #%d for %s — "
+                        "%.2f%%→%.2f%% (Δ%.2f) — new draw_type=%s",
+                        reeval_count, pool.name, prev_lpi, fresh_snap.lpi,
+                        lpi_delta, new_draw_type,
+                    )
+                    # Update the pool's draw type so it takes effect now
+                    pool.pool_draw_type = new_draw_type
+                    db.flush()
+                    prev_lpi = fresh_snap.lpi
+                # U-04: Convergence guard — LPI should only decrease or stay flat.
+                # Log a warning if it somehow increased (should be mathematically impossible).
+                elif fresh_snap.lpi > prev_lpi + MIN_LPI_DELTA:
+                    _logger.warning(
+                        "execute_weekly_draw: ⚠ Convergence anomaly — LPI INCREASED "
+                        "%.2f%% → %.2f%% (Δ+%.2f). This is unexpected within a single cycle. "
+                        "Possible cause: concurrent pool modification by another request.",
+                        prev_lpi, fresh_snap.lpi, fresh_snap.lpi - prev_lpi,
+                    )
+                    event_trace.append(_evt(
+                        event_type  = "convergence_guard",
+                        pool_id     = pool.id,
+                        pool_name   = pool.name,
+                        lpi_before  = prev_lpi,
+                        lpi_after   = fresh_snap.lpi,
+                        note        = "LPI increased — convergence anomaly logged (non-fatal).",
+                    ))
+        except Exception as reeval_exc:
+            _logger.debug("execute_weekly_draw: re-eval gate skipped: %s", reeval_exc)
+
         try:
             # Route to correct draw type based on pool_draw_type set at T-2H prep.
             # If prep hasn't run (pool_draw_type is None), default to 'regular'.
             effective_draw_type = pool.pool_draw_type or POOL_DRAW_REGULAR
+
+            # Record draw-start event (U-02)
+            event_trace.append(_evt(
+                event_type     = "draw_start",
+                pool_id        = pool.id,
+                pool_name      = pool.name,
+                draw_type_used = effective_draw_type,
+                lpi_before     = prev_lpi,
+                reeval_count   = reeval_count,
+            ))
 
             result = run_dual_draw(
                 db, pool.id,
@@ -651,6 +757,30 @@ def execute_weekly_draw(
                 draw_type=effective_draw_type,
             )
             draw_results.append(result)
+
+            # Record draw-complete event (U-02)
+            _dc_evt = _evt(
+                event_type     = "draw_complete",
+                pool_id        = pool.id,
+                pool_name      = pool.name,
+                draw_type_used = effective_draw_type,
+                lpi_before     = prev_lpi,
+                reeval_count   = reeval_count,
+                note           = (
+                    f"W1={result.winner_1.winner_username}(L{result.winner_1.winner_level}) "
+                    f"W2={result.winner_2.winner_username}(L{result.winner_2.winner_level})"
+                ),
+            )
+            event_trace.append(_dc_evt)
+
+            # U-05: Push to SSE live-stream queue (non-blocking — never affects draw)
+            try:
+                from app.routers.admin_analytics import post_draw_event
+                import dataclasses
+                post_draw_event(dataclasses.asdict(_dc_evt))
+            except Exception:
+                pass   # SSE is reporting only — draw continues regardless
+
             _logger.info(
                 "execute_weekly_draw: ✓ %s [%s] — W1=@%s (L%d %s), W2=@%s (L%d %s)",
                 pool.name, effective_draw_type,
@@ -689,6 +819,7 @@ def execute_weekly_draw(
         skipped_pools=skipped,
         paused_pools=paused_now,
         sde_pre_drawn=sde_skipped,
+        event_trace=event_trace,   # U-02: full EngineEvent trace
     )
 
 

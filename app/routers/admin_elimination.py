@@ -38,7 +38,23 @@ from app.database import get_db
 from app.models.elimination_event import EliminationEvent, EliminationReason
 from app.models.pool import Pool
 from app.models.system_settings import SystemSettings
+from app.models.token import Token, TokenType, TokenStatus
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
+
+
+def _unique_compliance_code(db: Session, prefix: str) -> str:
+    """
+    Collision-safe token code generator for Grace_Fee and Late_Fee settlement tokens.
+    Format: "{prefix}{6 uppercase alphanumeric chars}"  e.g. "GF-7MNQ2X"
+    Uses os.urandom via secrets — cryptographically random, not MT19937.
+    """
+    import secrets, string
+    from app.crud.token import get_token_by_code
+    _alpha = string.ascii_uppercase + string.digits
+    while True:
+        code = prefix + "".join(secrets.choice(_alpha) for _ in range(6))
+        if not get_token_by_code(db, code):
+            return code
 
 router = APIRouter(
     prefix="/admin/elimination",
@@ -600,6 +616,39 @@ def confirm_grace_payment(
 
     _increment_revenue("revenue_late_fees_collected_inr",  late_fees_cleared)
     _increment_revenue("revenue_grace_fees_collected_inr", grace_fee_inr)
+
+    # ── Create immutable compliance tokens (receipt / audit trail) ────────────
+    #
+    # Late_Fee settlement token — represents the accumulated late fees NOW PAID.
+    # This is the final "collected" record for fees that were accruing daily.
+    # Value = exact amount cleared (may be ₹0 if member had no late fees yet).
+    #
+    # Grace_Fee token — represents the ₹500 seat-save fee confirmed received.
+    # Created ONLY here (grace payment) — never at registration or weekly draw.
+    # This token is the canonical proof of grace period settlement.
+    #
+    # Both tokens are immediately Burned (cash already physically confirmed
+    # by admin via this endpoint — no pending state needed).
+    if late_fees_cleared > 0:
+        lf_code = _unique_compliance_code(db, "LFC-")   # LFC = Late Fee Collected
+        db.add(Token(
+            code      = lf_code,
+            type      = TokenType.Late_Fee,
+            status    = TokenStatus.Burned,
+            value_inr = Decimal(str(int(round(late_fees_cleared)))),
+            user_id   = user.id,
+            pool_id   = user.current_pool_id,
+        ))
+
+    gf_code = _unique_compliance_code(db, "GF-")
+    db.add(Token(
+        code      = gf_code,
+        type      = TokenType.Grace_Fee,
+        status    = TokenStatus.Burned,
+        value_inr = Decimal(str(grace_fee_inr)),
+        user_id   = user.id,
+        pool_id   = user.current_pool_id,
+    ))
 
     # ── Clear all elimination flags and settle payment ────────────────────────
     user.grace_fee_paid          = True

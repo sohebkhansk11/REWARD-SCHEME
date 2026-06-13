@@ -185,6 +185,27 @@ class ThresholdResponse(BaseModel):
     message:                 str
 
 
+class UpdateReferralRewardRequest(BaseModel):
+    """PUT /admin/settings/referral-reward — change the per-referral reward amount."""
+    new_amount_inr: int = Field(
+        ..., ge=0, le=10000,
+        description=(
+            "Per-referral reward credited in INR when a referred user enters an active pool "
+            "(Rule 39).  Range: 0 (disabled) – ₹10,000.  Default: ₹250."
+        ),
+    )
+    admin_password: str = Field(
+        ...,
+        description="Current admin account password — required to authorise this financial change.",
+    )
+
+
+class ReferralRewardResponse(BaseModel):
+    """Response body for GET / PUT /admin/settings/referral-reward."""
+    referral_reward_inr: int
+    message:             str
+
+
 class DeleteUserResponse(BaseModel):
     deleted_user_id:        int
     deleted_username:       str

@@ -233,6 +233,14 @@ def get_financials(db: Session = Depends(get_db)):
     )
     weekly_surplus: Decimal = weekly_collections - weekly_payouts
 
+    # ── Compliance Revenue — Late_Fee + Grace_Fee Burned tokens ───────────────
+    # These are ADDITIONAL cash flows beyond deposits.  Each Burned token = cash
+    # confirmed received by admin.  Queried separately so they appear as their
+    # own line items in the financial dashboard.
+    late_fee_collected: Decimal = _scalar_sum(db, TokenType.Late_Fee,  TokenStatus.Burned)
+    grace_fee_collected: Decimal = _scalar_sum(db, TokenType.Grace_Fee, TokenStatus.Burned)
+    compliance_revenue: Decimal = late_fee_collected + grace_fee_collected
+
     return FinancialStats(
         # ── Legacy fields (unchanged) ─────────────────────────────────────────
         total_collected_inr        = dep_burned,
@@ -259,6 +267,10 @@ def get_financials(db: Session = Depends(get_db)):
         weekly_collections_inr       = weekly_collections,
         weekly_payouts_inr           = weekly_payouts,
         weekly_rolling_surplus_inr   = weekly_surplus,
+        # ── New: Compliance Revenue ───────────────────────────────────────────
+        total_late_fees_collected_inr  = late_fee_collected,
+        total_grace_fees_collected_inr = grace_fee_collected,
+        total_compliance_revenue_inr   = compliance_revenue,
     )
 
 
@@ -997,11 +1009,32 @@ def get_ai_snapshot(db: Session = Depends(get_db)):
     active scenario, and dynamic reserve calculation.  Used by the admin
     dashboard header and DevTools AI status indicator.
 
-    v2: now includes Brain 5 LPI, forward signal, cliff signal,
-    blended velocity, and level distribution.
+    v3 (Circular Engine Update U-01): also returns the atomic snapshot so
+    the dashboard receives cross-consistent metrics from a single DB read.
+    Fields are merged — legacy `get_system_snapshot` fields are preserved for
+    backward compatibility; atomic snapshot adds lpi_atomic, blended_vel,
+    pool_type_decision, and captured_at for transparency.
     """
     from app.services.ai_quant_engine import get_system_snapshot
-    return get_system_snapshot(db)
+    legacy = get_system_snapshot(db)
+
+    # U-01: Atomic read — all brain metrics in one consistent transaction
+    try:
+        from app.services.engine_snapshot import get_system_snapshot_atomic
+        snap = get_system_snapshot_atomic(db)
+        # Merge atomic fields into response without overwriting legacy keys
+        legacy.update({
+            "lpi_atomic":          round(snap.lpi, 2),
+            "blended_velocity":    round(snap.blended_vel, 4),
+            "forward_signal_l3":   snap.forward_signal,
+            "pool_type_decision":  snap.pool_type_decision,
+            "burn_rate":           snap.burn_rate,
+            "snapshot_captured_at": snap.captured_at.isoformat(),
+        })
+    except Exception:
+        pass   # atomic read is additive — legacy snapshot always returns
+
+    return legacy
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1479,6 +1512,15 @@ def manual_execute_draw(db: Session = Depends(get_db)):
         state.countdown_active = False
         db.commit()
 
+    # U-02: Serialize event_trace for the API response
+    import dataclasses as _dc
+    evt_trace = []
+    for ev in (result.event_trace or []):
+        try:
+            evt_trace.append(_dc.asdict(ev))
+        except Exception:
+            pass
+
     return {
         "status":              "draw_complete",
         "week_id":             week_id,
@@ -1489,6 +1531,9 @@ def manual_execute_draw(db: Session = Depends(get_db)):
         "total_auto_paid":     result.total_auto_paid,
         "refill":              result.refill,
         "late_override_choice": late_choice,
+        # U-02: EngineEvent trace — array of per-step events for monitoring/debugging
+        "event_trace":         evt_trace,
+        "reeval_count":        len([e for e in evt_trace if e.get("event_type")=="lpi_reeval"]),
     }
 
 
@@ -1583,4 +1628,335 @@ def get_pause_calendar(db: Session = Depends(get_db)):
         "calendar":             calendar_days,
         "current_paused_count": len(paused_now),
         "total_pause_events":   sum(d["paused_count"] for d in calendar_days),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15.  GET /admin/draw/live-stream  — Server-Sent Events (U-05)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Decoupled real-time visibility:
+#   Draw execution stays synchronous + ACID (no change to draw.py).
+#   This endpoint pushes the event_trace accumulated during execute_weekly_draw()
+#   as SSE events so the admin dashboard subscribes via EventSource.
+#
+# Design (CON-4 resolution):
+#   • After each draw commit, the event_trace is stored in a module-level queue.
+#   • This SSE endpoint drains the queue, yielding one SSE event per EngineEvent.
+#   • If no draw is running, it yields a heartbeat every 15 s so EventSource
+#     doesn't time out and auto-reconnects.
+#
+# Usage (frontend):
+#   const es = new EventSource('/admin/draw/live-stream', {
+#     headers: { Authorization: `Bearer ${jwt}` }
+#   })
+#   es.onmessage = e => { const evt = JSON.parse(e.data); ... }
+#   es.addEventListener('heartbeat', () => {})
+#
+# Note: The JWT bearer header is NOT automatically sent by the browser's native
+# EventSource API.  The frontend must use a polyfill (eventsource-parser) or
+# the @microsoft/fetch-event-source library that supports custom headers.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import asyncio
+import json
+import queue as _queue
+from fastapi.responses import StreamingResponse
+
+# Module-level event queue — draw.py posts EngineEvents here after each draw.
+# SSE endpoint drains it.  Thread-safe: asyncio.Queue for async generator.
+_DRAW_EVENT_QUEUE: _queue.SimpleQueue = _queue.SimpleQueue()
+_MAX_QUEUE_SIZE = 500   # cap to prevent unbounded growth
+
+
+def post_draw_event(event: dict) -> None:
+    """
+    Called by execute_weekly_draw() (via a non-blocking try-except) to push
+    each EngineEvent into the live-stream queue.
+
+    draw.py calls this after each pool draw so the SSE clients receive
+    real-time progress without waiting for the full weekly draw to complete.
+    """
+    global _DRAW_EVENT_QUEUE
+    try:
+        # Evict oldest if queue is at cap to prevent unbounded growth
+        if _DRAW_EVENT_QUEUE.qsize() >= _MAX_QUEUE_SIZE:
+            try: _DRAW_EVENT_QUEUE.get_nowait()
+            except Exception: pass
+        _DRAW_EVENT_QUEUE.put_nowait(event)
+    except Exception:
+        pass   # non-fatal — SSE is a reporting layer, never blocks the draw
+
+
+@router.get("/admin/draw/live-stream")
+async def draw_live_stream(db: Session = Depends(get_db)):
+    """
+    Server-Sent Events endpoint — streams real-time EngineEvents from
+    execute_weekly_draw() to subscribing admin dashboards.
+
+    Each SSE message is a JSON-encoded EngineEvent dict:
+    {
+      "timestamp":        "2026-06-13T…Z",
+      "event_type":       "draw_complete"|"lpi_reeval"|"convergence_guard"|…,
+      "pool_id":          42,
+      "pool_name":        "Pool-042",
+      "draw_type_used":   "regular"|"type_a"|"sde"|…,
+      "lpi_before":       18.5,
+      "lpi_after":        17.2,
+      "reeval_count":     1,
+      "note":             "W1=@user001 W2=@user002"
+    }
+
+    Special events:
+      event: heartbeat   — emitted every 15 s when no draw is running.
+      event: draw_start  — emitted when execute_weekly_draw() begins.
+      event: draw_done   — emitted when all pools have been drawn.
+
+    The stream never ends (until the client disconnects).
+    """
+    async def _event_generator():
+        heartbeat_interval = 15   # seconds between heartbeats
+        last_hb            = 0.0
+
+        while True:
+            now = asyncio.get_event_loop().time()
+
+            # Drain all queued events
+            drained = False
+            while not _DRAW_EVENT_QUEUE.empty():
+                try:
+                    ev = _DRAW_EVENT_QUEUE.get_nowait()
+                    event_type = ev.get("event_type", "event")
+                    payload    = json.dumps(ev, default=str)
+                    yield f"event: {event_type}\ndata: {payload}\n\n"
+                    drained = True
+                except Exception:
+                    break
+
+            # Heartbeat if nothing drained and interval elapsed
+            if not drained and (now - last_hb) >= heartbeat_interval:
+                ts  = datetime.now(timezone.utc).isoformat()
+                hb  = json.dumps({"type": "heartbeat", "timestamp": ts})
+                yield f"event: heartbeat\ndata: {hb}\n\n"
+                last_hb = now
+
+            await asyncio.sleep(0.5)   # poll every 500 ms
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",     # disable Nginx buffering for SSE
+            "Connection":        "keep-alive",
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16.  GET /admin/stats/referral-trend  — Weekly RDR% trend for S-04 heatmap
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/stats/referral-trend")
+def get_referral_trend(
+    weeks: int = Query(52, ge=4, le=104,
+                       description="Number of recent ISO weeks to return (max 104 = 2 years)"),
+    db: Session = Depends(get_db),
+):
+    """
+    Per-week Referral Density Ratio (RDR%) trend for the S-04 Referral Heatmap
+    panel in the admin Statistics page.
+
+    Groups all users by their ISO join week and computes:
+      total_joins   — registrations that week (regardless of referral)
+      referral_joins — registrations where referred_by_user_id IS NOT NULL
+      rdr_pct       — referral_joins / total_joins × 100  (0–100)
+
+    Returns the most-recent `weeks` buckets sorted oldest-first so the
+    frontend can render them left-to-right in calendar order.
+
+    Zero-fills missing weeks (no registrations) so the heatmap calendar
+    has a continuous x-axis with no gaps.
+    """
+    from datetime import date as _date, timedelta as _td
+
+    now_utc = datetime.now(timezone.utc)
+
+    # Fetch all users with a join_date in the window
+    cutoff_dt = now_utc - timedelta(weeks=weeks)
+    user_rows = (
+        db.query(User.join_date, User.referred_by_user_id)
+        .filter(User.join_date >= cutoff_dt, User.join_date.isnot(None))
+        .all()
+    )
+
+    # ── Bucket by ISO week ────────────────────────────────────────────────────
+    bucket: dict[str, dict] = {}   # key = "YYYY-WXX"
+
+    for join_dt, ref_id in user_rows:
+        if join_dt is None:
+            continue
+        dt = join_dt.replace(tzinfo=timezone.utc) if join_dt.tzinfo is None else join_dt
+        iso = dt.isocalendar()
+        wk  = f"{iso.year}-W{iso.week:02d}"
+
+        if wk not in bucket:
+            # Derive Monday date for this ISO week
+            try:
+                monday = datetime.fromisocalendar(iso.year, iso.week, 1).date()
+            except Exception:
+                monday = dt.date()
+            bucket[wk] = {
+                "week_id":       wk,
+                "week_start":    monday.isoformat(),
+                "total_joins":   0,
+                "referral_joins": 0,
+                "rdr_pct":       0.0,
+            }
+
+        bucket[wk]["total_joins"] += 1
+        if ref_id is not None:
+            bucket[wk]["referral_joins"] += 1
+
+    # ── Compute RDR% and zero-fill missing weeks ──────────────────────────────
+    # Build a contiguous week range so the calendar has no gaps
+    result_map: dict[str, dict] = {}
+    cur_date = cutoff_dt.date()
+    end_date = now_utc.date()
+
+    while cur_date <= end_date:
+        iso = cur_date.isocalendar()
+        wk  = f"{iso.year}-W{iso.week:02d}"
+        if wk not in result_map:
+            entry = bucket.get(wk, {
+                "week_id":       wk,
+                "week_start":    (cur_date - timedelta(days=cur_date.weekday())).isoformat(),
+                "total_joins":   0,
+                "referral_joins": 0,
+            })
+            total = entry["total_joins"]
+            refs  = entry["referral_joins"]
+            entry["rdr_pct"] = round(refs / max(total, 1) * 100.0, 1) if total > 0 else 0.0
+            result_map[wk] = entry
+        cur_date += timedelta(days=7)
+
+    # Sort by week_start ascending, keep most-recent `weeks` items
+    sorted_items = sorted(result_map.values(), key=lambda x: x["week_start"])
+    if len(sorted_items) > weeks:
+        sorted_items = sorted_items[-weeks:]
+
+    # ── Summary statistics ─────────────────────────────────────────────────────
+    total_all   = sum(r["total_joins"]    for r in sorted_items)
+    referral_all = sum(r["referral_joins"] for r in sorted_items)
+    avg_rdr     = round(referral_all / max(total_all, 1) * 100.0, 1) if total_all > 0 else 0.0
+    peak_rdr    = max((r["rdr_pct"] for r in sorted_items), default=0.0)
+    peak_week   = next(
+        (r["week_id"] for r in sorted(sorted_items, key=lambda x: x["rdr_pct"], reverse=True)),
+        None,
+    )
+
+    return {
+        "weeks":           sorted_items,
+        "total_weeks":     len(sorted_items),
+        "summary": {
+            "total_joins_in_window":    total_all,
+            "referral_joins_in_window": referral_all,
+            "avg_rdr_pct":              avg_rdr,
+            "peak_rdr_pct":             peak_rdr,
+            "peak_rdr_week":            peak_week,
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17.  GET /admin/stats/winner-level-trend  — S-03 winner level over time
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/stats/winner-level-trend")
+def get_winner_level_trend(
+    weeks: int = Query(24, ge=4, le=104,
+                       description="Number of recent ISO weeks to return (max 104)."),
+    db: Session = Depends(get_db),
+):
+    """
+    Per-week winner level distribution trend for the S-03 panel.
+
+    Groups DrawHistory records by ISO draw week and returns per-level winner
+    counts so the frontend can render a stacked BarChart showing which levels
+    won most frequently over time.
+
+    This is distinct from the existing level-breakdown endpoint (which is a
+    cumulative aggregate) — this endpoint returns the TEMPORAL trend so the
+    admin can see whether L4/L5/L6 wins are becoming more frequent (a leading
+    indicator of SDE pressure building).
+    """
+    from app.models.draw_history import DrawHistory
+
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(weeks=weeks)
+    all_draws = (
+        db.query(DrawHistory)
+        .filter(DrawHistory.draw_timestamp >= cutoff_dt)
+        .order_by(DrawHistory.draw_timestamp.asc())
+        .all()
+    )
+
+    # ── Bucket by ISO week ────────────────────────────────────────────────────
+    weekly: dict[str, dict] = {}
+
+    for dh in all_draws:
+        dt = dh.draw_timestamp
+        if dt is None:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        iso = dt.isocalendar()
+        wk  = f"{iso.year}-W{iso.week:02d}"
+
+        if wk not in weekly:
+            try:
+                monday = datetime.fromisocalendar(iso.year, iso.week, 1).date()
+            except Exception:
+                monday = dt.date()
+            weekly[wk] = {
+                "week_id":    wk,
+                "week_start": monday.isoformat(),
+                "total_draws": 0,
+                "total_winners": 0,
+                "total_payout_inr": 0.0,
+                "levels": {f"L{l}": 0 for l in range(1, 7)},
+            }
+
+        weekly[wk]["total_draws"] += 1
+        for lvl, pay in (
+            (dh.winner_1_level, dh.winner_1_net_payout),
+            (dh.winner_2_level, dh.winner_2_net_payout),
+        ):
+            if lvl and 1 <= lvl <= 6:
+                lk = f"L{lvl}"
+                weekly[wk]["levels"][lk] += 1
+                weekly[wk]["total_winners"] += 1
+                weekly[wk]["total_payout_inr"] += float(pay or 0)
+
+    sorted_weeks = sorted(weekly.values(), key=lambda x: x["week_start"])
+    if len(sorted_weeks) > weeks:
+        sorted_weeks = sorted_weeks[-weeks:]
+
+    # ── Aggregate summary ─────────────────────────────────────────────────────
+    level_totals = {f"L{l}": 0 for l in range(1, 7)}
+    for row in sorted_weeks:
+        for k, v in row["levels"].items():
+            level_totals[k] += v
+
+    total_winners = sum(level_totals.values())
+    dominant_level = max(level_totals, key=level_totals.get) if total_winners else "L1"
+
+    return {
+        "weeks":          sorted_weeks,
+        "total_weeks":    len(sorted_weeks),
+        "summary": {
+            "level_totals":    level_totals,
+            "dominant_level":  dominant_level,
+            "total_winners":   total_winners,
+            "total_draws":     sum(r["total_draws"] for r in sorted_weeks),
+        },
     }

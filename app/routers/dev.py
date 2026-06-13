@@ -1128,6 +1128,7 @@ class _AdvSimEngine:
         self.n_scaled    = 0
         self.n_condensed = 0
         self.n_paused    = 0
+        self._elim = 0        # total eliminations across all cycles (A-path + grace-expired)
         self._dep  = Decimal("0")
         self._pay  = Decimal("0")
         self._late = Decimal("0")
@@ -1951,7 +1952,7 @@ class _AdvSimEngine:
         }
 
         return {
-            # ── Backward-compatible original 8 keys ───────────────────────────
+            # ── Backward-compatible original 8 keys ─────────��─────────────────
             "total_cycles_run":              len(self.logs),
             "total_simulated_users_created": self.n_created,
             "total_winners_drawn":           self.n_winners,
@@ -1960,6 +1961,8 @@ class _AdvSimEngine:
             "total_draw_pauses_triggered":   self.n_paused,
             "total_late_fees_collected_inr": late_fees,
             "final_virtual_liquidity_float": net_profit,
+            # ── Elimination tracking (BUG-1 fix: self._elim now initialized) ──
+            "total_eliminations":            self._elim,
             # ── God Mode extended sections ────────────────────────────────────
             "financial_metrics": {
                 "total_collected_inr":            total_collected,
@@ -3099,6 +3102,19 @@ class RealSimRequest(BaseModel):
                                       description="ISO year for simulated week 1 (affects Brain 2 timestamps).")
     start_week:         int   = Field(1,    ge=1,    le=52,
                                       description="ISO week number for simulated week 1.")
+    # ── K-12 to K-17: Extended Injection Knobs ────────────────────────────────
+    inflow_pattern:     str   = Field("linear",
+                                      description="K-12: Inflow pattern: linear|sine|burst|step.")
+    referral_burst_week: int  = Field(0, ge=0, le=200,
+                                      description="K-13: Week to inject a 2× referral surge (0=disabled).")
+    payment_shock_week: int   = Field(0, ge=0, le=200,
+                                      description="K-14: Week to inject a payment shock (0=disabled).")
+    waitlist_dropout_pct: float = Field(0.0, ge=0.0, le=50.0,
+                                        description="K-15: % of waitlist who drop out before pool entry.")
+    organic_decay_rate: float = Field(0.0, ge=0.0, le=1.0,
+                                      description="K-16: Weekly organic join rate decay (0=none).")
+    simulation_label:   str   = Field("",
+                                      description="K-17: Free-text label for multi-run comparison.")
 
 
 @router.post("/real-simulation")
@@ -3124,17 +3140,24 @@ def run_real_simulation(
     from app.services.real_simulation import RealSimEngine
 
     engine = RealSimEngine(
-        weeks           = body.weeks,
-        users_per_week  = body.users_per_week,
-        initial_users   = body.initial_users,
-        organic_ratio   = body.organic_ratio,
-        late_ratio      = body.late_users_ratio_pct / 100.0,
-        elim_pct_a      = body.elim_pct_a,
-        grace_pct_c     = body.grace_saver_pct_c,
-        volatility_mode = body.volatility_mode,
-        volatility_max  = body.volatility_max_inflow,
-        start_year      = body.start_year,
-        start_week      = body.start_week,
+        weeks                = body.weeks,
+        users_per_week       = body.users_per_week,
+        initial_users        = body.initial_users,
+        organic_ratio        = body.organic_ratio,
+        late_ratio           = body.late_users_ratio_pct / 100.0,
+        elim_pct_a           = body.elim_pct_a,
+        grace_pct_c          = body.grace_saver_pct_c,
+        volatility_mode      = body.volatility_mode,
+        volatility_max       = body.volatility_max_inflow,
+        start_year           = body.start_year,
+        start_week           = body.start_week,
+        # K-12 to K-17: Extended Injection Knobs
+        inflow_pattern       = body.inflow_pattern,
+        referral_burst_week  = body.referral_burst_week,
+        payment_shock_week   = body.payment_shock_week,
+        waitlist_dropout_pct = body.waitlist_dropout_pct,
+        organic_decay_rate   = body.organic_decay_rate,
+        simulation_label     = body.simulation_label,
     )
 
     _logger_sim.info(

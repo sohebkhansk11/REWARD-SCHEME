@@ -241,11 +241,25 @@ export const advancedSimulationDev = (params) =>
  * @param {number}  params.grace_saver_pct_c       C: % of grace-eligible who survive
  * @param {boolean} params.volatility_mode         random weekly inflow
  * @param {number}  params.volatility_max_inflow   max inflow in volatility mode
+ * @param {string}  params.inflow_pattern          K-12: linear|sine|burst|step
+ * @param {number}  params.referral_burst_week     K-13: week for 2× referral surge (0=off)
+ * @param {number}  params.payment_shock_week      K-14: week for payment shock (0=off)
+ * @param {number}  params.waitlist_dropout_pct    K-15: % of waitlist who drop out (0–50)
+ * @param {number}  params.organic_decay_rate      K-16: weekly organic ratio decay (0–1)
+ * @param {string}  params.simulation_label        K-17: label for multi-run comparison
  */
 export const realSimulationDev = (params) =>
   api.post('/dev/real-simulation', params, {
     timeout: 600_000,   // 10 min — real DB ops per cycle are slower than in-memory
   })
+
+/** GET /admin/draw/live-stream — Server-Sent Events for real-time draw monitoring (U-05) */
+export const getDrawLiveStream = (token) => {
+  const url = `${BASE_URL}/admin/draw/live-stream`
+  // Uses fetch-event-source pattern: returns a URL + headers so callers can
+  // use @microsoft/fetch-event-source or eventsource-parser with auth.
+  return { url, headers: { Authorization: `Bearer ${token}` } }
+}
 
 // ── Winners History & AI Snapshot ────────────────────────────────────────────
 
@@ -410,6 +424,14 @@ export const getPauseCalendar = () =>
 /** GET /admin/stats/weekly-pool-reports — per-week draw & pool activity report */
 export const getWeeklyPoolReports = (weeks = 24) =>
   api.get('/admin/stats/weekly-pool-reports', { params: { weeks } })
+
+/** GET /admin/stats/referral-trend — weekly RDR% trend for S-04 Referral Heatmap */
+export const getReferralTrend = (weeks = 52) =>
+  api.get('/admin/stats/referral-trend', { params: { weeks } })
+
+/** GET /admin/stats/winner-level-trend — weekly winner level breakdown for S-03 panel */
+export const getWinnerLevelTrend = (weeks = 24) =>
+  api.get('/admin/stats/winner-level-trend', { params: { weeks } })
 
 // ── System Settings ───────────────────────────────────────────────────────────
 

@@ -74,6 +74,26 @@ class FinancialStats(BaseModel):
     weekly_payouts_inr:          Decimal   # WIT Burned this week
     weekly_rolling_surplus_inr:  Decimal   # collections − payouts
 
+    # ── Compliance Revenue (new) ──────────────────────────────────────────────
+    # Revenue earned from payment non-compliance.  These are REAL cash flows
+    # that do NOT appear in DEP/WIT totals — tracked via dedicated tokens.
+    #
+    # total_late_fees_collected_inr:
+    #   SUM of all Burned Late_Fee tokens.  Each Burned Late_Fee = confirmed
+    #   cash received.  Created by apply-daily (₹50/day accrual) and by
+    #   save-seat (settlement of accumulated late fees at grace payment).
+    #
+    # total_grace_fees_collected_inr:
+    #   SUM of all Burned Grace_Fee tokens.  Each = admin-confirmed ₹500
+    #   seat-save payment received from a grace period member.
+    #
+    # total_compliance_revenue_inr:
+    #   late_fees + grace_fees.  Total non-deposit operator revenue.
+    #   NOT included in doomsday_liability (belongs to operator, not participant).
+    total_late_fees_collected_inr:   Decimal   # SUM Burned Late_Fee tokens
+    total_grace_fees_collected_inr:  Decimal   # SUM Burned Grace_Fee tokens
+    total_compliance_revenue_inr:    Decimal   # late_fees + grace_fees combined
+
 
 # ── 2. Pool-Wise Micro Analytics ──────────────────────────────────────────────
 

@@ -176,6 +176,70 @@ def get_adaptive_threshold(db: Session, lpi: float | None = None) -> int:
     return effective
 
 
+# ── Referral Reward ───────────────────────────────────────────────────────────
+
+_KEY_REFERRAL_REWARD = "referral_reward_inr"
+
+# Same 60-second TTL cache pattern as pool threshold — avoids a DB round-trip
+# on every pool-entry event (Phase 1/2/3 refill + draw replacement).
+_REFERRAL_REWARD_CACHE: dict = {"value": None, "expires": 0.0}
+
+
+def get_referral_reward(db: Session) -> int:
+    """
+    Return the current per-referral reward in INR.
+
+    Served from a 60-second process-local cache to avoid a DB hit on every
+    pool-entry event (Rule 39).  Falls back to the compiled-in
+    REFERRAL_REWARD_INR (250) when the DB row does not yet exist, keeping
+    all GET paths read-only.
+
+    Value of 0 is valid — it means referral rewards are temporarily disabled.
+    """
+    now = time.monotonic()
+    if _REFERRAL_REWARD_CACHE["value"] is not None and now < _REFERRAL_REWARD_CACHE["expires"]:
+        return _REFERRAL_REWARD_CACHE["value"]
+
+    row: SystemSettings | None = (
+        db.query(SystemSettings)
+        .filter(SystemSettings.key == _KEY_REFERRAL_REWARD)
+        .first()
+    )
+    from app.core.config import REFERRAL_REWARD_INR as _DEFAULT
+    # NOTE: explicit `is not None` check so that 0 (disabled state) is preserved.
+    result = row.value_int if (row is not None and row.value_int is not None) else _DEFAULT
+    _REFERRAL_REWARD_CACHE["value"]   = result
+    _REFERRAL_REWARD_CACHE["expires"] = now + _CACHE_TTL_S
+    return result
+
+
+def set_referral_reward(db: Session, new_amount: int) -> int:
+    """
+    Persist a new per-referral reward amount and return it.
+
+    Validates:
+      - Must be ≥ 0  (0 = disable referral rewards without code change)
+      - Must be ≤ 10,000  (prevents accidental ruinous value)
+
+    Cache is invalidated immediately so the next pool-entry event uses the
+    new amount without waiting up to 60 seconds.
+    Caller is responsible for any surrounding transaction if needed.
+    """
+    if new_amount < 0:
+        raise ValueError("referral_reward_inr must be ≥ 0 (0 = disabled).")
+    if new_amount > 10_000:
+        raise ValueError("referral_reward_inr must be ≤ ₹10,000.")
+
+    from app.core.config import REFERRAL_REWARD_INR as _DEFAULT
+    row = _get_or_create_row(db, _KEY_REFERRAL_REWARD, default_int=_DEFAULT)
+    row.value_int = new_amount
+    db.commit()
+    db.refresh(row)
+    # Invalidate cache — next call reads fresh value immediately.
+    _REFERRAL_REWARD_CACHE["value"] = None
+    return row.value_int
+
+
 def get_adaptive_threshold_info(db: Session, lpi: float | None = None) -> dict:
     """
     Return the adaptive threshold calculation with full explanation.

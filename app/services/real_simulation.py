@@ -274,35 +274,140 @@ class MassLoadInjector:
 
         return new_users
 
-    def auto_pay_installments(self, db: Session) -> int:
+    def auto_pay_installments(self, db: Session, week_num: int = 0) -> int:
         """
-        Mark ALL Active pool members as Paid for the current week.
+        U-08: Mark ALL Active pool members as Paid AND create one weekly
+        Burned DEP token per member — making total_collected_inr financially
+        accurate for multi-week simulations.
 
-        Simulates weekly deposit collection before the draw.  In production,
-        each member redeems a DEP token; here we set the flag directly (the
-        initial DEP token was already burned at inject_week time).
+        Without U-08: a 52-week run with 100 active members shows
+            total_collected_inr = ₹1,00,000 (only initial deposits)
+        With U-08:    same run shows
+            total_collected_inr = ₹52,00,000 (initial + 52 weekly payments)
 
-        Returns count of members whose payment status was updated.
+        Token code format: WK{week:04d}U{uid:010d} — deterministic, unique per
+        member per week, collision-safe without a DB lookup loop.
+
+        Returns count of members who were Unpaid (= new tokens created).
         """
-        from app.models.user import User, UserStatus, WeeklyPaymentStatus
+        from app.models.user  import User, UserStatus, WeeklyPaymentStatus
+        from app.models.token import Token, TokenType, TokenStatus
+        from datetime         import datetime, timezone
 
-        n = (
+        unpaid: list = (
             db.query(User)
             .filter(
-                User.status == UserStatus.Active,
+                User.status                == UserStatus.Active,
                 User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
             )
-            .update(
-                {"weekly_payment_status": WeeklyPaymentStatus.Paid},
-                synchronize_session=False,
-            )
+            .all()
         )
+
+        if not unpaid:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        token_rows = []
+        for member in unpaid:
+            member.weekly_payment_status = WeeklyPaymentStatus.Paid
+            # U-08: one DEP token per member per week — code is deterministic
+            # so a re-run of the same week is idempotent (same code = unique constraint
+            # violation → simulation catches + skips duplicates gracefully).
+            token_rows.append({
+                "code":        f"WK{week_num:04d}U{member.id:010d}",
+                "type":        TokenType.Deposit,
+                "status":      TokenStatus.Burned,
+                "value_inr":   _DEPOSIT_DEC,
+                "user_id":     member.id,
+                "pool_id":     member.current_pool_id,
+                "redeemed_at": now,
+            })
+
+        if token_rows:
+            try:
+                db.execute(sa_insert(Token), token_rows)
+            except Exception:
+                # Duplicate code on re-run — safe to skip; payment flag already set
+                db.rollback()
+                # Re-apply just the Paid status without tokens
+                for member in unpaid:
+                    member.weekly_payment_status = WeeklyPaymentStatus.Paid
+
         db.flush()
-        return n
+        return len(unpaid)
 
     # Keep legacy alias so any existing callers don't break
     def auto_pay_active(self, db: Session) -> int:
-        return self.auto_pay_installments(db)
+        return self.auto_pay_installments(db, week_num=0)
+
+    def auto_settle_referral_rw(self, db: Session, week_num: int = 0) -> int:
+        """
+        U-09: Post-draw RW token auto-settlement.
+
+        After each draw cycle, scan all users with
+            accumulated_referral_bonus_inr >= 1000
+        and create one Referral_Withdraw (RW) token as an auto-settlement record.
+
+        This makes the simulation's referral outflow stats accurate:
+        without U-09 the accumulated balance grows unbounded and is never
+        reflected in total_cash_outflow_inr.
+
+        Returns count of RW tokens created.
+        """
+        from app.models.user  import User, UserStatus
+        from app.models.token import Token, TokenType, TokenStatus
+        from decimal          import Decimal
+
+        _threshold = Decimal("1000")
+        _zero      = Decimal("0")
+
+        eligible: list = (
+            db.query(User)
+            .filter(
+                User.status.in_([UserStatus.Active, UserStatus.Waitlist, UserStatus.Eliminated_Won]),
+                User.accumulated_referral_bonus_inr >= _threshold,
+            )
+            .all()
+        )
+
+        if not eligible:
+            return 0
+
+        created = 0
+        for user in eligible:
+            balance = Decimal(str(user.accumulated_referral_bonus_inr or 0))
+            if balance < _threshold:
+                continue
+
+            rw_code = f"RW{week_num:04d}U{user.id:010d}"
+            rw_token = Token(
+                code      = rw_code,
+                type      = TokenType.Referral_Withdraw,
+                status    = TokenStatus.Burned,
+                value_inr = balance,
+                user_id   = user.id,
+                pool_id   = None,
+            )
+            db.add(rw_token)
+            # Zero the accumulated balance after settlement
+            user.accumulated_referral_bonus_inr = _zero
+            created += 1
+
+        if created:
+            db.flush()
+        return created
+
+    def _sim_token_code(self, db: Session, prefix: str) -> str:
+        """
+        Collision-safe token code for simulation-created compliance tokens.
+        Uses the same cryptographic pattern as production draw.py.
+        Format: "{prefix}{6 uppercase alphanumeric}"  e.g. "LF-A3KZ9W"
+        """
+        from app.crud.token import get_token_by_code
+        while True:
+            code = prefix + "".join(secrets.choice(_TOKEN_ALPHA) for _ in range(6))
+            if not get_token_by_code(db, code):
+                return code
 
     def apply_abc_model(
         self,
@@ -312,61 +417,218 @@ class MassLoadInjector:
         grace_pct_c: float,
     ) -> dict:
         """
-        Apply the A/B/C circular late-fee compliance model.
+        Apply the A/B/C circular late-fee compliance model with FULL production
+        fidelity — real tokens, real EliminationEvent records, real waitlist refill.
 
         late_ratio  : fraction of active members who miss payment this week
-        elim_pct_a  : of late payers, % directly eliminated (no grace attempt)
-        grace_pct_c : of remaining late payers, % who pay grace fee and survive
+        elim_pct_a  : of late payers, % directly eliminated (skip grace entirely)
+        grace_pct_c : of remaining late payers, % who successfully pay grace fee
 
-        Revenue from C path approximated as (₹500 seat-save + avg 3-day late fee).
-        Returns {n_late, n_elim, n_saved, late_fee_revenue_inr}
+        This method now mirrors the exact production flow:
+          1. Mark late payers (flag as Unpaid)
+          2. Accrue late fees on user.late_fees_inr (LATE_FEE_DAILY_INR × sim_days,
+             capped at LATE_FEE_MAX_CAP_INR) — creates Late_Fee tokens as receipts
+          3. A path: direct elimination → EliminationEvent record written
+          4. C path: grace savers pay → Grace_Fee token + Late_Fee settlement token
+          5. Failed grace: elimination → EliminationEvent record written
+          6. Call assign_waitlist_to_pools(db) to fill vacancies from eliminations
+             (Rule 39 referral credits fire naturally through this call)
+
+        Returns {n_late, n_elim, n_saved, late_fee_revenue_inr, grace_fee_revenue_inr,
+                 total_compliance_revenue_inr, week_id}
         """
         from app.models.user import User, UserStatus, WeeklyPaymentStatus
+        from app.models.token import Token, TokenType, TokenStatus
+        from app.models.elimination_event import EliminationEvent, EliminationReason
+        from app.core.config import LATE_FEE_DAILY_INR, LATE_FEE_MAX_CAP_INR
+        from app.services.waitlist import assign_waitlist_to_pools
+
+        _zero = Decimal("0")
+        _fee  = Decimal(str(LATE_FEE_DAILY_INR))
+        _cap  = Decimal(str(LATE_FEE_MAX_CAP_INR))
+        _grace_fee = Decimal("500")
+
+        now_utc  = datetime.now(timezone.utc)
+        iso      = now_utc.isocalendar()
+        week_id  = f"{iso.year}-W{iso.week:02d}"
+
+        _empty = {
+            "n_late": 0, "n_elim": 0, "n_saved": 0,
+            "late_fee_revenue_inr": 0, "grace_fee_revenue_inr": 0,
+            "total_compliance_revenue_inr": 0, "week_id": week_id,
+        }
 
         if late_ratio <= 0.0:
-            return {"n_late": 0, "n_elim": 0, "n_saved": 0, "late_fee_revenue_inr": 0}
+            return _empty
 
         active = db.query(User).filter(User.status == UserStatus.Active).all()
         if not active:
-            return {"n_late": 0, "n_elim": 0, "n_saved": 0, "late_fee_revenue_inr": 0}
+            return _empty
 
-        n_late      = max(0, int(len(active) * late_ratio))
-        late_batch  = random.sample(active, min(n_late, len(active)))
+        # ── Step 1: Mark late payers ──────────────────────────────────────────
+        n_late     = max(0, int(len(active) * late_ratio))
+        late_batch = random.sample(active, min(n_late, len(active)))
 
         for m in late_batch:
             m.weekly_payment_status = WeeklyPaymentStatus.Unpaid
         db.flush()
 
-        # A: direct elimination (skip grace entirely)
+        # ── Step 2: Accrue real late fees + create Late_Fee tokens ───────────
+        # Simulate 3 days of late accrual (Monday due → Thursday cutoff).
+        # Each day = LATE_FEE_DAILY_INR, capped at LATE_FEE_MAX_CAP_INR total.
+        # Random 1–4 days to make per-member amounts realistic (not all same).
+        sim_days_range = (1, min(4, int(_cap / _fee)))  # never exceed cap in days
+
+        for m in late_batch:
+            sim_days   = random.randint(*sim_days_range)
+            current    = Decimal(str(m.late_fees_inr or 0))
+            headroom   = max(_zero, _cap - current)
+            accrual    = min(_fee * sim_days, headroom)
+
+            if accrual > _zero:
+                m.late_fees_inr = current + accrual
+
+                # Create Late_Fee token — receipt of this week's accrual
+                lf_code = self._sim_token_code(db, "LF-")
+                db.add(Token(
+                    code      = lf_code,
+                    type      = TokenType.Late_Fee,
+                    status    = TokenStatus.Burned,
+                    value_inr = accrual,
+                    user_id   = m.id,
+                    pool_id   = m.current_pool_id,
+                ))
+
+        db.flush()
+
+        # ── Step 3: Split into A (direct elim) and grace pool ─────────────────
         n_direct_elim = max(0, int(n_late * (elim_pct_a / 100.0)))
         direct_elim   = late_batch[:n_direct_elim]
         grace_pool    = late_batch[n_direct_elim:]
 
+        # ── Step 4: A path — direct elimination + EliminationEvent ───────────
+        total_late_fee_rev   = _zero
+        total_grace_fee_rev  = _zero
+        n_total_elim         = 0
+
         for m in direct_elim:
+            late_fees_on_member = Decimal(str(m.late_fees_inr or 0))
+            total_ev = Decimal("1000") + late_fees_on_member
+
+            db.add(EliminationEvent(
+                user_id                   = m.id,
+                username_snapshot         = m.username,
+                user_level_at_elimination = m.current_level,
+                pool_id                   = m.current_pool_id,
+                pool_name_snapshot        = f"Pool-{m.current_pool_id}" if m.current_pool_id else "Unknown",
+                draw_week_id              = week_id,
+                reason                    = EliminationReason.non_payment,
+                late_fees_forfeited       = late_fees_on_member,
+                seat_save_fee             = _zero,
+                deposit_forfeited         = Decimal("1000"),
+                total_forfeited           = total_ev,
+                was_in_grace_period       = False,
+            ))
+
             m.status          = UserStatus.Eliminated
             m.current_pool_id = None
-
-        # C: grace savers pay and keep their seat
-        n_saved = max(0, int(len(grace_pool) * (grace_pct_c / 100.0)))
-        for m in grace_pool[:n_saved]:
-            m.weekly_payment_status = WeeklyPaymentStatus.Paid  # grace saved
-
-        # Remaining in grace pool who don't pay → eliminated
-        for m in grace_pool[n_saved:]:
-            m.status          = UserStatus.Eliminated
-            m.current_pool_id = None
+            m.late_fees_inr   = _zero
+            n_total_elim     += 1
 
         db.flush()
 
-        n_total_elim   = n_direct_elim + (len(grace_pool) - n_saved)
-        # Approximate revenue from C path: seat-save fee + 3-day late fees
-        late_fee_rev   = n_saved * (500 + 150)   # ₹500 + avg ₹50×3
+        # ── Step 5: Grace pool — C savers keep seat, rest eliminated ─────────
+        n_saved = max(0, int(len(grace_pool) * (grace_pct_c / 100.0)))
+        grace_savers  = grace_pool[:n_saved]
+        grace_expired = grace_pool[n_saved:]
+
+        # C path: savers pay grace fee + late fees
+        for m in grace_savers:
+            late_fees_on_member = Decimal(str(m.late_fees_inr or 0))
+
+            # Late_Fee settlement token (clears accumulated accrual)
+            if late_fees_on_member > _zero:
+                lfc_code = self._sim_token_code(db, "LFC-")
+                db.add(Token(
+                    code      = lfc_code,
+                    type      = TokenType.Late_Fee,
+                    status    = TokenStatus.Burned,
+                    value_inr = late_fees_on_member,
+                    user_id   = m.id,
+                    pool_id   = m.current_pool_id,
+                ))
+                total_late_fee_rev += late_fees_on_member
+
+            # Grace_Fee token — ₹500 seat-save confirmed
+            gf_code = self._sim_token_code(db, "GF-")
+            db.add(Token(
+                code      = gf_code,
+                type      = TokenType.Grace_Fee,
+                status    = TokenStatus.Burned,
+                value_inr = _grace_fee,
+                user_id   = m.id,
+                pool_id   = m.current_pool_id,
+            ))
+            total_grace_fee_rev += _grace_fee
+
+            # Clear elimination flags — seat saved
+            m.grace_fee_paid          = True
+            m.grace_active            = False
+            m.elimination_risk        = False
+            m.late_fees_inr           = _zero
+            m.weekly_payment_status   = WeeklyPaymentStatus.Paid
+
+        db.flush()
+
+        # Failed grace — eliminate + EliminationEvent
+        for m in grace_expired:
+            late_fees_on_member = Decimal(str(m.late_fees_inr or 0))
+            total_ev = Decimal("1000") + late_fees_on_member + _grace_fee
+
+            db.add(EliminationEvent(
+                user_id                   = m.id,
+                username_snapshot         = m.username,
+                user_level_at_elimination = m.current_level,
+                pool_id                   = m.current_pool_id,
+                pool_name_snapshot        = f"Pool-{m.current_pool_id}" if m.current_pool_id else "Unknown",
+                draw_week_id              = week_id,
+                reason                    = EliminationReason.grace_expired,
+                late_fees_forfeited       = late_fees_on_member,
+                seat_save_fee             = _grace_fee,   # entered grace but didn't pay
+                deposit_forfeited         = Decimal("1000"),
+                total_forfeited           = total_ev,
+                was_in_grace_period       = True,
+            ))
+
+            m.status          = UserStatus.Eliminated
+            m.current_pool_id = None
+            m.late_fees_inr   = _zero
+            m.grace_active    = False
+            m.grace_expires_at = None
+            n_total_elim     += 1
+
+        db.flush()
+
+        # ── Step 6: Refill vacancies via real production waitlist engine ──────
+        # This triggers Rule 39 referral credits for newly-active members.
+        if n_total_elim > 0:
+            try:
+                assign_waitlist_to_pools(db)
+            except Exception as e:
+                _logger.warning("apply_abc_model: waitlist refill failed: %s", e)
+                try: db.rollback()
+                except Exception: pass
+
+        total_compliance = total_late_fee_rev + total_grace_fee_rev
 
         return {
-            "n_late":               n_late,
-            "n_elim":               n_total_elim,
-            "n_saved":              n_saved,
-            "late_fee_revenue_inr": late_fee_rev,
+            "n_late":                       n_late,
+            "n_elim":                       n_total_elim,
+            "n_saved":                      n_saved,
+            "late_fee_revenue_inr":         float(total_late_fee_rev),
+            "grace_fee_revenue_inr":        float(total_grace_fee_rev),
+            "total_compliance_revenue_inr": float(total_compliance),
+            "week_id":                      week_id,
         }
 
 
@@ -416,6 +678,36 @@ def _snapshot(
         scenario = "NEUTRAL"
         mul = 1.0
 
+    # ── U-08: Weekly installment revenue from real WK-prefixed DEP tokens ────
+    try:
+        from app.models.token import Token as _Tok, TokenType as _TT, TokenStatus as _TS
+        installments_collected: float = float(
+            db.query(func.sum(_Tok.value_inr))
+            .filter(
+                _Tok.type   == _TT.Deposit,
+                _Tok.status == _TS.Burned,
+                _Tok.code.like(f"WK{week_num:04d}%"),
+            )
+            .scalar() or 0
+        )
+    except Exception:
+        installments_collected = 0.0
+
+    # ── U-09: RW settlements this week ───────────────────────────────────────
+    try:
+        from app.models.token import Token as _Tok2, TokenType as _TT2, TokenStatus as _TS2
+        rw_settled_inr: float = float(
+            db.query(func.sum(_Tok2.value_inr))
+            .filter(
+                _Tok2.type   == _TT2.Referral_Withdraw,
+                _Tok2.status == _TS2.Burned,
+                _Tok2.code.like(f"RW{week_num:04d}%"),
+            )
+            .scalar() or 0
+        )
+    except Exception:
+        rw_settled_inr = 0.0
+
     return {
         "week":               week_num,
         "lpi":                round(lpi, 2),
@@ -426,9 +718,24 @@ def _snapshot(
         "pools_formed":       0,
         "draws_this_week":    draws_this_week,
         "winners_this_week":  draws_this_week * 2,
-        "late_payers":        compliance.get("n_late",  0),
-        "eliminated":         compliance.get("n_elim",  0),
-        "grace_saved":        compliance.get("n_saved", 0),
+        "late_payers":               compliance.get("n_late",  0),
+        "eliminated":                compliance.get("n_elim",  0),
+        "grace_saved":               compliance.get("n_saved", 0),
+        "late_fee_revenue_inr":      compliance.get("late_fee_revenue_inr",         0),
+        "grace_fee_revenue_inr":     compliance.get("grace_fee_revenue_inr",        0),
+        "compliance_revenue_inr":    compliance.get("total_compliance_revenue_inr", 0),
+        # U-08: weekly installment collection (real DEP tokens created per active member)
+        "installments_collected_inr": installments_collected,
+        # U-09: referral withdraw settlements this week
+        "rw_settled_inr":             rw_settled_inr,
+        # Combined cash inflow this week (new deposits + installments + compliance fees)
+        "cash_inflow_inr": (
+            installments_collected
+            + compliance.get("late_fee_revenue_inr", 0)
+            + compliance.get("grace_fee_revenue_inr", 0)
+        ),
+        # Also store compliance fees under the legacy key for Cash Flow chart
+        "late_fees_collected_inr":   compliance.get("late_fee_revenue_inr", 0),
         "level_distribution": {
             "L1": dist.l1, "L2": dist.l2, "L3": dist.l3,
             "L4": dist.l4, "L5": dist.l5, "L6": dist.l6,
@@ -462,29 +769,93 @@ class RealSimEngine:
 
     def __init__(
         self,
-        weeks:            int   = 52,
-        users_per_week:   int   = 24,
-        initial_users:    int   = 24,
-        organic_ratio:    float = 0.6,
-        late_ratio:       float = 0.02,
-        elim_pct_a:       float = 80.0,
-        grace_pct_c:      float = 15.0,
-        volatility_mode:  bool  = False,
-        volatility_max:   int   = 100,
-        start_year:       int   = 2024,
-        start_week:       int   = 1,
+        weeks:                 int   = 52,
+        users_per_week:        int   = 24,
+        initial_users:         int   = 24,
+        organic_ratio:         float = 0.6,
+        late_ratio:            float = 0.02,
+        elim_pct_a:            float = 80.0,
+        grace_pct_c:           float = 15.0,
+        volatility_mode:       bool  = False,
+        volatility_max:        int   = 100,
+        start_year:            int   = 2024,
+        start_week:            int   = 1,
+        # ── K-12 through K-17: Extended Injection Knobs ───────────────────────
+        # K-12: inflow_pattern — how weekly new-user count varies over time
+        #   "linear"  = constant users_per_week every week (default)
+        #   "sine"    = sinusoidal ±50% oscillation with 12-week period
+        #   "burst"   = 3× spike every 8 weeks, normal otherwise
+        #   "step"    = ramp linearly from 50% to 150% of users_per_week
+        inflow_pattern:        str   = "linear",
+        # K-13: week to inject a 2× referral surge (0 = disabled)
+        #   When this week is reached, organic_ratio is halved for that week
+        #   simulating a viral referral spike (e.g. social media campaign).
+        referral_burst_week:   int   = 0,
+        # K-14: week to inject a payment shock (0 = disabled)
+        #   When this week is reached, late_ratio spikes to 20% for that week,
+        #   simulating a batch of users who skip payment (external shock event).
+        payment_shock_week:    int   = 0,
+        # K-15: % of waitlist members who randomly drop out before pool assignment
+        #   (0.0 = none drop out, 25.0 = 25% of waitlist never enter pools)
+        #   Simulates members who register but become inactive before admission.
+        waitlist_dropout_pct:  float = 0.0,
+        # K-16: organic_decay_rate — how fast organic join ratio decays over time
+        #   0.0 = constant (no decay), 0.02 = 2% decay per week
+        #   Simulates referral-programme momentum fading as base grows.
+        organic_decay_rate:    float = 0.0,
+        # K-17: simulation_label — free-text tag for multi-run comparison
+        #   Stored in simulation_summary for identification in side-by-side reports.
+        simulation_label:      str   = "",
     ):
-        self.weeks           = max(1, min(weeks, 200))
-        self.users_per_week  = users_per_week
-        self.initial_users   = max(12, initial_users)
-        self.organic_ratio   = organic_ratio
-        self.late_ratio      = late_ratio
-        self.elim_pct_a      = elim_pct_a
-        self.grace_pct_c     = grace_pct_c
-        self.volatility_mode = volatility_mode
-        self.volatility_max  = volatility_max
-        self.start_year      = start_year
-        self.start_week      = start_week
+        self.weeks                = max(1, min(weeks, 200))
+        self.users_per_week       = users_per_week
+        self.initial_users        = max(12, initial_users)
+        self.organic_ratio        = organic_ratio
+        self.late_ratio           = late_ratio
+        self.elim_pct_a           = elim_pct_a
+        self.grace_pct_c          = grace_pct_c
+        self.volatility_mode      = volatility_mode
+        self.volatility_max       = volatility_max
+        self.start_year           = start_year
+        self.start_week           = start_week
+        # K-12 to K-17
+        self.inflow_pattern       = inflow_pattern
+        self.referral_burst_week  = referral_burst_week
+        self.payment_shock_week   = payment_shock_week
+        self.waitlist_dropout_pct = max(0.0, min(50.0, waitlist_dropout_pct))
+        self.organic_decay_rate   = max(0.0, min(1.0, organic_decay_rate))
+        self.simulation_label     = simulation_label or ""
+
+    def _compute_weekly_inflow(self, week_num: int) -> int:
+        """
+        K-12: Compute weekly inflow based on inflow_pattern.
+
+        Returns the adjusted new-user count for the given week.
+        Volatility mode overrides all patterns (random 0–volatility_max).
+        """
+        import math as _math
+        base = self.users_per_week
+
+        if self.volatility_mode:
+            return random.randint(0, self.volatility_max)
+
+        if self.inflow_pattern == "sine":
+            # Oscillate ±50% with a 12-week period
+            osc   = _math.sin(2 * _math.pi * week_num / 12.0) * 0.5
+            return max(0, int(base * (1.0 + osc)))
+
+        if self.inflow_pattern == "burst":
+            # Triple inflow every 8th week
+            return base * 3 if (week_num % 8 == 0) else base
+
+        if self.inflow_pattern == "step":
+            # Linear ramp from 50% to 150% over the full simulation
+            frac  = week_num / max(self.weeks, 1)
+            scale = 0.5 + frac
+            return max(0, int(base * scale))
+
+        # Default: "linear" (constant)
+        return base
 
     def _sunday(self, week_offset: int) -> datetime:
         """Return Sunday 00:00 UTC for (start_week + week_offset)."""
@@ -583,9 +954,23 @@ class RealSimEngine:
 
                     # ── a. Inject new users (Monday morning) ─────────────────
                     chronos.jump_to(monday_morning)
-                    inflow = self.users_per_week
-                    if self.volatility_mode:
-                        inflow = random.randint(0, self.volatility_max)
+
+                    # K-12: Compute weekly inflow via pattern
+                    inflow = self._compute_weekly_inflow(week_num)
+
+                    # K-13: Referral burst — halve organic ratio for the burst week
+                    effective_organic = self.organic_ratio
+                    if self.referral_burst_week > 0 and week_num == self.referral_burst_week:
+                        effective_organic = max(0.0, self.organic_ratio * 0.5)
+                        _logger.info(
+                            "K-13: Referral burst week %d — organic ratio: %.2f → %.2f",
+                            week_num, self.organic_ratio, effective_organic,
+                        )
+
+                    # K-16: Organic decay — reduce organic ratio over time
+                    if self.organic_decay_rate > 0.0:
+                        decay   = 1.0 - self.organic_decay_rate * week_num
+                        effective_organic = max(0.0, effective_organic * max(0.0, decay))
 
                     # Build referral pool from existing users (Brain 3 RDR feed)
                     from app.models.user import User as _U, UserStatus as _US
@@ -597,18 +982,43 @@ class RealSimEngine:
 
                     new_batch = injector.inject_week(
                         db, inflow, chronos.current,
-                        self.organic_ratio, existing_ids,
+                        effective_organic, existing_ids,
                     )
                     db.commit()
                     total_users_created += len(new_batch)
 
-                    # ── b. Auto-pay all active pool members ──────────────────
-                    injector.auto_pay_installments(db)
+                    # K-15: Waitlist dropout — randomly remove a % of waitlist members
+                    # Simulates registrants who become inactive before pool entry.
+                    if self.waitlist_dropout_pct > 0.0:
+                        from app.models.user import UserStatus as _DS
+                        wl_all = db.query(_U).filter(_U.status == _DS.Waitlist).all()
+                        n_drop = max(0, int(len(wl_all) * self.waitlist_dropout_pct / 100.0))
+                        if n_drop > 0:
+                            dropouts = random.sample(wl_all, min(n_drop, len(wl_all)))
+                            for d in dropouts:
+                                d.status = UserStatus.Eliminated   # simulate dropout
+                            db.commit()
+                            _logger.debug(
+                                "K-15: week %d dropout %d/%d waitlist members",
+                                week_num, n_drop, len(wl_all),
+                            )
+
+                    # ── b. Auto-pay all active pool members (U-08 weekly DEP tokens)
+                    injector.auto_pay_installments(db, week_num=week_num)
                     db.commit()
 
                     # ── c. Apply A/B/C compliance model ─────────────────────
+                    # K-14: Payment shock — spike late_ratio for the shock week
+                    effective_late = self.late_ratio
+                    if self.payment_shock_week > 0 and week_num == self.payment_shock_week:
+                        effective_late = 0.20   # 20% spike regardless of normal rate
+                        _logger.info(
+                            "K-14: Payment shock week %d — late_ratio spiked to 20%%",
+                            week_num,
+                        )
+
                     compliance = injector.apply_abc_model(
-                        db, self.late_ratio, self.elim_pct_a, self.grace_pct_c,
+                        db, effective_late, self.elim_pct_a, self.grace_pct_c,
                     )
                     db.commit()
                     total_late        += compliance["n_late"]
@@ -720,6 +1130,21 @@ class RealSimEngine:
                         try: db.rollback()
                         except Exception: pass
 
+                    # ── U-09: RW token auto-settlement ───────────────────────
+                    # After each draw cycle, settle accumulated referral bonuses ≥ ₹1,000.
+                    # This makes total_cash_outflow_inr accurate in financial stats.
+                    try:
+                        rw_count = injector.auto_settle_referral_rw(db, week_num=week_num)
+                        if rw_count > 0:
+                            db.commit()
+                            _logger.debug(
+                                "Week %d: U-09 settled %d RW tokens", week_num, rw_count
+                            )
+                    except Exception as rw_exc:
+                        _logger.debug("Week %d RW settlement skipped: %s", week_num, rw_exc)
+                        try: db.rollback()
+                        except Exception: pass
+
                     # ── Collect metrics from REAL DB state ───────────────────
                     cumul_ext2  = db.query(func.count(DrawHistory.id)).filter(
                         DrawHistory.draw_type == POOL_DRAW_SDE_EXT2,
@@ -793,6 +1218,16 @@ class RealSimEngine:
 
                 # Build summary — same schema as legacy _AdvSimEngine.summary()
                 simulation_summary = {
+                    # ── K-17: simulation label ─────────────────────────────────────────
+                    "simulation_label":              self.simulation_label or "default",
+                    # ── K-12 to K-16: injection knobs used (for report display) ────────
+                    "injection_knobs": {
+                        "inflow_pattern":       self.inflow_pattern,
+                        "referral_burst_week":  self.referral_burst_week,
+                        "payment_shock_week":   self.payment_shock_week,
+                        "waitlist_dropout_pct": self.waitlist_dropout_pct,
+                        "organic_decay_rate":   self.organic_decay_rate,
+                    },
                     # Legacy backward-compatible keys
                     "total_cycles_run":              self.weeks,
                     "total_simulated_users_created": total_users_created,

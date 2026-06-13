@@ -992,6 +992,38 @@ class RealSimEngine:
                     db.commit()
                     total_users_created += len(new_batch)
 
+                    # ── a.5 Waitlist → Pool assignment (critical: must run every week)
+                    #
+                    # WHY THIS IS HERE:
+                    #   execute_weekly_draw() calls assign_waitlist_to_pools() ONLY after
+                    #   drawing.  But if ALL pools are Paused_Awaiting_Members, it raises
+                    #   ValueError BEFORE reaching the refill — creating an infinite
+                    #   deadlock: no refill → pools never unpause → no draw → no refill.
+                    #
+                    #   Production avoids this because assign_waitlist_to_pools() is called
+                    #   on every user-registration event and every pool-state change.
+                    #
+                    #   In the simulation, we replicate that by calling it explicitly here:
+                    #     Phase 1: fills paused pools with oldest paid Waitlist members
+                    #              → restores PoolStatus.Active when pool reaches capacity
+                    #     Phase 2: creates new full pools from remaining waitlist surplus
+                    #              (AI gate: _available_to_spawn >= threshold)
+                    #
+                    #   This is the exact equivalent of a user registering mid-week and
+                    #   triggering the waitlist engine, just done in one batch per week.
+                    try:
+                        weekly_refill = assign_waitlist_to_pools(db)
+                        total_p2_pools += weekly_refill.get("phase2_pools_count", 0)
+                        total_p3_xfers += weekly_refill.get("phase3_transfers", 0)
+                        db.commit()
+                    except Exception as _wl_exc:
+                        _logger.warning(
+                            "Week %d: weekly assign_waitlist_to_pools failed: %s",
+                            week_num, _wl_exc,
+                        )
+                        try: db.rollback()
+                        except Exception: pass
+
                     # K-15: Waitlist dropout — randomly remove a % of waitlist members
                     # Simulates registrants who become inactive before pool entry.
                     if self.waitlist_dropout_pct > 0.0:

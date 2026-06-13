@@ -781,8 +781,11 @@ def injection_status(prefix: str):
     """
     Poll the background pool-formation job started by POST /dev/simulate-users.
 
-    Returns the current status of the job keyed by `prefix` (returned in the
-    simulate-users response).
+    Accepts prefix as a PATH parameter (e.g. GET /dev/injection-status/dev_user_123).
+    Use POST /dev/simulate-users prefix in the response to poll here.
+
+    GET /dev/injection-status?prefix=<prefix> (query param) is the unified endpoint
+    that works for both simulate-users AND inject-timed background jobs.
 
     Status values:
       "running"  — pool formation in progress
@@ -3145,22 +3148,26 @@ def run_real_simulation(
     from app.services.real_simulation import RealSimEngine
 
     # ── Timeout guard: Render free tier proxy cuts the connection at 60 s ────────
-    # Real engine takes ≈ 2–5 s/week on shared CPU → 15 weeks ≈ 30–75 s.
-    # Anything above 15 weeks will likely time out and produce a "Network Error"
-    # with no response body.  The fast /dev/advanced-simulation handles 200 cycles
-    # in < 1 second and has no timeout risk — use it for larger parameter sweeps.
-    REAL_ENGINE_MAX_WEEKS_CLOUD = 15
+    # Real engine takes ≈ 2–5 s/week on shared CPU.
+    # Budget:  60 s proxy limit  –  5 s serialisation overhead  =  55 s for computation.
+    # Worst case 5 s/week → 55 ÷ 5 = 11 weeks.  Safety margin → cap at 8 weeks.
+    #   8 weeks × 5 s/week  = 40 s  → well within the 60 s window in ALL conditions.
+    #   15 weeks × 5 s/week = 75 s  → over limit on slower instances → Network Error.
+    # The fast /dev/advanced-simulation handles 1000 cycles in < 1 s — always use
+    # that for stress-testing.  Real Engine is for architecture-correctness validation.
+    REAL_ENGINE_MAX_WEEKS_CLOUD = 8
     if body.weeks > REAL_ENGINE_MAX_WEEKS_CLOUD:
         raise HTTPException(
             status_code=422,
             detail=(
                 f"Real Engine is limited to {REAL_ENGINE_MAX_WEEKS_CLOUD} weeks on this "
                 f"server to prevent HTTP proxy timeout (you requested {body.weeks} weeks). "
-                f"Options: (1) reduce to ≤ {REAL_ENGINE_MAX_WEEKS_CLOUD} weeks, OR "
-                f"(2) use Fast Preview (POST /dev/advanced-simulation) which handles "
-                f"1000 cycles with no timeout risk. "
-                f"Real Engine is for architecture validation; Fast Preview is for "
-                f"large-scale financial projections."
+                f"Real Engine runs actual production services (draw, SDE, waitlist, Brain 2/3/5) "
+                f"at ≈ 2–5 s/week on shared CPU — even {REAL_ENGINE_MAX_WEEKS_CLOUD+1}+ weeks "
+                f"risk hitting the 60 s Render proxy limit. "
+                f"Use Fast Preview (POST /dev/advanced-simulation) for 1–1,000-cycle "
+                f"statistical stress-testing (A/B/C model, lateRatio, elimPct) with no timeout. "
+                f"Real Engine is for architecture validation only, not load testing."
             ),
         )
 

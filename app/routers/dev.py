@@ -2125,8 +2125,9 @@ def dev_live_stats(db: Session = Depends(get_db)):
     # ── User counts ───────────────────────────────────────────────────────────
     active_count   = db.query(func.count(User.id)).filter(User.status == UserStatus.Active).scalar()   or 0
     waitlist_count = db.query(func.count(User.id)).filter(User.status == UserStatus.Waitlist).scalar() or 0
-    won_count      = db.query(func.count(User.id)).filter(User.status == "Eliminated_Won").scalar()    or 0
-    unpaid_count   = db.query(func.count(User.id)).filter(User.status == "Eliminated_Unpaid").scalar() or 0
+    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]: fix invalid enum string literals
+    won_count      = db.query(func.count(User.id)).filter(User.status == UserStatus.Eliminated_Won).scalar() or 0
+    unpaid_count   = db.query(func.count(User.id)).filter(User.status == UserStatus.Eliminated).scalar()     or 0
 
     # ── Pool counts ───────────────────────────────────────────────────────────
     active_pools  = db.query(func.count(Pool.id)).filter(Pool.status == PoolStatus.Active).scalar()                      or 0

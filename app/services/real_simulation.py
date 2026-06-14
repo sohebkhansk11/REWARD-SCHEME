@@ -1369,7 +1369,16 @@ class RealSimEngine:
 
                     try:
                         mass_result      = execute_weekly_draw(db, auto_pay_unpaid=False)
-                        draws_this_week  = mass_result.pools_drawn    # regular draws only (temp)
+                        # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        # Temporary value — overwritten by DrawHistory delta below (Bug #1 fix
+                        # from Jun-13 session).  Summing all MassDrawResult draw-type counters
+                        # for correctness in case the delta computation path is skipped.
+                        draws_this_week  = (
+                            mass_result.pools_drawn
+                            + mass_result.sde_draws_this_week
+                            + mass_result.ext_draws_this_week
+                            + mass_result.preventive_l3_draws_this_week
+                        )
                         pauses_this_week = len(mass_result.paused_pools)
                         # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
                         # Bug #1 — total_draws now accumulated AFTER T+5M using all-types
@@ -1468,15 +1477,27 @@ class RealSimEngine:
                     delta_ext3  = cumul_ext3  - _prev_cumul_ext3
                     delta_accel = cumul_accel - _prev_cumul_accel
 
+                    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # SIMULATION FIX — ext2/ext3/accel cumulative vs per-week mismatch.
+                    # _snapshot() stores these under the key ext2_exits_this_week.
+                    # The DevTools DrawAnalysisChart computes per-week counts by DIFFING
+                    # successive weekly_detail rows (w[n] - w[n-1]).  For this to work,
+                    # the stored value must be the RUNNING CUMULATIVE TOTAL (identical to
+                    # how _AdvSimEngine.self._l5_escalation_events is cumulative).
+                    # Previous code passed delta_ext2 (per-week count) — the frontend diff
+                    # then produced the second-derivative (change-in-delta), rendering
+                    # garbage escalation bars in the charts.
+                    # Fix: pass the all-time cumulative total (cumul_ext2) so the diff
+                    # w[n] - w[n-1] = draws of that type in week n  (correct per-week).
                     metrics = _snapshot(
                         db                   = db,
                         week_num             = week_num,
                         draws_this_week      = draws_this_week,
                         pauses_this_week     = pauses_this_week,
                         compliance           = compliance,
-                        cumulative_ext2      = delta_ext2,
-                        cumulative_ext3      = delta_ext3,
-                        cumulative_accel     = delta_accel,
+                        cumulative_ext2      = cumul_ext2,   # all-time total; frontend diffs
+                        cumulative_ext3      = cumul_ext3,
+                        cumulative_accel     = cumul_accel,
                         cash_outflow_inr     = cash_outflow_this_week,
                         members_joined       = members_joined_this_week,
                         members_exited       = members_exited_this_week,
@@ -1547,9 +1568,15 @@ class RealSimEngine:
                 # simulation-wide total; previously took only the last week's value which
                 # was the all-time cumulative (correct by accident) but now would only show
                 # the last week's count (wrong).
-                final_ext2  = sum(w.get("ext2_exits_this_week", 0) for w in weekly_detail)
-                final_ext3  = sum(w.get("ext3_exits_this_week", 0) for w in weekly_detail)
-                final_accel = sum(w.get("accel_diss_this_week",  0) for w in weekly_detail)
+                # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Since ext2/ext3/accel are now stored as CUMULATIVE totals (fixed above),
+                # the simulation-wide total is simply the last week's stored value.
+                # Previously used sum() which gave the running-sum-of-cumulative-sums
+                # (vastly over-counting: week-N value = w1+w2+...+wN, sum = huge).
+                _wd_last    = weekly_detail[-1] if weekly_detail else {}
+                final_ext2  = _wd_last.get("ext2_exits_this_week", 0)
+                final_ext3  = _wd_last.get("ext3_exits_this_week", 0)
+                final_accel = _wd_last.get("accel_diss_this_week",  0)
 
                 if max_l5 > 0 or max_l6 > 0:
                     escalation_note = (

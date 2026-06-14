@@ -1123,6 +1123,58 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
                 clearable + len(overflow_from_batch), clearable,
                 len(overflow_from_batch),
             )
+            # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Pre-batch Case C sweep — closes architectural gap where
+            # execute_sde_sub_draw() (sub-draw-level Case C) is unreachable when
+            # clearable=0.  Donor pools outside the SDE batch may still carry
+            # surplus L1/L2.  A successful transfer raises clearable ≥ 1, rebuilds
+            # the batch, and routes back to the normal SDE path — eliminating
+            # avoidable L4→L5 escalation in S1/S2 scenarios (projection table).
+            # Only true exhaustion (no donors, no WL, <2 L4s) reaches Case E.
+            if not batch:
+                _pb_transfers: int = 0
+                for _pb_l4 in list(overflow_from_batch):
+                    _pb_pid = _pb_l4.current_pool_id
+                    if _pb_pid is None:
+                        continue
+                    _pb_donor_result = _find_case_c_donor(db, _pb_pid, allow_l3_supply)
+                    if _pb_donor_result is None:
+                        continue
+                    _pb_donor_user, _pb_donor_pid = _pb_donor_result
+                    _execute_case_c_transfer(db, _pb_donor_user, _pb_pid)
+                    _pb_transfers += 1
+                    _logger.warning(
+                        "SDE Meta-Pool: PRE-BATCH CASE C — @%s(L%d) pool=%d → pool=%d  "
+                        "(session=%d  batch-level-transfer#%d)",
+                        _pb_donor_user.username, _pb_donor_user.current_level,
+                        _pb_donor_pid, _pb_pid, session_num, _pb_transfers,
+                    )
+                if _pb_transfers > 0:
+                    lower_supply_count = (
+                        db.query(func.count(User.id))
+                        .filter(
+                            User.current_pool_id.in_(pool_ids),
+                            User.status        == UserStatus.Active,
+                            User.current_level <= _lower_max_level,
+                        )
+                        .scalar()
+                    ) or 0
+                    clearable           = lower_supply_count // SDE_L1L2_THRESHOLD_PER_L4
+                    _pb_new_batch       = overflow_from_batch[:clearable]
+                    overflow_from_batch = overflow_from_batch[clearable:]
+                    meta_result.overflow_l4_count -= len(_pb_new_batch)
+                    for _pb_m in _pb_new_batch:
+                        try:
+                            meta_result.overflow_user_ids.remove(_pb_m.id)
+                        except ValueError:
+                            pass
+                    batch = _pb_new_batch
+                    if batch:
+                        _logger.info(
+                            "SDE Meta-Pool: PRE-BATCH CASE C recovered %d L4(s) into "
+                            "session %d (%d donor transfer(s)).  Resuming SDE path.",
+                            len(batch), session_num, _pb_transfers,
+                        )
 
         if not batch:
             # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:

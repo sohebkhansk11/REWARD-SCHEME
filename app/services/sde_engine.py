@@ -1191,6 +1191,89 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
                 .scalar()
             ) or 0
 
+            # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Gate 5 — Batch-level WL emergency promotion.
+            # Root cause of "Case E every week no skip": when clearable=0 and
+            # wl_count > 0, Case D's guard (wl_count == 0) evaluates False and
+            # routes directly to Case E despite WL members being available as
+            # lower-tier supply.  Fix: promote WL members (FIFO, up to
+            # SDE_WL_EMERGENCY_PROMOTE per L4 pool) into the overflow L4 pools,
+            # re-count supply, and fire run_sde_session() for any newly-clearable
+            # L4s.  Re-queries wl_count so Case D below sees the current value.
+            # Zero L4 escalation guarantee: Case E is only reached after this
+            # gate exhausts ALL available WL supply.
+            if wl_count > 0 and all_uncleared:
+                _g5_pool_ids = [m.current_pool_id for m in all_uncleared if m.current_pool_id]
+                _g5_promoted_ids: set[int] = set()
+                _g5_total_promoted: int = 0
+                for _g5_l4 in list(all_uncleared):
+                    _g5_pid = _g5_l4.current_pool_id
+                    if _g5_pid is None:
+                        continue
+                    _g5_filter = [User.status == UserStatus.Waitlist]
+                    if _g5_promoted_ids:
+                        _g5_filter.append(User.id.notin_(_g5_promoted_ids))
+                    _g5_wl_candidates = (
+                        db.query(User)
+                        .filter(*_g5_filter)
+                        .order_by(User.join_date.asc())
+                        .limit(SDE_WL_EMERGENCY_PROMOTE)
+                        .all()
+                    )
+                    for _g5_wl_m in _g5_wl_candidates:
+                        crud_user.update_user(
+                            db, _g5_wl_m.id,
+                            UserUpdate(
+                                status=UserStatus.Active,
+                                current_pool_id=_g5_pid,
+                                current_level=1,
+                            ),
+                        )
+                        _g5_promoted_ids.add(_g5_wl_m.id)
+                        _g5_total_promoted += 1
+                        _logger.warning(
+                            "SDE Meta-Pool: GATE 5 WL PROMO — @%s WL→L1 pool=%d  "
+                            "(session=%d  total_promoted=%d)",
+                            _g5_wl_m.username, _g5_pid,
+                            session_num, _g5_total_promoted,
+                        )
+                if _g5_total_promoted > 0:
+                    _g5_lower_supply = (
+                        db.query(func.count(User.id))
+                        .filter(
+                            User.current_pool_id.in_(_g5_pool_ids),
+                            User.status        == UserStatus.Active,
+                            User.current_level <= _lower_max_level,
+                        )
+                        .scalar()
+                    ) or 0
+                    _g5_clearable = _g5_lower_supply // SDE_L1L2_THRESHOLD_PER_L4
+                    if _g5_clearable > 0:
+                        _g5_new_batch  = all_uncleared[:_g5_clearable]
+                        all_uncleared  = all_uncleared[_g5_clearable:]
+                        meta_result.overflow_l4_count -= len(_g5_new_batch)
+                        for _g5_m in _g5_new_batch:
+                            try:
+                                meta_result.overflow_user_ids.remove(_g5_m.id)
+                            except ValueError:
+                                pass
+                        _g5_session = run_sde_session(
+                            db, week_id, session_num, _g5_new_batch, lpi,
+                        )
+                        meta_result.sessions.append(_g5_session)
+                        meta_result.total_l4_cleared += _g5_session.l4_count_completed
+                        session_num += 1
+                        _logger.info(
+                            "SDE Meta-Pool: GATE 5 WL PROMO recovered %d L4(s) into "
+                            "session %d (%d WL member(s) promoted).  Resuming SDE path.",
+                            len(_g5_new_batch), session_num - 1, _g5_total_promoted,
+                        )
+                        wl_count = (
+                            db.query(func.count(User.id))
+                            .filter(User.status == UserStatus.Waitlist)
+                            .scalar()
+                        ) or 0
+
             paired_ids: set[int] = set()
             if wl_count == 0 and len(all_uncleared) >= 2:
                 pairs = _case_d_pair_l4_members(all_uncleared)

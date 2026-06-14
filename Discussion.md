@@ -333,3 +333,12 @@ These are my 13 questions and the complete strategy as I now understand it. Plea
 
 
 NOW GIVE ME YOUR SYSTEMATIC REVIEW AND FRAMWORK IN WIRE DIAGRAM IF THIS IS ACCEPTABLE, IF THERE ARE QUESTION THEN ASK ME, ALSO GIVE ME SUGGESTION WHERE I NEED AND ASKED FROM YOU.
+
+
+
+-------
+-----------------
+-------
+
+I need a deep AI thinking from you for below point:
+also adopt same structure for SDE II/SDE III; just one rule is different if there are Case E then in case of SDE II a single winner of L5/L6 can be possible winner, For L5 pool criteria for draw is minimum 6 member, forced winner of L5 level all member, for SDE III no minimum pool criteria for L6 all L6  L5/L6 must Exit winner eliminated from system 

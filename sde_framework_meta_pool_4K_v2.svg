@@ -1,0 +1,250 @@
+<svg viewBox="0 0 1300 960" width="3840" height="2840" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>SDE Framework v2 — 5-Case Supply Routing + Meta Pool Buffer + L3 Cascade Prevention [CORRECTED CASE D/E]</title>
+<desc>Corrected SDE 5-case routing: Case D = Dual-L4 cross-pool (zero supply + zero waitlist), Case E = Solo-L4 true defer (extreme edge, L4=1 entire system). Includes Meta Pool Buffer self-balancing math and L3 Cascade Prevention algorithm.</desc>
+<defs>
+  <marker id="a" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#64748b"/></marker>
+  <marker id="ag" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#22c55e"/></marker>
+  <marker id="ao" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#f97316"/></marker>
+  <marker id="av" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#a78bfa"/></marker>
+  <marker id="ay" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#f59e0b"/></marker>
+  <marker id="ar" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#ef4444"/></marker>
+  <marker id="ab" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#475569"/></marker>
+</defs>
+
+<!-- Background -->
+<rect width="1300" height="960" fill="#0f172a" rx="12"/>
+
+<!-- Title -->
+<text x="650" y="22" text-anchor="middle" font-family="monospace" font-size="13" font-weight="bold" fill="#f1f5f9">SDE FRAMEWORK v2 — 5-CASE SUPPLY ROUTING  |  META POOL BUFFER  |  L3 CASCADE PREVENTION  [CASE D/E CORRECTED]</text>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<!-- LEFT COLUMN: SUPPLY ASSESSMENT DECISION TREE -->
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<text x="200" y="45" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="#a78bfa">T-2H: SUPPLY ASSESSMENT TREE</text>
+
+<!-- Step 1: LPI -->
+<rect x="108" y="52" width="188" height="54" fill="#1e293b" rx="5" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="202" y="68" text-anchor="middle" font-family="monospace" font-size="9" font-weight="bold" fill="#a78bfa">LPI CALCULATION</text>
+<text x="202" y="80" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">(L3+L4+L5+L6) / Total_Active × 100</text>
+<text x="202" y="91" text-anchor="middle" font-family="monospace" font-size="8" fill="#f59e0b">≥25% → SDE triggered system-wide</text>
+<text x="202" y="102" text-anchor="middle" font-family="monospace" font-size="8" fill="#f97316">&gt;50% → L3 valid lower-tier candidate</text>
+<line x1="202" y1="106" x2="202" y2="124" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#av)"/>
+
+<!-- Step 2: Count L4 -->
+<rect x="108" y="124" width="188" height="42" fill="#1e293b" rx="5" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="202" y="140" text-anchor="middle" font-family="monospace" font-size="9" font-weight="bold" fill="#a78bfa">COUNT L4 — SYSTEM-WIDE</text>
+<text x="202" y="151" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Each L4 member = 1 SDE draw needed</text>
+<text x="202" y="162" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Each draw = 1 upper + 1 lower winner</text>
+<line x1="202" y1="166" x2="202" y2="184" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#av)"/>
+
+<!-- Step 3: CASCADE RISK -->
+<rect x="78" y="184" width="248" height="52" fill="#1e293b" rx="5" stroke="#f59e0b" stroke-width="1.5"/>
+<text x="202" y="200" text-anchor="middle" font-family="monospace" font-size="9" font-weight="bold" fill="#f59e0b">CASCADE RISK SCORE</text>
+<text x="202" y="211" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">= L3_count / MAX(L1+L2, 1)</text>
+<text x="202" y="221" text-anchor="middle" font-family="monospace" font-size="8" fill="#f59e0b">≤1.0 Normal  |  &gt;1.0 Forming  |  &gt;2.0 Extreme</text>
+<text x="202" y="231" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Lower_pool = L1+L2 [+L3 if risk&gt;1.0 or LPI&gt;50%]</text>
+<line x1="202" y1="236" x2="202" y2="254" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#av)"/>
+
+<!-- Decision diamond -->
+<polygon points="202,254 285,281 202,308 119,281" fill="#1e293b" stroke="#f59e0b" stroke-width="1.5"/>
+<text x="202" y="277" text-anchor="middle" font-family="monospace" font-size="9" fill="#f59e0b">SUPPLY</text>
+<text x="202" y="289" text-anchor="middle" font-family="monospace" font-size="9" fill="#f59e0b">ROUTE</text>
+
+<!-- ═══ CASE A ═══ -->
+<line x1="285" y1="268" x2="390" y2="183" stroke="#22c55e" stroke-width="1.5" marker-end="url(#ag)"/>
+<rect x="390" y="148" width="178" height="82" fill="#1e293b" rx="4" stroke="#22c55e" stroke-width="1.5"/>
+<text x="479" y="163" text-anchor="middle" font-family="monospace" font-size="9" font-weight="bold" fill="#22c55e">CASE A — NATURAL</text>
+<text x="479" y="175" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">L1+L2 ≥ L4×2  AND  cascade_risk ≤ 1.0</text>
+<text x="479" y="185" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Full supply from existing active pools</text>
+<text x="479" y="195" text-anchor="middle" font-family="monospace" font-size="8" fill="#22c55e">SDE runs naturally — no meta pool</text>
+<text x="479" y="205" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Priority: L1 oldest first → L2 oldest</text>
+<text x="479" y="216" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Lower from ANY pool (system-wide)</text>
+<text x="479" y="226" text-anchor="middle" font-family="monospace" font-size="8" fill="#22c55e">System healthy — no cascade threat</text>
+
+<!-- ═══ CASE B ═══ -->
+<line x1="285" y1="275" x2="390" y2="272" stroke="#f59e0b" stroke-width="1.5" marker-end="url(#ay)"/>
+<rect x="390" y="244" width="178" height="82" fill="#1e293b" rx="4" stroke="#f59e0b" stroke-width="1.5"/>
+<text x="479" y="259" text-anchor="middle" font-family="monospace" font-size="9" font-weight="bold" fill="#f59e0b">CASE B — L3 PRIORITY</text>
+<text x="479" y="271" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">cascade_risk &gt; 1.0 (L3 &gt; L1+L2)</text>
+<text x="479" y="281" text-anchor="middle" font-family="monospace" font-size="8" fill="#f59e0b">FORCE L3 into lower-tier pool</text>
+<text x="479" y="291" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Priority: L3 oldest → L2 → L1</text>
+<text x="479" y="301" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">₹4,000 now → prevents ₹5,500 next week</text>
+<text x="479" y="311" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Exits L3 now → stops L3→L4 cascade</text>
+<text x="479" y="322" text-anchor="middle" font-family="monospace" font-size="8" fill="#f59e0b">cascade_risk &gt;2.0: L3 MANDATORY first</text>
+
+<!-- ═══ CASE C ═══ -->
+<line x1="285" y1="281" x2="390" y2="365" stroke="#f97316" stroke-width="1.5" marker-end="url(#ao)"/>
+<rect x="390" y="338" width="178" height="92" fill="#1e293b" rx="4" stroke="#f97316" stroke-width="1.5"/>
+<text x="479" y="353" text-anchor="middle" font-family="monospace" font-size="9" font-weight="bold" fill="#f97316">CASE C — META POOL BUFFER</text>
+<text x="479" y="365" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Lower_supply &lt; L4_count AND waitlist &gt; 0</text>
+<text x="479" y="375" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">deficit = L4 - (L1+L2+L3 available)</text>
+<text x="479" y="385" text-anchor="middle" font-family="monospace" font-size="8" fill="#f97316">Meta Pool Manager ACTIVATED</text>
+<text x="479" y="395" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Pulls from waitlist FIFO → temp buffer</text>
+<text x="479" y="405" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">deficit members exit as lower winners</text>
+<text x="479" y="415" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Remaining fill active pool vacancies</text>
+<text x="479" y="426" text-anchor="middle" font-family="monospace" font-size="8" fill="#f97316">DISSOLVED at T+5M — zero orphans</text>
+
+<!-- ═══ CASE D — CORRECTED ═══ -->
+<line x1="285" y1="288" x2="390" y2="460" stroke="#ef4444" stroke-width="2" marker-end="url(#ar)"/>
+<rect x="390" y="442" width="178" height="112" fill="#1c0a0a" rx="4" stroke="#ef4444" stroke-width="2"/>
+<text x="479" y="457" text-anchor="middle" font-family="monospace" font-size="9" font-weight="bold" fill="#ef4444">CASE D — DUAL-L4 [CORRECTED]</text>
+<text x="479" y="469" text-anchor="middle" font-family="monospace" font-size="8" fill="#fca5a5">CONDITION: lower=0, waitlist=0, L4≥2 system</text>
+<text x="479" y="479" text-anchor="middle" font-family="monospace" font-size="8" fill="#ef4444">BOTH winners from L4 (upper + lower)</text>
+<text x="479" y="489" text-anchor="middle" font-family="monospace" font-size="8" fill="#fca5a5">Cross-pool: Pool A L4 + Pool B L4</text>
+<text x="479" y="499" text-anchor="middle" font-family="monospace" font-size="8" fill="#fca5a5">Or same pool if it has 2+ L4 members</text>
+<text x="479" y="510" text-anchor="middle" font-family="monospace" font-size="8" fill="#ef4444">Cost: ₹11,000 vs normal ₹7,500</text>
+<text x="479" y="520" text-anchor="middle" font-family="monospace" font-size="8" fill="#fca5a5">But: L5 costs ₹6,500 + cascade chaos</text>
+<text x="479" y="530" text-anchor="middle" font-family="monospace" font-size="8" fill="#fca5a5">L5 PREVENTION AT ALL COSTS</text>
+<text x="479" y="541" text-anchor="middle" font-family="monospace" font-size="8" fill="#ef4444">Oldest L4 per pool = upper winner</text>
+<text x="479" y="551" text-anchor="middle" font-family="monospace" font-size="8" fill="#ef4444">Second oldest L4 anywhere = lower</text>
+
+<!-- ═══ CASE E — REDESIGNED ═══ -->
+<line x1="285" y1="295" x2="390" y2="584" stroke="#475569" stroke-width="1.5" marker-end="url(#ab)"/>
+<rect x="390" y="566" width="178" height="108" fill="#1e293b" rx="4" stroke="#475569" stroke-width="1.5"/>
+<text x="479" y="581" text-anchor="middle" font-family="monospace" font-size="9" font-weight="bold" fill="#64748b">CASE E — SOLO-L4 TRUE DEFER</text>
+<text x="479" y="593" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">CONDITION: Total L4 = 1 in ENTIRE system</text>
+<text x="479" y="603" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">lower=0  AND  waitlist=0</text>
+<text x="479" y="613" text-anchor="middle" font-family="monospace" font-size="8" fill="#64748b">Mathematically impossible: need 2 winners</text>
+<text x="479" y="623" text-anchor="middle" font-family="monospace" font-size="8" fill="#64748b">admin_override_required = True</text>
+<text x="479" y="633" text-anchor="middle" font-family="monospace" font-size="8" fill="#64748b">Max 1 week deferral only</text>
+<text x="479" y="643" text-anchor="middle" font-family="monospace" font-size="8" fill="#ef4444">CRITICAL ALERT to admin</text>
+<text x="479" y="653" text-anchor="middle" font-family="monospace" font-size="8" fill="#64748b">MUST NEVER happen in healthy system</text>
+<text x="479" y="663" text-anchor="middle" font-family="monospace" font-size="8" fill="#64748b">(10+ pools → always L4≥2 if LPI≥25%)</text>
+
+<!-- Case labels -->
+<text x="338" y="183" font-family="monospace" font-size="8" fill="#22c55e">FULL</text>
+<text x="338" y="272" font-family="monospace" font-size="8" fill="#f59e0b">CASCADE</text>
+<text x="338" y="365" font-family="monospace" font-size="8" fill="#f97316">DEFICIT</text>
+<text x="338" y="460" font-family="monospace" font-size="8" fill="#ef4444">ZERO+WL=0</text>
+<text x="338" y="584" font-family="monospace" font-size="8" fill="#64748b">EXTREME</text>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<!-- RIGHT COLUMN: META POOL BUFFER + CASCADE PREVENTION -->
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<text x="950" y="45" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="#f97316">META POOL BUFFER MECHANISM (Q3 — SELF-BALANCING)</text>
+
+<!-- Meta Pool Box -->
+<rect x="612" y="52" width="682" height="300" fill="#1e293b" rx="6" stroke="#f97316" stroke-width="1.5"/>
+
+<text x="953" y="70" text-anchor="middle" font-family="monospace" font-size="10" font-weight="bold" fill="#f97316">FORMULA</text>
+<text x="622" y="86" font-family="monospace" font-size="9" fill="#f59e0b">total_draws_this_week</text>
+<text x="790" y="86" font-family="monospace" font-size="9" fill="#94a3b8">= count of active pools with exactly 12 members</text>
+<text x="622" y="98" font-family="monospace" font-size="9" fill="#f59e0b">total_vacancies</text>
+<text x="790" y="98" font-family="monospace" font-size="9" fill="#94a3b8">= total_draws × 2  (every draw creates 2 vacancies)</text>
+<text x="622" y="110" font-family="monospace" font-size="9" fill="#f59e0b">lower_deficit</text>
+<text x="790" y="110" font-family="monospace" font-size="9" fill="#94a3b8">= L4_count − (L1+L2+L3 available as lower-tier)</text>
+<text x="622" y="122" font-family="monospace" font-size="9" fill="#ef4444">meta_pool_size</text>
+<text x="790" y="122" font-family="monospace" font-size="9" fill="#ef4444">= MIN(waitlist_available, total_vacancies + lower_deficit)</text>
+
+<line x1="622" y1="130" x2="1284" y2="130" stroke="#334155" stroke-width="1"/>
+
+<text x="953" y="146" text-anchor="middle" font-family="monospace" font-size="10" font-weight="bold" fill="#f97316">WORKED EXAMPLE (3 POOLS, 3 L4, 1 L1, WAITLIST=20)</text>
+<text x="622" y="161" font-family="monospace" font-size="9" fill="#94a3b8">total_draws = 3 pools  |  total_vacancies = 6  |  lower_deficit = 3 L4 − 1 L1 = 2</text>
+<text x="622" y="174" font-family="monospace" font-size="9" fill="#ef4444">meta_pool_size = MIN(20, 6 + 2) = 8 members pulled from waitlist FIFO</text>
+
+<line x1="622" y1="182" x2="1284" y2="182" stroke="#334155" stroke-width="1"/>
+
+<text x="622" y="196" font-family="monospace" font-size="9" fill="#22c55e">AT T-0H (DRAW EXECUTES):</text>
+<text x="622" y="209" font-family="monospace" font-size="9" fill="#94a3b8">1. Existing L1 exits as lower winner (pool draw 1)</text>
+<text x="622" y="222" font-family="monospace" font-size="9" fill="#94a3b8">2. Meta pool member #1 exits as lower winner (pool draw 2)  ← exits same as any pool winner</text>
+<text x="622" y="235" font-family="monospace" font-size="9" fill="#94a3b8">3. Meta pool member #2 exits as lower winner (pool draw 3)</text>
+<text x="622" y="248" font-family="monospace" font-size="9" fill="#94a3b8">4. 3 L4 members exit as upper winners (3 separate pool draws)</text>
+
+<line x1="622" y1="256" x2="1284" y2="256" stroke="#334155" stroke-width="1"/>
+
+<text x="622" y="270" font-family="monospace" font-size="9" fill="#38bdf8">AT T+5M (META POOL DISTRIBUTES — FIFO OLDEST POOL FIRST):</text>
+<text x="622" y="283" font-family="monospace" font-size="9" fill="#94a3b8">Remaining = 8 pulled − 2 winners = 6 members redistribute to active pools</text>
+<text x="622" y="296" font-family="monospace" font-size="9" fill="#38bdf8">6 remaining → fill 6 vacancies (FIFO: oldest pool gets filled first)</text>
+<text x="622" y="309" font-family="monospace" font-size="9" fill="#f97316">These 6 are now L1 members in their assigned active pools. Meta pool label REMOVED.</text>
+<text x="622" y="322" font-family="monospace" font-size="9" fill="#22c55e">RESULT: Meta pool DISSOLVED. Zero orphan members. Self-balancing. System fully refilled.</text>
+<text x="622" y="335" font-family="monospace" font-size="9" fill="#64748b">Remaining waitlist (20−8=12) stays in queue for Phase 1/2 normal processing next cycle.</text>
+
+<!-- ═══ CASCADE PREVENTION ═══ -->
+<text x="950" y="374" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="#f59e0b">L3 CASCADE PREVENTION ALGORITHM (Q4)</text>
+
+<rect x="612" y="382" width="682" height="262" fill="#1e293b" rx="6" stroke="#f59e0b" stroke-width="1.5"/>
+
+<text x="622" y="400" font-family="monospace" font-size="9" font-weight="bold" fill="#f59e0b">CASCADE RISK SCORE = L3_count / MAX(L1+L2, 1)  |  Logged in Weekly Report alongside LPI</text>
+
+<!-- 3 risk zones side by side -->
+<rect x="622" y="408" width="208" height="86" fill="#14532d" rx="4" stroke="#22c55e" stroke-width="1"/>
+<text x="726" y="423" text-anchor="middle" font-family="monospace" font-size="9" font-weight="bold" fill="#22c55e">RISK ≤ 1.0 — NORMAL</text>
+<text x="726" y="435" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Sufficient L1/L2 supply</text>
+<text x="726" y="445" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Lower pool: L1 → L2</text>
+<text x="726" y="455" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">L3 only if LPI &gt; 50%</text>
+<text x="726" y="465" text-anchor="middle" font-family="monospace" font-size="8" fill="#22c55e">System stable. No action.</text>
+<text x="726" y="476" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Cascade Risk logged weekly.</text>
+<text x="726" y="487" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Forecast: 0 new L4 next week.</text>
+
+<rect x="843" y="408" width="208" height="86" fill="#451a03" rx="4" stroke="#f97316" stroke-width="1"/>
+<text x="947" y="423" text-anchor="middle" font-family="monospace" font-size="9" font-weight="bold" fill="#f97316">RISK &gt; 1.0 — FORMING</text>
+<text x="947" y="435" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">More L3 than L1+L2</text>
+<text x="947" y="445" text-anchor="middle" font-family="monospace" font-size="8" fill="#f97316">FORCE L3 into lower pool</text>
+<text x="947" y="455" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Priority: L3 first, then L2, L1</text>
+<text x="947" y="465" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">₹4,000 exit now vs ₹5,500 next week</text>
+<text x="947" y="476" text-anchor="middle" font-family="monospace" font-size="8" fill="#f97316">If Risk &gt;1.5 for 3+ weeks:</text>
+<text x="947" y="487" text-anchor="middle" font-family="monospace" font-size="8" fill="#f97316">→ Auto-trigger Priority L3 permanently</text>
+
+<rect x="1064" y="408" width="222" height="86" fill="#450a0a" rx="4" stroke="#ef4444" stroke-width="1.5"/>
+<text x="1175" y="423" text-anchor="middle" font-family="monospace" font-size="9" font-weight="bold" fill="#ef4444">RISK &gt; 2.0 — EXTREME</text>
+<text x="1175" y="435" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">L3 ≥ 2× (L1+L2 count)</text>
+<text x="1175" y="445" text-anchor="middle" font-family="monospace" font-size="8" fill="#ef4444">L3 MANDATORY: first partner for L4</text>
+<text x="1175" y="455" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">Pair ALL available L3 with L4 first</text>
+<text x="1175" y="465" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">L1/L2 preserved as future supply</text>
+<text x="1175" y="476" text-anchor="middle" font-family="monospace" font-size="8" fill="#ef4444">Admin flash alert triggered</text>
+<text x="1175" y="487" text-anchor="middle" font-family="monospace" font-size="8" fill="#94a3b8">L3→L4 Forecast widget: HIGH RISK</text>
+
+<line x1="622" y1="500" x2="1284" y2="500" stroke="#334155" stroke-width="1"/>
+
+<text x="622" y="515" font-family="monospace" font-size="9" font-weight="bold" fill="#f59e0b">REVISED LOWER-TIER SELECTION PRIORITY (SDE) — DEPENDS ON CASCADE RISK:</text>
+<text x="622" y="528" font-family="monospace" font-size="9" fill="#94a3b8">IF Risk ≤ 1.0  →  L1 (oldest first) → L2 (oldest first) → L3 only if LPI &gt;50%</text>
+<text x="622" y="541" font-family="monospace" font-size="9" fill="#f97316">IF Risk &gt; 1.0  →  L3 (oldest first) → L2 (oldest first) → L1 (oldest first)  [anti-cascade mode]</text>
+<text x="622" y="554" font-family="monospace" font-size="9" fill="#ef4444">IF Risk &gt; 2.0  →  L3 MANDATORY first partner for every L4. L1/L2 preserved as future supply buffer.</text>
+<text x="622" y="567" font-family="monospace" font-size="9" fill="#94a3b8">IF lower=0 AND waitlist&gt;0  →  CASE C (Meta Pool from waitlist)</text>
+<text x="622" y="580" font-family="monospace" font-size="9" fill="#ef4444">IF lower=0 AND waitlist=0 AND L4≥2  →  CASE D (Dual-L4 cross-pool — L5 prevention at all costs)</text>
+<text x="622" y="593" font-family="monospace" font-size="9" fill="#64748b">IF lower=0 AND waitlist=0 AND L4=1  →  CASE E (True defer, max 1 week — should NEVER trigger)</text>
+
+<line x1="622" y1="601" x2="1284" y2="601" stroke="#334155" stroke-width="1"/>
+
+<text x="622" y="616" font-family="monospace" font-size="9" fill="#64748b">APPROVED SUGGESTION: CASCADE_RISK score added to Weekly Report alongside LPI (week-over-week trend visible).</text>
+<text x="622" y="629" font-family="monospace" font-size="9" fill="#64748b">APPROVED SUGGESTION: "L3→L4 Pressure Forecast" widget shows how many current L3 become L4 next week.</text>
+<text x="622" y="642" font-family="monospace" font-size="9" fill="#64748b">APPROVED SUGGESTION: If Cascade Risk &gt;1.5 for 3+ consecutive weeks → auto-trigger Priority L3 mode permanently until resolved.</text>
+
+<!-- ═══ Q2 WINNER SELECTION NOTE ═══ -->
+<rect x="612" y="658" width="682" height="68" fill="#1e293b" rx="4" stroke="#64748b" stroke-width="1"/>
+<text x="622" y="673" font-family="monospace" font-size="9" font-weight="bold" fill="#e2e8f0">Q2 — WINNER SELECTION WITHIN A DRAW:</text>
+<text x="622" y="686" font-family="monospace" font-size="9" fill="#94a3b8">Upper (L4): AI-weighted + Oldest L4 first (longest time at L4 = highest priority). Selected at T-2H. Revealed at T-0H.</text>
+<text x="622" y="699" font-family="monospace" font-size="9" fill="#94a3b8">Lower: Cascade Risk determines tier priority (see above). Within same tier: oldest member first.</text>
+<text x="622" y="712" font-family="monospace" font-size="9" fill="#f59e0b">Dual-L4 (Case D): Upper = oldest L4 system-wide. Lower = second-oldest L4 anywhere in system. Cross-pool allowed.</text>
+<text x="622" y="722" font-family="monospace" font-size="9" fill="#94a3b8">Lower-tier candidates are pulled from ANY pool system-wide (not restricted to the L4 member's own pool).</text>
+
+<!-- ═══ FULL FLOW SUMMARY ═══ -->
+<rect x="20" y="742" width="1260" height="78" fill="#1e293b" rx="4" stroke="#334155" stroke-width="1"/>
+<text x="640" y="758" text-anchor="middle" font-family="monospace" font-size="10" font-weight="bold" fill="#e2e8f0">COMPLETE SDE FLOW — T-2H SELECTION → T-0H EXECUTION → T+5M CLEANUP</text>
+<text x="30" y="773" font-family="monospace" font-size="9" fill="#a78bfa">T-2H:</text>
+<text x="78" y="773" font-family="monospace" font-size="9" fill="#94a3b8">LPI → Cascade Risk → Flag L4 → Case A/B/C/D/E → [Case C: Meta Pool pulls from waitlist] → Stage winners in DB (hidden, not executed)</text>
+<text x="30" y="786" font-family="monospace" font-size="9" fill="#22c55e">T-0H:</text>
+<text x="78" y="786" font-family="monospace" font-size="9" fill="#94a3b8">Phase 1: ALL draws computed (Ext-III + Ext-II + SDE staged + Regular for untouched pools)  →  Phase 2: ALL WINNERS REVEALED  →  Phase 3: Status+WIT tokens+vacancies</text>
+<text x="30" y="799" font-family="monospace" font-size="9" fill="#38bdf8">T+5M:</text>
+<text x="78" y="799" font-family="monospace" font-size="9" fill="#94a3b8">Meta pool remaining members → FIFO oldest pool first fills vacancies → Meta pool DISSOLVED → Phase 1/2/3 refill → SDE flags cleared → Draw lock released</text>
+<text x="30" y="812" font-family="monospace" font-size="9" fill="#f59e0b">GUARANTEES: At least 1 L4 exits every week. ALL 12-member pools draw every week. Winners revealed ONLY at T-0H Phase 2. WIT tokens ONLY AFTER reveal.</text>
+
+<!-- v2 CORRECTIONS NOTE -->
+<rect x="20" y="826" width="1260" height="44" fill="#1c0a0a" rx="4" stroke="#ef4444" stroke-width="1.5"/>
+<text x="30" y="842" font-family="monospace" font-size="9" font-weight="bold" fill="#ef4444">v2 CORRECTIONS FROM v1:</text>
+<text x="30" y="856" font-family="monospace" font-size="9" fill="#fca5a5">CASE D CORRECTED: Was "Dual-L4 only if same pool has 2+ L4". Corrected: Dual-L4 is CROSS-POOL. Pool A L4 (upper) + Pool B L4 (lower) — they exit from different pools. This handles total L4 saturation (Q-B answered).</text>
+<text x="30" y="870" font-family="monospace" font-size="9" fill="#fca5a5">CASE E CORRECTED: Was "SDE deferred to next week" when only 1 L4 in a pool. WRONG. True Case E = L4=1 in ENTIRE system, zero lower, zero waitlist. Physically cannot produce 2 winners. Should never trigger in healthy system with 10+ pools.</text>
+
+<!-- COST COMPARISON TABLE -->
+<rect x="20" y="876" width="1260" height="58" fill="#1e293b" rx="4" stroke="#334155" stroke-width="1"/>
+<text x="30" y="892" font-family="monospace" font-size="9" font-weight="bold" fill="#e2e8f0">COST JUSTIFICATION FOR CASE D (DUAL-L4):</text>
+<text x="30" y="905" font-family="monospace" font-size="9" fill="#94a3b8">Normal draw (L4 upper + L1 lower):  ₹5,500 + ₹2,000 = ₹7,500  ← cheapest</text>
+<text x="400" y="905" font-family="monospace" font-size="9" fill="#f59e0b">Case D Dual-L4 (L4 + L4):  ₹5,500 + ₹5,500 = ₹11,000  ← more expensive now</text>
+<text x="820" y="905" font-family="monospace" font-size="9" fill="#ef4444">Let L4 survive to L5:  ₹6,500 next week  +  cascade pressure  +  system instability  ← WORST</text>
+<text x="30" y="920" font-family="monospace" font-size="9" fill="#22c55e">VERDICT: Pay ₹11,000 now (Case D) rather than risk L5 creation. L5 prevention is non-negotiable. The ₹3,500 premium is the cost of system integrity.</text>
+<text x="900" y="920" font-family="monospace" font-size="9" fill="#64748b">Bug #11: Current code triggers defer instead of Dual-L4. Must fix.</text>
+
+<!-- Footer -->
+<text x="30" y="948" font-family="monospace" font-size="8" fill="#1e3a5f">REWARD SCHEME CORE ENGINE v2.0  |  SDE Framework v2  |  Case D/E Corrected  |  Session: Soheb Khan User 2 / Sohebkhan.sk11  |  2026-06-14</text>
+<text x="1270" y="948" text-anchor="end" font-family="monospace" font-size="8" fill="#1e3a5f">4K Export — 3840×2840px</text>
+</svg>

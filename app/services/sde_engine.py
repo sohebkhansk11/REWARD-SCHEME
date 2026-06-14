@@ -750,6 +750,187 @@ def run_sde_session(
     return result
 
 
+# ── CASE D: Dual-L4 Cross-Pool Draw ──────────────────────────────────────────
+# SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Bug #11 — Implements approved CASE D: when lower-tier supply = 0 AND waitlist = 0
+# AND system-wide L4 count ≥ 2, pair L4 members from DIFFERENT pools for a dual-L4
+# cross-pool draw.  Each L4 receives their own level's payout (₹5,500 each = ₹11,000
+# total vs ₹7,500 normal but PREVENTS L4→L5 escalation at any cost).
+
+def _case_d_pair_l4_members(l4_candidates: list[User]) -> list[tuple[User, User]]:
+    """
+    Group L4 candidates by pool, then pair consecutive pools (FIFO oldest pool first).
+
+    One L4 per pool contributes; pools with zero L4 remaining are skipped.
+    Returns list of (upper_winner, lower_winner) cross-pool pairs.
+    """
+    pool_to_first: dict[int, User] = {}
+    for m in l4_candidates:
+        pid = m.current_pool_id
+        if pid is not None and pid not in pool_to_first:
+            pool_to_first[pid] = m
+
+    ordered = [pool_to_first[pid] for pid in sorted(pool_to_first.keys())]
+    return [
+        (ordered[i], ordered[i + 1])
+        for i in range(0, len(ordered) - 1, 2)
+    ]
+
+
+def _execute_case_d_single_pair(
+    db:          Session,
+    session_num: int,
+    upper_l4:    User,
+    lower_l4:    User,
+) -> bool:
+    """
+    Execute one CASE D dual-L4 cross-pool pair draw.
+
+    Upper winner = Pool A's L4 (upper-tier payout).
+    Lower winner = Pool B's L4 (lower-tier slot — receives L4 payout not L1/L2).
+
+    Writes ONE DrawHistory row anchored to Pool A with edge_case_triggered=True.
+    Advances survivors and sets draw_completed_this_week=True on BOTH pools.
+    Issues WIT tokens for both.  Commits atomically.
+    """
+    from app.models.token import TokenType, TokenStatus
+
+    try:
+        pool_a: Pool | None = db.query(Pool).filter(Pool.id == upper_l4.current_pool_id).first()
+        pool_b: Pool | None = db.query(Pool).filter(Pool.id == lower_l4.current_pool_id).first()
+        if pool_a is None or pool_b is None:
+            _logger.warning(
+                "SDE CASE D: pool not found for pair (@%s pool=%s, @%s pool=%s) — skipping.",
+                upper_l4.username, upper_l4.current_pool_id,
+                lower_l4.username, lower_l4.current_pool_id,
+            )
+            return False
+
+        # Journey snapshot BEFORE any mutations
+        _up_dep    = upper_l4.total_deposited_inr        or 1000
+        _up_merges = upper_l4.dynamic_merges_experienced or 0
+        _up_pauses = upper_l4.pauses_experienced         or 0
+        _lo_dep    = lower_l4.total_deposited_inr        or 1000
+        _lo_merges = lower_l4.dynamic_merges_experienced or 0
+        _lo_pauses = lower_l4.pauses_experienced         or 0
+
+        # Both receive their level's net payout (L4 = ₹5,500 — same as upper normal SDE)
+        _, upper_net = LEVEL_PAYOUTS.get(upper_l4.current_level, (6000, 5500))
+        _, lower_net = LEVEL_PAYOUTS.get(lower_l4.current_level, (6000, 5500))
+        upper_net_d  = Decimal(str(upper_net))
+        lower_net_d  = Decimal(str(lower_net))
+
+        rng_hash = _compute_rng_seed_hash(pool_a.id, session_num, 1)
+
+        # WIT token — upper winner (Pool A L4)
+        crud_token.create_token(db, TokenCreate(
+            code      = _get_unique_token_code(db, "WIT-"),
+            type      = TokenType.Withdraw,
+            value_inr = upper_net_d,
+            user_id   = upper_l4.id,
+            pool_id   = pool_a.id,
+            status    = TokenStatus.Active,
+        ))
+
+        # WIT token — lower winner (Pool B L4, cross-pool)
+        crud_token.create_token(db, TokenCreate(
+            code      = _get_unique_token_code(db, "WIT-"),
+            type      = TokenType.Withdraw,
+            value_inr = lower_net_d,
+            user_id   = lower_l4.id,
+            pool_id   = pool_b.id,
+            status    = TokenStatus.Active,
+        ))
+
+        # Exit both as Eliminated_Won
+        crud_user.update_user(db, upper_l4.id, UserUpdate(
+            status           = UserStatus.Eliminated_Won,
+            current_pool_id  = None,
+            sde_required     = False,
+            sde_flagged_week = None,
+        ))
+        crud_user.update_user(db, lower_l4.id, UserUpdate(
+            status           = UserStatus.Eliminated_Won,
+            current_pool_id  = None,
+            sde_required     = False,
+            sde_flagged_week = None,
+        ))
+
+        # DrawHistory anchored to Pool A — edge_case_triggered=True marks CASE D cross-pool
+        db.add(DrawHistory(
+            pool_id             = pool_a.id,
+            draw_type           = POOL_DRAW_SDE,
+            targeted_early_exit = True,
+            edge_case_triggered = True,
+            winner_1_user_id            = upper_l4.id,
+            winner_1_level              = upper_l4.current_level,
+            winner_1_net_payout         = upper_net_d,
+            winner_1_total_deposited    = _up_dep,
+            winner_1_merges_experienced = _up_merges,
+            winner_1_pauses_experienced = _up_pauses,
+            winner_1_journey_type       = "merged" if _up_merges > 0 else "direct",
+            winner_2_user_id            = lower_l4.id,
+            winner_2_level              = lower_l4.current_level,
+            winner_2_net_payout         = lower_net_d,
+            winner_2_total_deposited    = _lo_dep,
+            winner_2_merges_experienced = _lo_merges,
+            winner_2_pauses_experienced = _lo_pauses,
+            winner_2_journey_type       = "merged" if _lo_merges > 0 else "direct",
+        ))
+
+        # Advance survivors in BOTH pools + mark draw_completed
+        now_utc = datetime.now(timezone.utc)
+        iso_wk  = now_utc.isocalendar()
+        wk_id   = f"{iso_wk.year}-W{iso_wk.week:02d}"
+
+        for pool, exited_id in ((pool_a, upper_l4.id), (pool_b, lower_l4.id)):
+            new_l4_created = False
+            for s in (
+                db.query(User)
+                .filter(
+                    User.current_pool_id == pool.id,
+                    User.status          == UserStatus.Active,
+                    User.id              != exited_id,
+                )
+                .all()
+            ):
+                new_lvl = min(s.current_level + 1, 6)
+                if new_lvl == 4:
+                    new_l4_created = True
+                crud_user.update_user(db, s.id, UserUpdate(
+                    current_level         = new_lvl,
+                    weekly_payment_status = WeeklyPaymentStatus.Unpaid,
+                    sde_required          = (True   if new_lvl == 4 else None),
+                    sde_flagged_week      = (wk_id  if new_lvl == 4 else None),
+                ))
+            pool.draw_completed_this_week = True
+            pool.pool_draw_type           = POOL_DRAW_SDE
+            if not new_l4_created:
+                pool.contains_flagged_l4 = False
+
+        db.commit()
+
+        _logger.info(
+            "SDE CASE D ✓  upper=@%s(Pool '%s' L%d ₹%s)  "
+            "lower=@%s(Pool '%s' L%d ₹%s)  total_payout=₹%s",
+            upper_l4.username, pool_a.name, upper_l4.current_level, upper_net_d,
+            lower_l4.username, pool_b.name, lower_l4.current_level, lower_net_d,
+            upper_net_d + lower_net_d,
+        )
+        return True
+
+    except Exception as exc:
+        _logger.error(
+            "SDE CASE D: pair (@%s, @%s) failed: %s",
+            upper_l4.username, lower_l4.username, exc, exc_info=True,
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+
+
 # ── Meta-pool orchestration ───────────────────────────────────────────────────
 
 def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
@@ -863,10 +1044,46 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
             )
 
         if not batch:
-            _logger.warning(
-                "SDE Meta-Pool session %d: empty batch after supply check — skipping.",
-                session_num,
-            )
+            # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Bug #11 — CASE D: before giving up on this batch, check whether two or more
+            # L4 members exist in DIFFERENT pools so they can be paired cross-pool.
+            # Conditions: lower_supply=0 AND waitlist=0 AND distinct_l4_pools≥2.
+            # Cost: ₹11,000 (₹5,500 + ₹5,500) — prevents L4→L5 at all costs.
+            all_uncleared = overflow_from_batch + remaining
+            remaining     = []  # all consumed; remaining repopulated below
+
+            wl_count = (
+                db.query(func.count(User.id))
+                .filter(User.status == UserStatus.Waitlist)
+                .scalar()
+            ) or 0
+
+            paired_ids: set[int] = set()
+            if wl_count == 0 and len(all_uncleared) >= 2:
+                pairs = _case_d_pair_l4_members(all_uncleared)
+                for upper_l4, lower_l4 in pairs:
+                    if _execute_case_d_single_pair(db, session_num, upper_l4, lower_l4):
+                        meta_result.total_l4_cleared += 2
+                        session_num                  += 1
+                        paired_ids.add(upper_l4.id)
+                        paired_ids.add(lower_l4.id)
+                if paired_ids:
+                    _logger.info(
+                        "SDE Meta-Pool: CASE D cleared %d pair(s) (%d L4 exits). "
+                        "edge_case_triggered=True on respective DrawHistory rows.",
+                        len(paired_ids) // 2, len(paired_ids),
+                    )
+
+            # Any L4 members not paired → true overflow
+            unpaired = [m for m in all_uncleared if m.id not in paired_ids]
+            if unpaired:
+                meta_result.overflow_l4_count += len(unpaired)
+                meta_result.overflow_user_ids.extend(m.id for m in unpaired)
+                _logger.warning(
+                    "SDE Meta-Pool: %d L4 member(s) → overflow "
+                    "(CASE D cleared %d, wl=%d, true_supply=0).",
+                    len(unpaired), len(paired_ids) // 2, wl_count,
+                )
             break
 
         session_result = run_sde_session(db, week_id, session_num, batch, lpi)

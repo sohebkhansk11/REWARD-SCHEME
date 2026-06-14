@@ -126,17 +126,21 @@ class DrawResult:
 @dataclass
 class MassDrawResult:
     """Return type of execute_weekly_draw()."""
-    pools_drawn:     int
-    draw_results:    list[DrawResult]
-    total_auto_paid: int
-    refill:          dict                     # assign_waitlist_to_pools() summary
-    skipped_pools:   list[str] = field(default_factory=list)   # errored mid-draw
-    paused_pools:    list[str] = field(default_factory=list)   # Active pools with < 12 — paused
-    sde_pre_drawn:   list[str] = field(default_factory=list)   # pools drawn by SDE pre-draw
+    pools_drawn:          int
+    draw_results:         list[DrawResult]
+    total_auto_paid:      int
+    refill:               dict                     # assign_waitlist_to_pools() summary
+    skipped_pools:        list[str] = field(default_factory=list)   # errored mid-draw
+    paused_pools:         list[str] = field(default_factory=list)   # Active pools with < 12 — paused
+    sde_pre_drawn:        list[str] = field(default_factory=list)   # pools drawn by SDE pre-draw
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Draw metrics fix — count ALL draw types, not just regular pools_drawn.
+    sde_draws_this_week:  int  = 0   # SDE sub-draws committed at T-0H
+    ext_draws_this_week:  int  = 0   # Ext-II + Ext-III draws this cycle
     # U-02: EngineEvent trace — one immutable record per draw sub-step.
     # Callers can inspect this to verify LPI monotonicity (CON-2 proof) and
     # diagnose why each pool was routed to a specific draw type.
-    event_trace:     list = field(default_factory=list)        # list[EngineEvent]
+    event_trace:          list = field(default_factory=list)        # list[EngineEvent]
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -532,6 +536,13 @@ def execute_weekly_draw(
         _evt,
     )
 
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Pre-initialize draw-cycle variables before try blocks so they are always
+    # in scope at the end of the function (winner reveal broadcast + return).
+    week_id_str:       str = _current_week_id()
+    _staged_executed:  int = 0
+    _ext_draws_count:  int = 0
+
     # ── 0. SDE Extension II/III pre-pass — clear any L5/L6 members FIRST ───────
     #
     # POINT 2+3 FIX: Before regular draws, run SDE Ext-II/III to eliminate any
@@ -547,15 +558,15 @@ def execute_weekly_draw(
     try:
         from app.services.sde_engine import check_and_run_sde_extensions
         from app.services.waitlist import assign_waitlist_to_pools as _wl_refill
-        week_id_str = _current_week_id()
         ext_results = check_and_run_sde_extensions(db, week_id_str)
         if ext_results:
+            _ext_draws_count = len(ext_results)
             # Run a quick partial refill so ext-II/III pools get replacements
             # before the main draw checks pool capacity.
             _wl_refill(db)
             _logger.info(
                 "execute_weekly_draw: SDE Ext-II/III ran %d draw(s) before main loop.",
-                len(ext_results),
+                _ext_draws_count,
             )
     except Exception as _ext_exc:
         _logger.error(
@@ -872,10 +883,69 @@ def execute_weekly_draw(
     # ── 4. Single combined FIFO refill after ALL draws ────────────────────────
     refill = assign_waitlist_to_pools(db)
 
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Winner reveal ordering fix (E1+E2) — unified broadcast AFTER all draws and
+    # refill complete.  Previously SDE Execute committed WIT tokens + Eliminated_Won
+    # before regular draws ran, implicitly revealing SDE winners early.  Now ALL
+    # draw types (Ext-III → Ext-II → SDE staged → regular) complete first, then
+    # a single consolidated "WINNERS REVEALED" broadcast reads DrawHistory for the
+    # current week and emits one atomic winner-list log entry.  This is the single
+    # authoritative moment all winners are announced — no partial early reveals.
+    try:
+        from app.models.draw_history import DrawHistory as _DH
+        # Filter by today's UTC date — covers all draw types committed this cycle
+        # (SDE staged via execute_staged_sde_draws, Ext-II/III, and regular draws).
+        _today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        _all_winners = (
+            db.query(_DH)
+            .filter(_DH.draw_timestamp >= _today_start)
+            .order_by(_DH.id.asc())
+            .all()
+        )
+        _winner_lines = [
+            f"  [{_dh.draw_type or 'regular'}] pool={_dh.pool_id}  "
+            f"W1=uid{_dh.winner_1_user_id}(L{_dh.winner_1_level})  "
+            f"W2=uid{_dh.winner_2_user_id}(L{_dh.winner_2_level})"
+            for _dh in _all_winners
+        ]
+        _logger.info(
+            "━━━ WINNERS REVEALED (week %s) — %d draw(s) — all payouts committed ━━━\n%s",
+            week_id_str, len(_all_winners),
+            "\n".join(_winner_lines) if _winner_lines else "  (none)",
+        )
+        # Push unified reveal event to SSE live-stream (non-blocking)
+        try:
+            from app.routers.admin_analytics import post_draw_event
+            post_draw_event({
+                "event_type":    "winners_revealed",
+                "week_id":       week_id_str,
+                "total_draws":   len(_all_winners),
+                "sde_draws":     _staged_executed,
+                "ext_draws":     _ext_draws_count,
+                "regular_draws": len(draw_results),
+            })
+        except Exception:
+            pass   # SSE is reporting only — never affects draw outcome
+    except Exception as _rev_exc:
+        _logger.warning(
+            "execute_weekly_draw: winner reveal broadcast failed (non-fatal): %s",
+            _rev_exc,
+        )
+
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Draw metrics fix — total draws = SDE staged + Ext-II/III + regular.
+    _total_draws_this_week = len(draw_results) + _staged_executed + _ext_draws_count
+
     _logger.info(
         "execute_weekly_draw COMPLETE — "
-        "pools_drawn=%d  P1_assigned=%d  P2_created=%s",
+        "pools_drawn=%d  sde_draws=%d  ext_draws=%d  total=%d  "
+        "P1_assigned=%d  P2_created=%s",
         len(draw_results),
+        _staged_executed,
+        _ext_draws_count,
+        _total_draws_this_week,
         refill["phase1_assigned"],
         refill["phase2_pool_created"] or "none",
     )
@@ -888,6 +958,8 @@ def execute_weekly_draw(
         skipped_pools=skipped,
         paused_pools=paused_now,
         sde_pre_drawn=sde_skipped,
+        sde_draws_this_week=_staged_executed,
+        ext_draws_this_week=_ext_draws_count,
         event_trace=event_trace,   # U-02: full EngineEvent trace
     )
 

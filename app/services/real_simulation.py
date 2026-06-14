@@ -745,6 +745,12 @@ def _snapshot(
     cumulative_ext2: int,
     cumulative_ext3: int,
     cumulative_accel: int,
+    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Bug #3 — cash_outflow_inr: actual winner payout total for this week's draws
+    # Bug #4 — members_joined/exited: pool-entry and winner-exit counts for weekly report
+    cash_outflow_inr: float = 0.0,
+    members_joined: int = 0,
+    members_exited: int = 0,
 ) -> dict:
     """
     Read ACTUAL DB state after the week completes.
@@ -839,6 +845,13 @@ def _snapshot(
             + compliance.get("late_fee_revenue_inr", 0)
             + compliance.get("grace_fee_revenue_inr", 0)
         ),
+        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Bug #3 — cash_outflow_inr was missing entirely; now populated from DrawHistory
+        # payout delta computed in calling code before/after the draw cycle
+        "cash_outflow_inr":          cash_outflow_inr,
+        # Bug #4 — members_joined/exited were missing; now populated from User status deltas
+        "members_joined_this_week":  members_joined,
+        "members_exited_this_week":  members_exited,
         # Also store compliance fees under the legacy key for Cash Flow chart
         "late_fees_collected_inr":   compliance.get("late_fee_revenue_inr", 0),
         "level_distribution": {
@@ -1029,6 +1042,13 @@ class RealSimEngine:
         max_l5              = 0
         max_l6              = 0
         scenario_counts:    dict[str, int] = {}
+        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Bug #6 — running cumulative ext2/3/accel totals so per-week delta can be
+        # computed as (current_cumulative - prev_cumulative) instead of returning the
+        # all-time cumulative total in every weekly snapshot row
+        _prev_cumul_ext2  = 0
+        _prev_cumul_ext3  = 0
+        _prev_cumul_accel = 0
 
         db = SessionLocal()
 
@@ -1064,6 +1084,19 @@ class RealSimEngine:
 
                     # Track pools formed THIS week (p2 pools only — new pool creation)
                     _week_p2_start = total_p2_pools
+                    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # Bug #4 — baseline active/eliminated_won counts at week start; delta
+                    # after T+5M gives members_joined_this_week and members_exited_this_week
+                    # Bug #5 — baseline paused pool count; delta after T+5M identifies Phase-1
+                    # restored pools so they are included in pools_formed (not just Phase 2)
+                    from app.models.pool import Pool as _P5s, PoolStatus as _PS5s
+                    from app.models.user import User as _U5s, UserStatus as _US5s
+                    _week_elim_won_before = db.query(func.count(_U5s.id)).filter(
+                        _U5s.status == _US5s.Eliminated_Won).scalar() or 0
+                    _week_active_before   = db.query(func.count(_U5s.id)).filter(
+                        _U5s.status == _US5s.Active).scalar() or 0
+                    _week_paused_before   = db.query(func.count(_P5s.id)).filter(
+                        _P5s.status == _PS5s.Paused_Awaiting_Members).scalar() or 0
 
                     # ── a. Inject new users (Monday morning) ─────────────────
                     chronos.jump_to(monday_morning)
@@ -1245,6 +1278,17 @@ class RealSimEngine:
                     #   5. Runs run_sde_meta_pool() (SDE sub-draws executed here)
                     #   6. Sets preparation_valid=True, countdown_active=True
                     chronos.jump_to(saturday_22h)
+                    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # Bug #1/#2/#3 — snapshot DrawHistory row count and total payout BEFORE
+                    # any draws fire this week (SDE sub-draws at T-2H + regular draws at T-0H).
+                    # Post-T+5M delta gives exact per-week draw count, winner count, and
+                    # cash outflow covering ALL draw types (SDE, Ext-II, Ext-III, Regular).
+                    _draws_total_before  = db.query(func.count(DrawHistory.id)).scalar() or 0
+                    _payout_total_before = float(
+                        db.query(func.sum(
+                            DrawHistory.winner_1_net_payout + DrawHistory.winner_2_net_payout,
+                        )).scalar() or 0
+                    )
 
                     # Clear any stale lock left by a previous failed cycle
                     try:
@@ -1273,7 +1317,11 @@ class RealSimEngine:
                             )
                             try:
                                 flag_l4_members(db); db.commit()
-                                redistribute_multi_l4_pools(db); db.commit()
+                                # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                                # Bug #8 — removed redundant redistribute_multi_l4_pools() call here.
+                                # run_sde_meta_pool() already calls redistribute_multi_l4_pools()
+                                # internally as its first step; calling it twice caused duplicate
+                                # L4-pool redistribution and double-counting in session tracking.
                                 run_sde_meta_pool(db, week_id)
                             except Exception as sde_exc:
                                 _logger.warning(
@@ -1313,10 +1361,13 @@ class RealSimEngine:
                     pauses_this_week = 0
 
                     try:
-                        mass_result     = execute_weekly_draw(db, auto_pay_unpaid=False)
-                        draws_this_week = mass_result.pools_drawn
+                        mass_result      = execute_weekly_draw(db, auto_pay_unpaid=False)
+                        draws_this_week  = mass_result.pools_drawn    # regular draws only (temp)
                         pauses_this_week = len(mass_result.paused_pools)
-                        total_draws     += draws_this_week
+                        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        # Bug #1 — total_draws now accumulated AFTER T+5M using all-types
+                        # DrawHistory delta instead of mass_result.pools_drawn (regular only).
+                        # Removed: total_draws += draws_this_week (moved to metrics section)
                         total_pauses    += pauses_this_week
                         total_p2_pools  += mass_result.refill.get("phase2_pools_count", 0)
                         total_p3_xfers  += mass_result.refill.get("phase3_transfers",   0)
@@ -1362,6 +1413,41 @@ class RealSimEngine:
                         except Exception: pass
 
                     # ── Collect metrics from REAL DB state ───────────────────
+                    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # Bug #1 — draws_this_week: recomputed from DrawHistory delta (all types:
+                    #          SDE sub-draws at T-2H + Ext-II/III + Regular at T-0H).
+                    #          mass_result.pools_drawn only counted regular draws.
+                    # Bug #2 — winners_this_week: 2 per draw row (all types); was derived
+                    #          from the wrong regular-only draws_this_week.
+                    # Bug #3 — cash_outflow_inr: sum of winner payouts from DrawHistory delta.
+                    # Bug #4 — members_joined/exited: User status deltas this week.
+                    # Bug #5 — pools_formed: Phase-2 new pools + Phase-1 restored pools.
+                    # Bug #6 — ext2/3/accel: per-week delta, not all-time cumulative.
+                    from app.models.user import User as _U6m, UserStatus as _US6m
+                    from app.models.pool import Pool as _P6m, PoolStatus as _PS6m
+
+                    # Bug #1 + #2 + #3: DrawHistory post-cycle totals vs pre-cycle baseline
+                    _draws_total_after  = db.query(func.count(DrawHistory.id)).scalar() or 0
+                    _payout_total_after = float(
+                        db.query(func.sum(
+                            DrawHistory.winner_1_net_payout + DrawHistory.winner_2_net_payout,
+                        )).scalar() or 0
+                    )
+                    draws_this_week        = _draws_total_after  - _draws_total_before
+                    cash_outflow_this_week = _payout_total_after - _payout_total_before
+                    total_draws           += draws_this_week
+
+                    # Bug #4: member flow deltas — who joined active pools, who exited as winners
+                    _week_elim_won_after  = db.query(func.count(_U6m.id)).filter(
+                        _U6m.status == _US6m.Eliminated_Won).scalar() or 0
+                    _week_active_after    = db.query(func.count(_U6m.id)).filter(
+                        _U6m.status == _US6m.Active).scalar() or 0
+                    members_exited_this_week = _week_elim_won_after - _week_elim_won_before
+                    members_joined_this_week = (
+                        (_week_active_after - _week_active_before) + members_exited_this_week
+                    )
+
+                    # Bug #6: ext2/3/accel per-week deltas (subtract previous cumulative total)
                     cumul_ext2  = db.query(func.count(DrawHistory.id)).filter(
                         DrawHistory.draw_type == POOL_DRAW_SDE_EXT2,
                     ).scalar() or 0
@@ -1371,19 +1457,37 @@ class RealSimEngine:
                     cumul_accel = db.query(func.count(DrawHistory.id)).filter(
                         DrawHistory.draw_type == POOL_DRAW_ACCELERATED,
                     ).scalar() or 0
+                    delta_ext2  = cumul_ext2  - _prev_cumul_ext2
+                    delta_ext3  = cumul_ext3  - _prev_cumul_ext3
+                    delta_accel = cumul_accel - _prev_cumul_accel
 
                     metrics = _snapshot(
-                        db               = db,
-                        week_num         = week_num,
-                        draws_this_week  = draws_this_week,
-                        pauses_this_week = pauses_this_week,
-                        compliance       = compliance,
-                        cumulative_ext2  = cumul_ext2,
-                        cumulative_ext3  = cumul_ext3,
-                        cumulative_accel = cumul_accel,
+                        db                   = db,
+                        week_num             = week_num,
+                        draws_this_week      = draws_this_week,
+                        pauses_this_week     = pauses_this_week,
+                        compliance           = compliance,
+                        cumulative_ext2      = delta_ext2,
+                        cumulative_ext3      = delta_ext3,
+                        cumulative_accel     = delta_accel,
+                        cash_outflow_inr     = cash_outflow_this_week,
+                        members_joined       = members_joined_this_week,
+                        members_exited       = members_exited_this_week,
                     )
-                    # Real per-week pools-formed count (Phase 2 new pool creation)
-                    metrics["pools_formed"] = total_p2_pools - _week_p2_start
+
+                    # Bug #5: pools_formed = Phase-2 new pools + Phase-1 Paused→Active restorations.
+                    # Phase-1 restorations are approximated by the decrease in Paused pool count;
+                    # max(0,...) guards against weeks where more pools became newly paused than restored.
+                    _week_paused_after  = db.query(func.count(_P6m.id)).filter(
+                        _P6m.status == _PS6m.Paused_Awaiting_Members).scalar() or 0
+                    phase2_new          = total_p2_pools - _week_p2_start
+                    phase1_restored     = max(0, _week_paused_before - _week_paused_after)
+                    metrics["pools_formed"] = phase2_new + phase1_restored
+
+                    # Bug #6: advance cumulative trackers for next week's delta computation
+                    _prev_cumul_ext2  = cumul_ext2
+                    _prev_cumul_ext3  = cumul_ext3
+                    _prev_cumul_accel = cumul_accel
                     weekly_detail.append(metrics)
 
                     cycle_logs.append({
@@ -1430,9 +1534,15 @@ class RealSimEngine:
                     sum(w["lpi"] for w in weekly_detail) / max(len(weekly_detail), 1), 2,
                 )
 
-                final_ext2  = weekly_detail[-1]["ext2_exits_this_week"]  if weekly_detail else 0
-                final_ext3  = weekly_detail[-1]["ext3_exits_this_week"]  if weekly_detail else 0
-                final_accel = weekly_detail[-1]["accel_diss_this_week"]  if weekly_detail else 0
+                # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Bug #6 — ext2/ext3/accel snapshot fields are now per-week DELTAS (not
+                # cumulative totals). The final summary must SUM all weeks to get the
+                # simulation-wide total; previously took only the last week's value which
+                # was the all-time cumulative (correct by accident) but now would only show
+                # the last week's count (wrong).
+                final_ext2  = sum(w.get("ext2_exits_this_week", 0) for w in weekly_detail)
+                final_ext3  = sum(w.get("ext3_exits_this_week", 0) for w in weekly_detail)
+                final_accel = sum(w.get("accel_diss_this_week",  0) for w in weekly_detail)
 
                 if max_l5 > 0 or max_l6 > 0:
                     escalation_note = (

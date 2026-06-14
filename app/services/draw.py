@@ -563,6 +563,28 @@ def execute_weekly_draw(
             _ext_exc, exc_info=True,
         )
 
+    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Bug #9 — Step 5: T-0H execution of all staged SDE sub-draws.
+    # Called here — after Ext-II/III but BEFORE the main candidate loop — so all
+    # SDE winners exit simultaneously with regular draw winners.  WIT tokens,
+    # Eliminated_Won, DrawHistory, and survivor advancement are all committed here.
+    # Pools processed this way already have draw_completed_this_week=True from T-2H
+    # staging, so the candidate loop below (Bug #10 guard) will skip them correctly.
+    try:
+        from app.services.sde_engine import execute_staged_sde_draws
+        _staged_executed = execute_staged_sde_draws(db)
+        if _staged_executed:
+            _logger.info(
+                "execute_weekly_draw: T-0H committed %d staged SDE sub-draw(s) "
+                "(WIT tokens + Eliminated_Won + DrawHistory + survivor advancement).",
+                _staged_executed,
+            )
+    except Exception as _staged_exc:
+        _logger.error(
+            "execute_weekly_draw: execute_staged_sde_draws failed (non-fatal): %s",
+            _staged_exc, exc_info=True,
+        )
+
     # ── 1. Discover eligible pools + apply draw-protection safeguard ─────────
     #
     # Draw protection (spec requirement):

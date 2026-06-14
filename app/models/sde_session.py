@@ -111,3 +111,13 @@ class SDECheckpoint(Base):
     rng_seed_hash = Column(String(64), nullable=False)
 
     completed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Bug #9 — two-phase SDE commit flag.
+    # False (default) = staged at T-2H: winners selected, checkpoint written, pool
+    #   locked (draw_completed_this_week=True), but NO WIT tokens, NO status change,
+    #   NO DrawHistory, NO survivor advancement yet.
+    # True = executed at T-0H: execute_staged_sde_draws() has committed the full
+    #   exit (tokens issued, Eliminated_Won, DrawHistory written, survivors advanced).
+    # Production migration: ALTER TABLE sde_checkpoints
+    #   ADD COLUMN IF NOT EXISTS executed BOOLEAN NOT NULL DEFAULT FALSE;
+    executed = Column(Boolean, nullable=False, server_default="false", default=False)

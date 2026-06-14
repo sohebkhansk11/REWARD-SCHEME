@@ -39,6 +39,34 @@ from app.routers import admin_elimination as admin_elimination_router
 
 Base.metadata.create_all(bind=engine)
 
+# SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Bug #9 — Safe production migration for the two-phase SDE commit column.
+# create_all() only creates MISSING tables, never adds new columns to existing
+# ones.  This block adds the `executed` column to sde_checkpoints if absent.
+# IF NOT EXISTS is a PostgreSQL 9.6+ feature — safe for Render/Supabase.
+# The DEFAULT FALSE ensures all historical rows are treated as already-executed
+# (they ran under the old single-phase system and do not need T-0H re-execution).
+try:
+    from sqlalchemy import text as _sa_text
+    with engine.begin() as _mig_conn:
+        _mig_conn.execute(_sa_text(
+            "ALTER TABLE sde_checkpoints "
+            "ADD COLUMN IF NOT EXISTS executed BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        # Mark ALL pre-existing rows as executed=TRUE so execute_staged_sde_draws()
+        # does not attempt to re-process draws that already completed under the old
+        # single-phase system.
+        _mig_conn.execute(_sa_text(
+            "UPDATE sde_checkpoints SET executed = TRUE "
+            "WHERE executed = FALSE AND completed_at < NOW() - INTERVAL '1 hour'"
+        ))
+    _logger.info("main: sde_checkpoints.executed column migration OK.")
+except Exception as _mig_exc:
+    _logger.warning(
+        "main: sde_checkpoints.executed migration skipped (may already exist or "
+        "non-PostgreSQL dialect): %s", _mig_exc,
+    )
+
 _IS_DEV_MODE        = os.getenv("ENABLE_DEV_MODE")   == "true"
 _SCHEDULER_ENABLED  = os.getenv("SCHEDULER_ENABLED", "false").lower() == "true"
 

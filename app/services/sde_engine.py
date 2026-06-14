@@ -404,167 +404,53 @@ def execute_sde_sub_draw(
     # ── Compute RNG seed hash ─────────────────────────────────────────────────
     rng_hash = _compute_rng_seed_hash(pool_id, session_id, sub_draw_number)
 
-    # ── Snapshot journey data BEFORE mutations ────────────────────────────────
-    _up_dep    = l4_member.total_deposited_inr        or 1000
-    _up_merges = l4_member.dynamic_merges_experienced or 0
-    _up_pauses = l4_member.pauses_experienced         or 0
-    _lo_dep    = lower_winner.total_deposited_inr        or 1000
-    _lo_merges = lower_winner.dynamic_merges_experienced or 0
-    _lo_pauses = lower_winner.pauses_experienced         or 0
-
-    # ── Payout calculation ────────────────────────────────────────────────────
+    # ── Payout calculation (stored in checkpoint for T-0H execution) ─────────
     upper_gross, upper_net = LEVEL_PAYOUTS.get(l4_member.current_level,    (6000, 5500))
     lower_gross, lower_net = LEVEL_PAYOUTS.get(lower_winner.current_level, (2500, 2000))
     upper_net_d = Decimal(str(upper_net))
     lower_net_d = Decimal(str(lower_net))
 
-    # ── BEGIN ATOMIC TRANSACTION ──────────────────────────────────────────────
-    # All writes below are committed together.  Any exception triggers rollback.
+    # ── BEGIN T-2H STAGING TRANSACTION ───────────────────────────────────────
+    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Bug #9 — Two-phase SDE commit.  T-2H = STAGING ONLY.
+    #
+    # Steps formerly executed here at T-2H and their new home:
+    #   (a) WIT token upper    → DEFERRED → execute_staged_sde_draws() at T-0H
+    #   (b) WIT token lower    → DEFERRED → execute_staged_sde_draws() at T-0H
+    #   (c) Eliminated_Won     → DEFERRED → execute_staged_sde_draws() at T-0H
+    #   (d) DrawHistory        → DEFERRED → execute_staged_sde_draws() at T-0H
+    #   (f) Survivor advance   → DEFERRED → execute_staged_sde_draws() at T-0H
+    #
+    # Only the crash-recovery checkpoint and the draw-lock flag are written here.
+    # Winners remain Active in their pool until T-0H so all reveals are simultaneous.
 
-    # (a) WIT token — upper winner (L4 guaranteed exit)
-    upper_token_code = _get_unique_token_code(db, "WIT-")
-    from app.models.token import TokenType, TokenStatus
-    crud_token.create_token(
-        db,
-        TokenCreate(
-            code=upper_token_code,
-            type=TokenType.Withdraw,
-            value_inr=upper_net_d,
-            user_id=l4_member.id,
-            pool_id=pool.id,
-            status=TokenStatus.Active,
-        ),
-    )
-
-    # (b) WIT token — lower winner
-    lower_token_code = _get_unique_token_code(db, "WIT-")
-    crud_token.create_token(
-        db,
-        TokenCreate(
-            code=lower_token_code,
-            type=TokenType.Withdraw,
-            value_inr=lower_net_d,
-            user_id=lower_winner.id,
-            pool_id=pool.id,
-            status=TokenStatus.Active,
-        ),
-    )
-
-    # (c) Eliminate both winners
-    crud_user.update_user(
-        db, l4_member.id,
-        UserUpdate(
-            status=UserStatus.Eliminated_Won,
-            current_pool_id=None,
-            sde_required=False,
-            sde_flagged_week=None,
-        ),
-    )
-    crud_user.update_user(
-        db, lower_winner.id,
-        UserUpdate(status=UserStatus.Eliminated_Won, current_pool_id=None),
-    )
-
-    # (d) DrawHistory row — targeted_early_exit=True for SDE upper winner
-    db.add(DrawHistory(
-        pool_id             = pool.id,
-        draw_type           = POOL_DRAW_SDE,
-        targeted_early_exit = True,            # [TARGETED EARLY EXIT] badge
-        edge_case_triggered = False,
-        sde_session_id      = session_id,
-        # Upper winner (L4 — guaranteed exit)
-        winner_1_user_id            = l4_member.id,
-        winner_1_level              = l4_member.current_level,
-        winner_1_net_payout         = upper_net_d,
-        winner_1_total_deposited    = _up_dep,
-        winner_1_merges_experienced = _up_merges,
-        winner_1_pauses_experienced = _up_pauses,
-        winner_1_journey_type       = "merged" if _up_merges > 0 else "direct",
-        # Lower winner (AI-weighted L1/L2 or L3)
-        winner_2_user_id            = lower_winner.id,
-        winner_2_level              = lower_winner.current_level,
-        winner_2_net_payout         = lower_net_d,
-        winner_2_total_deposited    = _lo_dep,
-        winner_2_merges_experienced = _lo_merges,
-        winner_2_pauses_experienced = _lo_pauses,
-        winner_2_journey_type       = "merged" if _lo_merges > 0 else "direct",
-    ))
-
-    # (e) SDE checkpoint — crash recovery anchor
+    # (e) SDE checkpoint — staged with executed=False; T-0H sets executed=True
     db.add(SDECheckpoint(
-        session_id               = session_id,
-        sub_draw_number          = sub_draw_number,
-        pool_id                  = pool.id,
-        upper_winner_user_id     = l4_member.id,
-        upper_winner_level       = l4_member.current_level,
-        upper_payout_inr         = upper_net_d,
-        lower_winner_user_id     = lower_winner.id,
-        lower_winner_level       = lower_winner.current_level,
-        lower_payout_inr         = lower_net_d,
+        session_id                 = session_id,
+        sub_draw_number            = sub_draw_number,
+        pool_id                    = pool.id,
+        upper_winner_user_id       = l4_member.id,
+        upper_winner_level         = l4_member.current_level,
+        upper_payout_inr           = upper_net_d,
+        lower_winner_user_id       = lower_winner.id,
+        lower_winner_level         = lower_winner.current_level,
+        lower_payout_inr           = lower_net_d,
         lower_winner_tier_override = lower_tier_override,
-        rng_seed_hash            = rng_hash,
+        rng_seed_hash              = rng_hash,
+        executed                   = False,
     ))
 
-    # (f) Advance surviving members by +1 level — mirrors run_dual_draw behaviour.
-    #
-    # CRITICAL: execute_weekly_draw() skips SDE-processed pools via
-    # draw_completed_this_week=True.  Without level advancement here, the 10
-    # survivors never progress that week — violating the weekly cycle contract.
-    # This block is part of the same atomic transaction as the exits above.
-    #
-    # New L4 edge case: if an L3 survivor advances to L4 in THIS same pool,
-    # it is flagged immediately and pool.contains_flagged_l4 stays True.
-    # The pool will be SDE-processed NEXT week.
-    now_utc  = datetime.now(timezone.utc)
-    iso      = now_utc.isocalendar()
-    week_id  = f"{iso.year}-W{iso.week:02d}"
-    new_l4_created_in_pool = False
-
-    # Load all survivors before mutations (excludes the two winners who just exited)
-    surviving_members: list[User] = (
-        db.query(User)
-        .filter(
-            User.current_pool_id == pool_id,
-            User.status          == UserStatus.Active,
-            User.id.notin_([l4_member.id, lower_winner.id]),
-        )
-        .all()
-    )
-
-    for survivor in surviving_members:
-        new_level   = min(survivor.current_level + 1, 6)
-        reaching_l4 = (new_level == 4)
-        if reaching_l4:
-            new_l4_created_in_pool = True
-            _logger.info(
-                "SDE pool '%s' survivor %d (%s) advanced to L4 — "
-                "sde_required=True, flagged for next week (%s).",
-                pool.name, survivor.id, survivor.username, week_id,
-            )
-        crud_user.update_user(
-            db, survivor.id,
-            UserUpdate(
-                current_level         = new_level,
-                weekly_payment_status = WeeklyPaymentStatus.Unpaid,
-                sde_required          = (True    if reaching_l4 else None),
-                sde_flagged_week      = (week_id if reaching_l4 else None),
-            ),
-        )
-
-    # (g) Mark pool as drawn this week — prevents double-draw
+    # (g) Draw-lock — prevents execute_weekly_draw() from re-drawing at T-0H.
+    # contains_flagged_l4 cleared at T-0H after exits if no new L4 created.
     pool.draw_completed_this_week = True
     pool.pool_draw_type           = POOL_DRAW_SDE
-    # contains_flagged_l4: clear if no survivor just advanced to L4;
-    # leave True if a new L4 was created (pool needs SDE next week)
-    if not new_l4_created_in_pool:
-        pool.contains_flagged_l4 = False
 
     db.commit()
-    # ── END ATOMIC TRANSACTION ────────────────────────────────────────────────
+    # ── END T-2H STAGING TRANSACTION ─────────────────────────────────────────
 
     _logger.info(
-        "SDE sub-draw %d.%d COMPLETE: pool='%s'  upper=@%s(L%d ₹%s)  "
-        "lower=@%s(L%d ₹%s)  seed=%s…",
+        "SDE sub-draw %d.%d STAGED (T-2H): pool='%s'  upper=@%s(L%d ₹%s)  "
+        "lower=@%s(L%d ₹%s)  seed=%s…  [exits deferred to T-0H]",
         session_id, sub_draw_number, pool.name,
         l4_member.username, l4_member.current_level, upper_net_d,
         lower_winner.username, lower_winner.current_level, lower_net_d,
@@ -1103,6 +989,242 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
         meta_result.total_l4_cleared, meta_result.overflow_l4_count,
     )
     return meta_result
+
+
+# SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Bug #9 — Step 4: T-0H execution phase.
+# execute_staged_sde_draws() commits all sub-draws that were staged at T-2H.
+# Called by execute_weekly_draw() at T-0H before the main candidate-pool loop.
+# For each SDECheckpoint where executed=False and session.week_id = this week:
+#   - Loads pool + both winners from DB (still Active, still in pool)
+#   - Issues WIT tokens, sets Eliminated_Won, writes DrawHistory
+#   - Advances survivors (+1 level, flags new L4s)
+#   - Marks checkpoint.executed=True and commits atomically per checkpoint
+# Returns the count of checkpoints executed (0 if nothing was staged).
+
+def execute_staged_sde_draws(db: Session) -> int:
+    """
+    T-0H phase of the two-phase SDE commit.  Executes all sub-draws that were
+    staged (executed=False) at T-2H for the current ISO week.
+
+    Returns the number of checkpoints committed.  Logs warnings for any
+    checkpoint that cannot be fully committed (both winners must still be
+    Active and in their original pool).
+    """
+    from app.models.token import TokenType, TokenStatus
+
+    now_utc  = datetime.now(timezone.utc)
+    iso      = now_utc.isocalendar()
+    week_id  = f"{iso.year}-W{iso.week:02d}"
+
+    # All staged-but-not-yet-executed checkpoints for this week, ordered by
+    # session then sub-draw so pair execution is deterministic.
+    staged = (
+        db.query(SDECheckpoint)
+        .join(SDESession, SDECheckpoint.session_id == SDESession.id)
+        .filter(
+            SDESession.week_id    == week_id,
+            SDECheckpoint.executed == False,  # noqa: E712
+        )
+        .order_by(SDECheckpoint.session_id, SDECheckpoint.sub_draw_number)
+        .all()
+    )
+
+    if not staged:
+        _logger.info(
+            "execute_staged_sde_draws: no staged SDE sub-draws for week %s.", week_id,
+        )
+        return 0
+
+    _logger.info(
+        "execute_staged_sde_draws: executing %d staged sub-draw(s) for week %s (T-0H).",
+        len(staged), week_id,
+    )
+
+    executed_count = 0
+
+    for cp in staged:
+        try:
+            # ── Load pool ─────────────────────────────────────────────────────
+            pool: Pool | None = db.query(Pool).filter(Pool.id == cp.pool_id).first()
+            if not pool:
+                _logger.error(
+                    "execute_staged_sde_draws: pool %d not found for checkpoint %d — skip.",
+                    cp.pool_id, cp.id,
+                )
+                continue
+
+            # ── Load both winners — must still be Active in their pool ────────
+            upper: User | None = (
+                db.query(User)
+                .filter(
+                    User.id             == cp.upper_winner_user_id,
+                    User.status         == UserStatus.Active,
+                    User.current_pool_id == cp.pool_id,
+                )
+                .first()
+            )
+            lower: User | None = (
+                db.query(User)
+                .filter(
+                    User.id             == cp.lower_winner_user_id,
+                    User.status         == UserStatus.Active,
+                    User.current_pool_id == cp.pool_id,
+                )
+                .first()
+            )
+
+            if not upper or not lower:
+                _logger.error(
+                    "execute_staged_sde_draws: checkpoint %d — winner(s) not found "
+                    "or no longer Active in pool %d (upper=%s lower=%s) — skip.",
+                    cp.id, cp.pool_id,
+                    upper.id if upper else "MISSING",
+                    lower.id if lower else "MISSING",
+                )
+                continue
+
+            # ── Snapshot journey data (fresh from DB — users haven't exited yet) ──
+            _up_dep    = upper.total_deposited_inr        or 1000
+            _up_merges = upper.dynamic_merges_experienced or 0
+            _up_pauses = upper.pauses_experienced         or 0
+            _lo_dep    = lower.total_deposited_inr        or 1000
+            _lo_merges = lower.dynamic_merges_experienced or 0
+            _lo_pauses = lower.pauses_experienced         or 0
+
+            upper_net_d = cp.upper_payout_inr   # computed at T-2H, stored in checkpoint
+            lower_net_d = cp.lower_payout_inr
+
+            # (a) WIT token — upper winner (L4 guaranteed exit)
+            crud_token.create_token(
+                db,
+                TokenCreate(
+                    code      = _get_unique_token_code(db, "WIT-"),
+                    type      = TokenType.Withdraw,
+                    value_inr = upper_net_d,
+                    user_id   = upper.id,
+                    pool_id   = pool.id,
+                    status    = TokenStatus.Active,
+                ),
+            )
+
+            # (b) WIT token — lower winner
+            crud_token.create_token(
+                db,
+                TokenCreate(
+                    code      = _get_unique_token_code(db, "WIT-"),
+                    type      = TokenType.Withdraw,
+                    value_inr = lower_net_d,
+                    user_id   = lower.id,
+                    pool_id   = pool.id,
+                    status    = TokenStatus.Active,
+                ),
+            )
+
+            # (c) Exit both winners
+            crud_user.update_user(
+                db, upper.id,
+                UserUpdate(
+                    status           = UserStatus.Eliminated_Won,
+                    current_pool_id  = None,
+                    sde_required     = False,
+                    sde_flagged_week = None,
+                ),
+            )
+            crud_user.update_user(
+                db, lower.id,
+                UserUpdate(status=UserStatus.Eliminated_Won, current_pool_id=None),
+            )
+
+            # (d) DrawHistory row — simultaneous reveal with all T-0H regular draws
+            db.add(DrawHistory(
+                pool_id             = pool.id,
+                draw_type           = POOL_DRAW_SDE,
+                targeted_early_exit = True,
+                edge_case_triggered = False,
+                sde_session_id      = cp.session_id,
+                winner_1_user_id            = upper.id,
+                winner_1_level              = cp.upper_winner_level,
+                winner_1_net_payout         = upper_net_d,
+                winner_1_total_deposited    = _up_dep,
+                winner_1_merges_experienced = _up_merges,
+                winner_1_pauses_experienced = _up_pauses,
+                winner_1_journey_type       = "merged" if _up_merges > 0 else "direct",
+                winner_2_user_id            = lower.id,
+                winner_2_level              = cp.lower_winner_level,
+                winner_2_net_payout         = lower_net_d,
+                winner_2_total_deposited    = _lo_dep,
+                winner_2_merges_experienced = _lo_merges,
+                winner_2_pauses_experienced = _lo_pauses,
+                winner_2_journey_type       = "merged" if _lo_merges > 0 else "direct",
+            ))
+
+            # (f) Advance surviving members +1 level; flag any new L4s
+            pool_id_local  = pool.id
+            new_l4_created = False
+            sde_flag_week  = week_id
+
+            for survivor in (
+                db.query(User)
+                .filter(
+                    User.current_pool_id == pool_id_local,
+                    User.status          == UserStatus.Active,
+                    User.id.notin_([upper.id, lower.id]),
+                )
+                .all()
+            ):
+                new_level   = min(survivor.current_level + 1, 6)
+                reaching_l4 = (new_level == 4)
+                if reaching_l4:
+                    new_l4_created = True
+                    _logger.info(
+                        "execute_staged_sde_draws: pool '%s' survivor %d (%s) → L4; "
+                        "sde_required=True, flagged week=%s.",
+                        pool.name, survivor.id, survivor.username, sde_flag_week,
+                    )
+                crud_user.update_user(
+                    db, survivor.id,
+                    UserUpdate(
+                        current_level         = new_level,
+                        weekly_payment_status = WeeklyPaymentStatus.Unpaid,
+                        sde_required          = (True         if reaching_l4 else None),
+                        sde_flagged_week      = (sde_flag_week if reaching_l4 else None),
+                    ),
+                )
+
+            # Clear L4 flag on pool if no new L4 was created by survivor advancement
+            if not new_l4_created:
+                pool.contains_flagged_l4 = False
+
+            # Mark checkpoint as fully executed
+            cp.executed = True
+
+            db.commit()
+            executed_count += 1
+
+            _logger.info(
+                "execute_staged_sde_draws: ✓ checkpoint %d  pool='%s'  "
+                "upper=@%s(L%d ₹%s)  lower=@%s(L%d ₹%s)",
+                cp.id, pool.name,
+                upper.username, cp.upper_winner_level, upper_net_d,
+                lower.username, cp.lower_winner_level, lower_net_d,
+            )
+
+        except Exception as exc:
+            _logger.error(
+                "execute_staged_sde_draws: checkpoint %d FAILED — %s; rolling back.",
+                cp.id, exc, exc_info=True,
+            )
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    _logger.info(
+        "execute_staged_sde_draws: T-0H committed %d/%d staged sub-draw(s) for week %s.",
+        executed_count, len(staged), week_id,
+    )
+    return executed_count
 
 
 # ═════════════════════════════════════════════════════════════════════════════

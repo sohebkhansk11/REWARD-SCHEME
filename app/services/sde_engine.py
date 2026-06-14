@@ -1271,11 +1271,19 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
                             "session %d (%d WL member(s) promoted).  Resuming SDE path.",
                             len(_g5_new_batch), session_num - 1, _g5_total_promoted,
                         )
-                        wl_count = (
-                            db.query(func.count(User.id))
-                            .filter(User.status == UserStatus.Waitlist)
-                            .scalar()
-                        ) or 0
+                    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # BUG 1 FIX — Gate 5 stale wl_count: must re-query after ANY Gate 5
+                    # promotion, not only when _g5_clearable > 0 launched an SDE session.
+                    # When WL members were promoted but _g5_clearable == 0 (supply still
+                    # insufficient to pair with all L4s), the pre-promotion wl_count is
+                    # stale.  Case D below reads wl_count == 0 to decide whether to pair
+                    # overflow L4s directly; with the stale value it incorrectly sees
+                    # wl_count > 0 and skips Case D, falling through to Case E instead.
+                    wl_count = (
+                        db.query(func.count(User.id))
+                        .filter(User.status == UserStatus.Waitlist)
+                        .scalar()
+                    ) or 0
 
             paired_ids: set[int] = set()
             if wl_count == 0 and len(all_uncleared) >= 2:
@@ -2152,7 +2160,14 @@ def run_preventive_l3_draw(
             f"member(s); exactly {POOL_CAPACITY} required."
         )
 
-    l3_members = [m for m in members if m.current_level == 3]
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # BUG 2 FIX — use PREVENTIVE_L3_LEVEL constant (imported from config) instead of
+    # the hardcoded literal 3.  If the level range ever widens (e.g. to (2,3) or
+    # (3,4)), only config.py needs changing — no code changes required here.
+    l3_members = [
+        m for m in members
+        if PREVENTIVE_L3_LEVEL[0] <= m.current_level <= PREVENTIVE_L3_LEVEL[1]
+    ]
     if len(l3_members) < 2:
         raise ValueError(
             f"Preventive L3 draw: pool '{pool.name}' has only {len(l3_members)} "
@@ -2307,9 +2322,15 @@ def check_and_run_preventive_l3_draws(
     """
     results: list[SDEPreventiveL3DrawResult] = []
 
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # BUG 2 FIX — use PREVENTIVE_L3_LEVEL bounds; mirrors run_preventive_l3_draw filter.
     _l3_count = (
         db.query(func.count(User.id))
-        .filter(User.status == UserStatus.Active, User.current_level == 3)
+        .filter(
+            User.status        == UserStatus.Active,
+            User.current_level >= PREVENTIVE_L3_LEVEL[0],
+            User.current_level <= PREVENTIVE_L3_LEVEL[1],
+        )
         .scalar()
     ) or 0
     _l1l2_count = (
@@ -2357,7 +2378,8 @@ def check_and_run_preventive_l3_draws(
             .filter(
                 User.current_pool_id == pool.id,
                 User.status          == UserStatus.Active,
-                User.current_level   == 3,
+                User.current_level   >= PREVENTIVE_L3_LEVEL[0],
+                User.current_level   <= PREVENTIVE_L3_LEVEL[1],
             )
             .scalar()
         ) or 0

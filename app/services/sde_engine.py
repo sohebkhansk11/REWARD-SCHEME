@@ -791,42 +791,73 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
         _logger.info("SDE Meta-Pool: no flagged L4 members — nothing to process.")
         return SDEMetaPoolResult(week_id=week_id)
 
-    # Step 4: LPI for L3 exception check
+    # Step 4: LPI for L3 exception check + cascade risk assessment
     lpi = calculate_lpi(db)
+    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Bug #7 — supply check was fixed at current_level <= 2 (L1+L2 only) which
+    # ignored L3 members even when cascade_risk > 1.0.  False supply shortage
+    # triggered admin_override_required → SDE deferred → L4 accumulated → L5.
+    # Cascade Risk = L3_count / MAX(L1+L2, 1).  Thresholds (approved): >1.0
+    # Forming (L3 eligible), >2.0 Extreme (L3 mandatory).  Supply check now
+    # widens to level ≤ 3 when cascade_risk > 1.0 OR lpi > LPI_L3_WIN_EXCEPTION.
+    _l3_sys = (
+        db.query(func.count(User.id))
+        .filter(User.status == UserStatus.Active, User.current_level == 3)
+        .scalar()
+    ) or 0
+    _l1l2_sys = (
+        db.query(func.count(User.id))
+        .filter(User.status == UserStatus.Active, User.current_level <= 2)
+        .scalar()
+    ) or 0
+    cascade_risk    = _l3_sys / max(_l1l2_sys, 1)
+    allow_l3_supply = cascade_risk > 1.0 or lpi > LPI_L3_WIN_EXCEPTION
+    _logger.info(
+        "SDE Meta-Pool: cascade_risk=%.3f  L3=%d  L1+L2=%d  "
+        "allow_l3_supply=%s  lpi=%.1f%%",
+        cascade_risk, _l3_sys, _l1l2_sys, allow_l3_supply, lpi,
+    )
 
     meta_result = SDEMetaPoolResult(week_id=week_id)
     session_num  = 1
     remaining    = list(l4_members)
 
     while remaining:
-        batch    = remaining[:SDE_MAX_POOLS_PER_SESSION]
+        batch     = remaining[:SDE_MAX_POOLS_PER_SESSION]
         remaining = remaining[SDE_MAX_POOLS_PER_SESSION:]
 
-        # Check L1/L2 supply sufficiency for this batch
-        pool_ids = [m.current_pool_id for m in batch if m.current_pool_id]
-        l1l2_count = (
+        # Check lower-tier supply sufficiency for this batch.
+        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Bug #7 — lower-tier threshold widens to level ≤ 3 (includes L3) when
+        # cascade_risk > 1.0 or lpi > LPI_L3_WIN_EXCEPTION.  Previously fixed at
+        # level ≤ 2 which under-counted supply and triggered false overrides.
+        pool_ids           = [m.current_pool_id for m in batch if m.current_pool_id]
+        _lower_max_level   = 3 if allow_l3_supply else 2
+        lower_supply_count = (
             db.query(func.count(User.id))
             .filter(
                 User.current_pool_id.in_(pool_ids),
                 User.status          == UserStatus.Active,
-                User.current_level   <= 2,
+                User.current_level   <= _lower_max_level,
             )
             .scalar()
         ) or 0
 
         min_needed = len(batch) * SDE_L1L2_THRESHOLD_PER_L4
-        if l1l2_count < min_needed:
+        if lower_supply_count < min_needed:
             # Reduce batch to what supply allows
-            clearable = l1l2_count // SDE_L1L2_THRESHOLD_PER_L4
+            clearable           = lower_supply_count // SDE_L1L2_THRESHOLD_PER_L4
             overflow_from_batch = batch[clearable:]
-            batch                = batch[:clearable]
+            batch               = batch[:clearable]
             meta_result.overflow_l4_count  += len(overflow_from_batch)
             meta_result.overflow_user_ids.extend(m.id for m in overflow_from_batch)
             _logger.warning(
                 "SDE Meta-Pool session %d: supply shortage — "
-                "L1L2_available=%d  needed=%d  "
+                "lower_supply(L1+L2%s)=%d  needed=%d  "
                 "reducing batch from %d → %d  overflow=%d",
-                session_num, l1l2_count, min_needed,
+                session_num,
+                "+L3" if allow_l3_supply else "",
+                lower_supply_count, min_needed,
                 clearable + len(overflow_from_batch), clearable,
                 len(overflow_from_batch),
             )

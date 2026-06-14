@@ -21,6 +21,8 @@ from app.schemas.admin import (
     ThresholdResponse,
     UpdateReferralRewardRequest,
     ReferralRewardResponse,
+    UpdateDrawScheduleRequest,
+    DrawScheduleResponse,
 )
 from app.schemas.token import TokenResponse
 from app.services import tokens as svc_tokens
@@ -571,6 +573,95 @@ def update_referral_reward_setting(
     return ReferralRewardResponse(
         referral_reward_inr=new_val,
         message=status_note,
+    )
+
+
+# SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Draw Calendar settings — runtime-configurable draw timing.
+# GET reads current schedule; PUT requires admin password to change.
+
+@router.get("/admin/settings/draw-schedule", response_model=DrawScheduleResponse)
+def get_draw_schedule_setting(db: Session = Depends(get_db)):
+    """
+    Return the current draw schedule (day, UTC time, prep window).
+
+    Default: Sunday 13:30 UTC (7:00 PM IST), T-2H prep window.
+    Configurable via PUT /admin/settings/draw-schedule without a server restart.
+    The scheduler picks up new timing on the NEXT scheduled APScheduler fire.
+    """
+    from app.services.settings import get_draw_schedule
+    sched = get_draw_schedule(db)
+    return DrawScheduleResponse(
+        draw_hour_utc   = sched["draw_hour_utc"],
+        draw_minute_utc = sched["draw_minute_utc"],
+        draw_prep_hours = sched["draw_prep_hours"],
+        draw_time_ist   = sched["draw_time_ist"],
+        draw_day        = sched["draw_day"],
+        message         = (
+            f"Draw scheduled every {sched['draw_day']} at "
+            f"{sched['draw_hour_utc']:02d}:{sched['draw_minute_utc']:02d} UTC "
+            f"({sched['draw_time_ist']}). "
+            f"Preparation starts {sched['draw_prep_hours']}h before draw time."
+        ),
+    )
+
+
+@router.put("/admin/settings/draw-schedule", response_model=DrawScheduleResponse)
+def update_draw_schedule_setting(
+    body:           UpdateDrawScheduleRequest,
+    admin_username: str     = Depends(require_admin_jwt),
+    db:             Session = Depends(get_db),
+):
+    """
+    Update the weekly draw schedule.
+
+    Security gate: admin account password required.  Changes the UTC draw hour,
+    minute, and T-2H prep window.  The APScheduler jobs on Render pick up the
+    new values on the next fire — no redeploy needed.
+
+    Draw day is always Sunday.  To change the draw day, a code change is required.
+    """
+    from app.models.admin import Admin as AdminModel
+    from app.services.settings import set_draw_schedule
+    from app.services.auth import verify_password
+
+    admin: AdminModel | None = (
+        db.query(AdminModel).filter(AdminModel.username == admin_username).first()
+    )
+    if not admin:
+        raise HTTPException(status_code=401, detail="Admin account not found — re-authenticate.")
+
+    dummy  = "$2b$12$invalidhashplaceholderXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    stored = admin.hashed_password or dummy
+    if not verify_password(body.admin_password, stored):
+        raise HTTPException(
+            status_code=401,
+            detail="Admin password verification failed. Draw schedule was NOT changed.",
+        )
+
+    try:
+        sched = set_draw_schedule(
+            db,
+            draw_hour_utc   = body.draw_hour_utc,
+            draw_minute_utc = body.draw_minute_utc,
+            draw_prep_hours = body.draw_prep_hours,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return DrawScheduleResponse(
+        draw_hour_utc   = sched["draw_hour_utc"],
+        draw_minute_utc = sched["draw_minute_utc"],
+        draw_prep_hours = sched["draw_prep_hours"],
+        draw_time_ist   = sched["draw_time_ist"],
+        draw_day        = sched["draw_day"],
+        message         = (
+            f"Draw schedule updated: every {sched['draw_day']} at "
+            f"{sched['draw_hour_utc']:02d}:{sched['draw_minute_utc']:02d} UTC "
+            f"({sched['draw_time_ist']}). "
+            f"Prep window: {sched['draw_prep_hours']}h before draw. "
+            "Takes effect on the next APScheduler fire — no server restart needed."
+        ),
     )
 
 

@@ -276,3 +276,96 @@ def get_adaptive_threshold_info(db: Session, lpi: float | None = None) -> dict:
             f"Threshold unchanged at {base} (LPI={lpi:.1f}% — no pressure)."
         ),
     }
+
+
+# ── Draw Schedule Settings ────────────────────────────────────────────────────
+# SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Draw Calendar — runtime-configurable draw timing stored in system_settings.
+# Keys:
+#   draw_hour_utc   (Integer, default 13)  — UTC hour of Sunday draw (0–23)
+#   draw_minute_utc (Integer, default 30)  — UTC minute of Sunday draw (0–59)
+#   draw_prep_hours (Integer, default 2)   — hours before draw for T-2H prep (1–6)
+#
+# The scheduler reads DRAW_HOUR_UTC / DRAW_MINUTE_UTC env vars at process start.
+# These settings allow in-app adjustment without a Render env-var change + redeploy.
+# Scheduler picks up new values on next Sunday's job fire via get_draw_schedule().
+
+_KEY_DRAW_HOUR   = "draw_hour_utc"
+_KEY_DRAW_MINUTE = "draw_minute_utc"
+_KEY_DRAW_PREP   = "draw_prep_hours"
+
+_DRAW_DEFAULTS = {
+    _KEY_DRAW_HOUR:   13,   # 13:30 UTC = 7:00 PM IST
+    _KEY_DRAW_MINUTE: 30,
+    _KEY_DRAW_PREP:   2,    # T-2H preparation window
+}
+
+
+def _utc_to_ist_label(hour_utc: int, minute_utc: int) -> str:
+    """Convert UTC draw time to IST label string (IST = UTC+5:30)."""
+    total_min  = hour_utc * 60 + minute_utc + 330   # +5h30m
+    ist_hour   = (total_min // 60) % 24
+    ist_min    = total_min % 60
+    period     = "PM" if ist_hour >= 12 else "AM"
+    h12        = ist_hour % 12 or 12
+    return f"{h12}:{ist_min:02d} {period} IST (Sunday)"
+
+
+def get_draw_schedule(db: Session) -> dict:
+    """
+    Return the current draw schedule settings.
+
+    Reads from system_settings table; falls back to compiled-in defaults
+    (13:30 UTC = 7:00 PM IST, T-2H prep) when rows do not exist.
+    """
+    keys = [_KEY_DRAW_HOUR, _KEY_DRAW_MINUTE, _KEY_DRAW_PREP]
+    rows = {
+        r.key: r.value_int
+        for r in db.query(SystemSettings).filter(SystemSettings.key.in_(keys)).all()
+        if r.value_int is not None
+    }
+    hour   = rows.get(_KEY_DRAW_HOUR,   _DRAW_DEFAULTS[_KEY_DRAW_HOUR])
+    minute = rows.get(_KEY_DRAW_MINUTE, _DRAW_DEFAULTS[_KEY_DRAW_MINUTE])
+    prep   = rows.get(_KEY_DRAW_PREP,   _DRAW_DEFAULTS[_KEY_DRAW_PREP])
+    return {
+        "draw_hour_utc":   hour,
+        "draw_minute_utc": minute,
+        "draw_prep_hours": prep,
+        "draw_time_ist":   _utc_to_ist_label(hour, minute),
+        "draw_day":        "Sunday",
+    }
+
+
+def set_draw_schedule(
+    db:             Session,
+    draw_hour_utc:  int,
+    draw_minute_utc: int,
+    draw_prep_hours: int,
+) -> dict:
+    """
+    Persist new draw schedule settings.
+
+    Validates all three values and writes them atomically.
+    The scheduler picks up the new times on its next APScheduler cron fire.
+    """
+    if not (0 <= draw_hour_utc <= 23):
+        raise ValueError("draw_hour_utc must be 0–23.")
+    if not (0 <= draw_minute_utc <= 59):
+        raise ValueError("draw_minute_utc must be 0–59.")
+    if not (1 <= draw_prep_hours <= 6):
+        raise ValueError("draw_prep_hours must be 1–6.")
+
+    updates = {
+        _KEY_DRAW_HOUR:   draw_hour_utc,
+        _KEY_DRAW_MINUTE: draw_minute_utc,
+        _KEY_DRAW_PREP:   draw_prep_hours,
+    }
+    for key, val in updates.items():
+        row = db.query(SystemSettings).filter(SystemSettings.key == key).first()
+        if row:
+            row.value_int = val
+        else:
+            db.add(SystemSettings(key=key, value_int=val))
+
+    db.commit()
+    return get_draw_schedule(db)

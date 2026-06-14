@@ -1092,6 +1092,17 @@ def get_brain5_lpi(db: Session = Depends(get_db)):
         },
         "forward_signal_l3":  round(fwd, 2),
         "elevated_risk":      elev,
+        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # CASCADE_RISK for live CommandCenter forecast widget.
+        # l3_count / MAX(l1+l2, 1): >1.0 = Forming, >2.0 = Extreme.
+        # allow_l3_supply mirrors the live SDE decision so the widget shows
+        # whether L3 is currently eligible as lower-tier supply.
+        "cascade_risk":    round(dist.l3 / max(dist.l1 + dist.l2, 1), 3),
+        "l3_count":        dist.l3,
+        "l1l2_count":      dist.l1 + dist.l2,
+        "allow_l3_supply": (
+            (dist.l3 / max(dist.l1 + dist.l2, 1)) > 1.0 or lpi > 50.0
+        ),
     }
 
 

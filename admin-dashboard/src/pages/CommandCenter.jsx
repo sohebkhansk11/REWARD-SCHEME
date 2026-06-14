@@ -148,6 +148,88 @@ function LpiThermometer({ lpi = 0 }) {
   )
 }
 
+// SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// MODULE 1-A² — Cascade Risk Forecast Panel
+// L3→L4 pressure indicator: cascade_risk = L3 / MAX(L1+L2, 1)
+// Thresholds: ≤1.0 Normal, >1.0 Forming (L3 eligible supply), >2.0 Extreme (forced supply)
+// Weeks-to-Extreme forecast: assumes net accumulation rate = (L3 - L1+L2) per week
+function CascadeRiskPanel({ cascadeRisk = 0, l3Count = 0, l1l2Count = 0, allowL3Supply = false }) {
+  const tier   = cascadeRisk > 2.0 ? 'EXTREME' : cascadeRisk > 1.0 ? 'FORMING' : 'NORMAL'
+  const color  = cascadeRisk > 2.0 ? '#ef4444' : cascadeRisk > 1.0 ? '#f59e0b' : '#10b981'
+  const bgCls  = cascadeRisk > 2.0
+    ? 'bg-red-950/40 border-red-800/40'
+    : cascadeRisk > 1.0
+      ? 'bg-amber-950/40 border-amber-800/40'
+      : 'bg-emerald-950/30 border-emerald-800/30'
+
+  // Weeks until cascade_risk hits Extreme (2.0): gap = 2×L1+L2 - L3 (if positive, still growing)
+  // Rate = net L3 accumulation per week (L3 - L1+L2); if ≤0 risk is falling, show '—'
+  const netRate     = l3Count - l1l2Count
+  const gapToExt    = 2 * l1l2Count - l3Count   // positive = room before Extreme
+  const weeksToExt  = cascadeRisk >= 2.0
+    ? 0
+    : (cascadeRisk > 1.0 && netRate > 0)
+      ? Math.ceil(gapToExt / netRate)
+      : null
+
+  const barPct = Math.min(100, (cascadeRisk / 3) * 100)
+
+  return (
+    <div className={`rounded-xl border p-3 mt-3 ${bgCls}`}>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-[10px] font-bold uppercase tracking-widest" style={{ color }}>
+          Cascade — {tier}
+        </span>
+        {allowL3Supply && (
+          <span className="text-[9px] font-bold text-amber-400 bg-amber-900/40 border border-amber-700/40 rounded-full px-2 py-0.5 animate-pulse">
+            L3 SUPPLY ON
+          </span>
+        )}
+      </div>
+
+      <div className="flex items-end gap-3">
+        <div>
+          <p className="text-2xl font-black tabular-nums leading-none" style={{ color }}>
+            {cascadeRisk.toFixed(3)}
+          </p>
+          <p className="text-[9px] text-slate-500 mt-0.5">L3 ÷ max(L1+L2,1)</p>
+        </div>
+        <div className="text-right flex-1">
+          <p className="text-[11px] text-slate-300">
+            L3: <span className="font-bold text-amber-400">{l3Count}</span>
+            {'  '}L1+L2: <span className="font-bold text-slate-200">{l1l2Count}</span>
+          </p>
+          {weeksToExt === 0 && (
+            <p className="text-[10px] text-red-400 font-bold mt-0.5 animate-pulse">EXTREME NOW</p>
+          )}
+          {weeksToExt !== null && weeksToExt > 0 && (
+            <p className="text-[10px] text-slate-400 mt-0.5">
+              Extreme in <span className="font-bold text-red-400">~{weeksToExt}w</span>
+            </p>
+          )}
+          {weeksToExt === null && cascadeRisk <= 1.0 && (
+            <p className="text-[10px] text-emerald-500 mt-0.5">Supply healthy</p>
+          )}
+          {weeksToExt === null && cascadeRisk > 1.0 && (
+            <p className="text-[10px] text-emerald-500 mt-0.5">Risk stabilising</p>
+          )}
+        </div>
+      </div>
+
+      {/* Risk progress bar: 0 → 3.0 scale */}
+      <div className="mt-2 h-1.5 rounded-full bg-slate-800 overflow-hidden">
+        <div
+          className="h-full rounded-full transition-all duration-700"
+          style={{ width: `${barPct}%`, background: color }}
+        />
+      </div>
+      <div className="flex justify-between text-[9px] text-slate-600 mt-0.5 select-none">
+        <span>0</span><span>1.0 Forming</span><span>2.0 Extreme</span><span>3.0+</span>
+      </div>
+    </div>
+  )
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MODULE 1-B — Velocity vs Burn Rate "Breathing Chart"
 // ─────────────────────────────────────────────────────────────────────────────
@@ -691,15 +773,27 @@ export default function CommandCenter() {
       {/* ══ MODULE 1: TELEMETRY HUD ══════════════════════════════════════════ */}
       <motion.div {..._fadeUp} className="grid grid-cols-12 gap-5">
 
-        {/* LPI Thermometer — tall left column */}
+        {/* LPI Thermometer + Cascade Risk Forecast — tall left column */}
         <div className="col-span-2">
           <DarkCard title="LPI" icon={Activity} iconColor="text-violet-400"
             badge={{ label: 'LIVE', cls: 'bg-emerald-900/60 text-emerald-400 border border-emerald-700/50' }}>
-            <div className="p-4 flex flex-col items-center justify-center">
+            <div className="p-4 flex flex-col items-center">
               {loading ? (
                 <DarkSkeleton className="h-56 w-12"/>
               ) : (
                 <LpiThermometer lpi={lpi}/>
+              )}
+              {/* SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                  Cascade Risk Forecast widget — L3→L4 pressure indicator */}
+              {!loading && lpiData && (
+                <div className="w-full mt-2">
+                  <CascadeRiskPanel
+                    cascadeRisk  = {fP(lpiData.cascade_risk)}
+                    l3Count      = {fI(lpiData.l3_count)}
+                    l1l2Count    = {fI(lpiData.l1l2_count)}
+                    allowL3Supply= {lpiData.allow_l3_supply ?? false}
+                  />
+                </div>
               )}
             </div>
           </DarkCard>
@@ -833,14 +927,22 @@ export default function CommandCenter() {
       </motion.div>
 
       {/* ── AI Brain Status Footer ────────────────────────────────────────── */}
+      {/* SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+          AI Brain Status Footer — extended from 5→6 cols with Cascade Risk */}
       {!loading && lpiData && (
-        <motion.div {..._fadeUp} className="grid grid-cols-5 gap-3">
+        <motion.div {..._fadeUp} className="grid grid-cols-6 gap-3">
           {[
-            { l: 'LPI', v: `${lpi.toFixed(1)}%`, sub: 'Pressure Index',      c: lpi > 50 ? 'text-red-400' : lpi > 25 ? 'text-orange-400' : 'text-emerald-400' },
+            { l: 'LPI', v: `${lpi.toFixed(1)}%`, sub: 'Pressure Index', c: lpi > 50 ? 'text-red-400' : lpi > 25 ? 'text-orange-400' : 'text-emerald-400' },
             { l: 'L4 Targets', v: fI(lpiData.l4_flagged_count), sub: 'Queued for SDE', c: fI(lpiData.l4_flagged_count) > 0 ? 'text-rose-400' : 'text-slate-500' },
             { l: 'L3 Candidates', v: fI(lpiData.l3_count ?? l3l4Users.filter(u=>u.current_level===3).length), sub: 'Next pipeline', c: 'text-amber-400' },
             { l: 'SDE Demand', v: `${fP(lpiData.sde_demand_pct).toFixed(1)}%`, sub: 'Clearance Demand', c: fP(lpiData.sde_demand_pct) > 50 ? 'text-red-400' : 'text-slate-400' },
             { l: 'Active Pools', v: fI(poolData?.active_pools_count), sub: 'Execution Engines', c: 'text-blue-400' },
+            {
+              l: 'Cascade Risk',
+              v: fP(lpiData.cascade_risk).toFixed(3),
+              sub: fP(lpiData.cascade_risk) > 2.0 ? 'EXTREME' : fP(lpiData.cascade_risk) > 1.0 ? 'Forming' : 'Normal',
+              c: fP(lpiData.cascade_risk) > 2.0 ? 'text-red-400 animate-pulse' : fP(lpiData.cascade_risk) > 1.0 ? 'text-amber-400' : 'text-emerald-400',
+            },
           ].map(({ l, v, sub, c }) => (
             <div key={l} className="bg-slate-900 border border-slate-700/50 rounded-xl p-3 text-center">
               <p className="text-[9px] text-slate-500 uppercase tracking-widest mb-1">{l}</p>

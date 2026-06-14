@@ -870,6 +870,13 @@ def _snapshot(
         "burn_rate":          burn,
         "rdr_pct":            round(rdr, 1),
         "multiplier":         mul,
+        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # CASCADE_RISK metric — L3 / MAX(L1+L2, 1).
+        # Thresholds: >1.0 = Forming (L3 eligible as supply), >2.0 = Extreme (forced L3 supply).
+        # dist is already loaded above — zero extra DB queries.
+        "cascade_risk":  round(dist.l3 / max(dist.l1 + dist.l2, 1), 3),
+        "l3_count":      dist.l3,
+        "l1l2_count":    dist.l1 + dist.l2,
     }
 
 

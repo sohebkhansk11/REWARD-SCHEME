@@ -477,6 +477,21 @@ export const getThreshold = () =>
 export const updateThreshold = (newThreshold, adminPassword) =>
   api.put('/admin/settings/threshold', { new_threshold: newThreshold, admin_password: adminPassword })
 
+// SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// Draw Calendar settings — runtime-configurable draw timing.
+/** GET  /admin/settings/draw-schedule — current draw day/time/prep window */
+export const getDrawSchedule    = () =>
+  api.get('/admin/settings/draw-schedule')
+
+/** PUT  /admin/settings/draw-schedule — update draw timing (admin password required) */
+export const updateDrawSchedule = (drawHourUtc, drawMinuteUtc, drawPrepHours, adminPassword) =>
+  api.put('/admin/settings/draw-schedule', {
+    draw_hour_utc:   drawHourUtc,
+    draw_minute_utc: drawMinuteUtc,
+    draw_prep_hours: drawPrepHours,
+    admin_password:  adminPassword,
+  })
+
 // ── Auth (no JWT needed for these calls) ──────────────────────────────────────
 export const adminLogin     = (username, password) =>
   api.post('/admin/auth/login',      { username, password })

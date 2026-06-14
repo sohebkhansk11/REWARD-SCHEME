@@ -879,6 +879,56 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
     ) or 0
     cascade_risk    = _l3_sys / max(_l1l2_sys, 1)
     allow_l3_supply = cascade_risk > 1.0 or lpi > LPI_L3_WIN_EXCEPTION
+
+    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Auto Priority-L3 mode: if cascade_risk > 1.5 for 3+ consecutive weeks,
+    # force allow_l3_supply=True regardless of current week's cascade_risk or LPI.
+    # Streak and priority-active flag are persisted in system_settings so the
+    # 3-week memory survives server restarts.  Non-fatal — streak failure is logged
+    # and normal cascade_risk/lpi logic still runs.
+    _CASCADE_STREAK_KEY   = "cascade_risk_streak"
+    _CASCADE_PRIORITY_KEY = "cascade_risk_priority_l3"
+    _CASCADE_HIGH_THRESH  = 1.5    # trigger threshold for streak counting
+    _CASCADE_WEEKS_NEEDED = 3      # consecutive weeks above threshold to activate
+    try:
+        from app.models.system_settings import SystemSettings as _SS
+        streak_row  = db.query(_SS).filter(_SS.key == _CASCADE_STREAK_KEY).first()
+        cur_streak  = (streak_row.value_int or 0) if streak_row else 0
+        new_streak  = (cur_streak + 1) if cascade_risk > _CASCADE_HIGH_THRESH else 0
+
+        if streak_row:
+            streak_row.value_int = new_streak
+        else:
+            db.add(_SS(key=_CASCADE_STREAK_KEY, value_int=new_streak))
+
+        priority_active = new_streak >= _CASCADE_WEEKS_NEEDED
+        prio_val        = "1" if priority_active else "0"
+        prio_row        = db.query(_SS).filter(_SS.key == _CASCADE_PRIORITY_KEY).first()
+        if prio_row:
+            prio_row.value_str = prio_val
+        else:
+            db.add(_SS(key=_CASCADE_PRIORITY_KEY, value_str=prio_val))
+
+        db.flush()
+
+        if priority_active:
+            allow_l3_supply = True
+            _logger.warning(
+                "SDE Meta-Pool: AUTO PRIORITY-L3 ACTIVE — cascade_risk=%.3f > %.1f "
+                "for %d consecutive week(s) (threshold=%d weeks). "
+                "allow_l3_supply FORCED True — L3 members eligible as lower-tier supply.",
+                cascade_risk, _CASCADE_HIGH_THRESH, new_streak, _CASCADE_WEEKS_NEEDED,
+            )
+
+        _logger.info(
+            "SDE Meta-Pool: cascade_streak=%d/%d  priority_l3=%s",
+            new_streak, _CASCADE_WEEKS_NEEDED, priority_active,
+        )
+    except Exception as _streak_exc:
+        _logger.warning(
+            "SDE Meta-Pool: cascade streak update failed (non-fatal): %s", _streak_exc,
+        )
+
     _logger.info(
         "SDE Meta-Pool: cascade_risk=%.3f  L3=%d  L1+L2=%d  "
         "allow_l3_supply=%s  lpi=%.1f%%",

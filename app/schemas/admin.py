@@ -206,6 +206,27 @@ class ReferralRewardResponse(BaseModel):
     message:             str
 
 
+# SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Draw Calendar settings schemas — runtime-configurable draw timing.
+
+class UpdateDrawScheduleRequest(BaseModel):
+    """PUT /admin/settings/draw-schedule — change draw timing (admin password required)."""
+    draw_hour_utc:   int = Field(..., ge=0,  le=23, description="UTC hour of Sunday draw (0–23). Default: 13 (7 PM IST).")
+    draw_minute_utc: int = Field(..., ge=0,  le=59, description="UTC minute of Sunday draw (0–59). Default: 30.")
+    draw_prep_hours: int = Field(..., ge=1,  le=6,  description="Hours before draw for T-2H preparation window (1–6). Default: 2.")
+    admin_password:  str = Field(..., description="Admin account password — required to authorise timing changes.")
+
+
+class DrawScheduleResponse(BaseModel):
+    """Response body for GET / PUT /admin/settings/draw-schedule."""
+    draw_hour_utc:   int
+    draw_minute_utc: int
+    draw_prep_hours: int
+    draw_time_ist:   str   # human-readable IST label e.g. "7:30 PM IST (Sunday)"
+    draw_day:        str   # always "Sunday"
+    message:         str
+
+
 class DeleteUserResponse(BaseModel):
     deleted_user_id:        int
     deleted_username:       str

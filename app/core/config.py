@@ -60,6 +60,14 @@ POOL_DRAW_SDE_EXT3 = "sde_ext3"
 #   Both Winner 1 and Winner 2 drawn from L4/L5/L6.
 #   Created simultaneously with a new relief pool from waitlist.
 POOL_DRAW_ACCELERATED = "accelerated_dissolution"
+# SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Case C — Meta Pool cross-pool supply transfer
+# POOL_DRAW_SDE_CASE_C: draw_type written to DrawHistory when the lower winner
+#   was permanently transferred from a donor pool (edge_case_triggered=True).
+# SDE_CASE_C_MIN_DONOR_L1L2: minimum L1/L2 a donor pool must have BEFORE donating
+#   (3 = retains 2 after donating 1 — enough for future SDE lower tier if needed).
+POOL_DRAW_SDE_CASE_C:     str = "sde_case_c"
+SDE_CASE_C_MIN_DONOR_L1L2: int = 3
 
 # ── LPI (Level Pressure Index) thresholds ────────────────────────────────────
 # LPI = (L3 + L4 + L5 + L6) ÷ Total Active Members × 100

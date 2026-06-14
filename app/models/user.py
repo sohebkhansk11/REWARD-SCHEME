@@ -68,6 +68,13 @@ class User(Base):
     #   the flag was raised.  Prevents cross-week SDE contamination.
     sde_required     = Column(Boolean, default=False, server_default="false", nullable=False)
     sde_flagged_week = Column(String(10), nullable=True)   # e.g. "2026-W24"
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Case E True Defer — set to ISO week string when ALL supply routes are exhausted
+    # (Cases A→B→C→D all fail) and this L4 member cannot be cleared this week.
+    # Triggers CASE E ALERT panel in Admin CommandCenter for urgent manual action.
+    # Cleared automatically when the member is successfully cleared in a future week.
+    # Production migration: ALTER TABLE users ADD COLUMN IF NOT EXISTS case_e_deferred_week VARCHAR(10);
+    case_e_deferred_week = Column(String(10), nullable=True)   # e.g. "2026-W24"
 
     # ── Payment Compliance / Elimination Engine ───────────────────────────────
     # Elimination flow:

@@ -50,6 +50,7 @@ from app.core.config import (
     SDE_MAX_POOLS_PER_SESSION,
     SDE_L1L2_THRESHOLD_PER_L4,
     SDE_WL_EMERGENCY_PROMOTE,
+    SDE_CASE_C_MIN_DONOR_L1L2,
     SDE_LEVEL_LOWER_NORMAL, SDE_LEVEL_LOWER_EXCEPTION, SDE_LEVEL_UPPER,
     SDE_EXT2_LEVEL_UPPER, SDE_EXT2_LEVEL_LOWER,
     SDE_EXT3_LEVEL_UPPER, SDE_EXT3_LEVEL_LOWER,
@@ -57,7 +58,7 @@ from app.core.config import (
     LPI_L3_WIN_EXCEPTION,
     SDE_WEIGHT_TIME, SDE_WEIGHT_DEPOSIT, SDE_WEIGHT_PAUSE,
     SDE_WEIGHT_ORGANIC, SDE_WEIGHT_NOISE, SDE_WEIGHT_MIN_FLOOR,
-    POOL_DRAW_SDE, POOL_DRAW_SDE_EXT2, POOL_DRAW_SDE_EXT3,
+    POOL_DRAW_SDE, POOL_DRAW_SDE_CASE_C, POOL_DRAW_SDE_EXT2, POOL_DRAW_SDE_EXT3,
 )
 from app.crud import token as crud_token, user as crud_user
 from app.models.draw_history import DrawHistory
@@ -242,6 +243,106 @@ def _get_unique_token_code(db: Session, prefix: str) -> str:
             return code
 
 
+# ── Case C — Meta Pool cross-pool supply transfer ─────────────────────────────
+# SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Case C fills the supply gap between WL emergency promotion (already in
+# execute_sde_sub_draw) and Case D / Case E (in run_sde_meta_pool).
+#
+# Trigger: pool A has an L4 member (upper winner), but ZERO eligible L1/L2 members
+#   locally AND the Waitlist is also empty (WL emergency promotion yielded nothing).
+# Action: find any OTHER Active pool with surplus L1/L2 (≥ SDE_CASE_C_MIN_DONOR_L1L2)
+#   that has NOT drawn yet this week AND has NO flagged L4 of its own.
+#   Permanently transfer one L1 (or L2 if no L1 exists) to pool A.
+# Result: pool A runs its SDE sub-draw normally.  Donor pool drops to 11 members
+#   and will receive a Waitlist replacement during Phase-1 of the next draw cycle.
+# Audit: SDECheckpoint.case_c_transfer=True + .case_c_donor_pool_id recorded.
+#   DrawHistory.draw_type = POOL_DRAW_SDE_CASE_C, edge_case_triggered=True.
+
+def _find_case_c_donor(
+    db: Session,
+    needy_pool_id: int,
+    allow_l3: bool,
+) -> tuple[User, int] | None:
+    """
+    Find one L1/L2 member from a surplus donor pool to transfer to the needy pool.
+
+    Donor pool eligibility:
+      - PoolStatus.Active, draw_completed_this_week=False
+      - contains_flagged_l4=False (don't cannibalize a pool that also needs SDE supply)
+      - Not the needy pool itself
+      - Has ≥ SDE_CASE_C_MIN_DONOR_L1L2 L1/L2 members (retains ≥2 after donating 1)
+
+    Donor member selection (minimum financial disruption):
+      - Lowest level first: L1 before L2 (lower payout obligation)
+      - Among same level: newest join_date (shortest tenure = least embedded in pool)
+
+    Returns (donor_user, original_pool_id) or None if no eligible donor exists.
+    """
+    _lower_max: int = 3 if allow_l3 else 2
+
+    candidate_pools: list[Pool] = (
+        db.query(Pool)
+        .filter(
+            Pool.status                   == PoolStatus.Active,
+            Pool.draw_completed_this_week == False,   # noqa: E712
+            Pool.contains_flagged_l4      == False,   # noqa: E712
+            Pool.id                       != needy_pool_id,
+        )
+        .order_by(Pool.id.asc())   # deterministic — oldest pool first
+        .all()
+    )
+
+    for dpool in candidate_pools:
+        supply_count: int = (
+            db.query(func.count(User.id))
+            .filter(
+                User.current_pool_id == dpool.id,
+                User.status          == UserStatus.Active,
+                User.current_level   <= _lower_max,
+            )
+            .scalar()
+        ) or 0
+
+        if supply_count < SDE_CASE_C_MIN_DONOR_L1L2:
+            continue   # pool cannot donate without dropping below minimum
+
+        candidate: User | None = (
+            db.query(User)
+            .filter(
+                User.current_pool_id == dpool.id,
+                User.status          == UserStatus.Active,
+                User.current_level   <= _lower_max,
+            )
+            .order_by(User.current_level.asc(), User.join_date.desc())
+            .first()
+        )
+        if candidate is not None:
+            return (candidate, dpool.id)
+
+    return None   # no eligible donor pool → caller proceeds to Case D / Case E
+
+
+def _execute_case_c_transfer(
+    db: Session,
+    donor_user: User,
+    recipient_pool_id: int,
+) -> None:
+    """
+    Permanently transfer donor_user from their current pool to recipient_pool_id.
+
+    crud_user.update_user() commits internally — the transfer is persisted
+    immediately so the subsequent re-query of lower_candidates in the caller
+    sees the donor as an Active member of the needy pool.
+
+    The donor pool will have one fewer member after this call and will receive
+    a Waitlist replacement during Phase-1 of the next regular draw cycle.
+    """
+    crud_user.update_user(
+        db, donor_user.id,
+        UserUpdate(current_pool_id=recipient_pool_id),
+    )
+
+
 # ── Core sub-draw execution ───────────────────────────────────────────────────
 
 def execute_sde_sub_draw(
@@ -301,6 +402,9 @@ def execute_sde_sub_draw(
             f"SDE sub-draw: L4 member {l4_member_id} is not in pool {pool_id} "
             f"(currently in pool {l4_member.current_pool_id})."
         )
+
+    # ── Case C donor tracking — initialised here; set if cross-pool transfer fires ──
+    _case_c_donor_pool_id: int | None = None
 
     # ── Build lower tier candidate pool ───────────────────────────────────────
     lower_bounds = SDE_LEVEL_LOWER_EXCEPTION if allow_l3_lower else SDE_LEVEL_LOWER_NORMAL
@@ -380,6 +484,43 @@ def execute_sde_sub_draw(
                 ).count(),
             )
 
+        # ── Case C: Cross-pool supply transfer ────────────────────────────────
+        # Local supply = 0 AND WL is empty (or WL promotion still insufficient).
+        # Check if any Active pool has surplus L1/L2 that can be permanently
+        # transferred here to serve as the lower-tier candidate.
+        # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Case C — Meta Pool cross-pool supply transfer.
+        if not lower_candidates:
+            _case_c_result = _find_case_c_donor(db, pool_id, allow_l3_lower)
+            if _case_c_result is not None:
+                _donor_member, _case_c_donor_pool_id = _case_c_result
+                # Capture log values before transfer (object may be refreshed after commit)
+                _donor_username = _donor_member.username
+                _donor_level    = _donor_member.current_level
+                _execute_case_c_transfer(db, _donor_member, pool_id)
+                # Re-query lower candidates — donor is now Active in this pool
+                lower_candidates = (
+                    db.query(User)
+                    .filter(
+                        User.current_pool_id == pool_id,
+                        User.status          == UserStatus.Active,
+                        User.current_level   >= lower_bounds[0],
+                        User.current_level   <= lower_bounds[1],
+                        User.id              != l4_member_id,
+                    )
+                    .all()
+                )
+                _logger.warning(
+                    "SDE sub-draw %d.%d: CASE C — @%s(L%d) permanently transferred "
+                    "from pool_id=%d → pool '%s' "
+                    "(local L1/L2=0, WL=0; cross-pool donor found). "
+                    "lower_candidates_after=%d",
+                    session_id, sub_draw_number,
+                    _donor_username, _donor_level,
+                    _case_c_donor_pool_id, pool.name,
+                    len(lower_candidates),
+                )
+
         if not lower_candidates:
             raise ValueError(
                 f"SDE sub-draw: pool '{pool.name}' has no eligible {tier_desc} members "
@@ -438,6 +579,10 @@ def execute_sde_sub_draw(
         lower_winner_tier_override = lower_tier_override,
         rng_seed_hash              = rng_hash,
         executed                   = False,
+        # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Case C audit — records that lower winner came from a different pool.
+        case_c_transfer      = (_case_c_donor_pool_id is not None),
+        case_c_donor_pool_id = _case_c_donor_pool_id,
     ))
 
     # (g) Draw-lock — prevents execute_weekly_draw() from re-drawing at T-0H.
@@ -1010,16 +1155,44 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
                         len(paired_ids) // 2, len(paired_ids),
                     )
 
-            # Any L4 members not paired → true overflow
+            # Any L4 members not paired → CASE E True Defer
             unpaired = [m for m in all_uncleared if m.id not in paired_ids]
             if unpaired:
                 meta_result.overflow_l4_count += len(unpaired)
                 meta_result.overflow_user_ids.extend(m.id for m in unpaired)
                 _logger.warning(
-                    "SDE Meta-Pool: %d L4 member(s) → overflow "
-                    "(CASE D cleared %d, wl=%d, true_supply=0).",
+                    "SDE Meta-Pool: %d L4 member(s) → CASE E TRUE DEFER "
+                    "(CASE D cleared %d, wl=%d, all supply routes A→B→C→D exhausted).",
                     len(unpaired), len(paired_ids) // 2, wl_count,
                 )
+                # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Case E — mark each truly uncleared L4 with case_e_deferred_week.
+                # Persists across restarts; triggers CASE E ALERT in Admin CommandCenter
+                # so the admin knows manual supply injection is required.
+                # Cleared automatically when the member is cleared in a future draw.
+                _ce_now  = datetime.now(timezone.utc)
+                _ce_iso  = _ce_now.isocalendar()
+                _ce_week = f"{_ce_iso.year}-W{_ce_iso.week:02d}"
+                _ce_any  = False
+                for _ce_m in unpaired:
+                    try:
+                        crud_user.update_user(
+                            db, _ce_m.id,
+                            UserUpdate(case_e_deferred_week=_ce_week),
+                        )
+                        _ce_any = True
+                        _logger.warning(
+                            "SDE CASE E — TRUE DEFER: @%s(L%d pool=%d) "
+                            "case_e_deferred_week=%s  "
+                            "Manual supply injection required before this member can be cleared.",
+                            _ce_m.username, _ce_m.current_level,
+                            _ce_m.current_pool_id or 0, _ce_week,
+                        )
+                    except Exception as _ce_exc:
+                        _logger.error(
+                            "SDE Case E: failed to flag user %d (%s): %s",
+                            _ce_m.id, _ce_m.username, _ce_exc,
+                        )
             break
 
         session_result = run_sde_session(db, week_id, session_num, batch, lpi)
@@ -1175,10 +1348,14 @@ def execute_staged_sde_draws(db: Session) -> int:
             crud_user.update_user(
                 db, upper.id,
                 UserUpdate(
-                    status           = UserStatus.Eliminated_Won,
-                    current_pool_id  = None,
-                    sde_required     = False,
-                    sde_flagged_week = None,
+                    status               = UserStatus.Eliminated_Won,
+                    current_pool_id      = None,
+                    sde_required         = False,
+                    sde_flagged_week     = None,
+                    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # Clear Case E flag on successful exit — member was finally cleared
+                    # this week even if they were deferred in a prior week.
+                    case_e_deferred_week = None,
                 ),
             )
             crud_user.update_user(
@@ -1187,11 +1364,15 @@ def execute_staged_sde_draws(db: Session) -> int:
             )
 
             # (d) DrawHistory row — simultaneous reveal with all T-0H regular draws
+            # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Case C draws use POOL_DRAW_SDE_CASE_C draw type + edge_case_triggered=True
+            # so the cross-pool supply transfer is fully captured in the financial audit trail.
+            _is_case_c = getattr(cp, "case_c_transfer", False)
             db.add(DrawHistory(
                 pool_id             = pool.id,
-                draw_type           = POOL_DRAW_SDE,
+                draw_type           = POOL_DRAW_SDE_CASE_C if _is_case_c else POOL_DRAW_SDE,
                 targeted_early_exit = True,
-                edge_case_triggered = False,
+                edge_case_triggered = _is_case_c,
                 sde_session_id      = cp.session_id,
                 winner_1_user_id            = upper.id,
                 winner_1_level              = cp.upper_winner_level,

@@ -121,3 +121,14 @@ class SDECheckpoint(Base):
     # Production migration: ALTER TABLE sde_checkpoints
     #   ADD COLUMN IF NOT EXISTS executed BOOLEAN NOT NULL DEFAULT FALSE;
     executed = Column(Boolean, nullable=False, server_default="false", default=False)
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Case C — Meta Pool cross-pool supply transfer audit trail.
+    # case_c_transfer=True  → lower winner was transferred from a donor pool.
+    # case_c_donor_pool_id  → source pool the lower winner came FROM (soft FK → pools.id).
+    # Execute_staged_sde_draws() uses case_c_transfer to set draw_type=POOL_DRAW_SDE_CASE_C
+    # and edge_case_triggered=True in the DrawHistory row for full financial audit trail.
+    # Production migration:
+    #   ALTER TABLE sde_checkpoints ADD COLUMN IF NOT EXISTS case_c_transfer BOOLEAN NOT NULL DEFAULT FALSE;
+    #   ALTER TABLE sde_checkpoints ADD COLUMN IF NOT EXISTS case_c_donor_pool_id INTEGER;
+    case_c_transfer      = Column(Boolean, nullable=False, server_default="false", default=False)
+    case_c_donor_pool_id = Column(Integer, nullable=True)

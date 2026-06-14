@@ -923,6 +923,47 @@ export default function CommandCenter() {
               </div>
             ) : <AntiMaturityGrid users={l3l4Users}/>}
           </div>
+
+          {/* SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+              Case E True Defer Alert — triggered when all supply routes A→B→C→D are
+              exhausted for one or more L4 members.  Requires manual admin intervention
+              (supply injection or waitlist emergency promotion). */}
+          {!loading && lpiData && fI(lpiData.case_e_deferred_count) > 0 && (
+            <motion.div
+              {..._fadeUp}
+              className="mx-3 mb-3 rounded-xl bg-red-950/50 border border-red-700/60 p-3"
+            >
+              <div className="flex items-center gap-2 mb-2">
+                <AlertTriangle className="w-4 h-4 text-red-400 animate-pulse flex-shrink-0"/>
+                <span className="text-[11px] font-black text-red-300 uppercase tracking-widest">
+                  CASE E — TRUE DEFER ACTIVE
+                </span>
+                <span className="ml-auto text-[9px] font-black text-red-300 bg-red-900/50 border border-red-700/50 px-2 py-0.5 rounded-full animate-pulse">
+                  {fI(lpiData.case_e_deferred_count)} MEMBER{fI(lpiData.case_e_deferred_count) !== 1 ? 'S' : ''}
+                </span>
+              </div>
+              <p className="text-[9px] text-red-400/80 mb-2 leading-relaxed">
+                All supply routes exhausted (A→B→C→D). Manual supply injection required — these L4 members cannot be cleared until new L1/L2 members are available.
+              </p>
+              <div className="space-y-1">
+                {(lpiData.case_e_deferred_members ?? []).map(m => (
+                  <div key={m.user_id} className="flex items-center gap-2 py-1 border-t border-red-800/30">
+                    <span className="text-[9px] font-mono text-red-300">@{m.username}</span>
+                    <span className="text-[8px] text-slate-500 font-mono">L{m.level}</span>
+                    <span className="text-[8px] text-slate-600">Pool #{m.pool_id}</span>
+                    <span className="ml-auto text-[8px] text-red-500 font-mono">{m.deferred_week}</span>
+                  </div>
+                ))}
+              </div>
+            </motion.div>
+          )}
+
+          {!loading && lpiData && fI(lpiData.case_e_deferred_count) === 0 && (
+            <div className="mx-3 mb-3 flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-950/30 border border-emerald-800/30">
+              <span className="text-[10px] text-emerald-400">✓</span>
+              <span className="text-[9px] text-emerald-400/80 font-medium">All L4s clearable — no Case E deferrals this week</span>
+            </div>
+          )}
         </DarkCard>
       </motion.div>
 

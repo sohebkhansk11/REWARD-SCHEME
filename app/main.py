@@ -60,7 +60,22 @@ try:
             "UPDATE sde_checkpoints SET executed = TRUE "
             "WHERE executed = FALSE AND completed_at < NOW() - INTERVAL '1 hour'"
         ))
-    _logger.info("main: sde_checkpoints.executed column migration OK.")
+        # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Case C audit columns on sde_checkpoints + Case E True Defer column on users.
+        # All IF NOT EXISTS — safe to re-run on restarts; idempotent.
+        _mig_conn.execute(_sa_text(
+            "ALTER TABLE sde_checkpoints "
+            "ADD COLUMN IF NOT EXISTS case_c_transfer BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        _mig_conn.execute(_sa_text(
+            "ALTER TABLE sde_checkpoints "
+            "ADD COLUMN IF NOT EXISTS case_c_donor_pool_id INTEGER"
+        ))
+        _mig_conn.execute(_sa_text(
+            "ALTER TABLE users "
+            "ADD COLUMN IF NOT EXISTS case_e_deferred_week VARCHAR(10)"
+        ))
+    _logger.info("main: sde_checkpoints.executed + Case C audit + Case E defer column migrations OK.")
 except Exception as _mig_exc:
     _logger.warning(
         "main: sde_checkpoints.executed migration skipped (may already exist or "

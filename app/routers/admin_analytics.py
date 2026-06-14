@@ -1103,7 +1103,40 @@ def get_brain5_lpi(db: Session = Depends(get_db)):
         "allow_l3_supply": (
             (dist.l3 / max(dist.l1 + dist.l2, 1)) > 1.0 or lpi > 50.0
         ),
+        # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Case E True Defer — L4 members where all supply routes are exhausted.
+        # Triggers CASE E ALERT panel in Admin CommandCenter for urgent action.
+        # Wrapped in try/except: column may not exist on first startup before migration.
+        **_get_case_e_data(db),
     }
+
+
+def _get_case_e_data(db: Session) -> dict:
+    """Return Case E deferred member data for the brain5-lpi endpoint."""
+    try:
+        case_e_members = (
+            db.query(User)
+            .filter(
+                User.case_e_deferred_week.isnot(None),
+                User.status == UserStatus.Active,
+            )
+            .all()
+        )
+        return {
+            "case_e_deferred_count": len(case_e_members),
+            "case_e_deferred_members": [
+                {
+                    "user_id":       u.id,
+                    "username":      u.username,
+                    "level":         u.current_level,
+                    "pool_id":       u.current_pool_id,
+                    "deferred_week": u.case_e_deferred_week,
+                }
+                for u in case_e_members
+            ],
+        }
+    except Exception:
+        return {"case_e_deferred_count": 0, "case_e_deferred_members": []}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

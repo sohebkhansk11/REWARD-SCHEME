@@ -44,6 +44,10 @@ class UserUpdate(BaseModel):
     # Never exposed via user-facing API endpoints — internal use only.
     sde_required:     Optional[bool] = None
     sde_flagged_week: Optional[str]  = None
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Case E True Defer flag — set by run_sde_meta_pool() when all supply routes
+    # are exhausted.  Cleared when member is successfully cleared via SDE sub-draw.
+    case_e_deferred_week: Optional[str] = None
 
     @field_validator("current_level")
     @classmethod

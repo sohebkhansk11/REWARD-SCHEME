@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import (
     LEVEL_PAYOUTS, PAYOUT_FEE_INR,
+    POOL_CAPACITY,
     SDE_MAX_POOLS_PER_SESSION,
     SDE_L1L2_THRESHOLD_PER_L4,
     SDE_WL_EMERGENCY_PROMOTE,
@@ -59,6 +60,8 @@ from app.core.config import (
     SDE_WEIGHT_TIME, SDE_WEIGHT_DEPOSIT, SDE_WEIGHT_PAUSE,
     SDE_WEIGHT_ORGANIC, SDE_WEIGHT_NOISE, SDE_WEIGHT_MIN_FLOOR,
     POOL_DRAW_SDE, POOL_DRAW_SDE_CASE_C, POOL_DRAW_SDE_EXT2, POOL_DRAW_SDE_EXT3,
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    POOL_DRAW_SDE_PREVENTIVE_L3, PREVENTIVE_L3_LEVEL, CASCADE_PREVENT_L3_THRESH,
 )
 from app.crud import token as crud_token, user as crud_user
 from app.models.draw_history import DrawHistory
@@ -1308,14 +1311,14 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
                 _ce_now  = datetime.now(timezone.utc)
                 _ce_iso  = _ce_now.isocalendar()
                 _ce_week = f"{_ce_iso.year}-W{_ce_iso.week:02d}"
-                _ce_any  = False
+                # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Removed dead variable _ce_any — was set and updated but never read.
                 for _ce_m in unpaired:
                     try:
                         crud_user.update_user(
                             db, _ce_m.id,
                             UserUpdate(case_e_deferred_week=_ce_week),
                         )
-                        _ce_any = True
                         _logger.warning(
                             "SDE CASE E — TRUE DEFER: @%s(L%d pool=%d) "
                             "case_e_deferred_week=%s  "
@@ -2077,4 +2080,310 @@ def check_and_run_sde_extensions(db: Session, week_id: str) -> list[SDEExt2DrawR
             "SDE Extensions complete: %d Ext-II/III draw(s) executed this week.",
             len(results),
         )
+    return results
+
+
+# SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Q4 Preventive L3 Draw — proactive cascade pressure relief.
+# When cascade_risk > CASCADE_PREVENT_L3_THRESH (2.0), both draw winners are
+# selected from the L3 tier, exiting them BEFORE they advance to L4 next week.
+# This directly reduces the future L4 population that drives SDE pressure.
+# Architecture: same pre-pass pattern as check_and_run_sde_extensions() —
+# called before the main draw loop, sets draw_completed_this_week=True so the
+# main loop skips these pools.  targeted_early_exit=True on DrawHistory rows.
+
+@dataclass
+class SDEPreventiveL3DrawResult:
+    """Result of one Preventive L3 draw (cascade_risk > CASCADE_PREVENT_L3_THRESH)."""
+    pool_id:              int
+    pool_name:            str
+    winner_1_user_id:     int
+    winner_1_level:       int       # always 3
+    winner_1_payout:      Decimal
+    winner_2_user_id:     int
+    winner_2_level:       int       # always 3
+    winner_2_payout:      Decimal
+    l3_count_before:      int       # L3 members in pool before draw
+    cascade_risk_at_draw: float
+    draw_type:            str = POOL_DRAW_SDE_PREVENTIVE_L3
+
+
+def run_preventive_l3_draw(
+    db: Session,
+    pool_id: int,
+    cascade_risk: float,
+) -> SDEPreventiveL3DrawResult:
+    """
+    Execute one Preventive L3 draw — both winners from the L3 tier.
+
+    Requires ≥ 2 L3 members in an Active full-capacity pool that has not yet
+    drawn this week.  Winner selection uses secrets.choice() (os.urandom-backed)
+    with explicit exclusion for the second pick — guaranteed distinct.
+
+    Survivor advancement applies the same payment gate as run_dual_draw():
+    Unpaid survivors do not advance; reaching L4 is flagged atomically.
+
+    Raises ValueError on any validation failure.
+    """
+    from app.schemas.token import TokenCreate
+    from app.models.token import TokenType, TokenStatus
+
+    pool: Pool | None = db.query(Pool).filter(Pool.id == pool_id).first()
+    if not pool:
+        raise ValueError(f"Preventive L3 draw: pool {pool_id} not found.")
+    if pool.status != PoolStatus.Active:
+        raise ValueError(
+            f"Preventive L3 draw: pool '{pool.name}' is not Active "
+            f"(status: {pool.status.value})."
+        )
+    if pool.draw_completed_this_week:
+        raise ValueError(
+            f"Preventive L3 draw: pool '{pool.name}' already drew this week."
+        )
+
+    members: list[User] = (
+        db.query(User)
+        .filter(User.current_pool_id == pool_id, User.status == UserStatus.Active)
+        .all()
+    )
+    if len(members) != POOL_CAPACITY:
+        raise ValueError(
+            f"Preventive L3 draw: pool '{pool.name}' has {len(members)} active "
+            f"member(s); exactly {POOL_CAPACITY} required."
+        )
+
+    l3_members = [m for m in members if m.current_level == 3]
+    if len(l3_members) < 2:
+        raise ValueError(
+            f"Preventive L3 draw: pool '{pool.name}' has only {len(l3_members)} "
+            f"L3 member(s); ≥ 2 required."
+        )
+    l3_count_before = len(l3_members)
+
+    # Guaranteed-distinct L3 winner pair via secrets.choice (os.urandom-backed)
+    winner_1: User = secrets.choice(l3_members)
+    _remaining_l3  = [m for m in l3_members if m.id != winner_1.id]
+    winner_2: User = secrets.choice(_remaining_l3)
+
+    # Snapshot journey data BEFORE any status mutations
+    _w1_dep    = winner_1.total_deposited_inr        or 1000
+    _w1_merges = winner_1.dynamic_merges_experienced or 0
+    _w1_pauses = winner_1.pauses_experienced         or 0
+    _w2_dep    = winner_2.total_deposited_inr        or 1000
+    _w2_merges = winner_2.dynamic_merges_experienced or 0
+    _w2_pauses = winner_2.pauses_experienced         or 0
+
+    _, w1_net = LEVEL_PAYOUTS.get(3, (4500, 4000))
+    _, w2_net = LEVEL_PAYOUTS.get(3, (4500, 4000))
+    w1_net_d  = Decimal(str(w1_net))
+    w2_net_d  = Decimal(str(w2_net))
+
+    # ── Issue WIT tokens ──────────────────────────────────────────────────────
+    w1_token = _get_unique_token_code(db, "WIT-")
+    crud_token.create_token(
+        db,
+        TokenCreate(
+            code=w1_token, type=TokenType.Withdraw, value_inr=w1_net_d,
+            user_id=winner_1.id, pool_id=pool.id, status=TokenStatus.Active,
+        ),
+    )
+    w2_token = _get_unique_token_code(db, "WIT-")
+    crud_token.create_token(
+        db,
+        TokenCreate(
+            code=w2_token, type=TokenType.Withdraw, value_inr=w2_net_d,
+            user_id=winner_2.id, pool_id=pool.id, status=TokenStatus.Active,
+        ),
+    )
+
+    # ── Eliminate both winners ────────────────────────────────────────────────
+    crud_user.update_user(
+        db, winner_1.id,
+        UserUpdate(status=UserStatus.Eliminated_Won, current_pool_id=None),
+    )
+    crud_user.update_user(
+        db, winner_2.id,
+        UserUpdate(status=UserStatus.Eliminated_Won, current_pool_id=None),
+    )
+
+    # ── Advance surviving members (payment gate + atomic L4 flag) ─────────────
+    surviving_ids = {m.id for m in members} - {winner_1.id, winner_2.id}
+    now_utc   = datetime.now(timezone.utc)
+    _iso      = now_utc.isocalendar()
+    week_id   = f"{_iso.year}-W{_iso.week:02d}"
+    new_l4_flagged = False
+
+    for member_id in surviving_ids:
+        member = crud_user.get_user(db, member_id)
+        if member and member.status == UserStatus.Active and member.current_pool_id == pool_id:
+            if member.weekly_payment_status == WeeklyPaymentStatus.Paid:
+                new_level   = min(member.current_level + 1, 6)
+                reaching_l4 = (new_level == 4)
+            else:
+                new_level   = member.current_level
+                reaching_l4 = False
+            if reaching_l4:
+                new_l4_flagged = True
+            _upd: dict = {
+                "current_level":         new_level,
+                "weekly_payment_status": WeeklyPaymentStatus.Unpaid,
+            }
+            if reaching_l4:
+                _upd["sde_required"]     = True
+                _upd["sde_flagged_week"] = week_id
+            crud_user.update_user(db, member_id, UserUpdate(**_upd))
+
+    if new_l4_flagged:
+        pool.contains_flagged_l4 = True
+
+    pool.draw_completed_this_week = True
+    pool.pool_draw_type           = POOL_DRAW_SDE_PREVENTIVE_L3
+
+    # ── DrawHistory row ───────────────────────────────────────────────────────
+    db.add(DrawHistory(
+        pool_id             = pool.id,
+        draw_type           = POOL_DRAW_SDE_PREVENTIVE_L3,
+        targeted_early_exit = True,    # both winners are targeted preventive exits
+        edge_case_triggered = False,
+        winner_1_user_id            = winner_1.id,
+        winner_1_level              = winner_1.current_level,
+        winner_1_net_payout         = w1_net_d,
+        winner_1_total_deposited    = _w1_dep,
+        winner_1_merges_experienced = _w1_merges,
+        winner_1_pauses_experienced = _w1_pauses,
+        winner_1_journey_type       = "merged" if _w1_merges > 0 else "direct",
+        winner_2_user_id            = winner_2.id,
+        winner_2_level              = winner_2.current_level,
+        winner_2_net_payout         = w2_net_d,
+        winner_2_total_deposited    = _w2_dep,
+        winner_2_merges_experienced = _w2_merges,
+        winner_2_pauses_experienced = _w2_pauses,
+        winner_2_journey_type       = "merged" if _w2_merges > 0 else "direct",
+    ))
+    db.commit()
+
+    _logger.warning(
+        "Preventive L3 draw COMPLETE: pool='%s'  cascade_risk=%.3f  "
+        "W1=@%s(L3 ₹%d)  W2=@%s(L3 ₹%d)  l3_before=%d",
+        pool.name, cascade_risk,
+        winner_1.username, w1_net,
+        winner_2.username, w2_net,
+        l3_count_before,
+    )
+
+    return SDEPreventiveL3DrawResult(
+        pool_id              = pool.id,
+        pool_name            = pool.name,
+        winner_1_user_id     = winner_1.id,
+        winner_1_level       = winner_1.current_level,
+        winner_1_payout      = w1_net_d,
+        winner_2_user_id     = winner_2.id,
+        winner_2_level       = winner_2.current_level,
+        winner_2_payout      = w2_net_d,
+        l3_count_before      = l3_count_before,
+        cascade_risk_at_draw = cascade_risk,
+    )
+
+
+def check_and_run_preventive_l3_draws(
+    db: Session,
+    week_id: str,
+) -> list[SDEPreventiveL3DrawResult]:
+    """
+    Check system cascade_risk and execute Preventive L3 draws if threshold exceeded.
+
+    cascade_risk = L3_active / max(L1+L2_active, 1)
+    Threshold   = CASCADE_PREVENT_L3_THRESH (2.0)
+
+    When triggered, scans all full Active pools not yet drawn this week and
+    calls run_preventive_l3_draw() on any pool with ≥ 2 L3 members.
+
+    Called in execute_weekly_draw() AFTER Ext-II/III and BEFORE staged SDE
+    execution — same pre-pass pattern as check_and_run_sde_extensions().
+    Pools processed here have draw_completed_this_week=True, so the main
+    regular-draw loop skips them correctly.
+
+    Returns list of all Preventive L3 draws executed this run.
+    """
+    results: list[SDEPreventiveL3DrawResult] = []
+
+    _l3_count = (
+        db.query(func.count(User.id))
+        .filter(User.status == UserStatus.Active, User.current_level == 3)
+        .scalar()
+    ) or 0
+    _l1l2_count = (
+        db.query(func.count(User.id))
+        .filter(User.status == UserStatus.Active, User.current_level <= 2)
+        .scalar()
+    ) or 0
+    cascade_risk = _l3_count / max(_l1l2_count, 1)
+
+    if cascade_risk <= CASCADE_PREVENT_L3_THRESH:
+        _logger.info(
+            "Preventive L3 check (week %s): cascade_risk=%.3f ≤ threshold %.1f — "
+            "no preventive draws needed.",
+            week_id, cascade_risk, CASCADE_PREVENT_L3_THRESH,
+        )
+        return results
+
+    _logger.warning(
+        "Preventive L3 TRIGGERED (week %s): cascade_risk=%.3f > %.1f  "
+        "L3=%d  L1+L2=%d — scanning for pools with ≥ 2 L3 members.",
+        week_id, cascade_risk, CASCADE_PREVENT_L3_THRESH, _l3_count, _l1l2_count,
+    )
+
+    candidate_pools: list[Pool] = (
+        db.query(Pool)
+        .filter(
+            Pool.status                    == PoolStatus.Active,
+            Pool.draw_completed_this_week  == False,   # noqa: E712
+        )
+        .order_by(Pool.id.asc())
+        .all()
+    )
+
+    for pool in candidate_pools:
+        active_count = (
+            db.query(func.count(User.id))
+            .filter(User.current_pool_id == pool.id, User.status == UserStatus.Active)
+            .scalar()
+        ) or 0
+        if active_count != POOL_CAPACITY:
+            continue   # skip under-capacity pools — draw would fail validation
+
+        l3_in_pool = (
+            db.query(func.count(User.id))
+            .filter(
+                User.current_pool_id == pool.id,
+                User.status          == UserStatus.Active,
+                User.current_level   == 3,
+            )
+            .scalar()
+        ) or 0
+        if l3_in_pool < 2:
+            continue   # not enough L3 members for a pair
+
+        try:
+            r = run_preventive_l3_draw(db, pool.id, cascade_risk)
+            results.append(r)
+        except ValueError as exc:
+            _logger.error(
+                "Preventive L3: draw FAILED for pool '%s' (l3=%d): %s",
+                pool.name, l3_in_pool, exc,
+            )
+
+    if results:
+        _logger.info(
+            "Preventive L3 complete (week %s): %d pool(s) drew preventive L3 exits "
+            "(cascade_risk=%.3f).",
+            week_id, len(results), cascade_risk,
+        )
+    else:
+        _logger.info(
+            "Preventive L3 (week %s): threshold exceeded (%.3f) but no eligible pools "
+            "found (all full pools have < 2 L3 members or already drew).",
+            week_id, cascade_risk,
+        )
+
     return results

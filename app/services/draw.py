@@ -49,6 +49,8 @@ from app.core.config import (
     POOL_DRAW_ACCELERATED,              # accelerated dissolution draw type
     ACCEL_DISS_TRIGGER_RATIO,          # ≥60% L4+ triggers accelerated mode
     ACCEL_DISS_DISSOLVE_BELOW,         # dissolve pool if active count falls below 8
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    POOL_DRAW_SDE_PREVENTIVE_L3,       # Q4 preventive L3 draw type
     LEVEL_PAYOUTS, PAYOUT_FEE_INR, REFERRAL_REWARD_INR,
 )
 from app.crud import token as crud_token, user as crud_user, pool as crud_pool
@@ -135,8 +137,10 @@ class MassDrawResult:
     sde_pre_drawn:        list[str] = field(default_factory=list)   # pools drawn by SDE pre-draw
     # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # Draw metrics fix — count ALL draw types, not just regular pools_drawn.
-    sde_draws_this_week:  int  = 0   # SDE sub-draws committed at T-0H
-    ext_draws_this_week:  int  = 0   # Ext-II + Ext-III draws this cycle
+    sde_draws_this_week:          int  = 0   # SDE sub-draws committed at T-0H
+    ext_draws_this_week:          int  = 0   # Ext-II + Ext-III draws this cycle
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    preventive_l3_draws_this_week: int = 0   # Q4 preventive L3 draws this cycle
     # U-02: EngineEvent trace — one immutable record per draw sub-step.
     # Callers can inspect this to verify LPI monotonicity (CON-2 proof) and
     # diagnose why each pool was routed to a specific draw type.
@@ -574,6 +578,30 @@ def execute_weekly_draw(
             _ext_exc, exc_info=True,
         )
 
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Q4 Preventive L3 pre-pass — runs AFTER Ext-II/III and BEFORE staged SDE.
+    # When cascade_risk > CASCADE_PREVENT_L3_THRESH (2.0), exits 2 L3 members
+    # from each eligible full pool BEFORE they advance to L4 next week.
+    # Pools processed here get draw_completed_this_week=True and are skipped by
+    # the main regular-draw loop below (same pattern as Ext-II/III pre-pass).
+    _preventive_l3_count: int = 0
+    try:
+        from app.services.sde_engine import check_and_run_preventive_l3_draws
+        _prev_l3_results = check_and_run_preventive_l3_draws(db, week_id_str)
+        if _prev_l3_results:
+            _preventive_l3_count = len(_prev_l3_results)
+            from app.services.waitlist import assign_waitlist_to_pools as _wl_refill_pl3
+            _wl_refill_pl3(db)
+            _logger.info(
+                "execute_weekly_draw: Preventive L3 ran %d draw(s) before main loop.",
+                _preventive_l3_count,
+            )
+    except Exception as _pl3_exc:
+        _logger.error(
+            "execute_weekly_draw: Preventive L3 check failed (non-fatal): %s",
+            _pl3_exc, exc_info=True,
+        )
+
     # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # Bug #9 — Step 5: T-0H execution of all staged SDE sub-draws.
     # Called here — after Ext-II/III but BEFORE the main candidate loop — so all
@@ -936,15 +964,20 @@ def execute_weekly_draw(
 
     # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # Draw metrics fix — total draws = SDE staged + Ext-II/III + regular.
-    _total_draws_this_week = len(draw_results) + _staged_executed + _ext_draws_count
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Total draws = regular + SDE staged + Ext-II/III + Preventive L3.
+    _total_draws_this_week = (
+        len(draw_results) + _staged_executed + _ext_draws_count + _preventive_l3_count
+    )
 
     _logger.info(
         "execute_weekly_draw COMPLETE — "
-        "pools_drawn=%d  sde_draws=%d  ext_draws=%d  total=%d  "
+        "pools_drawn=%d  sde_draws=%d  ext_draws=%d  preventive_l3=%d  total=%d  "
         "P1_assigned=%d  P2_created=%s",
         len(draw_results),
         _staged_executed,
         _ext_draws_count,
+        _preventive_l3_count,
         _total_draws_this_week,
         refill["phase1_assigned"],
         refill["phase2_pool_created"] or "none",
@@ -960,6 +993,7 @@ def execute_weekly_draw(
         sde_pre_drawn=sde_skipped,
         sde_draws_this_week=_staged_executed,
         ext_draws_this_week=_ext_draws_count,
+        preventive_l3_draws_this_week=_preventive_l3_count,
         event_trace=event_trace,   # U-02: full EngineEvent trace
     )
 

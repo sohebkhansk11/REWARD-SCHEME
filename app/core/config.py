@@ -68,6 +68,13 @@ POOL_DRAW_ACCELERATED = "accelerated_dissolution"
 #   (3 = retains 2 after donating 1 — enough for future SDE lower tier if needed).
 POOL_DRAW_SDE_CASE_C:     str = "sde_case_c"
 SDE_CASE_C_MIN_DONOR_L1L2: int = 3
+# SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Q4 Preventive L3 draw — both winners from L3 tier only, triggered when
+# cascade_risk > CASCADE_PREVENT_L3_THRESH (2.0).  Exits 2 L3 members BEFORE
+# they advance to L4 next week, reducing future SDE/cascade pressure proactively.
+POOL_DRAW_SDE_PREVENTIVE_L3: str           = "sde_preventive_l3"
+PREVENTIVE_L3_LEVEL:         tuple[int,int] = (3, 3)   # both winners from L3 only
+CASCADE_PREVENT_L3_THRESH:   float          = 2.0      # cascade_risk threshold to trigger
 
 # ── LPI (Level Pressure Index) thresholds ────────────────────────────────────
 # LPI = (L3 + L4 + L5 + L6) ÷ Total Active Members × 100

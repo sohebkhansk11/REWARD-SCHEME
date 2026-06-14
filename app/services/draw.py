@@ -706,11 +706,28 @@ def execute_weekly_draw(
             ", ".join(paused_now),
         )
 
-    if not eligible:
+    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # BUG 3 FIX — Preventive L3 (or Ext-II/III) may have drawn ALL full Active pools
+    # as a pre-pass, leaving `eligible` empty even though this week's draws completed
+    # normally.  Raising ValueError in that scenario is misleading — it fires the
+    # "no eligible pools" warning in callers and suppresses normal draw metrics.
+    # Guard: only raise if no pre-pass draws ran at all (truly no eligible pools).
+    # If pre-passes covered everything, log a warning and fall through so WL refill
+    # and the WINNERS REVEALED broadcast still execute correctly.
+    _total_pre_pass_draws = _ext_draws_count + _preventive_l3_count + _staged_executed
+    if not eligible and _total_pre_pass_draws == 0:
         raise ValueError(
             "No active pools with exactly 12 members found. "
             "Run 'Fill Pool Vacancies' (POST /admin/waitlist/check) first, "
             "then retry the draw."
+        )
+    elif not eligible:
+        _logger.warning(
+            "execute_weekly_draw: no regular-draw candidates — all %d draw(s) this "
+            "week completed via pre-passes (ext=%d  preventive_l3=%d  staged_sde=%d). "
+            "Continuing to WL refill + WINNERS REVEALED broadcast.",
+            _total_pre_pass_draws,
+            _ext_draws_count, _preventive_l3_count, _staged_executed,
         )
 
     _logger.info(

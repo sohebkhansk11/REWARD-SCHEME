@@ -584,6 +584,21 @@ def execute_weekly_draw(
     paused_now:   list[str]  = []   # newly paused this run (were Active, < 12)
 
     for pool in candidate_pools:
+        # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Bug #10 — SDE sub-draw at T-2H sets draw_completed_this_week=True on the
+        # pool and exits the 2 winners (leaving 10 members).  Without this guard the
+        # T-0H candidate loop sees only 10 members, triggers draw-protection, marks
+        # the pool Paused_Awaiting_Members, and increments pauses_experienced on all
+        # 10 remaining members — a completely false pause.
+        # Correct behaviour: silently skip; SDE already completed this pool's draw.
+        if pool.draw_completed_this_week:
+            _logger.info(
+                "execute_weekly_draw: ⏭  %s draw_completed_this_week=True — "
+                "SDE already drew this pool this cycle, skipping.",
+                pool.name,
+            )
+            continue
+
         actual: int = (
             db.query(User)
             .filter(User.current_pool_id == pool.id, User.status == UserStatus.Active)

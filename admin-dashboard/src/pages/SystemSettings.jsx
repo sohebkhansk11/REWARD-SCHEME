@@ -1025,6 +1025,29 @@ export default function SystemSettings() {
               className={inputCls}
               value={levelAdminPw}
               onChange={e => setLevelAdminPw(e.target.value)}
+              onKeyDown={async e => {
+                // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                if (e.key === 'Enter' && !levelSaving && levelAdminPw.trim()) {
+                  setLevelSaving(true)
+                  try {
+                    const payload = {}
+                    Object.entries(levelPayouts).forEach(([lvl, { gross, net }]) => {
+                      payload[lvl] = { gross_inr: parseInt(gross, 10), net_inr: parseInt(net, 10) }
+                    })
+                    const r = await updateAllLevelPayouts(payload, levelAdminPw)
+                    const refreshed = {}
+                    Object.entries(r.data.all_level_payouts ?? {}).forEach(([l, { gross_inr, net_inr }]) => {
+                      refreshed[l] = { gross: String(gross_inr), net: String(net_inr) }
+                    })
+                    if (Object.keys(refreshed).length) setLevelPayouts(refreshed)
+                    setFinConfig(prev => ({ ...prev, level_payouts: r.data.all_level_payouts }))
+                    toast(r.data.message, 'success')
+                    setLevelModalOpen(false)
+                    setLevelAdminPw('')
+                  } catch (err) { toast(err.response?.data?.detail ?? 'Failed to update level payouts', 'error') }
+                  finally { setLevelSaving(false) }
+                }
+              }}
               placeholder="Enter admin password"
               autoFocus
             />
@@ -1085,6 +1108,23 @@ export default function SystemSettings() {
               className={inputCls}
               value={threshAdminPw}
               onChange={e => setThreshAdminPw(e.target.value)}
+              onKeyDown={async e => {
+                // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                if (e.key === 'Enter' && !threshSaving && threshAdminPw.trim()) {
+                  setThreshSaving(true)
+                  try {
+                    const payload = Object.fromEntries(
+                      Object.entries(thresholds).map(([k, v]) => [k, parseFloat(v)])
+                    )
+                    const r = await updateThresholds(payload, threshAdminPw)
+                    setFinConfig(prev => ({ ...prev, ...r.data }))
+                    toast(r.data.message, 'success')
+                    setThreshModalOpen(false)
+                    setThreshAdminPw('')
+                  } catch (err) { toast(err.response?.data?.detail ?? 'Failed to update thresholds', 'error') }
+                  finally { setThreshSaving(false) }
+                }
+              }}
               placeholder="Enter admin password"
               autoFocus
             />

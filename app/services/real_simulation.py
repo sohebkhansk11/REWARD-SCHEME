@@ -1654,14 +1654,22 @@ class RealSimEngine:
         db = SessionLocal()
 
         try:
-            with ChronosEngine(self._sunday(0)) as chronos:
+            # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # 9-tick dynamic Chronos Timeline — all milestones derived from DB global_config.
+            current_T_00H = self._initial_draw_time(db)
+            with ChronosEngine(current_T_00H) as chronos:
 
-                # ── Seed: inject initial users one week before first draw ────
-                seed_time = self._sunday(0) - timedelta(days=7)
-                chronos.jump_to(seed_time)
-
-                seed_users = injector.inject_week(
-                    db, self.initial_users, seed_time, self.organic_ratio,
+                # ── Seed: inject initial users into the cycle before first draw ──
+                # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                seed_m           = _compute_milestones(db, current_T_00H)
+                seed_win_start   = seed_m.CYCLE_START
+                seed_win_end     = min(
+                    seed_m.CYCLE_START + timedelta(hours=72), seed_m.DUE_DATE,
+                )
+                chronos.jump_to(seed_win_start)
+                seed_users = injector.inject_distributed(
+                    db, self.initial_users, seed_win_start, seed_win_end,
+                    self.organic_ratio, [], chronos,
                 )
                 db.commit()
                 total_users_created += len(seed_users)
@@ -1669,18 +1677,19 @@ class RealSimEngine:
                 # Trigger initial pool formation from seed users
                 refill = assign_waitlist_to_pools(db)
                 total_p2_pools += refill.get("phase2_pools_count", 0)
+                db.commit()
 
-                # ────────────────────────────────────────────────────────────
-                # MAIN WEEKLY LOOP
-                # ────────────────────────────────────────────────────────────
+                # ────────────────────────────────────────────────────────────────
+                # 9-TICK CHRONOS MAIN LOOP (all milestones derived from DB config)
+                # ────────────────────────────────────────────────────────────────
                 for w in range(self.weeks):
-                    week_num         = w + 1
-                    sunday_midnight  = self._sunday(w)
-                    saturday_22h     = sunday_midnight - timedelta(hours=2)
-                    sunday_5min      = sunday_midnight + timedelta(minutes=5)
-                    monday_morning   = sunday_midnight - timedelta(days=6)
+                    week_num = w + 1
 
-                    iso     = sunday_midnight.isocalendar()
+                    # ── Compute all 7 milestones for this cycle (ZERO hardcoding) ──
+                    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    m = _compute_milestones(db, current_T_00H)
+
+                    iso     = m.T_00H.isocalendar()
                     week_id = f"{iso.year}-W{iso.week:02d}"
 
                     # Track pools formed THIS week (p2 pools only — new pool creation)
@@ -1699,8 +1708,11 @@ class RealSimEngine:
                     _week_paused_before   = db.query(func.count(_P5s.id)).filter(
                         _P5s.status == _PS5s.Paused_Awaiting_Members).scalar() or 0
 
-                    # ── a. Inject new users (Monday morning) ─────────────────
-                    chronos.jump_to(monday_morning)
+                    # ── TICK 1: CYCLE_START — reset payment cycle + inject users ──
+                    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    chronos.jump_to(m.CYCLE_START)
+                    _fm_reset_payment_cycle(db)
+                    db.commit()
 
                     # K-12: Compute weekly inflow via pattern
                     inflow = self._compute_weekly_inflow(week_num)
@@ -1716,7 +1728,7 @@ class RealSimEngine:
 
                     # K-16: Organic decay — reduce organic ratio over time
                     if self.organic_decay_rate > 0.0:
-                        decay   = 1.0 - self.organic_decay_rate * week_num
+                        decay = 1.0 - self.organic_decay_rate * week_num
                         effective_organic = max(0.0, effective_organic * max(0.0, decay))
 
                     # Build referral pool from existing users (Brain 3 RDR feed)
@@ -1727,9 +1739,10 @@ class RealSimEngine:
                         ).limit(500).all()
                     ]
 
-                    new_batch = injector.inject_week(
-                        db, inflow, chronos.current,
-                        effective_organic, existing_ids,
+                    # Distribute users across CYCLE_START → DUE_DATE (dynamic window)
+                    new_batch = injector.inject_distributed(
+                        db, inflow, m.CYCLE_START, m.DUE_DATE,
+                        effective_organic, existing_ids, chronos,
                     )
                     db.commit()
                     total_users_created += len(new_batch)
@@ -1782,86 +1795,65 @@ class RealSimEngine:
                                 week_num, n_drop, len(wl_all),
                             )
 
-                    # ── b. Finance Manager: Reset payment cycle (Monday morning)
-                    #
-                    # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
-                    # FIX A3: Corrected FM payment-cycle order.
-                    #
-                    # OLD (wrong) order:
-                    #   Monday — reset ALL → Unpaid
-                    #   Monday — auto_pay ALL → Paid + WK tokens (even future late payers!)
-                    #   Thursday — apply_abc → re-mark n_late% Unpaid (tokens already issued!)
-                    #
-                    # NEW (correct) order:
-                    #   Monday    — reset ALL → Unpaid
-                    #   Thursday  — apply_abc → A eliminated, B late-fee stays Unpaid,
-                    #                           C grace saved → Paid
-                    #   Thursday  — auto_pay(skip_ids=type_b_ids) → non-late Unpaid → Paid
-                    #
-                    # Effect: WK installment tokens are only created for members who
-                    # ACTUALLY paid this week.  installments_collected_inr is now correct.
-
-                    # ── b. Finance Manager: Reset payment cycle (Monday morning) ──
-                    # All Active members start the week Unpaid (they owe this week's ₹1000).
-                    _fm_reset_payment_cycle(db)
+                    # ── TICK 2: ON-TIME WINDOW — on_time_fraction pay before DUE_DATE ──
+                    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    on_time_fraction = max(0.0, 1.0 - self.late_ratio)
+                    t2_count = injector.tick2_on_time_payments(
+                        db, on_time_fraction, chronos,
+                        m.CYCLE_START, m.DUE_DATE, week_num,
+                    )
                     db.commit()
 
-                    # ── c. Thursday 23:59 — Payment due date: Apply A/B/C compliance ──
-                    #
-                    # Time-travel to Thursday 23:59 (T-3d from Sunday draw).
-                    # Production due-date cutoff: late members enter A/B/C processing.
-                    #
-                    # Timeline:
-                    #   Monday  00:01 (above)  — reset to Unpaid
-                    #   Thursday 23:59 (now)   — due date: A eliminated, B late-fee,
-                    #                            C grace saves seat → Paid
-                    #   Thursday 23:59 (below) — FM auto-pays remaining non-late members
-                    #   Saturday 22:00 (T-2H)  — draw preparation with FULL pools
-                    #   Sunday   00:00 (T-0)   — draw executes
-                    thursday_2359 = monday_morning + timedelta(days=3, hours=23, minutes=59)
-                    chronos.jump_to(thursday_2359)
-
+                    # ── TICK 3: LATE FEE WINDOW (DUE_DATE → GRACE_PERIOD_START) ────
                     # K-14: Payment shock — spike late_ratio for the shock week
                     effective_late = self.late_ratio
                     if self.payment_shock_week > 0 and week_num == self.payment_shock_week:
-                        effective_late = 0.20   # 20% spike regardless of normal rate
+                        effective_late = 0.20
                         _logger.info(
                             "K-14: Payment shock week %d — late_ratio spiked to 20%%",
                             week_num,
                         )
-
-                    compliance = injector.apply_abc_model(
-                        db, effective_late, self.elim_pct_a, self.grace_pct_c,
-                    )
-                    db.commit()
-                    total_late        += compliance["n_late"]
-                    total_elim        += compliance["n_elim"]
-                    total_grace_saved += compliance["n_saved"]
-                    total_late_fee_rev += compliance["late_fee_revenue_inr"]
-
-                    # ── c.2 FM: Auto-pay non-late members (U-08 weekly DEP tokens) ──
-                    # Now that A/B/C has run, we know which members are Type B (Unpaid
-                    # late-fee holders).  auto_pay skips them and pays everyone else.
-                    # This ensures WK tokens reflect only genuine installment payments.
-                    injector.auto_pay_installments(
-                        db,
-                        week_num = week_num,
-                        skip_ids = compliance.get("type_b_ids", set()),
+                    type_b_fraction = effective_late * (1.0 - self.elim_pct_a)
+                    t3 = injector.tick3_late_fee_window(
+                        db, type_b_fraction, chronos,
+                        m.DUE_DATE, m.GRACE_PERIOD_START, week_num,
                     )
                     db.commit()
 
-                    # ── c.5 Finance Manager: Enforce pool capacity before T-2H ─
-                    #
-                    # apply_abc_model eliminated some members.  Their pools are still
-                    # Active (not Paused) so assign_waitlist_to_pools Phase 1 won't
-                    # refill the vacancies.  Without this step, execute_weekly_draw
-                    # would find an Active pool with < 12 members → pause it mid-draw
-                    # → no draw for that pool this week.
-                    #
-                    # Fix: Proactively pause every under-capacity Active pool and call
-                    # assign_waitlist_to_pools so Phase 1 fills them from waitlist.
-                    # By T-2H, every pool is back to 12 members and eligible to draw.
-                    if compliance.get("n_elim", 0) > 0:
+                    # ── TICK 4: GRACE PERIOD (GRACE_PERIOD_START → G_CLOSE) ──────
+                    t4 = injector.tick4_grace_period(
+                        db, self.grace_pct_c, chronos,
+                        m.GRACE_PERIOD_START, m.G_CLOSE, week_num,
+                    )
+                    db.commit()
+
+                    # ── TICK 5: GUILLOTINE / G_CLOSE — eliminate all remaining Unpaid ──
+                    chronos.jump_to(m.G_CLOSE)
+                    t5 = injector.tick5_guillotine(db, week_id)
+                    db.commit()
+
+                    # Build compliance dict from tick results (same keys as _snapshot())
+                    compliance = {
+                        "n_late":                       t3["n_late"],
+                        "n_elim":                       t5["n_eliminated"],
+                        "n_saved":                      t4["n_grace_saved"],
+                        "n_type_b":                     t3["n_b_paid"],
+                        "type_b_ids":                   t3["type_b_ids"],
+                        "late_fee_revenue_inr":         t3["late_fee_rev"] + t4["lf_settled_rev"],
+                        "grace_fee_revenue_inr":        t4["grace_fee_rev"],
+                        "total_compliance_revenue_inr": (
+                            t3["late_fee_rev"] + t4["lf_settled_rev"] + t4["grace_fee_rev"]
+                        ),
+                        "week_id":                      week_id,
+                    }
+                    total_late        += t3["n_late"]
+                    total_elim        += t5["n_eliminated"]
+                    total_grace_saved += t4["n_grace_saved"]
+                    total_late_fee_rev += (
+                        t3["late_fee_rev"] + t4["lf_settled_rev"] + t4["grace_fee_rev"]
+                    )
+
+                    if t5["n_eliminated"] > 0:
                         _fm_paused = _fm_enforce_pool_capacity(db)
                         if _fm_paused:
                             _logger.info(
@@ -1870,7 +1862,8 @@ class RealSimEngine:
                                 week_num, _fm_paused,
                             )
 
-                    # ── d. T-2H: Call start_draw_preparation() ────────────────
+                    # ── TICK 6: T_02H — start_draw_preparation() ─────────────────
+                    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
                     # This is the REAL T-2H production service.  It:
                     #   1. Acquires the draw_engine system lock
                     #   2. Freezes LPI snapshot into WeeklyDrawState
@@ -1878,7 +1871,7 @@ class RealSimEngine:
                     #   4. Quantifies SDE demand + checks L1/L2 supply
                     #   5. Runs run_sde_meta_pool() (SDE sub-draws executed here)
                     #   6. Sets preparation_valid=True, countdown_active=True
-                    chronos.jump_to(saturday_22h)
+                    chronos.jump_to(m.T_02H)
                     # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
                     # Bug #1/#2/#3 — snapshot DrawHistory row count and total payout BEFORE
                     # any draws fire this week (SDE sub-draws at T-2H + regular draws at T-0H).
@@ -1904,7 +1897,7 @@ class RealSimEngine:
 
                     try:
                         prep_state = start_draw_preparation(
-                            db, draw_time_utc=sunday_midnight,
+                            db, draw_time_utc=m.T_00H,
                         )
                         prep_ok   = True
                         admin_ovr = bool(prep_state.admin_override_required)
@@ -1953,10 +1946,11 @@ class RealSimEngine:
                         try: db.rollback()
                         except Exception: pass
 
-                    # ── e. T-0H: Call execute_weekly_draw() ──────────────────
+                    # ── TICK 7: T_00H — execute_weekly_draw() ────────────────────
+                    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
                     # This runs the Ext-II/III pre-pass THEN draws all eligible pools.
                     # SDE-processed pools are skipped (draw_completed_this_week=True).
-                    chronos.jump_to(sunday_midnight)
+                    chronos.jump_to(m.T_00H)
 
                     draws_this_week  = 0
                     pauses_this_week = 0
@@ -1996,9 +1990,10 @@ class RealSimEngine:
                         try: db.rollback()
                         except Exception: pass
 
-                    # ── f. T+5m: Call post_draw_cleanup() ────────────────────
+                    # ── TICK 8: T_05M — post_draw_cleanup() + RW settlement ──────
+                    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
                     # Resets draw_completed_this_week, clears L4 flags, releases lock.
-                    chronos.jump_to(sunday_5min)
+                    chronos.jump_to(m.T_05M)
 
                     try:
                         post_draw_cleanup(db)
@@ -2136,6 +2131,10 @@ class RealSimEngine:
                     max_l6       = max(max_l6,       metrics["l6_count"])
                     sc           = metrics["scenario"]
                     scenario_counts[sc] = scenario_counts.get(sc, 0) + 1
+
+                    # ── TICK 9: advance to next draw time ────────────────────────
+                    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    current_T_00H = _compute_next_draw_time(m.T_00H, m.cycle_length)
 
                 # ── Final financials from actual DrawHistory ─────────────────
                 total_payout = db.query(

@@ -46,7 +46,10 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import (
-    LEVEL_PAYOUTS, PAYOUT_FEE_INR,
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVEL_PAYOUTS, PAYOUT_FEE_INR — removed, now served from global_config.py.
+    # LPI_L3_WIN_EXCEPTION — removed, now served from global_config.py.
+    # CASCADE_PREVENT_L3_THRESH — removed, now served from global_config.py.
     POOL_CAPACITY,
     SDE_MAX_POOLS_PER_SESSION,
     SDE_L1L2_THRESHOLD_PER_L4,
@@ -56,12 +59,18 @@ from app.core.config import (
     SDE_EXT2_LEVEL_UPPER, SDE_EXT2_LEVEL_LOWER,
     SDE_EXT3_LEVEL_UPPER, SDE_EXT3_LEVEL_LOWER,
     L5_DRAWDOWN_ENABLED,
-    LPI_L3_WIN_EXCEPTION,
     SDE_WEIGHT_TIME, SDE_WEIGHT_DEPOSIT, SDE_WEIGHT_PAUSE,
     SDE_WEIGHT_ORGANIC, SDE_WEIGHT_NOISE, SDE_WEIGHT_MIN_FLOOR,
     POOL_DRAW_SDE, POOL_DRAW_SDE_CASE_C, POOL_DRAW_SDE_EXT2, POOL_DRAW_SDE_EXT3,
     # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
-    POOL_DRAW_SDE_PREVENTIVE_L3, PREVENTIVE_L3_LEVEL, CASCADE_PREVENT_L3_THRESH,
+    POOL_DRAW_SDE_PREVENTIVE_L3, PREVENTIVE_L3_LEVEL,
+)
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Dynamic getters replacing 8 hardcoded usages across 4 call sites.
+from app.services.global_config import (
+    get_level_payout,
+    get_lpi_l3_win_exception,
+    get_cascade_prevent_thresh,
 )
 from app.crud import token as crud_token, user as crud_user
 from app.models.draw_history import DrawHistory
@@ -549,8 +558,9 @@ def execute_sde_sub_draw(
     rng_hash = _compute_rng_seed_hash(pool_id, session_id, sub_draw_number)
 
     # ── Payout calculation (stored in checkpoint for T-0H execution) ─────────
-    upper_gross, upper_net = LEVEL_PAYOUTS.get(l4_member.current_level,    (6000, 5500))
-    lower_gross, lower_net = LEVEL_PAYOUTS.get(lower_winner.current_level, (2500, 2000))
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    upper_gross, upper_net = get_level_payout(db, l4_member.current_level)
+    lower_gross, lower_net = get_level_payout(db, lower_winner.current_level)
     upper_net_d = Decimal(str(upper_net))
     lower_net_d = Decimal(str(lower_net))
 
@@ -695,7 +705,8 @@ def run_sde_session(
     )
 
     # ── L3 exception: allow L3 in lower tier if LPI > 50% ────────────────────
-    allow_l3 = lpi > LPI_L3_WIN_EXCEPTION
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    allow_l3 = lpi > get_lpi_l3_win_exception(db)
 
     # ── Process each L4 member ────────────────────────────────────────────────
     for idx, l4_member in enumerate(l4_batch):
@@ -849,8 +860,9 @@ def _execute_case_d_single_pair(
         _lo_pauses = lower_l4.pauses_experienced         or 0
 
         # Both receive their level's net payout (L4 = ₹5,500 — same as upper normal SDE)
-        _, upper_net = LEVEL_PAYOUTS.get(upper_l4.current_level, (6000, 5500))
-        _, lower_net = LEVEL_PAYOUTS.get(lower_l4.current_level, (6000, 5500))
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        _, upper_net = get_level_payout(db, upper_l4.current_level)
+        _, lower_net = get_level_payout(db, lower_l4.current_level)
         upper_net_d  = Decimal(str(upper_net))
         lower_net_d  = Decimal(str(lower_net))
 
@@ -1026,7 +1038,8 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
         .scalar()
     ) or 0
     cascade_risk    = _l3_sys / max(_l1l2_sys, 1)
-    allow_l3_supply = cascade_risk > 1.0 or lpi > LPI_L3_WIN_EXCEPTION
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    allow_l3_supply = cascade_risk > 1.0 or lpi > get_lpi_l3_win_exception(db)
 
     # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # Auto Priority-L3 mode: if cascade_risk > 1.5 for 3+ consecutive weeks,
@@ -1640,7 +1653,9 @@ class SDEExt2DrawResult:
     drawdown_projection:     dict      # financial projection that justified this draw
 
 
-def calculate_l5_drawdown_projection(pool_members: list) -> dict:
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Added db parameter so payout amounts are read from DB (dynamic) not config.
+def calculate_l5_drawdown_projection(pool_members: list, db: "Session | None" = None) -> dict:
     """
     Calculate the payout drawdown comparison for an L5 (or L6) emergency draw.
 
@@ -1654,8 +1669,15 @@ def calculate_l5_drawdown_projection(pool_members: list) -> dict:
     n_l5 = len(l5_members)
     n_l6 = len(l6_members)
 
-    l5_net = Decimal(str(LEVEL_PAYOUTS[5][1]))   # ₹6,500
-    l6_net = Decimal(str(LEVEL_PAYOUTS[6][1]))   # ₹8,000
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVEL_PAYOUTS[5][1] and [6][1] replaced with DB-backed dynamic getters.
+    if db is not None:
+        l5_net = Decimal(str(get_level_payout(db, 5)[1]))
+        l6_net = Decimal(str(get_level_payout(db, 6)[1]))
+    else:
+        import app.core.config as _c
+        l5_net = Decimal(str(_c.LEVEL_PAYOUTS[5][1]))
+        l6_net = Decimal(str(_c.LEVEL_PAYOUTS[6][1]))
 
     # Option A: dual-L5 exit NOW
     dual_l5_payout = l5_net * 2   # ₹13,000
@@ -1767,7 +1789,8 @@ def execute_sde_ext2_draw(
 
     projection = {}
     if L5_DRAWDOWN_ENABLED and draw_type == POOL_DRAW_SDE_EXT2:
-        projection = calculate_l5_drawdown_projection(all_pool_members)
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        projection = calculate_l5_drawdown_projection(all_pool_members, db=db)
         _logger.info(
             "SDE Ext-II DRAWDOWN PROJECTION pool='%s': %s",
             pool.name, projection["reasoning"],
@@ -1848,8 +1871,9 @@ def execute_sde_ext2_draw(
     _lo_pauses = lower_winner.pauses_experienced         or 0
 
     # ── Payout calculation ────────────────────────────────────────────────────
-    upper_gross, upper_net = LEVEL_PAYOUTS.get(upper_member.current_level, (7000, 6500))
-    lower_gross, lower_net = LEVEL_PAYOUTS.get(lower_winner.current_level, (2500, 2000))
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    upper_gross, upper_net = get_level_payout(db, upper_member.current_level)
+    lower_gross, lower_net = get_level_payout(db, lower_winner.current_level)
     upper_net_d = Decimal(str(upper_net))
     lower_net_d = Decimal(str(lower_net))
 
@@ -2188,8 +2212,9 @@ def run_preventive_l3_draw(
     _w2_merges = winner_2.dynamic_merges_experienced or 0
     _w2_pauses = winner_2.pauses_experienced         or 0
 
-    _, w1_net = LEVEL_PAYOUTS.get(3, (4500, 4000))
-    _, w2_net = LEVEL_PAYOUTS.get(3, (4500, 4000))
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    _, w1_net = get_level_payout(db, 3)
+    _, w2_net = get_level_payout(db, 3)
     w1_net_d  = Decimal(str(w1_net))
     w2_net_d  = Decimal(str(w2_net))
 
@@ -2340,18 +2365,22 @@ def check_and_run_preventive_l3_draws(
     ) or 0
     cascade_risk = _l3_count / max(_l1l2_count, 1)
 
-    if cascade_risk <= CASCADE_PREVENT_L3_THRESH:
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # CASCADE_PREVENT_L3_THRESH replaced with DB-backed dynamic getter.
+    _cascade_thresh = get_cascade_prevent_thresh(db)
+
+    if cascade_risk <= _cascade_thresh:
         _logger.info(
             "Preventive L3 check (week %s): cascade_risk=%.3f ≤ threshold %.1f — "
             "no preventive draws needed.",
-            week_id, cascade_risk, CASCADE_PREVENT_L3_THRESH,
+            week_id, cascade_risk, _cascade_thresh,
         )
         return results
 
     _logger.warning(
         "Preventive L3 TRIGGERED (week %s): cascade_risk=%.3f > %.1f  "
         "L3=%d  L1+L2=%d — scanning for pools with ≥ 2 L3 members.",
-        week_id, cascade_risk, CASCADE_PREVENT_L3_THRESH, _l3_count, _l1l2_count,
+        week_id, cascade_risk, _cascade_thresh, _l3_count, _l1l2_count,
     )
 
     candidate_pools: list[Pool] = (

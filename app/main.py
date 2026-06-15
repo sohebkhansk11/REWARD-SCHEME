@@ -36,6 +36,9 @@ from app.routers import dev as dev_router
 from app.routers import auth as auth_router
 from app.routers import user_auth as user_auth_router
 from app.routers import admin_elimination as admin_elimination_router
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Draw & Financial Strategy config router — backs the new admin sub-tab.
+from app.routers import admin_financial_config as admin_financial_config_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -75,7 +78,13 @@ try:
             "ALTER TABLE users "
             "ADD COLUMN IF NOT EXISTS case_e_deferred_week VARCHAR(10)"
         ))
-    _logger.info("main: sde_checkpoints.executed + Case C audit + Case E defer column migrations OK.")
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # value_float column — NUMERIC(15,6) for LPI thresholds / cascade ratios.
+        _mig_conn.execute(_sa_text(
+            "ALTER TABLE system_settings "
+            "ADD COLUMN IF NOT EXISTS value_float NUMERIC(15,6)"
+        ))
+    _logger.info("main: sde_checkpoints.executed + Case C audit + Case E defer column + system_settings.value_float migrations OK.")
 except Exception as _mig_exc:
     _logger.warning(
         "main: sde_checkpoints.executed migration skipped (may already exist or "
@@ -195,6 +204,8 @@ app.include_router(admin_user_mgmt.router)    # /admin/users|tokens (destroy) �
 app.include_router(referrals_router.router)   # /users/request-referral-payout + /admin/referrals/* (JWT required)
 app.include_router(dev_router.router)         # /dev/*                        — DEV MODE ONLY (JWT + ENABLE_DEV_MODE=true)
 app.include_router(admin_elimination_router.router)  # /admin/elimination/*  — Payment Compliance engine (JWT required)
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+app.include_router(admin_financial_config_router.router)  # /admin/financial-config/* — Draw & Financial Strategy (JWT required)
 
 
 @app.get("/", tags=["Health"])

@@ -1679,7 +1679,11 @@ class RealSimEngine:
         # Without this, one stale lock = infinite hang at "Week 0 / 10".
         try:
             from sqlalchemy import text as _text
-            db.execute(_text("SET LOCAL statement_timeout = '45000'"))
+            # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # FIX: Use SET (session-level) not SET LOCAL (transaction-level).
+            # SET LOCAL is reset on db.commit() — all subsequent queries lose
+            # the timeout.  Session-level SET persists for the entire DB session.
+            db.execute(_text("SET statement_timeout = '45000'"))
             db.commit()
         except Exception:
             pass  # non-PostgreSQL dialect or permission issue — proceed without timeout

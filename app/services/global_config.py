@@ -504,6 +504,30 @@ def set_payment_due_offset_days(db: Session, days: int) -> None:
     _C_PAYMENT_DUE_DAYS["value"] = None
 
 
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# 30th key — grace_close_offset_minutes: minutes before T_02H when grace window
+# closes and guillotine list is locked.  Default 5.  Previously hardcoded in
+# _compute_milestones() as `timedelta(minutes=5)`; now DB-configurable so admins
+# can extend the close window without a code deploy.
+_C_GRACE_CLOSE_MINS: dict = _cache()
+
+
+def get_grace_close_offset_minutes(db: Session) -> int:
+    """
+    Minutes before T_02H (draw preparation) when the grace period closes.
+    G_CLOSE = T_02H − grace_close_offset_minutes.
+    Default: 5.  DB key: grace_close_offset_minutes (value_int).
+    """
+    return _read_int(db, "grace_close_offset_minutes", 5, _C_GRACE_CLOSE_MINS)
+
+
+def set_grace_close_offset_minutes(db: Session, minutes: int) -> None:
+    if not (1 <= minutes <= 119):
+        raise ValueError("grace_close_offset_minutes must be 1–119.")
+    _upsert_int(db, "grace_close_offset_minutes", minutes)
+    _C_GRACE_CLOSE_MINS["value"] = None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BULK READ — Admin "Draw & Financial Strategy" panel
 # ══════════════════════════════════════════════════════════════════════════════
@@ -543,4 +567,6 @@ def get_all_financial_config(db: Session) -> dict:
         "cleanup_offset_minutes":    get_cleanup_offset_minutes(db),
         # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
         "payment_due_offset_days":   get_payment_due_offset_days(db),
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        "grace_close_offset_minutes": get_grace_close_offset_minutes(db),
     }

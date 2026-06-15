@@ -51,6 +51,8 @@ from app.services.global_config import (
     get_cleanup_offset_minutes, set_cleanup_offset_minutes,
     # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
     get_payment_due_offset_days, set_payment_due_offset_days,
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    get_grace_close_offset_minutes, set_grace_close_offset_minutes,
 )
 
 router = APIRouter(
@@ -139,6 +141,10 @@ class UpdateDrawCalendarRequest(BaseModel):
     # 29th key — Chronos Engine DUE_DATE milestone: CYCLE_START + payment_due_offset_days
     payment_due_offset_days:  int = Field(4,   ge=1, le=27,
                                           description="Days after cycle start before on-time payment window closes (default 4 = Mon→Thu)")
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # 30th key — G_CLOSE = T_02H − grace_close_offset_minutes (was hardcoded 5)
+    grace_close_offset_minutes: int = Field(5, ge=1, le=119,
+                                            description="Minutes before T-02H when grace period closes and elimination list locks (default 5)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -384,7 +390,9 @@ def update_draw_calendar(
         set_grace_period_hours(db,       body.grace_period_hours)
         set_cleanup_offset_minutes(db,   body.cleanup_offset_minutes)
         # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
-        set_payment_due_offset_days(db,  body.payment_due_offset_days)
+        set_payment_due_offset_days(db,    body.payment_due_offset_days)
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        set_grace_close_offset_minutes(db, body.grace_close_offset_minutes)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -398,10 +406,13 @@ def update_draw_calendar(
         "grace_period_hours":       get_grace_period_hours(db),
         "cleanup_offset_minutes":   get_cleanup_offset_minutes(db),
         # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
-        "payment_due_offset_days":  get_payment_due_offset_days(db),
+        "payment_due_offset_days":    get_payment_due_offset_days(db),
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        "grace_close_offset_minutes": get_grace_close_offset_minutes(db),
         "message": (
             f"Draw calendar: {body.draw_frequency} on {_day_names.get(body.draw_day_of_week, 'Sunday')}, "
-            f"grace={body.grace_period_hours}h, cleanup T+{body.cleanup_offset_minutes}min, "
-            f"due_offset={body.payment_due_offset_days}d. Active within 60 seconds."
+            f"grace={body.grace_period_hours}h, close T-2H−{body.grace_close_offset_minutes}min, "
+            f"cleanup T+{body.cleanup_offset_minutes}min, due_offset={body.payment_due_offset_days}d. "
+            "Active within 60 seconds."
         ),
     }

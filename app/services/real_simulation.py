@@ -238,12 +238,16 @@ def _compute_milestones(db: "Session", T_00H: datetime) -> _SimMilestones:
         get_grace_period_hours,
         get_cleanup_offset_minutes,
         get_payment_due_offset_days,
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        get_grace_close_offset_minutes,
     )
 
-    freq      = get_draw_frequency(db)
-    grace_h   = get_grace_period_hours(db)
-    cleanup_m = get_cleanup_offset_minutes(db)
-    due_days  = get_payment_due_offset_days(db)
+    freq          = get_draw_frequency(db)
+    grace_h       = get_grace_period_hours(db)
+    cleanup_m     = get_cleanup_offset_minutes(db)
+    due_days      = get_payment_due_offset_days(db)
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    grace_close_m = get_grace_close_offset_minutes(db)
 
     cycle_length: timedelta = (
         timedelta(days=7)  if freq == "weekly"   else
@@ -256,7 +260,8 @@ def _compute_milestones(db: "Session", T_00H: datetime) -> _SimMilestones:
     T_05M              = T_00H + timedelta(minutes=cleanup_m)
     CYCLE_START        = T_00H - cycle_length
     GRACE_PERIOD_START = T_02H - timedelta(hours=grace_h)
-    G_CLOSE            = T_02H - timedelta(minutes=5)
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    G_CLOSE            = T_02H - timedelta(minutes=grace_close_m)
     DUE_DATE           = CYCLE_START + timedelta(days=due_days)
 
     # Guard: DUE_DATE must be strictly before GRACE_PERIOD_START

@@ -32,6 +32,8 @@ import {
   startRealSimulation, getRealSimStatus, getRealSimResult,
   devInjectTimed, devMarkAllPaid,
   devSetPaymentScenario, getInjectionStatus,
+  // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  getDebuggerStatus, toggleDebugger, getDebuggerLogs, clearDebuggerLogs,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -224,7 +226,7 @@ function SimLockout({ progress = null, isRealEngine = false }) {
         /* Real Engine — no progress yet (still queued) */
         <div className="text-slate-400 text-sm text-center max-w-xs leading-relaxed px-4 space-y-1 mt-3">
           <p className="text-emerald-400 font-semibold">Starting simulation engine…</p>
-          <p>Preparing isolated SQLite DB + ChronosEngine time-travel.</p>
+          <p>Connecting to Real PostgreSQL DB + ChronosEngine time-travel.</p>
         </div>
       ) : (
         /* Fast Preview */
@@ -2259,6 +2261,45 @@ export default function DevTools() {
   const [tab, setTab] = useState(0)
   const [serverDevError, setServerDevError] = useState(null)
 
+  // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // ── Global System Debugger state ─────────────────────────────────────────
+  const [debuggerOn,     setDebuggerOn]     = useState(false)
+  const [debugLogs,      setDebugLogs]      = useState([])
+  const [debugStatus,    setDebugStatus]    = useState(null)
+  const [showDebugPanel, setShowDebugPanel] = useState(false)
+
+  useEffect(() => {
+    const poll = () =>
+      getDebuggerStatus()
+        .then(r => { setDebugStatus(r.data); setDebuggerOn(r.data.enabled) })
+        .catch(() => {})
+    poll()
+    const id = setInterval(poll, 10_000)
+    return () => clearInterval(id)
+  }, [])
+
+  useEffect(() => {
+    if (!debuggerOn) return
+    const poll = () =>
+      getDebuggerLogs({ limit: 50 })
+        .then(r => setDebugLogs(r.data.logs ?? []))
+        .catch(() => {})
+    poll()
+    const id = setInterval(poll, 5_000)
+    return () => clearInterval(id)
+  }, [debuggerOn])
+
+  const handleDebuggerToggle = async (on) => {
+    try {
+      await toggleDebugger(on)
+      setDebuggerOn(on)
+      if (!on) setDebugLogs([])
+      toast(on ? 'System Debugger ON' : 'System Debugger OFF', on ? 'success' : 'info')
+    } catch {
+      toast('Debugger toggle failed — check server logs', 'error')
+    }
+  }
+
   return (
     <div className="min-h-full bg-slate-950">
 
@@ -2276,6 +2317,20 @@ export default function DevTools() {
             <span className="w-1.5 h-1.5 bg-red-400 rounded-full animate-pulse block"/>
             <code className="text-xs font-mono font-bold text-red-300 tracking-wider">ENABLE_DEV_MODE=true</code>
           </div>
+          {/* SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
+          {/* Debugger Mode toggle badge */}
+          <button
+            onClick={() => setShowDebugPanel(v => !v)}
+            className={`hidden sm:flex items-center gap-2 border rounded-lg px-3 py-1.5 flex-shrink-0 transition-colors ${
+              debuggerOn
+                ? 'bg-emerald-950/80 border-emerald-700 text-emerald-300'
+                : 'bg-slate-900/60 border-slate-700 text-slate-400 hover:border-slate-500'
+            }`}
+          >
+            <span className={`w-1.5 h-1.5 rounded-full block ${debuggerOn ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}/>
+            <code className="text-xs font-mono font-bold tracking-wider">DEBUGGER</code>
+            <Toggle checked={debuggerOn} onChange={handleDebuggerToggle} label="System Debugger"/>
+          </button>
         </div>
       </div>
 
@@ -2291,6 +2346,68 @@ export default function DevTools() {
               <p className="text-red-500 text-xs font-mono mt-3 bg-red-950/60 rounded px-3 py-2 border border-red-900">{serverDevError}</p>
               <button onClick={()=>setServerDevError(null)} className="mt-3 text-xs text-red-400 hover:text-red-200 underline transition">Dismiss</button>
             </div>
+          </div>
+        )}
+
+        {/* SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
+        {/* ── Global System Debugger log panel ─────────────────────────────── */}
+        {showDebugPanel&&(
+          <div className="bg-slate-900 border border-emerald-800/40 rounded-2xl overflow-hidden">
+            <div className="flex items-center gap-3 px-5 py-3 bg-emerald-950/40 border-b border-emerald-800/30">
+              <Activity className="w-4 h-4 text-emerald-400"/>
+              <span className="text-sm font-bold text-emerald-300">System Debugger</span>
+              {debugStatus&&(
+                <span className="text-xs text-slate-400 ml-1">
+                  run_id: <code className="text-emerald-300">{debugStatus.run_id||'—'}</code>
+                  {' '}·{' '}week: <code className="text-emerald-300">{debugStatus.week||0}</code>
+                  {' '}·{' '}<code className="text-emerald-300">{debugStatus.log_count??0}</code> logs
+                </span>
+              )}
+              <div className="ml-auto flex items-center gap-3">
+                <Toggle checked={debuggerOn} onChange={handleDebuggerToggle} label="Debugger on/off"/>
+                <span className={`text-xs font-bold ${debuggerOn?'text-emerald-400':'text-slate-500'}`}>
+                  {debuggerOn?'ON':'OFF'}
+                </span>
+                {debugLogs.length>0&&(
+                  <button
+                    onClick={()=>clearDebuggerLogs().then(()=>setDebugLogs([])).catch(()=>{})}
+                    className="text-xs text-red-400 hover:text-red-300 underline transition"
+                  >Clear logs</button>
+                )}
+              </div>
+            </div>
+            {debugLogs.length===0?(
+              <div className="px-5 py-6 text-center text-slate-500 text-sm">
+                {debuggerOn?'Waiting for log entries…':'Enable debugger and run a simulation to see logs.'}
+              </div>
+            ):(
+              <div className="overflow-x-auto max-h-72">
+                <table className="w-full text-[11px] font-mono">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-slate-500 uppercase text-[10px]">
+                      <th className="px-3 py-2 text-left">Phase</th>
+                      <th className="px-3 py-2 text-left">Event</th>
+                      <th className="px-3 py-2 text-left">Week</th>
+                      <th className="px-3 py-2 text-right">ms</th>
+                      <th className="px-3 py-2 text-left">Data</th>
+                      <th className="px-3 py-2 text-left">Error</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {debugLogs.map(l=>(
+                      <tr key={l.id} className="border-b border-slate-800/60 hover:bg-slate-800/30 transition-colors">
+                        <td className="px-3 py-1.5 text-cyan-400">{l.phase}</td>
+                        <td className="px-3 py-1.5 text-slate-300">{l.event}</td>
+                        <td className="px-3 py-1.5 text-slate-400">{l.week_num??'—'}</td>
+                        <td className="px-3 py-1.5 text-right text-violet-300">{l.duration_ms!=null?l.duration_ms.toFixed(1):'—'}</td>
+                        <td className="px-3 py-1.5 text-slate-400 max-w-[200px] truncate">{l.data_json??'—'}</td>
+                        <td className="px-3 py-1.5 text-red-400 max-w-[150px] truncate">{l.error??''}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         )}
 

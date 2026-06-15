@@ -13,10 +13,16 @@ from app.models.system_lock       import SystemLock
 # ── Phase 1: Elimination & Grace Period engine ────────────────────────────────
 from app.models.elimination_event import EliminationEvent, EliminationReason
 
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ── Global System Debugger audit trail ───────────────────────────────────────
+from app.models.debug_log import DebugLog
+
 __all__ = [
     "Pool", "User", "Token", "Admin", "SystemSettings", "DrawHistory",
     # SDE architecture
     "WeeklyDrawState", "SDESession", "SDECheckpoint", "SystemLock",
     # Elimination engine
     "EliminationEvent", "EliminationReason",
+    # System Debugger
+    "DebugLog",
 ]

@@ -342,3 +342,100 @@ NOW GIVE ME YOUR SYSTEMATIC REVIEW AND FRAMWORK IN WIRE DIAGRAM IF THIS IS ACCEP
 
 I need a deep AI thinking from you for below point:
 also adopt same structure for SDE II/SDE III; just one rule is different if there are Case E then in case of SDE II a single winner of L5/L6 can be possible winner, For L5 pool criteria for draw is minimum 6 member, forced winner of L5 level all member, for SDE III no minimum pool criteria for L6 all L6  L5/L6 must Exit winner eliminated from system 
+
+
+
+
+CRITICAL ARCHITECTURE INSTRUCTION: THE "REAL TRACK" SIMULATOR INTEGRATION & FINANCE MANAGER ENGINE
+
+Claude, we are now building the actual Stress Test Simulator. Read this micro-explanation carefully. 
+
+### THE PHILOSOPHY: "REAL PASSENGERS ON THE REAL TRACK"
+The simulator MUST NOT contain its own duplicated draw logic, rules, or math. The Core System (Waitlist, Brains 1-5, Draw Prep, Dual-Draw) is the "Real Track". The Core System must remain completely untouched and unaware that it is being tested. 
+The ONLY difference in this simulation is:
+1. The users are Fake (Dummy data).
+2. The Time is Fast-Forwarded (Time Travel).
+Everything else—Dynamic Global Settings, DEP/WIT/OTHER ALL tokens, execution logic—must use the EXACT production services.
+
+To achieve this, you must build the Simulator using 3 distinct internal modules:
+
+### MODULE 1: THE CHRONOS ENGINE (STRICT FORWARD TIME TRAVEL)
+The simulator must globally mock the system time (`datetime.now` / DB timestamps) for the duration of the test.
+* STRICT RULE (Proper Time Order): Time MUST flow strictly forward. You cannot simulate an event on June 14, 2026, and then simulate a subsequent event on March 30, 2026. 
+* The Chronos Engine will jump to exact chronological milestones configured in the Dynamic Settings and in stratigcal order and timeline (e.g., Monday 00:00 → Monday 10:00 AM → Thursday 23:59 (Due Date) → Saturday T-2H → Sunday T-0H → T+05M).
+
+### MODULE 2: THE DYNAMIC LOAD INJECTOR (24x7 REALISTIC INFLOW)
+Instead of dumping all fake users at the exact same millisecond, the Load Injector must distribute user creation realistically across the simulated week (24x7).
+* Micro-Explanation: If simulating 100 users joining in a week, inject User A at Monday 10:15 AM, User B at Tuesday 02:30 PM, User C at Wednesday 08:45 AM, etc. (Always maintaining the strict forward-time rule).
+* For every injected user, the system MUST call the real registration service, generate a real DEP token (value derived from Dynamic Settings), burn it, and strategy follow the math further like place them on the Waitlist natively etc.
+
+### MODULE 3: THE "FINANCE MANAGER" (BEHAVIOR & TOKEN SIMULATOR)
+Since there are no real humans to click "Pay", the simulator needs a "Finance Manager" module to mimic human behavior dynamically as the Chronos Engine moves time forward.
+* Payment Simulation: Pay Installment on Due Date configured in system, the Finance Manager loops through active dummy members and naturally marks them as 'Paid' by interacting with the real payment services.
+* Behavior Scenarios (Path A/B/C): Based on Dev UI sliders, the Finance Manager will deliberately leave X% of users 'Unpaid' past the due date. 
+* It will let some fall into Path A (Eliminated without grace), put some in Path B (Accrue daily late fees), and make some use Path C (Pay the Grace Fee+late Fee at the last minute before grace Period over).
+* Token Management: It manages the generation and tracking of all fake DEP and WIT, LF, GF, REF-WIT tokens to ensure the float math matches reality.
+
+### THE SIMULATION LOOP (EXACT EXECUTION ORDER)
+CRITICAL ARCHITECTURE INSTRUCTION: THE PURELY DYNAMIC CHRONOS ENGINE "TICK-TOCK" SEQUENCE
+
+Claude, disregard any previous assumptions about fixed days (like Monday or Saturday) or fixed times. The Chronos Engine MUST be 100% dynamic and rely exclusively on the global configuration variables (Offsets) set by the Admin. 
+
+Do NOT hardcode any datetime values. The simulator must fetch the dynamic variables (`CYCLE_START`, `DUE_DATE`, `GRACE_PERIOD_START`, `T_02H`, `T_00H`, `T_05M`) and mock the time to hit these exact milestones progressively.
+
+Here is the EXACT dynamic micro-chronological order for one simulated cycle:
+
+### THE DYNAMIC CHRONOS TIMELINE
+
+**[TICK 1] CYCLE START (Time = `[CYCLE_START]`)**
+- Chronos sets time to the start of the configured cycle.
+- Finance Manager (FM) resets all active dummy users to `Unpaid`.
+- Load Injector begins progressively injecting new users into the Waitlist.
+
+**[TICK 2] THE ON-TIME WINDOW (Time = `[CYCLE_START]` to `[DUE_DATE]`)**
+- Chronos fast-forwards progressively.
+- FM randomly selects X% of users to pay on time.
+- FM calls real payment API: User pays dynamic Base Installment → Status `Paid`.
+
+**[TICK 3] LATE FEE WINDOW (Time = `[DUE_DATE]` to `[GRACE_PERIOD_START]`)**
+- Chronos jumps past the dynamic `[DUE_DATE]`.
+- FM triggers the daily/periodic `apply_late_fees()` job.
+- FM selects Y% of users to pay late.
+- FM calls real API: User pays (Base Installment + dynamically calculated Late Fee) → Status `Paid`.
+
+**[TICK 4] GRACE PERIOD (Time = `[GRACE_PERIOD_START]` to `[G_CLOSE]`)**
+- Chronos enters the Grace Period.
+- FM selects a final Z% of users to save their seats.
+- FM calls real API: User pays (Base Installment + Late Fee + dynamic Grace Fee) → `grace_fee_paid=True` → Status `Paid`.
+
+**[TICK 5] THE GUILLOTINE / G-CLOSE (Time = `[T_02H] minus 5 Minutes`)**
+- Chronos jumps to exactly 5 minutes before Draw Prep.
+- Grace Period is forcefully closed.
+- FM triggers the real `eliminate_unpaid_users()` job.
+- ALL remaining `Unpaid` users are Eliminated.
+- Phase 1 Waitlist natively refills these exact vacancies to ensure pools are full before T-02H.
+
+**[TICK 6] THE PLANNING SNAPSHOT (Time = `[T_02H]`)**
+- Chronos jumps to the dynamically configured `[T_02H]` offset.
+- Simulator triggers REAL `start_draw_preparation()`.
+- System Lock acquired, LPI calculated, L4s flagged, SDE Virtual Meta-Pool staged.
+
+**[TICK 7] THE UNIFIED EXECUTION (Time = `[T_00H]`)**
+- Chronos jumps to the dynamically configured draw execution time `[T_00H]`.
+- Simulator triggers REAL `execute_weekly_draw()`.
+- Ext-III, Ext-II, Staged SDE, and Regular draws commit atomically. WIT Tokens generated.
+
+**[TICK 8] THE REBUILD PHASE (Time = `[T_05M]`)**
+- Chronos jumps to the dynamically configured post-draw offset `[T_05M]`.
+- Simulator triggers REAL `post_draw_cleanup()` and `assign_waitlist_to_pools()`.
+- System Lock released. Paid survivors advance +1 level.
+
+**[TICK 9] NEXT CYCLE (Time = `[NEXT_CYCLE_START]`)**
+- Chronos calculates the exact datetime for the next cycle start based on the configured frequency (Daily/Weekly/Monthly).
+- Loop repeats for N cycles.
+
+**EXECUTION COMMAND:** 
+Build the Simulator's main cycle loop strictly using this variable-based Tick Sequence. Use `timedelta` and the dynamic settings from the DB to calculate the actual timestamps. Do NOT use strings like "Monday" or fixed hours like "22:00". Confirm you understand this strictly dynamic requirement.
+
+**EXECUTION COMMAND:** 
+Build the simulator exactly according to these 3 modules. Ensure the Load Injector NEVER violates the strict forward-time rule, and ensure the Finance Manager strictly uses the real core payment/token functions. Confirm you understand this architecture before writing the code.

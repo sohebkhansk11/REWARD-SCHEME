@@ -3294,6 +3294,21 @@ def run_real_simulation(body: RealSimRequest):
     No cap on weeks — simulation CAN take time (like MetaTrader strategy tester).
     1–200 weeks supported.
     """
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # FIX: Refuse a second simulation if one is already running.
+    # Concurrent simulations share the same PostgreSQL tables — both call
+    # execute_weekly_draw() on the same pools → row-level deadlock → infinite hang.
+    with _SIM_LOCK:
+        _active_sims = [jid for jid, v in _SIM_STATUS.items() if v.get("status") == "running"]
+    if _active_sims:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Simulation {_active_sims[0][:8]}… is already running. "
+                "Wait for it to complete, or restart the server to cancel all in-progress jobs."
+            ),
+        )
+
     job_id = str(uuid.uuid4())
 
     params = {

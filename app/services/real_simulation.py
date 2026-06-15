@@ -1672,6 +1672,18 @@ class RealSimEngine:
         # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
         db = _PgSession()   # real PostgreSQL — data persists, Dashboard shows it live
 
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # FIX: 45-second per-statement timeout so a PostgreSQL lock-wait or
+        # deadlock surfaces as a QueryCanceledError (caught by existing try/except
+        # patterns) instead of blocking the background thread indefinitely.
+        # Without this, one stale lock = infinite hang at "Week 0 / 10".
+        try:
+            from sqlalchemy import text as _text
+            db.execute(_text("SET LOCAL statement_timeout = '45000'"))
+            db.commit()
+        except Exception:
+            pass  # non-PostgreSQL dialect or permission issue — proceed without timeout
+
         try:
             # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
             # Open Global System Debugger bracket for this run (no-op when debugger OFF).
@@ -1700,6 +1712,25 @@ class RealSimEngine:
                 refill = assign_waitlist_to_pools(db)
                 total_p2_pools += refill.get("phase2_pools_count", 0)
                 db.commit()
+
+                # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # FIX: Clear any stale SystemLock + WeeklyDrawState left by:
+                #   - A previous simulation that crashed or was server-killed
+                #   - A previous admin force-draw that was interrupted mid-draw
+                #   - Multiple concurrent simulation threads (race condition)
+                # Without this, start_draw_preparation() hits a UNIQUE constraint
+                # on lock_name → db.rollback() → the simulation session's mid-week
+                # state evaporates → week 1 produces no draws → infinite wait.
+                try:
+                    from app.models.weekly_draw_state import WeeklyDrawState as _WDS
+                    db.query(SystemLock).delete()
+                    db.query(_WDS).delete()
+                    db.commit()
+                    _logger.info("RealSimEngine: cleared stale SystemLock + WeeklyDrawState.")
+                except Exception as _pre_exc:
+                    _logger.warning("RealSimEngine: pre-loop stale-state clear failed: %s", _pre_exc)
+                    try: db.rollback()
+                    except Exception: pass
 
                 # ────────────────────────────────────────────────────────────────
                 # 9-TICK CHRONOS MAIN LOOP (all milestones derived from DB config)

@@ -494,7 +494,7 @@ export const updateDrawSchedule = (drawHourUtc, drawMinuteUtc, drawPrepHours, ad
 
 // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
 // Draw & Financial Strategy — backs the new admin sub-tab in System Settings.
-/** GET  /admin/financial-config — full 28-key config snapshot */
+/** GET  /admin/financial-config — full 30-key config snapshot */
 export const getFinancialConfig = () =>
   api.get('/admin/financial-config')
 

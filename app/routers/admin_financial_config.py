@@ -10,7 +10,7 @@ All PUT endpoints: mutate SystemSettings rows — REQUIRE admin_password in body
 
 Endpoint map
 ------------
-  GET  /admin/financial-config                  — full config snapshot (28 keys)
+  GET  /admin/financial-config                  — full config snapshot (30 keys)
   PUT  /admin/financial-config/base             — base_installment_inr + payout_fee
   PUT  /admin/financial-config/late-fees        — late_fee_daily_inr + cap
   PUT  /admin/financial-config/level-payout     — one level's gross + net
@@ -154,7 +154,7 @@ class UpdateDrawCalendarRequest(BaseModel):
 @router.get("", summary="Get full Draw & Financial Strategy configuration")
 def get_financial_config(db: Session = Depends(get_db)) -> dict:
     """
-    Return all 29 runtime-configurable financial/threshold/chronology values
+    Return all 30 runtime-configurable financial/threshold/chronology values
     in a single response.  Values are served from the 60-second TTL cache
     (warm) or read fresh from system_settings (cold).
 

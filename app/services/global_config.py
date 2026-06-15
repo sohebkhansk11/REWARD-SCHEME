@@ -538,7 +538,7 @@ def get_all_financial_config(db: Session) -> dict:
 
     Used by GET /admin/financial-config.
     All values are served from cache (60s TTL) where warm — single DB
-    round-trip set for all 29 keys when cache is cold.
+    round-trip set for all 30 keys when cache is cold.
     """
     lvl_payouts = get_all_level_payouts(db)
     return {

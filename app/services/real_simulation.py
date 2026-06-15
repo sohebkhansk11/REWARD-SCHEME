@@ -1691,6 +1691,7 @@ class RealSimEngine:
         try:
             # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
             # Open Global System Debugger bracket for this run (no-op when debugger OFF).
+            _logger.info("RealSimEngine [%s]: PHASE-A — entering main try block", self._run_id)
             log_milestone("SIM/start", "simulation_started", {"run_id": self._run_id})
 
             # 9-tick dynamic Chronos Timeline — all milestones derived from DB global_config.
@@ -1705,17 +1706,20 @@ class RealSimEngine:
                     seed_m.CYCLE_START + timedelta(hours=72), seed_m.DUE_DATE,
                 )
                 chronos.jump_to(seed_win_start)
+                _logger.info("RealSimEngine [%s]: PHASE-B — seed inject start (%d users)", self._run_id, self.initial_users)
                 seed_users = injector.inject_distributed(
                     db, self.initial_users, seed_win_start, seed_win_end,
                     self.organic_ratio, [], chronos,
                 )
                 db.commit()
                 total_users_created += len(seed_users)
+                _logger.info("RealSimEngine [%s]: PHASE-C — seed inject done (%d created), starting pool formation", self._run_id, len(seed_users))
 
                 # Trigger initial pool formation from seed users
                 refill = assign_waitlist_to_pools(db)
                 total_p2_pools += refill.get("phase2_pools_count", 0)
                 db.commit()
+                _logger.info("RealSimEngine [%s]: PHASE-D — initial pool formation done", self._run_id)
 
                 # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
                 # FIX: Clear any stale SystemLock + WeeklyDrawState left by:
@@ -1725,12 +1729,13 @@ class RealSimEngine:
                 # Without this, start_draw_preparation() hits a UNIQUE constraint
                 # on lock_name → db.rollback() → the simulation session's mid-week
                 # state evaporates → week 1 produces no draws → infinite wait.
+                _logger.info("RealSimEngine [%s]: PHASE-E — clearing stale SystemLock + WeeklyDrawState", self._run_id)
                 try:
                     from app.models.weekly_draw_state import WeeklyDrawState as _WDS
                     db.query(SystemLock).delete()
                     db.query(_WDS).delete()
                     db.commit()
-                    _logger.info("RealSimEngine: cleared stale SystemLock + WeeklyDrawState.")
+                    _logger.info("RealSimEngine [%s]: PHASE-F — stale lock clear done — entering week loop", self._run_id)
                 except Exception as _pre_exc:
                     _logger.warning("RealSimEngine: pre-loop stale-state clear failed: %s", _pre_exc)
                     try: db.rollback()
@@ -1770,9 +1775,11 @@ class RealSimEngine:
 
                     # ── TICK 1: CYCLE_START — reset payment cycle + inject users ──
                     # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    _logger.info("RealSimEngine [%s]: TICK1-start week=%d — reset_payment_cycle", self._run_id, week_num)
                     chronos.jump_to(m.CYCLE_START)
                     _fm_reset_payment_cycle(db)
                     db.commit()
+                    _logger.info("RealSimEngine [%s]: TICK1-done week=%d", self._run_id, week_num)
 
                     # K-12: Compute weekly inflow via pattern
                     inflow = self._compute_weekly_inflow(week_num)
@@ -1931,6 +1938,7 @@ class RealSimEngine:
                     #   4. Quantifies SDE demand + checks L1/L2 supply
                     #   5. Runs run_sde_meta_pool() (SDE sub-draws executed here)
                     #   6. Sets preparation_valid=True, countdown_active=True
+                    _logger.info("RealSimEngine [%s]: TICK6-start week=%d — start_draw_preparation", self._run_id, week_num)
                     chronos.jump_to(m.T_02H)
                     # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
                     # Bug #1/#2/#3 — snapshot DrawHistory row count and total payout BEFORE
@@ -2010,6 +2018,7 @@ class RealSimEngine:
                     # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
                     # This runs the Ext-II/III pre-pass THEN draws all eligible pools.
                     # SDE-processed pools are skipped (draw_completed_this_week=True).
+                    _logger.info("RealSimEngine [%s]: TICK7-start week=%d — execute_weekly_draw", self._run_id, week_num)
                     chronos.jump_to(m.T_00H)
 
                     draws_this_week  = 0
@@ -2017,6 +2026,7 @@ class RealSimEngine:
 
                     try:
                         mass_result      = execute_weekly_draw(db, auto_pay_unpaid=False)
+                        _logger.info("RealSimEngine [%s]: TICK7-done week=%d — pools_drawn=%d", self._run_id, week_num, mass_result.pools_drawn)
                         # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
                         # Temporary value — overwritten by DrawHistory delta below (Bug #1 fix
                         # from Jun-13 session).  Summing all MassDrawResult draw-type counters

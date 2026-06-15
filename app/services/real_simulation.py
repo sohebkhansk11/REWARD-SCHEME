@@ -1728,7 +1728,10 @@ class RealSimEngine:
                 _logger.info("RealSimEngine [%s]: PHASE-C — seed inject done (%d created), starting pool formation", self._run_id, len(seed_users))
 
                 # Trigger initial pool formation from seed users
-                refill = assign_waitlist_to_pools(db)
+                # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Scoped to rsim_ users — prevents assigning thousands of real
+                # Waitlist users into pools during simulation setup.
+                refill = assign_waitlist_to_pools(db, user_prefix=injector._pfx)
                 total_p2_pools += refill.get("phase2_pools_count", 0)
                 db.commit()
                 _logger.info("RealSimEngine [%s]: PHASE-D — initial pool formation done", self._run_id)
@@ -1866,7 +1869,10 @@ class RealSimEngine:
                     #   This is the exact equivalent of a user registering mid-week and
                     #   triggering the waitlist engine, just done in one batch per week.
                     try:
-                        weekly_refill = assign_waitlist_to_pools(db)
+                        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        # Scoped to rsim_ users — prevents fetching/processing thousands
+                        # of real Waitlist users every week, which caused the 10+ min hang.
+                        weekly_refill = assign_waitlist_to_pools(db, user_prefix=injector._pfx)
                         total_p2_pools += weekly_refill.get("phase2_pools_count", 0)
                         total_p3_xfers += weekly_refill.get("phase3_transfers", 0)
                         db.commit()

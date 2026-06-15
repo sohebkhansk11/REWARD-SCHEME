@@ -126,7 +126,12 @@ def _activate_user(db: Session, user: User, pool: Pool, phase: str) -> None:
 # MASTER FUNCTION — Bulk Double-FIFO Auto-Refill Engine
 # ─────────────────────────────────────────────────────────────────────────────
 
-def assign_waitlist_to_pools(db: Session) -> dict:
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Added user_prefix parameter — when set (simulation only), all Waitlist user
+# queries are scoped to usernames matching the prefix. Default None = no filter
+# = production behaviour unchanged. Without this, the simulation was fetching
+# and processing 2000+ real Waitlist users every week, causing a 10+ min hang.
+def assign_waitlist_to_pools(db: Session, *, user_prefix: str | None = None) -> dict:
     """
     Bulk Double-FIFO Auto-Refill Engine — single source of truth for all
     waitlist-to-pool assignment logic.
@@ -197,12 +202,16 @@ def assign_waitlist_to_pools(db: Session) -> dict:
 
     if pools_needing_fill and total_vacancies > 0:
         # 1c. Fetch exactly total_vacancies oldest paid Waitlist members.
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        _p1_filters = [
+            User.status == UserStatus.Waitlist,
+            User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+        ]
+        if user_prefix:
+            _p1_filters.append(User.username.like(f"{user_prefix}%"))
         candidates: list[User] = (
             db.query(User)
-            .filter(
-                User.status == UserStatus.Waitlist,
-                User.weekly_payment_status == WeeklyPaymentStatus.Paid,
-            )
+            .filter(*_p1_filters)
             .order_by(User.join_date.asc())
             .limit(total_vacancies)
             .all()
@@ -315,12 +324,16 @@ def assign_waitlist_to_pools(db: Session) -> dict:
         # At LPI ≥ 50%, threshold auto-reduces to POOL_CAPACITY (12).
         threshold = get_adaptive_threshold(db)   # was: get_pool_threshold(db)
         base_threshold = get_pool_threshold(db)
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        _p2_count_filters = [
+            User.status == UserStatus.Waitlist,
+            User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+        ]
+        if user_prefix:
+            _p2_count_filters.append(User.username.like(f"{user_prefix}%"))
         remaining: int = (
             db.query(User)
-            .filter(
-                User.status == UserStatus.Waitlist,
-                User.weekly_payment_status == WeeklyPaymentStatus.Paid,
-            )
+            .filter(*_p2_count_filters)
             .count()
         )
         _logger.info(
@@ -404,13 +417,17 @@ def assign_waitlist_to_pools(db: Session) -> dict:
                 )
 
                 # Fetch exactly the waitlist users we need (FIFO order).
+                # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
                 users_needed = pools_to_make * POOL_CAPACITY
+                _p2_member_filters = [
+                    User.status == UserStatus.Waitlist,
+                    User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+                ]
+                if user_prefix:
+                    _p2_member_filters.append(User.username.like(f"{user_prefix}%"))
                 new_members: list[User] = (
                     db.query(User)
-                    .filter(
-                        User.status == UserStatus.Waitlist,
-                        User.weekly_payment_status == WeeklyPaymentStatus.Paid,
-                    )
+                    .filter(*_p2_member_filters)
                     .order_by(User.join_date.asc())
                     .limit(users_needed)
                     .all()
@@ -532,12 +549,16 @@ def assign_waitlist_to_pools(db: Session) -> dict:
         }
 
     # ── Safeguard (a): check paid waitlist count ──────────────────────────────
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    _p3_wl_filters = [
+        User.status == UserStatus.Waitlist,
+        User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+    ]
+    if user_prefix:
+        _p3_wl_filters.append(User.username.like(f"{user_prefix}%"))
     wl_remaining: int = (
         db.query(User)
-        .filter(
-            User.status == UserStatus.Waitlist,
-            User.weekly_payment_status == WeeklyPaymentStatus.Paid,
-        )
+        .filter(*_p3_wl_filters)
         .count()
     )
 

@@ -166,6 +166,8 @@ export default function SystemSettings() {
   const [drawDayOfWeek,   setDrawDayOfWeek]   = useState(6)
   const [gracePeriodHrs,  setGracePeriodHrs]  = useState('')
   const [cleanupMins,     setCleanupMins]     = useState('')
+  // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  const [paymentDueDays,  setPaymentDueDays]  = useState(4)
   const [chronoModalOpen, setChronoModalOpen] = useState(false)
   const [chronoAdminPw,   setChronoAdminPw]   = useState('')
   const [chronoSaving,    setChronoSaving]    = useState(false)
@@ -194,6 +196,8 @@ export default function SystemSettings() {
     setDrawDayOfWeek(cfg.draw_day_of_week)
     setGracePeriodHrs(String(cfg.grace_period_hours))
     setCleanupMins(String(cfg.cleanup_offset_minutes))
+    // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    setPaymentDueDays(String(cfg.payment_due_offset_days ?? 4))
   }
 
   // ── Fetch all settings ────────────────────────────────────────────────────
@@ -667,6 +671,8 @@ export default function SystemSettings() {
                 <StatRow label="Draw Day"                value={finConfig.draw_day_name}   accent="text-violet-600" />
                 <StatRow label="Grace Period"            value={`${finConfig.grace_period_hours}h`} />
                 <StatRow label="Cleanup Offset"          value={`T+${finConfig.cleanup_offset_minutes}min`} />
+                {/* SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
+                <StatRow label="Payment Due Offset"      value={`T+${finConfig.payment_due_offset_days ?? 4}d`} />
               </div>
               <div className="grid grid-cols-2 gap-4 mb-4">
                 <div className="space-y-1.5">
@@ -687,6 +693,8 @@ export default function SystemSettings() {
                 </div>
                 <NumInput label="Grace Period (hours)" value={gracePeriodHrs} onChange={setGracePeriodHrs} min={1} max={168} unit="hrs" note="1–168 hours (max 7 days)" />
                 <NumInput label="Cleanup Offset (min)" value={cleanupMins}    onChange={setCleanupMins}    min={1} max={60}  unit="min" note="Minutes after draw T-0H" />
+                {/* SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
+                <NumInput label="Payment Due Offset (days)" value={paymentDueDays} onChange={setPaymentDueDays} min={1} max={27} unit="days" note="Days after cycle start before on-time window closes (1–27)" />
               </div>
               <button onClick={() => { setChronoAdminPw(''); setChronoModalOpen(true) }}
                 className="inline-flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white rounded-xl text-sm font-semibold shadow-sm transition-colors">
@@ -1127,6 +1135,11 @@ export default function SystemSettings() {
               <span className="text-sm text-slate-500">Cleanup Offset</span>
               <span className="text-sm font-bold text-violet-600">T+{cleanupMins} min</span>
             </div>
+            {/* SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
+            <div className="flex items-center justify-between px-4 py-3">
+              <span className="text-sm text-slate-500">Payment Due Offset</span>
+              <span className="text-sm font-bold text-violet-600">T+{paymentDueDays} days</span>
+            </div>
           </div>
           <div className="space-y-2">
             <label className="block text-sm font-semibold text-slate-700">
@@ -1146,6 +1159,8 @@ export default function SystemSettings() {
                       draw_day_of_week: parseInt(drawDayOfWeek, 10),
                       grace_period_hours: parseInt(gracePeriodHrs, 10),
                       cleanup_offset_minutes: parseInt(cleanupMins, 10),
+                      // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                      payment_due_offset_days: parseInt(paymentDueDays, 10),
                     }, chronoAdminPw)
                     setFinConfig(prev => ({ ...prev, ...r.data }))
                     toast(r.data.message, 'success')
@@ -1171,6 +1186,8 @@ export default function SystemSettings() {
                     draw_day_of_week: parseInt(drawDayOfWeek, 10),
                     grace_period_hours: parseInt(gracePeriodHrs, 10),
                     cleanup_offset_minutes: parseInt(cleanupMins, 10),
+                    // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    payment_due_offset_days: parseInt(paymentDueDays, 10),
                   }, chronoAdminPw)
                   setFinConfig(prev => ({ ...prev, ...r.data }))
                   toast(r.data.message, 'success')

@@ -959,6 +959,17 @@ function StressTestTab({ toast }) {
           }
         }
       } catch (pollErr) {
+        // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        // 404 = server restarted — job is permanently gone from _SIM_STATUS.
+        // This is terminal, not transient. Reset UI to idle immediately.
+        if (pollErr.response?.status === 404) {
+          if (!cancelled) {
+            toast('Simulation session lost — server was restarted. Please start a new run.', 'warning')
+            setRunning(false)
+            setSimJobId(null)
+          }
+          return
+        }
         // Transient network error during poll — don't abort, just log
         console.warn('[SimPoll] transient error:', pollErr.message)
       }

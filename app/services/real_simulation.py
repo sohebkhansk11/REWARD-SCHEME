@@ -877,7 +877,39 @@ def _snapshot(
         "cascade_risk":  round(dist.l3 / max(dist.l1 + dist.l2, 1), 3),
         "l3_count":      dist.l3,
         "l1l2_count":    dist.l1 + dist.l2,
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # DIRECTIVE 4 — Finance Manager Analytics additions.
+        # base_installment_inr: live DB value — reflects any admin change mid-simulation.
+        # net_float_inr: cash_inflow - WIT payout outflow - referral settle outflow.
+        # l3_to_l4_pressure_pct: % of active members at L3 (all will advance to L4
+        #   next week if they survive) — forward-looking cascade risk indicator.
+        "base_installment_inr": (
+            _get_base_installment_safe(db)
+        ),
+        "net_float_inr": round(
+            (
+                installments_collected
+                + compliance.get("late_fee_revenue_inr", 0)
+                + compliance.get("grace_fee_revenue_inr", 0)
+            )
+            - cash_outflow_inr
+            - rw_settled_inr,
+            2,
+        ),
+        "l3_to_l4_pressure_pct": round(
+            dist.l3 / max(active_users, 1) * 100, 2
+        ),
     }
+
+
+def _get_base_installment_safe(db: Session) -> int:
+    """Read base installment from DB; return config default on any failure."""
+    try:
+        from app.services.global_config import get_base_installment
+        return get_base_installment(db)
+    except Exception:
+        from app.core.config import DEPOSIT_AMOUNT_INR
+        return DEPOSIT_AMOUNT_INR
 
 
 # ══════════════════════════════════════════════════════════════════════════════

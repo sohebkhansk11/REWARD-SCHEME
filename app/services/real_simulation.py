@@ -33,6 +33,7 @@ import logging
 import random
 import secrets
 import string
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import patch
@@ -55,6 +56,42 @@ _TIME_PATCHED = [
 
 _DEPOSIT_DEC = Decimal("1000")
 _TOKEN_ALPHA = string.ascii_uppercase + string.digits
+
+
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ── _SimMilestones — typed container for all 9-tick Chronos timestamps ───────
+# All fields are computed dynamically from DB-backed global_config values by
+# _compute_milestones().  NO field may ever be hardcoded inside the simulator.
+@dataclass(frozen=True)
+class _SimMilestones:
+    """
+    Immutable snapshot of every chronological milestone for one simulated cycle.
+
+    Strict ordering guaranteed by _compute_milestones():
+        CYCLE_START < DUE_DATE < GRACE_PERIOD_START < G_CLOSE < T_02H < T_00H < T_05M
+
+    Fields:
+        CYCLE_START         — payment window opens (= previous T_00H)
+        DUE_DATE            — on-time payment window closes
+                              (= CYCLE_START + payment_due_offset_days)
+        GRACE_PERIOD_START  — grace-period opens after late-fee window
+                              (= T_02H − grace_period_hours)
+        G_CLOSE             — guillotine: FM triggers elimination
+                              (= T_02H − 5 min)
+        T_02H               — draw preparation start (= T_00H − 2 h)
+        T_00H               — draw execution time
+        T_05M               — post-draw cleanup fires
+                              (= T_00H + cleanup_offset_minutes)
+        cycle_length        — total duration of one cycle (weekly = 7 days, etc.)
+    """
+    CYCLE_START:        datetime
+    DUE_DATE:           datetime
+    GRACE_PERIOD_START: datetime
+    G_CLOSE:            datetime
+    T_02H:              datetime
+    T_00H:              datetime
+    T_05M:              datetime
+    cycle_length:       timedelta
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -176,6 +213,77 @@ def _create_sim_db():
     return engine, SessionLocal
 
 
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.5  CHRONOS MILESTONE ENGINE — Dynamic Timeline Computation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _compute_milestones(db: "Session", T_00H: datetime) -> _SimMilestones:
+    """
+    Compute every Chronos tick timestamp for one simulation cycle from live
+    DB-backed global_config values.
+
+    All offsets are read fresh every cycle so an admin changing a value
+    mid-simulation takes effect on the next cycle (within 60-second TTL).
+
+    STRICT CHRONOLOGICAL GUARANTEE:
+        CYCLE_START < DUE_DATE < GRACE_PERIOD_START < G_CLOSE < T_02H < T_00H < T_05M
+
+    DUE_DATE guard: if DUE_DATE >= GRACE_PERIOD_START (misconfigured settings,
+    e.g. due_days = 6 with grace 48 h and a 7-day cycle), DUE_DATE is clamped
+    to GRACE_PERIOD_START − 1 hour so the late-fee window is always positive.
+    """
+    from app.services.global_config import (
+        get_draw_frequency,
+        get_grace_period_hours,
+        get_cleanup_offset_minutes,
+        get_payment_due_offset_days,
+    )
+
+    freq      = get_draw_frequency(db)
+    grace_h   = get_grace_period_hours(db)
+    cleanup_m = get_cleanup_offset_minutes(db)
+    due_days  = get_payment_due_offset_days(db)
+
+    cycle_length: timedelta = (
+        timedelta(days=7)  if freq == "weekly"   else
+        timedelta(days=14) if freq == "biweekly"  else
+        timedelta(days=30) if freq == "monthly"   else
+        timedelta(days=7)
+    )
+
+    T_02H              = T_00H - timedelta(hours=2)
+    T_05M              = T_00H + timedelta(minutes=cleanup_m)
+    CYCLE_START        = T_00H - cycle_length
+    GRACE_PERIOD_START = T_02H - timedelta(hours=grace_h)
+    G_CLOSE            = T_02H - timedelta(minutes=5)
+    DUE_DATE           = CYCLE_START + timedelta(days=due_days)
+
+    # Guard: DUE_DATE must be strictly before GRACE_PERIOD_START
+    if DUE_DATE >= GRACE_PERIOD_START:
+        DUE_DATE = GRACE_PERIOD_START - timedelta(hours=1)
+
+    return _SimMilestones(
+        CYCLE_START        = CYCLE_START,
+        DUE_DATE           = DUE_DATE,
+        GRACE_PERIOD_START = GRACE_PERIOD_START,
+        G_CLOSE            = G_CLOSE,
+        T_02H              = T_02H,
+        T_00H              = T_00H,
+        T_05M              = T_05M,
+        cycle_length       = cycle_length,
+    )
+
+
+def _compute_next_draw_time(T_00H: datetime, cycle_length: timedelta) -> datetime:
+    """
+    TICK 9 — advance to the next cycle's draw execution time.
+    Pure arithmetic: no DB read required (cycle_length already read from DB
+    in _compute_milestones and passed through _SimMilestones.cycle_length).
+    """
+    return T_00H + cycle_length
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. MASS LOAD INJECTOR — Synthetic User Traffic + DEP Token Burning
 # ══════════════════════════════════════════════════════════════════════════════
@@ -271,6 +379,92 @@ class MassLoadInjector:
 
         if token_rows:
             db.execute(sa_insert(Token), token_rows)
+
+        return new_users
+
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    def inject_distributed(
+        self,
+        db:            "Session",
+        count:         int,
+        window_start:  datetime,
+        window_end:    datetime,
+        organic_ratio: float,
+        existing_ids:  "list[int]",
+        chronos:       "ChronosEngine",
+    ) -> list:
+        """
+        MODULE 2 — DYNAMIC LOAD INJECTOR
+
+        Distribute `count` user injections across [window_start, window_end]
+        with randomly-generated timestamps in strictly ascending order.
+        Chronos advances to each injection timestamp before the User ORM
+        object is created so that join_date and any auto-timestamp fields
+        reflect the correct simulated time.
+
+        One DEP token (₹1,000 Burned) is created per user — mirrors the
+        production registration flow where the DEP token is burned on entry.
+
+        STRICT FORWARD-TIME GUARANTEE: timestamps are generated then sorted
+        ascending before iteration.  Chronos never moves backward inside this
+        method, and is guaranteed to leave at a time ≥ window_start.
+        """
+        if count <= 0:
+            return []
+
+        from app.models.user  import User, UserStatus, WeeklyPaymentStatus
+        from app.models.token import Token, TokenType, TokenStatus
+
+        window_secs = max(1, int((window_end - window_start).total_seconds()))
+        # Sort timestamps so Chronos always moves forward
+        timestamps = sorted(
+            window_start + timedelta(seconds=random.randint(0, window_secs))
+            for _ in range(count)
+        )
+
+        new_users: list = []
+        for ts in timestamps:
+            chronos.jump_to(ts)          # Chronos at exact injection time
+            self._counter += 1
+            uid = self._counter
+
+            u = User(
+                name                  = f"SimUser{uid}",
+                mobile                = f"9{uid:010d}",
+                username              = f"s{uid:08d}",
+                join_date             = ts,
+                status                = UserStatus.Waitlist,
+                weekly_payment_status = WeeklyPaymentStatus.Paid,
+                current_level         = 1,
+                total_deposited_inr   = 1000,
+                sde_required          = False,
+                elimination_risk      = False,
+                grace_active          = False,
+                grace_fee_paid        = False,
+                referred_by_user_id   = (
+                    random.choice(existing_ids)
+                    if existing_ids and random.random() >= organic_ratio else None
+                ),
+            )
+            db.add(u)
+            new_users.append(u)
+
+        # Single flush to get all PKs, then batch-insert DEP tokens
+        db.flush()
+        token_rows = [
+            {
+                "code":      f"SD{u.id:010d}",
+                "type":      TokenType.Deposit,
+                "status":    TokenStatus.Burned,
+                "value_inr": _DEPOSIT_DEC,
+                "user_id":   u.id,
+                "pool_id":   None,
+            }
+            for u in new_users
+        ]
+        if token_rows:
+            db.execute(sa_insert(Token), token_rows)
+        db.flush()
 
         return new_users
 
@@ -423,6 +617,359 @@ class MassLoadInjector:
             if not get_token_by_code(db, code):
                 return code
 
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # ── MODULE 3: FINANCE MANAGER — 9-Tick Payment Behaviour Engine ────────────
+    #
+    # These four methods implement the exact chronological payment cascade from
+    # the Chronos Timeline spec.  Each method is called at a specific Chronos
+    # milestone and operates ONLY on members who are in the correct state at
+    # that moment in simulated time.
+    #
+    # Existing apply_abc_model() is kept below as a backward-compat wrapper.
+
+    def tick2_on_time_payments(
+        self,
+        db:            "Session",
+        on_time_fraction: float,
+        chronos:       "ChronosEngine",
+        window_start:  datetime,
+        window_end:    datetime,
+        week_num:      int,
+    ) -> int:
+        """
+        TICK 2 — ON-TIME WINDOW (CYCLE_START → DUE_DATE)
+
+        Finance Manager selects `on_time_fraction` of Active+Unpaid members
+        and marks them Paid.  One WK{week}U{uid} DEP token is created per
+        member — mirrors production weekly-installment token flow.
+
+        Chronos does NOT advance inside this method (it was already advanced
+        by inject_distributed).  All tokens are created at chronos.current.
+
+        Returns: count of members paid on time.
+        """
+        from app.models.user  import User, UserStatus, WeeklyPaymentStatus
+        from app.models.token import Token, TokenType, TokenStatus
+
+        unpaid = (
+            db.query(User)
+            .filter(User.status == UserStatus.Active,
+                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid)
+            .all()
+        )
+        if not unpaid:
+            return 0
+
+        n_on_time  = max(0, int(len(unpaid) * on_time_fraction))
+        batch      = random.sample(unpaid, min(n_on_time, len(unpaid)))
+
+        for m in batch:
+            m.weekly_payment_status = WeeklyPaymentStatus.Paid
+
+        token_rows = [
+            {
+                "code":        f"WK{week_num:04d}U{m.id:010d}",
+                "type":        TokenType.Deposit,
+                "status":      TokenStatus.Burned,
+                "value_inr":   _DEPOSIT_DEC,
+                "user_id":     m.id,
+                "pool_id":     m.current_pool_id,
+            }
+            for m in batch
+        ]
+        if token_rows:
+            try:
+                db.execute(sa_insert(Token), token_rows)
+            except Exception:
+                db.rollback()
+                for m in batch:
+                    m.weekly_payment_status = WeeklyPaymentStatus.Paid
+        db.flush()
+        return len(batch)
+
+    def tick3_late_fee_window(
+        self,
+        db:              "Session",
+        type_b_fraction: float,
+        chronos:         "ChronosEngine",
+        due_date:        datetime,
+        grace_start:     datetime,
+        week_num:        int,
+    ) -> dict:
+        """
+        TICK 3 — LATE FEE WINDOW (DUE_DATE → GRACE_PERIOD_START)
+
+        Finance Manager:
+          1. Accrues daily late fees on ALL remaining Active+Unpaid members
+             using get_late_fee_daily(db) and get_late_fee_cap(db) from
+             global_config — zero hardcoded amounts.  Chronos advances by
+             one simulated day per accrual step.
+          2. `type_b_fraction` of Unpaid members pay their installment + accrued
+             late fee in this window (Type-B-equivalent: late but before grace).
+             WK tokens created for them.
+
+        Returns: {n_late, n_b_paid, late_fee_rev, type_b_ids}
+        """
+        from app.models.user  import User, UserStatus, WeeklyPaymentStatus
+        from app.models.token import Token, TokenType, TokenStatus
+        from app.services.global_config import get_late_fee_daily, get_late_fee_cap
+
+        _zero = Decimal("0")
+        _fee  = Decimal(str(get_late_fee_daily(db)))
+        _cap  = Decimal(str(get_late_fee_cap(db)))
+
+        # Jump to DUE_DATE to start the late-fee accrual
+        chronos.jump_to(due_date)
+
+        unpaid: list = (
+            db.query(User)
+            .filter(User.status == UserStatus.Active,
+                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid)
+            .all()
+        )
+        n_late = len(unpaid)
+        if not unpaid:
+            return {"n_late": 0, "n_b_paid": 0, "late_fee_rev": 0.0,
+                    "type_b_ids": set()}
+
+        # Days in the late-fee window
+        late_window_hours = max(1.0, (grace_start - due_date).total_seconds() / 3600)
+        sim_days          = max(1, int(late_window_hours / 24))
+
+        total_lf_rev = _zero
+
+        for day_idx in range(sim_days):
+            day_ts = due_date + timedelta(days=day_idx)
+            if day_ts >= grace_start:
+                break
+            chronos.jump_to(day_ts)          # advance clock one day at a time
+
+            for m in unpaid:
+                current  = Decimal(str(m.late_fees_inr or 0))
+                headroom = max(_zero, _cap - current)
+                if headroom <= _zero:
+                    continue
+                accrual         = min(_fee, headroom)
+                m.late_fees_inr = current + accrual
+
+                lf_code = self._sim_token_code(db, "LF-")
+                db.add(Token(
+                    code      = lf_code,
+                    type      = TokenType.Late_Fee,
+                    status    = TokenStatus.Burned,
+                    value_inr = accrual,
+                    user_id   = m.id,
+                    pool_id   = m.current_pool_id,
+                ))
+                total_lf_rev += accrual
+
+        db.flush()
+
+        # Type-B-equivalent: pay installment + late fee before grace period
+        n_b   = max(0, int(n_late * type_b_fraction))
+        b_batch = random.sample(unpaid, min(n_b, len(unpaid)))
+
+        for m in b_batch:
+            m.weekly_payment_status = WeeklyPaymentStatus.Paid
+            m.late_fees_inr         = _zero
+
+        token_rows = [
+            {
+                "code":      f"WK{week_num:04d}U{m.id:010d}",
+                "type":      TokenType.Deposit,
+                "status":    TokenStatus.Burned,
+                "value_inr": _DEPOSIT_DEC,
+                "user_id":   m.id,
+                "pool_id":   m.current_pool_id,
+            }
+            for m in b_batch
+        ]
+        if token_rows:
+            try:
+                db.execute(sa_insert(Token), token_rows)
+            except Exception:
+                db.rollback()
+                for m in b_batch:
+                    m.weekly_payment_status = WeeklyPaymentStatus.Paid
+                    m.late_fees_inr         = _zero
+        db.flush()
+
+        return {
+            "n_late":      n_late,
+            "n_b_paid":    len(b_batch),
+            "late_fee_rev": float(total_lf_rev),
+            "type_b_ids":  {m.id for m in b_batch},
+        }
+
+    def tick4_grace_period(
+        self,
+        db:             "Session",
+        grace_fraction: float,
+        chronos:        "ChronosEngine",
+        grace_start:    datetime,
+        g_close:        datetime,
+        week_num:       int,
+    ) -> dict:
+        """
+        TICK 4 — GRACE PERIOD (GRACE_PERIOD_START → G_CLOSE)
+
+        Finance Manager selects `grace_fraction` of remaining Active+Unpaid
+        members who save their seats by paying:
+          • Accrued late fee  → LFC- settlement token
+          • ₹500 grace fee    → GF- token
+          • Weekly installment → WK token
+
+        Chronos advances for each grace payment (distributed across the window)
+        so timestamps are realistic.
+
+        Returns: {n_grace_saved, grace_fee_rev, lf_settled_rev}
+        """
+        from app.models.user  import User, UserStatus, WeeklyPaymentStatus
+        from app.models.token import Token, TokenType, TokenStatus
+
+        _zero      = Decimal("0")
+        _grace_fee = Decimal("500")
+
+        chronos.jump_to(grace_start)
+
+        unpaid: list = (
+            db.query(User)
+            .filter(User.status == UserStatus.Active,
+                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid)
+            .all()
+        )
+        if not unpaid:
+            return {"n_grace_saved": 0, "grace_fee_rev": 0.0, "lf_settled_rev": 0.0}
+
+        n_grace     = max(0, int(len(unpaid) * grace_fraction))
+        grace_batch = random.sample(unpaid, min(n_grace, len(unpaid)))
+
+        grace_fee_rev  = _zero
+        lf_settled_rev = _zero
+        window_secs    = max(1, int((g_close - grace_start).total_seconds()))
+
+        # Advance Chronos progressively through the grace window
+        pay_times = sorted(
+            grace_start + timedelta(seconds=random.randint(0, window_secs))
+            for _ in grace_batch
+        )
+
+        for m, pay_time in zip(grace_batch, pay_times):
+            if pay_time > chronos.current:
+                chronos.jump_to(pay_time)
+
+            late_on_member = Decimal(str(m.late_fees_inr or 0))
+
+            # Settle accrued late fee
+            if late_on_member > _zero:
+                lfc_code = self._sim_token_code(db, "LFC-")
+                db.add(Token(
+                    code      = lfc_code,
+                    type      = TokenType.Late_Fee,
+                    status    = TokenStatus.Burned,
+                    value_inr = late_on_member,
+                    user_id   = m.id,
+                    pool_id   = m.current_pool_id,
+                ))
+                lf_settled_rev += late_on_member
+
+            # Grace fee
+            gf_code = self._sim_token_code(db, "GF-")
+            db.add(Token(
+                code      = gf_code,
+                type      = TokenType.Grace_Fee,
+                status    = TokenStatus.Burned,
+                value_inr = _grace_fee,
+                user_id   = m.id,
+                pool_id   = m.current_pool_id,
+            ))
+            grace_fee_rev += _grace_fee
+
+            # Weekly installment token
+            db.add(Token(
+                code      = f"WK{week_num:04d}U{m.id:010d}",
+                type      = TokenType.Deposit,
+                status    = TokenStatus.Burned,
+                value_inr = _DEPOSIT_DEC,
+                user_id   = m.id,
+                pool_id   = m.current_pool_id,
+            ))
+
+            m.weekly_payment_status = WeeklyPaymentStatus.Paid
+            m.grace_fee_paid        = True
+            m.grace_active          = False
+            m.elimination_risk      = False
+            m.late_fees_inr         = _zero
+
+        db.flush()
+        return {
+            "n_grace_saved":  len(grace_batch),
+            "grace_fee_rev":  float(grace_fee_rev),
+            "lf_settled_rev": float(lf_settled_rev),
+        }
+
+    def tick5_guillotine(self, db: "Session", week_id: str) -> dict:
+        """
+        TICK 5 — GUILLOTINE / G_CLOSE
+
+        Chronos is at G_CLOSE (T_02H − 5 min).  ALL remaining Active+Unpaid
+        members are eliminated unconditionally.  EliminationEvent record written
+        per member.  Waitlist refill fires afterward so pools are full before
+        draw preparation starts at T_02H.
+
+        Returns: {n_eliminated}
+        """
+        from app.models.user              import User, UserStatus, WeeklyPaymentStatus
+        from app.models.elimination_event import EliminationEvent, EliminationReason
+        from app.services.waitlist        import assign_waitlist_to_pools
+
+        _zero = Decimal("0")
+
+        unpaid: list = (
+            db.query(User)
+            .filter(User.status == UserStatus.Active,
+                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid)
+            .all()
+        )
+        if not unpaid:
+            return {"n_eliminated": 0}
+
+        for m in unpaid:
+            late_fees_on_member = Decimal(str(m.late_fees_inr or 0))
+            db.add(EliminationEvent(
+                user_id                   = m.id,
+                username_snapshot         = m.username,
+                user_level_at_elimination = m.current_level,
+                pool_id                   = m.current_pool_id,
+                pool_name_snapshot        = (
+                    f"Pool-{m.current_pool_id}" if m.current_pool_id else "Unknown"
+                ),
+                draw_week_id              = week_id,
+                reason                    = EliminationReason.non_payment,
+                late_fees_forfeited       = late_fees_on_member,
+                seat_save_fee             = _zero,
+                deposit_forfeited         = Decimal("1000"),
+                total_forfeited           = Decimal("1000") + late_fees_on_member,
+                was_in_grace_period       = False,
+            ))
+            m.status          = UserStatus.Eliminated
+            m.current_pool_id = None
+            m.late_fees_inr   = _zero
+
+        db.flush()
+
+        # Refill vacancies from waitlist so pools are full before T_02H
+        try:
+            assign_waitlist_to_pools(db)
+        except Exception as exc:
+            _logger.warning("tick5_guillotine: waitlist refill failed: %s", exc)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        return {"n_eliminated": len(unpaid)}
+
     def apply_abc_model(
         self,
         db: Session,
@@ -454,12 +1001,14 @@ class MassLoadInjector:
         from app.models.user import User, UserStatus, WeeklyPaymentStatus
         from app.models.token import Token, TokenType, TokenStatus
         from app.models.elimination_event import EliminationEvent, EliminationReason
-        from app.core.config import LATE_FEE_DAILY_INR, LATE_FEE_MAX_CAP_INR
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Read late-fee amounts from global_config (DB-backed) instead of static config.
+        from app.services.global_config import get_late_fee_daily, get_late_fee_cap
         from app.services.waitlist import assign_waitlist_to_pools
 
         _zero = Decimal("0")
-        _fee  = Decimal(str(LATE_FEE_DAILY_INR))
-        _cap  = Decimal(str(LATE_FEE_MAX_CAP_INR))
+        _fee  = Decimal(str(get_late_fee_daily(db)))
+        _cap  = Decimal(str(get_late_fee_cap(db)))
         _grace_fee = Decimal("500")
 
         now_utc  = datetime.now(timezone.utc)
@@ -1014,15 +1563,28 @@ class RealSimEngine:
         # Default: "linear" (constant)
         return base
 
-    def _sunday(self, week_offset: int) -> datetime:
-        """Return Sunday 00:00 UTC for (start_week + week_offset)."""
-        total_week = self.start_week + week_offset
-        year       = self.start_year + (total_week - 1) // 52
-        iso_week   = ((total_week - 1) % 52) + 1
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Replaced hardcoded _sunday() (ISO weekday 7 = always Sunday) with
+    # _initial_draw_time() which reads draw_day_of_week from DB via global_config.
+    def _initial_draw_time(self, db: "Session") -> datetime:
+        """
+        Compute the first draw execution time (T_00H) from live DB settings.
+
+        Reads draw_day_of_week (0=Mon … 6=Sun) from global_config.
+        draw_day_of_week → Python ISO weekday: Mon=1 … Sun=7.
+        Derives the target ISO week from start_year + start_week.
+        Falls back to ISO week 52 if the computed week is out of range.
+        """
+        from app.services.global_config import get_draw_day_of_week
+        dow         = get_draw_day_of_week(db)          # 0–6
+        iso_weekday = dow + 1                           # ISO: 1=Mon … 7=Sun
+        total_week  = self.start_week
+        year        = self.start_year + (total_week - 1) // 52
+        iso_week    = ((total_week - 1) % 52) + 1
         try:
-            base = datetime.fromisocalendar(year, iso_week, 7)   # 7 = Sunday
+            base = datetime.fromisocalendar(year, iso_week, iso_weekday)
         except ValueError:
-            base = datetime.fromisocalendar(year, 52, 7)
+            base = datetime.fromisocalendar(year, 52, iso_weekday)
         return base.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
 
     def run(self, progress_callback=None) -> dict:

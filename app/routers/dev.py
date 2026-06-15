@@ -28,7 +28,7 @@ from typing import Optional
 
 import threading
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, insert as sa_insert, text
 from sqlalchemy.orm import Session
@@ -3155,6 +3155,9 @@ def _background_real_simulation(job_id: str, params: dict) -> None:
         _SIM_STATUS[job_id]["status"] = "running"
 
     try:
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Pass job_id as run_id so MassLoadInjector prefixes all usernames/tokens
+        # with rsim_{job_id[:8]} — collision-safe on real PostgreSQL.
         engine = RealSimEngine(
             weeks                = params["weeks"],
             users_per_week       = params["users_per_week"],
@@ -3173,6 +3176,7 @@ def _background_real_simulation(job_id: str, params: dict) -> None:
             waitlist_dropout_pct = params["waitlist_dropout_pct"],
             organic_decay_rate   = params["organic_decay_rate"],
             simulation_label     = params["simulation_label"],
+            run_id               = job_id,
         )
 
         result = engine.run(progress_callback=_on_week)
@@ -3459,3 +3463,134 @@ def real_sim_result(job_id: str):
 
     # status == "done"
     return entry["result"]
+
+
+# =============================================================================
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# GET/POST/DELETE /dev/debugger/* — Global System Debugger controls
+# =============================================================================
+#
+# Four endpoints that expose the SystemDebugger toggle and DebugLog table.
+# All require ENABLE_DEV_MODE=true (require_dev_mode dependency).
+#
+# POST /dev/debugger/toggle  {"enabled": true|false}  — flip the toggle
+# GET  /dev/debugger/status                           — current state + log count
+# GET  /dev/debugger/logs    ?run_id=&limit=&offset=  — paginated log entries
+# DELETE /dev/debugger/logs                           — clear all entries
+# =============================================================================
+
+class DebuggerToggleRequest(BaseModel):
+    enabled: bool = Field(..., description="True to enable the Global System Debugger.")
+
+
+@router.post("/debugger/toggle")
+def toggle_debugger(
+    body: DebuggerToggleRequest,
+    _: None = Depends(require_dev_mode),
+):
+    """
+    Enable or disable the Global System Debugger.
+
+    When enabled, every @debug_trace-decorated call in RealSimEngine writes
+    a DebugLog row (phase, event, duration_ms, error) to the debug_logs table.
+    When disabled, all decorators are pure zero-overhead pass-throughs.
+    """
+    from app.services.system_debugger import enable_debugger, disable_debugger
+
+    if body.enabled:
+        enable_debugger()
+    else:
+        disable_debugger()
+
+    return {
+        "enabled": body.enabled,
+        "message": f"Global System Debugger {'ENABLED' if body.enabled else 'DISABLED'}.",
+    }
+
+
+@router.get("/debugger/status")
+def debugger_status(
+    db: Session = Depends(get_db),
+    _: None = Depends(require_dev_mode),
+):
+    """
+    Return the current debugger toggle state + count of rows in debug_logs.
+    """
+    from app.services.system_debugger import get_debug_context
+    from app.models.debug_log import DebugLog
+
+    log_count = db.query(func.count(DebugLog.id)).scalar() or 0
+    ctx = get_debug_context()
+    return {
+        "enabled":    ctx["enabled"],
+        "run_id":     ctx["run_id"],
+        "week":       ctx["week"],
+        "log_count":  log_count,
+    }
+
+
+@router.get("/debugger/logs")
+def get_debugger_logs(
+    run_id:   str | None = Query(None, description="Filter by simulation run_id."),
+    week_num: int | None = Query(None, description="Filter by simulated week number."),
+    phase:    str | None = Query(None, description="Substring filter on phase tag."),
+    limit:    int        = Query(100,  ge=1, le=1000),
+    offset:   int        = Query(0,    ge=0),
+    db: Session = Depends(get_db),
+    _: None     = Depends(require_dev_mode),
+):
+    """
+    Return paginated DebugLog entries, newest-first.
+
+    Filters are additive (AND).  All filters are optional.
+    """
+    from app.models.debug_log import DebugLog
+
+    q = db.query(DebugLog)
+    if run_id   is not None: q = q.filter(DebugLog.run_id   == run_id)
+    if week_num is not None: q = q.filter(DebugLog.week_num == week_num)
+    if phase    is not None: q = q.filter(DebugLog.phase.contains(phase))
+
+    total = q.count()
+    rows  = q.order_by(DebugLog.id.desc()).offset(offset).limit(limit).all()
+
+    return {
+        "total":  total,
+        "offset": offset,
+        "limit":  limit,
+        "logs": [
+            {
+                "id":          r.id,
+                "run_id":      r.run_id,
+                "week_num":    r.week_num,
+                "phase":       r.phase,
+                "event":       r.event,
+                "data_json":   r.data_json,
+                "duration_ms": r.duration_ms,
+                "lpi":         r.lpi,
+                "error":       r.error,
+                "created_at":  r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.delete("/debugger/logs")
+def clear_debugger_logs(
+    db: Session = Depends(get_db),
+    _: None     = Depends(require_dev_mode),
+):
+    """
+    Delete all rows from the debug_logs table.
+    Use before a new load-test run to get a clean log.
+    """
+    from app.models.debug_log import DebugLog
+
+    count = db.query(func.count(DebugLog.id)).scalar() or 0
+    db.query(DebugLog).delete(synchronize_session=False)
+    db.commit()
+    return {
+        "deleted": count,
+        "message": f"Cleared {count} debug log entries from debug_logs.",
+    }

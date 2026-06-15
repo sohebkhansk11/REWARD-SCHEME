@@ -49,6 +49,8 @@ from app.services.global_config import (
     get_draw_day_of_week,     set_draw_day_of_week,
     get_grace_period_hours,   set_grace_period_hours,
     get_cleanup_offset_minutes, set_cleanup_offset_minutes,
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    get_payment_due_offset_days, set_payment_due_offset_days,
 )
 
 router = APIRouter(
@@ -128,11 +130,15 @@ class UpdateThresholdsRequest(BaseModel):
 
 
 class UpdateDrawCalendarRequest(BaseModel):
-    admin_password:         str = Field(..., description="Admin password for verification")
-    draw_frequency:         str = Field(..., description="'daily' | 'weekly' | 'monthly'")
-    draw_day_of_week:       int = Field(..., ge=0, le=6, description="0=Monday … 6=Sunday")
-    grace_period_hours:     int = Field(..., ge=1, le=168, description="Grace window duration (hours)")
-    cleanup_offset_minutes: int = Field(..., ge=1, le=60,  description="Minutes after draw before cleanup fires")
+    admin_password:           str = Field(..., description="Admin password for verification")
+    draw_frequency:           str = Field(..., description="'daily' | 'weekly' | 'monthly'")
+    draw_day_of_week:         int = Field(..., ge=0, le=6, description="0=Monday … 6=Sunday")
+    grace_period_hours:       int = Field(..., ge=1, le=168, description="Grace window duration (hours)")
+    cleanup_offset_minutes:   int = Field(..., ge=1, le=60,  description="Minutes after draw before cleanup fires")
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # 29th key — Chronos Engine DUE_DATE milestone: CYCLE_START + payment_due_offset_days
+    payment_due_offset_days:  int = Field(4,   ge=1, le=27,
+                                          description="Days after cycle start before on-time payment window closes (default 4 = Mon→Thu)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -142,7 +148,7 @@ class UpdateDrawCalendarRequest(BaseModel):
 @router.get("", summary="Get full Draw & Financial Strategy configuration")
 def get_financial_config(db: Session = Depends(get_db)) -> dict:
     """
-    Return all 28 runtime-configurable financial/threshold/chronology values
+    Return all 29 runtime-configurable financial/threshold/chronology values
     in a single response.  Values are served from the 60-second TTL cache
     (warm) or read fresh from system_settings (cold).
 
@@ -373,10 +379,12 @@ def update_draw_calendar(
     _verify_admin_password(db, body.admin_password)
 
     try:
-        set_draw_frequency(db,        body.draw_frequency)
-        set_draw_day_of_week(db,      body.draw_day_of_week)
-        set_grace_period_hours(db,    body.grace_period_hours)
-        set_cleanup_offset_minutes(db, body.cleanup_offset_minutes)
+        set_draw_frequency(db,           body.draw_frequency)
+        set_draw_day_of_week(db,         body.draw_day_of_week)
+        set_grace_period_hours(db,       body.grace_period_hours)
+        set_cleanup_offset_minutes(db,   body.cleanup_offset_minutes)
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        set_payment_due_offset_days(db,  body.payment_due_offset_days)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -384,14 +392,16 @@ def update_draw_calendar(
                   4: "Friday", 5: "Saturday", 6: "Sunday"}
 
     return {
-        "draw_frequency":         get_draw_frequency(db),
-        "draw_day_of_week":       get_draw_day_of_week(db),
-        "draw_day_name":          _day_names.get(get_draw_day_of_week(db), "Sunday"),
-        "grace_period_hours":     get_grace_period_hours(db),
-        "cleanup_offset_minutes": get_cleanup_offset_minutes(db),
+        "draw_frequency":           get_draw_frequency(db),
+        "draw_day_of_week":         get_draw_day_of_week(db),
+        "draw_day_name":            _day_names.get(get_draw_day_of_week(db), "Sunday"),
+        "grace_period_hours":       get_grace_period_hours(db),
+        "cleanup_offset_minutes":   get_cleanup_offset_minutes(db),
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        "payment_due_offset_days":  get_payment_due_offset_days(db),
         "message": (
             f"Draw calendar: {body.draw_frequency} on {_day_names.get(body.draw_day_of_week, 'Sunday')}, "
-            f"grace={body.grace_period_hours}h, cleanup T+{body.cleanup_offset_minutes}min. "
-            "Active within 60 seconds."
+            f"grace={body.grace_period_hours}h, cleanup T+{body.cleanup_offset_minutes}min, "
+            f"due_offset={body.payment_due_offset_days}d. Active within 60 seconds."
         ),
     }

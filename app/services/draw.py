@@ -47,11 +47,22 @@ from app.core.config import (
     TYPE_B_LEVEL_LOW, TYPE_B_LEVEL_HIGH,# type_b tier split
     POOL_DRAW_REGULAR, POOL_DRAW_TYPE_A, POOL_DRAW_TYPE_B, POOL_DRAW_SDE,
     POOL_DRAW_ACCELERATED,              # accelerated dissolution draw type
-    ACCEL_DISS_TRIGGER_RATIO,          # ≥60% L4+ triggers accelerated mode
     ACCEL_DISS_DISSOLVE_BELOW,         # dissolve pool if active count falls below 8
     # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
     POOL_DRAW_SDE_PREVENTIVE_L3,       # Q4 preventive L3 draw type
-    LEVEL_PAYOUTS, PAYOUT_FEE_INR, REFERRAL_REWARD_INR,
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVEL_PAYOUTS, PAYOUT_FEE_INR removed — now served from global_config.py (DB-backed).
+    # ACCEL_DISS_TRIGGER_RATIO removed — now served from global_config.py (DB-backed).
+    # REFERRAL_REWARD_INR retained as import-only fallback label (settings.py uses it).
+    REFERRAL_REWARD_INR,
+)
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Dynamic financial config — replaces hardcoded LEVEL_PAYOUTS and PAYOUT_FEE_INR.
+# get_accel_diss_trigger_ratio replaces ACCEL_DISS_TRIGGER_RATIO constant.
+from app.services.global_config import (
+    get_level_payout,
+    get_payout_fee,
+    get_accel_diss_trigger_ratio,
 )
 from app.crud import token as crud_token, user as crud_user, pool as crud_pool
 from app.models.draw_history import DrawHistory
@@ -217,10 +228,12 @@ def _process_winner(
        Set pull_replacement=False when running a mass draw; the caller will do
        a single combined refill via assign_waitlist_to_pools() afterwards.
     """
-    gross, net = LEVEL_PAYOUTS.get(winner.current_level, (2500, 2000))
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVEL_PAYOUTS and PAYOUT_FEE_INR replaced with DB-backed dynamic getters.
+    gross, net = get_level_payout(db, winner.current_level)
     gross_d = Decimal(str(gross))
     net_d   = Decimal(str(net))
-    fee_d   = Decimal(str(PAYOUT_FEE_INR))
+    fee_d   = Decimal(str(get_payout_fee(db)))
 
     # Generate Withdraw token — stamp pool_id for wallet history traceability
     code = _unique_token_code(db, "WIT-")
@@ -1140,7 +1153,9 @@ def check_accelerated_dissolution(db: Session, pool: Pool) -> bool:
 
     l4plus_count = sum(1 for m in members if m.current_level >= 4)
     ratio        = l4plus_count / len(members)
-    return ratio >= ACCEL_DISS_TRIGGER_RATIO
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # ACCEL_DISS_TRIGGER_RATIO replaced with DB-backed dynamic getter.
+    return ratio >= get_accel_diss_trigger_ratio(db)
 
 
 @dataclass

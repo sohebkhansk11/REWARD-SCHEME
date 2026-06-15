@@ -2,11 +2,18 @@
 Real Simulation Engine  — Zero-Duplication Stress-Test Harness
 ==============================================================
 
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ARCHITECTURAL PIVOT: SQLite isolation REMOVED — engine now operates directly
+# on the real PostgreSQL database so that Admin Dashboard, Statistics, Pool
+# Oversight, and all analytics reflect the load-test data in real time.
+# Users are namespaced with a per-run prefix (rsim_{run_id}) so multiple runs
+# can coexist and be purged with a targeted DELETE or /dev/reset-data.
+
 ARCHITECTURE GUARANTEE:
   This module contains ZERO business logic.  Every formula, algorithm, and
   rule lives exclusively in the production services.  This engine is a
   dumb orchestrator that:
-    1. Creates an isolated in-memory SQLite database (SimulationDB)
+    1. Opens a session on the REAL PostgreSQL database (no SQLite isolation)
     2. Mocks datetime.now() globally across all production modules (ChronosEngine)
     3. Generates synthetic load with DEP tokens (MassLoadInjector)
     4. Calls real production services in exact weekly chronological order
@@ -33,13 +40,16 @@ import logging
 import random
 import secrets
 import string
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import patch
 
-from sqlalchemy import create_engine, event, func, insert as sa_insert
-from sqlalchemy.orm import sessionmaker, Session
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Removed: create_engine, event, sessionmaker — no longer needed (SQLite gone).
+from sqlalchemy import func, insert as sa_insert
+from sqlalchemy.orm import Session
 
 _logger = logging.getLogger(__name__)
 
@@ -167,50 +177,23 @@ class ChronosEngine:
         self._patches.clear()
 
 
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. SIMULATION DB — Isolated In-Memory SQLite
+# 2. DATABASE SESSION — Real PostgreSQL (SQLite isolation REMOVED)
 # ══════════════════════════════════════════════════════════════════════════════
-
-def _create_sim_db():
-    """
-    Create a fresh in-memory SQLite database with all production tables.
-    Uses the same SQLAlchemy models — zero schema duplication.
-    The production database is NEVER touched.
-
-    Returns (engine, SessionLocal).  Call engine.dispose() when done.
-    """
-    from app.database import Base
-
-    # Force-import all model modules so their tables register on Base.metadata
-    import app.models.user              # noqa: F401
-    import app.models.pool              # noqa: F401
-    import app.models.token             # noqa: F401
-    import app.models.draw_history      # noqa: F401
-    import app.models.sde_session       # noqa: F401
-    import app.models.system_settings   # noqa: F401
-    import app.models.system_lock       # noqa: F401
-    import app.models.weekly_draw_state # noqa: F401
-
-    try:
-        import app.models.elimination_event  # noqa: F401
-    except ImportError:
-        pass
-
-    engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        echo=False,
-    )
-
-    @event.listens_for(engine, "connect")
-    def _fk(dbapi_conn, _):
-        cursor = dbapi_conn.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    Base.metadata.create_all(engine)
-    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-    return engine, SessionLocal
+# _create_sim_db() and its sqlite:///:memory: engine are DELETED.
+# RealSimEngine.run() now opens a session via app.database.SessionLocal so
+# all writes land in the real PostgreSQL database and are immediately
+# visible in the Admin Dashboard, Statistics, Pool Oversight, and all
+# analytics pages.
+#
+# Collision safety: MassLoadInjector prefixes every username, mobile, and
+# weekly token code with the run-specific rsim_{run_id[:8]} slug.  This
+# guarantees uniqueness across multiple back-to-back simulation runs
+# without a DB reset between them.
+#
+# Cleanup before public launch: POST /dev/reset-data (Danger Zone in
+# Dev Tools) truncates users + pools + tokens and resets sequences to 1.
 
 
 # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
@@ -304,8 +287,13 @@ class MassLoadInjector:
       financial metrics (total_collected_inr, Cash Flow charts) are accurate.
     """
 
-    def __init__(self):
-        self._counter = 0   # global monotonic counter for unique IDs
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    def __init__(self, run_prefix: str = "rsim"):
+        self._counter = 0   # global monotonic counter for unique IDs within this run
+        # 8-char run-specific slug embedded in every username, mobile, and
+        # weekly token code so concurrent / back-to-back runs never collide.
+        # Padded with '0' if shorter than 8 chars (e.g. bare "rsim" → "rsim0000").
+        self._pfx = run_prefix[:8].ljust(8, '0')
 
     def _unique_token_code(self) -> str:
         """Generate a collision-resistant simulation token code."""
@@ -348,10 +336,13 @@ class MassLoadInjector:
             if random.random() >= organic_ratio and existing_ids:
                 referrer_id = random.choice(existing_ids)
 
+            # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Username/mobile include run-specific prefix so back-to-back runs
+            # on the real DB never violate UNIQUE constraints.
             u = User(
-                name                    = f"SimUser{uid}",
-                mobile                  = f"9{uid:010d}",
-                username                = f"s{uid:08d}",
+                name                    = f"SimUser{self._pfx}{uid}",
+                mobile                  = f"SIM{self._pfx}{uid:06d}",
+                username                = f"{self._pfx}_{uid:06d}",
                 join_date               = now,
                 status                  = UserStatus.Waitlist,
                 weekly_payment_status   = WeeklyPaymentStatus.Paid,
@@ -370,6 +361,7 @@ class MassLoadInjector:
         db.flush()
 
         # Bulk-insert burned DEP tokens (1 per user) — mirrors production payment flow
+        # DEP code uses auto-increment user.id — globally unique without prefix.
         token_rows = [
             {
                 "code":      f"SD{u.id:010d}",   # deterministic, unique per user
@@ -433,10 +425,11 @@ class MassLoadInjector:
             self._counter += 1
             uid = self._counter
 
+            # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
             u = User(
-                name                  = f"SimUser{uid}",
-                mobile                = f"9{uid:010d}",
-                username              = f"s{uid:08d}",
+                name                  = f"SimUser{self._pfx}{uid}",
+                mobile                = f"SIM{self._pfx}{uid:06d}",
+                username              = f"{self._pfx}_{uid:06d}",
                 join_date             = ts,
                 status                = UserStatus.Waitlist,
                 weekly_payment_status = WeeklyPaymentStatus.Paid,
@@ -523,11 +516,11 @@ class MassLoadInjector:
         token_rows = []
         for member in unpaid:
             member.weekly_payment_status = WeeklyPaymentStatus.Paid
-            # U-08: one DEP token per member per week — code is deterministic
-            # so a re-run of the same week is idempotent (same code = unique constraint
-            # violation → simulation catches + skips duplicates gracefully).
+            # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # WK code includes run prefix so back-to-back runs on real DB don't
+            # produce duplicate codes for the same week + user-id combination.
             token_rows.append({
-                "code":        f"WK{week_num:04d}U{member.id:010d}",
+                "code":        f"WK{self._pfx}{week_num:04d}U{member.id:010d}",
                 "type":        TokenType.Deposit,
                 "status":      TokenStatus.Burned,
                 "value_inr":   _DEPOSIT_DEC,
@@ -592,7 +585,8 @@ class MassLoadInjector:
             if balance < _threshold:
                 continue
 
-            rw_code = f"RW{week_num:04d}U{user.id:010d}"
+            # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        rw_code = f"RW{self._pfx}{week_num:04d}U{user.id:010d}"
             rw_token = Token(
                 code      = rw_code,
                 type      = TokenType.Referral_Withdraw,
@@ -671,9 +665,10 @@ class MassLoadInjector:
         for m in batch:
             m.weekly_payment_status = WeeklyPaymentStatus.Paid
 
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
         token_rows = [
             {
-                "code":        f"WK{week_num:04d}U{m.id:010d}",
+                "code":        f"WK{self._pfx}{week_num:04d}U{m.id:010d}",
                 "type":        TokenType.Deposit,
                 "status":      TokenStatus.Burned,
                 "value_inr":   _DEPOSIT_DEC,
@@ -778,9 +773,10 @@ class MassLoadInjector:
             m.weekly_payment_status = WeeklyPaymentStatus.Paid
             m.late_fees_inr         = _zero
 
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
         token_rows = [
             {
-                "code":      f"WK{week_num:04d}U{m.id:010d}",
+                "code":      f"WK{self._pfx}{week_num:04d}U{m.id:010d}",
                 "type":      TokenType.Deposit,
                 "status":    TokenStatus.Burned,
                 "value_inr": _DEPOSIT_DEC,
@@ -890,9 +886,10 @@ class MassLoadInjector:
             ))
             grace_fee_rev += _grace_fee
 
+            # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
             # Weekly installment token
             db.add(Token(
-                code      = f"WK{week_num:04d}U{m.id:010d}",
+                code      = f"WK{self._pfx}{week_num:04d}U{m.id:010d}",
                 type      = TokenType.Deposit,
                 status    = TokenStatus.Burned,
                 value_inr = _DEPOSIT_DEC,
@@ -1517,6 +1514,12 @@ class RealSimEngine:
         # K-17: simulation_label — free-text tag for multi-run comparison
         #   Stored in simulation_summary for identification in side-by-side reports.
         simulation_label:      str   = "",
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # run_id — job_id from the background task registry (uuid.uuid4().hex).
+        # Passed into MassLoadInjector as the run prefix slug so every username,
+        # mobile, and weekly token code produced by this run is globally unique
+        # in the real PostgreSQL database without requiring a DB reset between runs.
+        run_id:                str   = "",
     ):
         self.weeks                = max(1, min(weeks, 200))
         self.users_per_week       = users_per_week
@@ -1536,6 +1539,8 @@ class RealSimEngine:
         self.waitlist_dropout_pct = max(0.0, min(50.0, waitlist_dropout_pct))
         self.organic_decay_rate   = max(0.0, min(1.0, organic_decay_rate))
         self.simulation_label     = simulation_label or ""
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        self._run_id              = (run_id or uuid.uuid4().hex)[:8]
 
     def _compute_weekly_inflow(self, week_num: int) -> int:
         """
@@ -1622,12 +1627,20 @@ class RealSimEngine:
         from app.models.draw_history import DrawHistory
         from app.core.config import POOL_DRAW_SDE_EXT2, POOL_DRAW_SDE_EXT3, POOL_DRAW_ACCELERATED
 
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # ── REAL PostgreSQL session — replaces sqlite:///:memory: ─────────────
+        from app.database import SessionLocal as _PgSession
+        from app.services.system_debugger import (
+            DebuggerSession, log_milestone, set_debug_week,
+        )
+
         # ── Preserve + force production-compatible global state ───────────────
         _orig_auto = get_auto_pool_creation()
         set_auto_pool_creation(True)
 
-        engine_db, SessionLocal = _create_sim_db()
-        injector = MassLoadInjector()
+        # MassLoadInjector receives the run-specific prefix for collision-safe
+        # usernames, mobiles, and weekly token codes on the real DB.
+        injector = MassLoadInjector(run_prefix=f"rsim_{self._run_id}")
 
         weekly_detail:  list[dict] = []
         cycle_logs:     list[dict] = []
@@ -1656,10 +1669,14 @@ class RealSimEngine:
         _prev_cumul_ext3  = 0
         _prev_cumul_accel = 0
 
-        db = SessionLocal()
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        db = _PgSession()   # real PostgreSQL — data persists, Dashboard shows it live
 
         try:
             # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Open Global System Debugger bracket for this run (no-op when debugger OFF).
+            log_milestone("SIM/start", "simulation_started", {"run_id": self._run_id})
+
             # 9-tick dynamic Chronos Timeline — all milestones derived from DB global_config.
             current_T_00H = self._initial_draw_time(db)
             with ChronosEngine(current_T_00H) as chronos:
@@ -1689,6 +1706,9 @@ class RealSimEngine:
                 # ────────────────────────────────────────────────────────────────
                 for w in range(self.weeks):
                     week_num = w + 1
+                    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # Tell the debugger which week we're in so all log entries carry week_num.
+                    set_debug_week(week_num)
 
                     # ── Compute all 7 milestones for this cycle (ZERO hardcoding) ──
                     # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
@@ -2258,8 +2278,11 @@ class RealSimEngine:
                 }
 
         finally:
+            # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Close SIM bracket + close real DB session.
+            # engine_db.dispose() REMOVED — no longer using an isolated SQLite engine.
+            log_milestone("SIM/end", "simulation_ended", {"run_id": self._run_id})
             db.close()
-            engine_db.dispose()
             set_auto_pool_creation(_orig_auto)
 
         return {

@@ -650,10 +650,13 @@ class MassLoadInjector:
         from app.models.user  import User, UserStatus, WeeklyPaymentStatus
         from app.models.token import Token, TokenType, TokenStatus
 
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Scoped to rsim_ users — prevents processing 2000+ real users in production DB.
         unpaid = (
             db.query(User)
             .filter(User.status == UserStatus.Active,
-                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid)
+                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
+                    User.username.like(f"{self._pfx}%"))
             .all()
         )
         if not unpaid:
@@ -721,10 +724,13 @@ class MassLoadInjector:
         # Jump to DUE_DATE to start the late-fee accrual
         chronos.jump_to(due_date)
 
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Scoped to rsim_ users — prevents processing 2000+ real users in production DB.
         unpaid: list = (
             db.query(User)
             .filter(User.status == UserStatus.Active,
-                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid)
+                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
+                    User.username.like(f"{self._pfx}%"))
             .all()
         )
         n_late = len(unpaid)
@@ -833,10 +839,13 @@ class MassLoadInjector:
 
         chronos.jump_to(grace_start)
 
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Scoped to rsim_ users — prevents processing 2000+ real users in production DB.
         unpaid: list = (
             db.query(User)
             .filter(User.status == UserStatus.Active,
-                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid)
+                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
+                    User.username.like(f"{self._pfx}%"))
             .all()
         )
         if not unpaid:
@@ -927,10 +936,13 @@ class MassLoadInjector:
 
         _zero = Decimal("0")
 
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Scoped to rsim_ users — prevents eliminating 2000+ real users in production DB.
         unpaid: list = (
             db.query(User)
             .filter(User.status == UserStatus.Active,
-                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid)
+                    User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
+                    User.username.like(f"{self._pfx}%"))
             .all()
         )
         if not unpaid:
@@ -1741,6 +1753,18 @@ class RealSimEngine:
                     try: db.rollback()
                     except Exception: pass
 
+                # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Record the max pool ID that exists BEFORE this simulation run.
+                # Any pool with id <= this ceiling is a pre-existing real pool and
+                # must be skipped in execute_weekly_draw — drawing 100+ real pools
+                # takes 10+ minutes and corrupts production draw history.
+                _pre_sim_max_pool_id: int = db.query(func.max(Pool.id)).scalar() or 0
+                _logger.info(
+                    "RealSimEngine [%s]: draw isolation ceiling = pool_id %d "
+                    "(pools with id <= this are skipped in all week draws)",
+                    self._run_id, _pre_sim_max_pool_id,
+                )
+
                 # ────────────────────────────────────────────────────────────────
                 # 9-TICK CHRONOS MAIN LOOP (all milestones derived from DB config)
                 # ────────────────────────────────────────────────────────────────
@@ -1777,7 +1801,15 @@ class RealSimEngine:
                     # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
                     _logger.info("RealSimEngine [%s]: TICK1-start week=%d — reset_payment_cycle", self._run_id, week_num)
                     chronos.jump_to(m.CYCLE_START)
-                    _fm_reset_payment_cycle(db)
+                    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # Scoped replacement for _fm_reset_payment_cycle — only resets rsim_
+                    # users so 2000+ real Active users are NOT marked Unpaid (which would
+                    # cause tick5 to eliminate them and corrupt production data).
+                    from app.models.user import User as _Ut1, UserStatus as _USt1, WeeklyPaymentStatus as _WPSt1
+                    db.query(_Ut1).filter(
+                        _Ut1.status == _USt1.Active,
+                        _Ut1.username.like(f"{injector._pfx}%"),
+                    ).update({"weekly_payment_status": _WPSt1.Unpaid}, synchronize_session=False)
                     db.commit()
                     _logger.info("RealSimEngine [%s]: TICK1-done week=%d", self._run_id, week_num)
 
@@ -1938,6 +1970,21 @@ class RealSimEngine:
                     #   4. Quantifies SDE demand + checks L1/L2 supply
                     #   5. Runs run_sde_meta_pool() (SDE sub-draws executed here)
                     #   6. Sets preparation_valid=True, countdown_active=True
+                    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # Mark all pre-existing real pools as draw_completed_this_week=True
+                    # so execute_weekly_draw skips them entirely. Without this, 100+
+                    # real pools from production data would be drawn every week cycle,
+                    # taking 10+ minutes and corrupting real draw history.
+                    if _pre_sim_max_pool_id > 0:
+                        db.query(Pool).filter(
+                            Pool.id <= _pre_sim_max_pool_id,
+                            Pool.draw_completed_this_week == False,
+                        ).update({"draw_completed_this_week": True}, synchronize_session=False)
+                        db.commit()
+                        _logger.info(
+                            "RealSimEngine [%s]: pre-skipped pools with id <= %d for week %d",
+                            self._run_id, _pre_sim_max_pool_id, week_num,
+                        )
                     _logger.info("RealSimEngine [%s]: TICK6-start week=%d — start_draw_preparation", self._run_id, week_num)
                     chronos.jump_to(m.T_02H)
                     # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:

@@ -492,6 +492,49 @@ export const updateDrawSchedule = (drawHourUtc, drawMinuteUtc, drawPrepHours, ad
     admin_password:  adminPassword,
   })
 
+// SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// Draw & Financial Strategy — backs the new admin sub-tab in System Settings.
+/** GET  /admin/financial-config — full 28-key config snapshot */
+export const getFinancialConfig = () =>
+  api.get('/admin/financial-config')
+
+/** PUT  /admin/financial-config/base — base installment + payout fee */
+export const updateBaseFinancial = (baseInstallmentInr, payoutFeeInr, adminPassword) =>
+  api.put('/admin/financial-config/base', {
+    base_installment_inr: baseInstallmentInr,
+    payout_fee_inr:       payoutFeeInr,
+    admin_password:       adminPassword,
+  })
+
+/** PUT  /admin/financial-config/late-fees — daily rate + cap */
+export const updateLateFees = (lateFeeDaily, lateFeeMaxCap, adminPassword) =>
+  api.put('/admin/financial-config/late-fees', {
+    late_fee_daily_inr:   lateFeeDaily,
+    late_fee_max_cap_inr: lateFeeMaxCap,
+    admin_password:       adminPassword,
+  })
+
+/** PUT  /admin/financial-config/level-payouts — bulk all 6 levels */
+export const updateAllLevelPayouts = (payouts, adminPassword) =>
+  api.put('/admin/financial-config/level-payouts', {
+    payouts,
+    admin_password: adminPassword,
+  })
+
+/** PUT  /admin/financial-config/thresholds — LPI + cascade + accel thresholds */
+export const updateThresholds = (thresholdData, adminPassword) =>
+  api.put('/admin/financial-config/thresholds', {
+    ...thresholdData,
+    admin_password: adminPassword,
+  })
+
+/** PUT  /admin/financial-config/draw-calendar — frequency, day, grace, cleanup */
+export const updateDrawCalendar = (calendarData, adminPassword) =>
+  api.put('/admin/financial-config/draw-calendar', {
+    ...calendarData,
+    admin_password: adminPassword,
+  })
+
 // ── Auth (no JWT needed for these calls) ──────────────────────────────────────
 export const adminLogin     = (username, password) =>
   api.post('/admin/auth/login',      { username, password })

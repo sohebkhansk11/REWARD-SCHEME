@@ -535,6 +535,28 @@ export const updateDrawCalendar = (calendarData, adminPassword) =>
     admin_password: adminPassword,
   })
 
+// SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// ── Global System Debugger ────────────────────────────────────────────────────
+
+/** POST /dev/debugger/toggle — { enabled: bool } — flip the debugger toggle */
+export const toggleDebugger = (enabled) =>
+  api.post('/dev/debugger/toggle', { enabled })
+
+/** GET /dev/debugger/status — { enabled, run_id, week, log_count } */
+export const getDebuggerStatus = () =>
+  api.get('/dev/debugger/status')
+
+/**
+ * GET /dev/debugger/logs — paginated DebugLog rows, newest-first.
+ * @param {{ run_id?, week_num?, phase?, limit?, offset? }} params
+ */
+export const getDebuggerLogs = (params = {}) =>
+  api.get('/dev/debugger/logs', { params })
+
+/** DELETE /dev/debugger/logs — clear all debug log entries */
+export const clearDebuggerLogs = () =>
+  api.delete('/dev/debugger/logs')
+
 // ── Auth (no JWT needed for these calls) ──────────────────────────────────────
 export const adminLogin     = (username, password) =>
   api.post('/admin/auth/login',      { username, password })

@@ -479,6 +479,31 @@ def set_cleanup_offset_minutes(db: Session, value: int) -> None:
     _C_CLEANUP_OFFSET_MINS["value"] = None
 
 
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# 29th key — payment_due_offset_days: how many days after CYCLE_START before
+# payment is due.  Default 4 = Monday → Thursday (classic production cadence).
+# Consumed by _compute_milestones() in real_simulation.py to derive DUE_DATE
+# dynamically.  Without this key DUE_DATE is not configurable and the Chronos
+# Engine would need to hardcode "3 days 23 h 59 min" (Thursday).
+_C_PAYMENT_DUE_DAYS: dict = _cache()
+
+
+def get_payment_due_offset_days(db: Session) -> int:
+    """
+    Days after CYCLE_START when the on-time payment window closes (DUE_DATE).
+    Default: 4 (Monday → Thursday for a weekly Sunday draw).
+    DB key: payment_due_offset_days (value_int).
+    """
+    return _read_int(db, "payment_due_offset_days", 4, _C_PAYMENT_DUE_DAYS)
+
+
+def set_payment_due_offset_days(db: Session, days: int) -> None:
+    if not (1 <= days <= 27):
+        raise ValueError("payment_due_offset_days must be 1–27.")
+    _upsert_int(db, "payment_due_offset_days", days)
+    _C_PAYMENT_DUE_DAYS["value"] = None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BULK READ — Admin "Draw & Financial Strategy" panel
 # ══════════════════════════════════════════════════════════════════════════════
@@ -489,7 +514,7 @@ def get_all_financial_config(db: Session) -> dict:
 
     Used by GET /admin/financial-config.
     All values are served from cache (60s TTL) where warm — single DB
-    round-trip set for all 28 keys when cache is cold.
+    round-trip set for all 29 keys when cache is cold.
     """
     lvl_payouts = get_all_level_payouts(db)
     return {
@@ -516,4 +541,6 @@ def get_all_financial_config(db: Session) -> dict:
         "draw_day_name":             _DAY_NAMES.get(get_draw_day_of_week(db), "Sunday"),
         "grace_period_hours":        get_grace_period_hours(db),
         "cleanup_offset_minutes":    get_cleanup_offset_minutes(db),
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        "payment_due_offset_days":   get_payment_due_offset_days(db),
     }

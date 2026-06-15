@@ -37,8 +37,11 @@ from sqlalchemy.orm import Session
 from app.core.config import (
     ADMIN_OVERRIDE_TIMEOUT_HOURS,
     DRAW_LOCK_TOTAL_MINUTES,
-    LEVEL_PAYOUTS,
+    # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVEL_PAYOUTS removed — now served from global_config.py (DB-backed).
 )
+# SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+from app.services.global_config import get_level_payout
 from app.models.pool          import Pool, PoolStatus
 from app.models.system_lock   import SystemLock
 from app.models.user          import User, UserStatus
@@ -156,8 +159,10 @@ def _calculate_projected_payout(db: Session) -> int:
         ) or 1
 
         # Upper winner payout at max level + lower winner at L1 (floor estimate)
-        upper_net = LEVEL_PAYOUTS.get(min(max_level, 4), (6000, 5500))[1]  # capped at L4
-        lower_net = LEVEL_PAYOUTS.get(1, (2500, 2000))[1]                   # L1 minimum
+        # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # LEVEL_PAYOUTS replaced with DB-backed dynamic getter.
+        upper_net = get_level_payout(db, min(max_level, 4))[1]
+        lower_net = get_level_payout(db, 1)[1]
         total_projected += upper_net + lower_net
 
     return total_projected

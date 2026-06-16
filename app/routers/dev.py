@@ -1282,11 +1282,15 @@ def dev_winners_analytics(db: Session = Depends(get_db)):
         for slot in (1, 2):
             lvl  = (dh.winner_1_level if slot == 1 else dh.winner_2_level) or 1
             # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
-            # Precedence fix: parenthesize the slot ternary so the `or 0` None-guard
-            # applies to BOTH winner slots, not just slot 2. Previously
-            # `float(A if c else B or 0)` parsed as `float(A if c else (B or 0))`, so a
-            # None winner_1_net_payout (column is nullable) would raise
-            # float(None) → TypeError → HTTP 500 on the Winners statistics tab.
+            # Precedence + defensive None-guard. Previously
+            # `float(A if c else B or 0)` parsed as `float(A if c else (B or 0))`,
+            # so the `or 0` guard covered ONLY slot 2; the slot-1 branch had none.
+            # winner_*_net_payout is nullable=False at the DDL level, so well-formed
+            # ORM rows are already safe — but a Python-level None reaching this line
+            # (a legacy / raw-SQL row that bypassed the ORM constraint, or any non-ORM
+            # insert path) would raise float(None) → TypeError → HTTP 500 on the
+            # Winners statistics tab. Parenthesising makes the guard symmetric across
+            # both slots regardless of insert path. No behaviour change for valid rows.
             pay  = float((dh.winner_1_net_payout if slot == 1 else dh.winner_2_net_payout) or 0)
             uid  = dh.winner_1_user_id if slot == 1 else dh.winner_2_user_id
 

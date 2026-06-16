@@ -2180,10 +2180,13 @@ function DangerTab({ toast }) {
         <div className="p-6 space-y-5">
           <div className="bg-red-900/15 border border-red-800/30 rounded-xl p-4 space-y-2">
             <p className="text-xs font-bold text-red-200 flex items-center gap-2"><AlertTriangle className="w-3.5 h-3.5 text-red-400"/>What "Nuke Database" does</p>
+            {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                Reset now wipes ALL transactional tables for a true clean slate
+                (required before a clean simulation run). */}
             <ul className="text-xs text-red-300/70 space-y-1 pl-5 list-disc leading-relaxed">
-              <li>Deletes <strong className="text-red-200">all rows</strong> from <code className="bg-red-900/50 px-1 rounded font-mono">users</code>, <code className="bg-red-900/50 px-1 rounded font-mono">pools</code>, and <code className="bg-red-900/50 px-1 rounded font-mono">tokens</code> tables</li>
+              <li>Deletes <strong className="text-red-200">all rows</strong> from <code className="bg-red-900/50 px-1 rounded font-mono">users</code>, <code className="bg-red-900/50 px-1 rounded font-mono">pools</code>, <code className="bg-red-900/50 px-1 rounded font-mono">tokens</code>, <code className="bg-red-900/50 px-1 rounded font-mono">draw_history</code>, <code className="bg-red-900/50 px-1 rounded font-mono">weekly_draw_state</code>, <code className="bg-red-900/50 px-1 rounded font-mono">system_locks</code>, SDE sessions and elimination events</li>
               <li>Resets PostgreSQL auto-increment sequences — next user gets <code className="bg-red-900/50 px-1 rounded font-mono">id = 1</code></li>
-              <li><strong className="text-red-100">Admin accounts are NOT deleted</strong></li>
+              <li><strong className="text-red-100">Admin accounts and system settings are NOT deleted</strong></li>
               <li className="text-red-400">This action <strong>cannot be undone</strong></li>
             </ul>
           </div>

@@ -585,8 +585,12 @@ class MassLoadInjector:
             if balance < _threshold:
                 continue
 
-            # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
-        rw_code = f"RW{self._pfx}{week_num:04d}U{user.id:010d}"
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # FIX: this line was indented at 8 spaces (pre-existing error from a prior
+            # session) but must be 12 to sit inside the `for user in eligible:` loop.
+            # The IndentationError made real_simulation.py un-importable, so EVERY
+            # simulation thread died instantly on import → UI stuck at "Week 0 / 0.0%".
+            rw_code = f"RW{self._pfx}{week_num:04d}U{user.id:010d}"
             rw_token = Token(
                 code      = rw_code,
                 type      = TokenType.Referral_Withdraw,
@@ -1706,6 +1710,21 @@ class RealSimEngine:
             _logger.info("RealSimEngine [%s]: PHASE-A — entering main try block", self._run_id)
             log_milestone("SIM/start", "simulation_started", {"run_id": self._run_id})
 
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Record the max pool ID that exists BEFORE the simulation creates ANY
+            # pools (i.e. before seed inject + seed pool formation). Any pool with
+            # id <= this ceiling is a pre-existing (non-simulation) pool and is
+            # skipped in every week's draw. On a freshly-wiped DB this is 0, so the
+            # skip becomes a no-op and the simulation draws its own pools normally.
+            # CRITICAL: must be captured HERE, not after seed pool formation —
+            # otherwise the sim's own seed pools fall under the ceiling and never draw.
+            _pre_sim_max_pool_id: int = db.query(func.max(Pool.id)).scalar() or 0
+            _logger.info(
+                "RealSimEngine [%s]: draw isolation ceiling = pool_id %d "
+                "(pools with id <= this are skipped in all week draws; 0 = clean DB)",
+                self._run_id, _pre_sim_max_pool_id,
+            )
+
             # 9-tick dynamic Chronos Timeline — all milestones derived from DB global_config.
             current_T_00H = self._initial_draw_time(db)
             with ChronosEngine(current_T_00H) as chronos:
@@ -1755,18 +1774,6 @@ class RealSimEngine:
                     _logger.warning("RealSimEngine: pre-loop stale-state clear failed: %s", _pre_exc)
                     try: db.rollback()
                     except Exception: pass
-
-                # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
-                # Record the max pool ID that exists BEFORE this simulation run.
-                # Any pool with id <= this ceiling is a pre-existing real pool and
-                # must be skipped in execute_weekly_draw — drawing 100+ real pools
-                # takes 10+ minutes and corrupts production draw history.
-                _pre_sim_max_pool_id: int = db.query(func.max(Pool.id)).scalar() or 0
-                _logger.info(
-                    "RealSimEngine [%s]: draw isolation ceiling = pool_id %d "
-                    "(pools with id <= this are skipped in all week draws)",
-                    self._run_id, _pre_sim_max_pool_id,
-                )
 
                 # ────────────────────────────────────────────────────────────────
                 # 9-TICK CHRONOS MAIN LOOP (all milestones derived from DB config)

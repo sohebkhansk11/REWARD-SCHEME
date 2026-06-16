@@ -875,21 +875,42 @@ def reset_data(body: ResetDataRequest, db: Session = Depends(get_db)):
     pools_count  = db.query(Pool).count()
 
     sequences_reset = False
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # COMPREHENSIVE clean slate — truncate ALL transactional/test tables, not just
+    # users/pools/tokens. Leftover draw_history, weekly_draw_state, system_locks,
+    # SDE sessions and elimination_events from earlier test injections corrupt
+    # downstream stats and can interfere with a fresh simulation. We explicitly
+    # PRESERVE admins (login accounts) and system_settings (global config).
+    _test_tables = [
+        "tokens",
+        "draw_history",
+        "weekly_draw_state",
+        "system_locks",
+        "sde_checkpoints",
+        "sde_sessions",
+        "elimination_events",
+        "users",
+        "pools",
+    ]
     try:
         # PostgreSQL: TRUNCATE with RESTART IDENTITY resets sequences to 1.
-        # CASCADE handles all FK constraints automatically (tokens → users → pools).
-        # The admins table has no FK to any of these tables and is unaffected.
+        # CASCADE handles all FK constraints automatically across the listed tables.
+        # The admins and system_settings tables have no FK to any of these and are
+        # therefore NOT affected by CASCADE.
         db.execute(text(
-            "TRUNCATE TABLE tokens, users, pools RESTART IDENTITY CASCADE"
+            f"TRUNCATE TABLE {', '.join(_test_tables)} RESTART IDENTITY CASCADE"
         ))
         db.commit()
         sequences_reset = True
     except Exception:
-        # Fallback for non-PostgreSQL environments (e.g., SQLite in local unit tests)
+        # Fallback for non-PostgreSQL environments (e.g., SQLite in local unit tests).
+        # Delete children before parents to respect FK ordering.
         db.rollback()
-        db.execute(text("DELETE FROM tokens"))
-        db.execute(text("DELETE FROM users"))
-        db.execute(text("DELETE FROM pools"))
+        for _tbl in _test_tables:
+            try:
+                db.execute(text(f"DELETE FROM {_tbl}"))
+            except Exception:
+                pass  # table may not exist on older schemas — skip
         db.commit()
 
     return ResetDataResult(
@@ -898,7 +919,9 @@ def reset_data(body: ResetDataRequest, db: Session = Depends(get_db)):
         pools_deleted=pools_count,
         sequences_reset=sequences_reset,
         note=(
-            "Admin accounts and server settings were NOT affected. "
+            "Clean slate: users, pools, tokens, draw history, weekly draw state, "
+            "system locks, SDE sessions and elimination events were all cleared. "
+            "Admin accounts and system settings were NOT affected. "
             + ("All auto-increment IDs reset to 1." if sequences_reset else
                "Rows deleted but sequence reset skipped (non-PostgreSQL backend).")
         ),

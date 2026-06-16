@@ -352,3 +352,109 @@ def version_info():
     except Exception as exc:  # defensive: report, never raise
         info["schema_check_error"] = f"{type(exc).__name__}: {exc}"
     return info
+
+
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+@app.get("/admin/repair-weekly-enum", tags=["Health"])
+def repair_weekly_enum(confirm: str = ""):
+    """
+    One-shot, idempotent, finance-safe repair of the misspelled PostgreSQL enum
+    type `weeklypaymentsatus` -> `weeklypaymentstatus` that backs
+    users.weekly_payment_status.
+
+    The equivalent startup migration apparently FAILED SILENTLY in production
+    (its error was swallowed into Render's logs, which we can't read live). This
+    endpoint runs the SAME class of repair but RETURNS the exact outcome / error
+    plus a full type-dependency map, so the fix can be both driven and verified
+    over HTTP. It is guarded by a fixed confirm token and is a no-op once the
+    type name is already correct, so it is safe to leave callable; remove it
+    after the schema is confirmed repaired.
+
+    Strategy (minimises the ACCESS EXCLUSIVE lock window on the finance `users`
+    table) — with statement/lock timeouts disabled so neither path can be
+    cancelled mid-flight:
+      * only misspelled exists          -> ALTER TYPE ... RENAME (instant, catalog only)
+      * both exist, correct is an orphan -> DROP correct orphan, then RENAME    (instant)
+      * both exist, correct used elsewhere -> repoint users col (table rewrite),
+                                              then DROP the misspelled type
+    """
+    from sqlalchemy import text as _t
+    from app.database import engine as _e
+    out: dict = {
+        "ran": False, "confirmed": False,
+        "before": {}, "after": {},
+        "dependencies": [], "actions": [], "error": None,
+    }
+    if confirm != "repair-weekly-enum-jun16":
+        out["error"] = "missing/invalid confirm token (?confirm=repair-weekly-enum-jun16)"
+        return out
+    out["confirmed"] = True
+
+    def _snapshot(conn):
+        col = conn.execute(_t(
+            "SELECT t.typname FROM pg_attribute a "
+            "JOIN pg_class c ON a.attrelid=c.oid "
+            "JOIN pg_type  t ON a.atttypid=t.oid "
+            "WHERE c.relname='users' AND a.attname='weekly_payment_status'"
+        )).scalar()
+        types = [r[0] for r in conn.execute(_t(
+            "SELECT typname FROM pg_type "
+            "WHERE typname IN ('weeklypaymentstatus','weeklypaymentsatus') ORDER BY typname"
+        )).fetchall()]
+        return {"column_type": col, "types_present": types}
+
+    try:
+        # --- diagnostics: every real/partitioned/view/matview column using either spelling
+        with _e.connect() as conn:
+            out["before"] = _snapshot(conn)
+            out["dependencies"] = [
+                {"type_name": r[0], "table": r[1], "column": r[2], "relkind": r[3]}
+                for r in conn.execute(_t(
+                    "SELECT t.typname, c.relname, a.attname, c.relkind "
+                    "FROM pg_type t "
+                    "JOIN pg_attribute a ON a.atttypid=t.oid "
+                    "JOIN pg_class c ON a.attrelid=c.oid "
+                    "WHERE t.typname IN ('weeklypaymentstatus','weeklypaymentsatus') "
+                    "AND a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','p','v','m') "
+                    "ORDER BY t.typname, c.relname, a.attname"
+                )).fetchall()
+            ]
+        # --- repair (own transaction; timeouts off so nothing can cancel a rewrite)
+        with _e.begin() as conn:
+            conn.execute(_t("SET LOCAL statement_timeout = 0"))
+            conn.execute(_t("SET LOCAL lock_timeout = 0"))
+            present = set(_snapshot(conn)["types_present"])
+            if "weeklypaymentsatus" not in present:
+                out["actions"].append("no-op: misspelled type 'weeklypaymentsatus' absent")
+            elif "weeklypaymentstatus" not in present:
+                conn.execute(_t("ALTER TYPE weeklypaymentsatus RENAME TO weeklypaymentstatus"))
+                out["actions"].append("ALTER TYPE weeklypaymentsatus RENAME TO weeklypaymentstatus")
+            else:
+                # both exist — is the correctly-named type used by any REAL table column?
+                correct_in_use = conn.execute(_t(
+                    "SELECT count(*) FROM pg_type t "
+                    "JOIN pg_attribute a ON a.atttypid=t.oid "
+                    "JOIN pg_class c ON a.attrelid=c.oid "
+                    "WHERE t.typname='weeklypaymentstatus' "
+                    "AND a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','p')"
+                )).scalar() or 0
+                if correct_in_use > 0:
+                    conn.execute(_t(
+                        "ALTER TABLE users ALTER COLUMN weekly_payment_status "
+                        "TYPE weeklypaymentstatus "
+                        "USING weekly_payment_status::text::weeklypaymentstatus"
+                    ))
+                    out["actions"].append("ALTER TABLE users repoint -> weeklypaymentstatus (rewrite)")
+                    conn.execute(_t("DROP TYPE IF EXISTS weeklypaymentsatus"))
+                    out["actions"].append("DROP TYPE IF EXISTS weeklypaymentsatus")
+                else:
+                    conn.execute(_t("DROP TYPE weeklypaymentstatus"))
+                    out["actions"].append("DROP TYPE weeklypaymentstatus (orphan)")
+                    conn.execute(_t("ALTER TYPE weeklypaymentsatus RENAME TO weeklypaymentstatus"))
+                    out["actions"].append("ALTER TYPE weeklypaymentsatus RENAME TO weeklypaymentstatus")
+            out["ran"] = True
+        with _e.connect() as conn:
+            out["after"] = _snapshot(conn)
+    except Exception as exc:  # report the precise failure instead of hiding it
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out

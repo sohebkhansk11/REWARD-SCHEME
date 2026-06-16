@@ -1718,6 +1718,18 @@ class RealSimEngine:
             # skip becomes a no-op and the simulation draws its own pools normally.
             # CRITICAL: must be captured HERE, not after seed pool formation —
             # otherwise the sim's own seed pools fall under the ceiling and never draw.
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # FIX (NameError caught LIVE in the Debugger Panel at run() line ~1721:
+            # "name 'Pool' is not defined"): `Pool` is NOT a module-level import in
+            # this file — models are imported locally inside methods to avoid
+            # circular imports. The old ceiling-capture block I relocated had carried
+            # this import; moving the capture up here dropped it, so BOTH this line
+            # and the pre-skip query at ~1992 raised NameError. A function-local
+            # import here binds `Pool` for the REST of run(), covering both call
+            # sites. A module-level model import is deliberately avoided — it could
+            # reintroduce a circular-import / un-importable failure like the one we
+            # just fixed.
+            from app.models.pool import Pool
             _pre_sim_max_pool_id: int = db.query(func.max(Pool.id)).scalar() or 0
             _logger.info(
                 "RealSimEngine [%s]: draw isolation ceiling = pool_id %d "

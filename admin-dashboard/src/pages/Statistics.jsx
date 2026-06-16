@@ -31,6 +31,7 @@ import {
   devLiveStats, devLevelMap, devWinnersAnalytics, devProjection,
   getPauseCalendar, getWeeklyPoolReports,
   getReferralTrend, getWinnerLevelTrend,
+  getWeeklyTimeline,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -2150,6 +2151,272 @@ function WeeklyPoolReportsPanel({ toast }) {
 // Main page
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// Weekly Timeline — system-birth-anchored cumulative summary (directive Point 2).
+// Week 1 begins the moment the first user joins; every metric (users in/out, cash
+// in/out, pools created, draws, winners) is bucketed into contiguous 7-day windows
+// with running cumulative totals.  Source: GET /admin/stats/weekly-timeline — now
+// meaningful because the Chronos virtual-clock fix stamps audit rows with the
+// simulated instant instead of the real PostgreSQL clock.
+// ═══════════════════════════════════════════════════════════════════════════
+function WeeklyTimelinePanel({ toast }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [view,    setView]    = useState('weekly')   // 'weekly' | 'cumulative'
+
+  const fetch_ = useCallback(async () => {
+    setLoading(true)
+    try   { const r = await getWeeklyTimeline(); setData(r.data) }
+    catch { toast('Failed to load weekly timeline', 'error') }
+    finally { setLoading(false) }
+  }, [toast])
+  useEffect(() => { fetch_() }, [fetch_])
+
+  if (loading) return <div className="flex justify-center h-48"><Spinner className="w-8 h-8 text-violet-500 mt-16"/></div>
+  if (!data?.weeks?.length)
+    return (
+      <div className="flex items-start gap-3 bg-blue-50 border border-blue-200 rounded-xl p-4">
+        <AlertCircle className="w-4 h-4 text-blue-500 flex-shrink-0 mt-0.5"/>
+        <p className="text-sm text-blue-700">No activity yet — the timeline begins the moment the first user joins the system.</p>
+      </div>
+    )
+
+  const t     = data.totals
+  const weeks = data.weeks
+
+  const chartData = weeks.map(w => ({
+    week:      `W${w.week}`,
+    users_in:  w.users_in,
+    users_out: w.users_out,
+    net_users: w.net_users,
+    cash_in:   w.cash_in_inr,
+    cash_out:  w.cash_out_inr,
+    net_cash:  w.net_cash_inr,
+    draws:     w.draws,
+    pools:     w.pools_created,
+    cum_users: w.cumulative_net_users,
+    cum_cash:  w.cumulative_net_cash_inr,
+  }))
+
+  // Client-side CSV export — no backend round-trip needed
+  const exportCsv = () => {
+    const cols = [
+      'week','week_start','week_end','users_in','exits_nonpay','exits_won','users_out',
+      'net_users','pools_created','draws','winners','sde_exits','deposits_in_inr',
+      'grace_in_inr','late_fee_in_inr','cash_in_inr','payouts_out_inr','referral_out_inr',
+      'cash_out_inr','net_cash_inr','app_fees_retained_inr','late_fees_accrued_inr',
+      'cumulative_users_in','cumulative_users_out','cumulative_net_users','cumulative_draws',
+      'cumulative_winners','cumulative_pools_created','cumulative_cash_in_inr',
+      'cumulative_cash_out_inr','cumulative_net_cash_inr',
+    ]
+    const csv = [cols.join(','), ...weeks.map(w => cols.map(c => w[c] ?? 0).join(','))].join('\n')
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href = url
+    a.download = `weekly-timeline-${new Date().toISOString().slice(0, 10)}.csv`
+    document.body.appendChild(a); a.click(); document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }
+
+  const netCashPos = fP(t.net_cash_inr) >= 0
+  const KPIS = [
+    { label:'Total Weeks',   value: NUM(data.total_weeks), color:'text-slate-800',   bg:'bg-slate-50 border-slate-200' },
+    { label:'Users In',      value: NUM(t.users_in),       color:'text-emerald-600', bg:'bg-emerald-50 border-emerald-200' },
+    { label:'Users Out',     value: NUM(t.users_out),      color:'text-rose-600',    bg:'bg-rose-50 border-rose-200' },
+    { label:'Net Members',   value: NUM(t.net_users),      color:'text-blue-600',    bg:'bg-blue-50 border-blue-200' },
+    { label:'Pools Created', value: NUM(t.pools_created),  color:'text-teal-600',    bg:'bg-teal-50 border-teal-200' },
+    { label:'Total Draws',   value: NUM(t.draws),          color:'text-violet-700',  bg:'bg-violet-50 border-violet-200' },
+    { label:'Total Winners', value: NUM(t.winners),        color:'text-amber-600',   bg:'bg-amber-50 border-amber-200' },
+    { label:'Cash In',       value: INR(t.cash_in_inr),    color:'text-emerald-600', bg:'bg-emerald-50 border-emerald-200' },
+    { label:'Cash Out',      value: INR(t.cash_out_inr),   color:'text-rose-600',    bg:'bg-rose-50 border-rose-200' },
+    { label:'Net Cash',      value: INR(t.net_cash_inr),   color: netCashPos?'text-emerald-700':'text-red-700', bg: netCashPos?'bg-emerald-50 border-emerald-200':'bg-red-50 border-red-200' },
+  ]
+
+  return (
+    <motion.div {..._fadeUp} className="space-y-6">
+      {/* Header */}
+      <div className="flex items-start justify-between flex-wrap gap-3">
+        <div>
+          <h2 className="text-lg font-bold text-slate-800">Weekly Timeline — Cumulative System Summary</h2>
+          <p className="text-sm text-slate-400 mt-0.5">
+            Week 1 begins when the first user joined{data.anchor_date ? ` · anchor ${data.anchor_date}` : ''}. Every metric is bucketed into 7-day windows with running totals.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="flex rounded-lg border border-slate-200 overflow-hidden">
+            {['weekly','cumulative'].map(v => (
+              <button key={v} onClick={() => setView(v)}
+                className={`px-3 py-1.5 text-xs font-bold transition ${view===v?'bg-violet-600 text-white':'bg-white text-slate-500 hover:bg-slate-50'}`}>
+                {v==='weekly'?'Per-Week':'Cumulative'}
+              </button>
+            ))}
+          </div>
+          <button onClick={exportCsv} className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs text-slate-500 hover:bg-slate-50 transition">
+            <Download className="w-3.5 h-3.5"/>CSV
+          </button>
+          <button onClick={fetch_} className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 transition">
+            <RefreshCw className="w-3.5 h-3.5 text-slate-500"/>
+          </button>
+        </div>
+      </div>
+
+      {/* Totals strip */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+        {KPIS.map(k => (
+          <div key={k.label} className={`rounded-2xl border p-4 ${k.bg}`}>
+            <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">{k.label}</p>
+            <p className={`text-lg font-black tabular-nums mt-1 ${k.color}`}>{k.value}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Cumulative growth */}
+      <SectionCard title="Cumulative Growth — Net Members & Net Cash" icon={TrendingUp} iconColor="text-violet-500">
+        <ResponsiveContainer width="100%" height={260}>
+          <ComposedChart data={chartData} margin={{top:8,right:16,left:0,bottom:4}}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+            <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} tickLine={false} interval="preserveStartEnd"/>
+            <YAxis yAxisId="u" tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false}/>
+            <YAxis yAxisId="c" orientation="right" tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false} tickFormatter={v=>INR_COMPACT(v)}/>
+            <Tooltip formatter={(v,n)=> n==='Cumulative Net Cash' ? INR(v) : NUM(v)} contentStyle={{border:'1px solid #e2e8f0',borderRadius:12,fontSize:11}}/>
+            <Legend wrapperStyle={{fontSize:11}}/>
+            <Area yAxisId="u" type="monotone" dataKey="cum_users" name="Cumulative Net Members" stroke={C.blue} strokeWidth={2} fill={C.blue+'18'} dot={false}/>
+            <Line yAxisId="c" type="monotone" dataKey="cum_cash" name="Cumulative Net Cash" stroke={C.violet} strokeWidth={2} dot={false}/>
+          </ComposedChart>
+        </ResponsiveContainer>
+      </SectionCard>
+
+      {/* Weekly cash flow */}
+      <SectionCard title="Weekly Cash Flow — In vs Out" icon={IndianRupee} iconColor="text-emerald-500">
+        <ResponsiveContainer width="100%" height={240}>
+          <ComposedChart data={chartData} margin={{top:8,right:16,left:0,bottom:4}}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+            <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} tickLine={false} interval="preserveStartEnd"/>
+            <YAxis tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false} tickFormatter={v=>INR_COMPACT(v)}/>
+            <Tooltip formatter={(v,n)=>[INR(v),n]} contentStyle={{border:'1px solid #e2e8f0',borderRadius:12,fontSize:11}}/>
+            <Legend wrapperStyle={{fontSize:11}}/>
+            <ReferenceLine y={0} stroke="#94a3b8"/>
+            <Bar dataKey="cash_in"  name="Cash In"  fill={C.emerald} radius={[3,3,0,0]} maxBarSize={28}/>
+            <Bar dataKey="cash_out" name="Cash Out" fill={C.rose}    radius={[3,3,0,0]} maxBarSize={28}/>
+            <Line type="monotone" dataKey="net_cash" name="Net Cash" stroke={C.violet} strokeWidth={2} dot={false}/>
+          </ComposedChart>
+        </ResponsiveContainer>
+      </SectionCard>
+
+      {/* Weekly member flow */}
+      <SectionCard title="Weekly Member Flow — In vs Out · Draws · Pools" icon={Users} iconColor="text-blue-500">
+        <ResponsiveContainer width="100%" height={240}>
+          <ComposedChart data={chartData} margin={{top:8,right:16,left:0,bottom:4}}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+            <XAxis dataKey="week" tick={{fill:'#64748b',fontSize:10}} tickLine={false} interval="preserveStartEnd"/>
+            <YAxis yAxisId="u" tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false}/>
+            <YAxis yAxisId="d" orientation="right" tick={{fill:'#64748b',fontSize:10}} tickLine={false} axisLine={false}/>
+            <Tooltip contentStyle={{border:'1px solid #e2e8f0',borderRadius:12,fontSize:11}}/>
+            <Legend wrapperStyle={{fontSize:11}}/>
+            <Bar yAxisId="u" dataKey="users_in"  name="Users In"  fill={C.emerald} radius={[3,3,0,0]} maxBarSize={28}/>
+            <Bar yAxisId="u" dataKey="users_out" name="Users Out" fill={C.rose}    radius={[3,3,0,0]} maxBarSize={28}/>
+            <Line yAxisId="d" type="monotone" dataKey="draws" name="Draws" stroke={C.blue} strokeWidth={2} dot={false}/>
+            <Line yAxisId="d" type="monotone" dataKey="pools" name="Pools Created" stroke={C.teal} strokeWidth={2} strokeDasharray="4 2" dot={false}/>
+          </ComposedChart>
+        </ResponsiveContainer>
+      </SectionCard>
+
+      {/* Detailed table */}
+      <SectionCard
+        title={view==='weekly' ? 'Per-Week Breakdown' : 'Cumulative Running Totals'}
+        icon={TableProperties} iconColor="text-slate-500"
+      >
+        <div className="overflow-x-auto">
+          {view==='weekly' ? (
+            <table className="w-full text-sm min-w-[1000px]">
+              <thead>
+                <tr className="border-b border-slate-100 bg-slate-50/50">
+                  {['Week','Period','In','Out (NP+Won)','Net','Pools','Draws','Win','SDE','Cash In','Cash Out','Net Cash'].map(h=>(
+                    <th key={h} className="text-left px-3 py-2.5 text-[11px] font-semibold text-slate-400 uppercase tracking-wider whitespace-nowrap">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {weeks.map((w,i)=>(
+                  <tr key={w.week} className={`border-b border-slate-50 hover:bg-slate-50 transition-colors ${i%2?'bg-slate-50/30':''}`}>
+                    <td className="px-3 py-2 font-bold text-slate-700">W{w.week}</td>
+                    <td className="px-3 py-2 text-[11px] text-slate-400 whitespace-nowrap">{w.week_start} → {w.week_end}</td>
+                    <td className="px-3 py-2 text-emerald-600 font-semibold tabular-nums">{NUM(w.users_in)}</td>
+                    <td className="px-3 py-2 text-rose-600 tabular-nums">{NUM(w.users_out)} <span className="text-[10px] text-slate-400">({NUM(w.exits_nonpay)}+{NUM(w.exits_won)})</span></td>
+                    <td className={`px-3 py-2 font-semibold tabular-nums ${w.net_users>=0?'text-blue-600':'text-red-600'}`}>{w.net_users>=0?'+':''}{NUM(w.net_users)}</td>
+                    <td className="px-3 py-2 text-teal-600 tabular-nums">{NUM(w.pools_created)}</td>
+                    <td className="px-3 py-2 text-slate-700 tabular-nums">{NUM(w.draws)}</td>
+                    <td className="px-3 py-2 text-amber-600 tabular-nums">{NUM(w.winners)}</td>
+                    <td className="px-3 py-2 text-cyan-600 tabular-nums">{w.sde_exits>0?NUM(w.sde_exits):'—'}</td>
+                    <td className="px-3 py-2 text-emerald-600 tabular-nums">{INR(w.cash_in_inr)}</td>
+                    <td className="px-3 py-2 text-rose-600 tabular-nums">{INR(w.cash_out_inr)}</td>
+                    <td className={`px-3 py-2 font-bold tabular-nums ${fP(w.net_cash_inr)>=0?'text-emerald-700':'text-red-700'}`}>{INR(w.net_cash_inr)}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr className="border-t-2 border-slate-200 bg-slate-50 font-bold">
+                  <td className="px-3 py-2.5 text-slate-700" colSpan={2}>TOTAL</td>
+                  <td className="px-3 py-2.5 text-emerald-600 tabular-nums">{NUM(t.users_in)}</td>
+                  <td className="px-3 py-2.5 text-rose-600 tabular-nums">{NUM(t.users_out)}</td>
+                  <td className={`px-3 py-2.5 tabular-nums ${t.net_users>=0?'text-blue-700':'text-red-700'}`}>{NUM(t.net_users)}</td>
+                  <td className="px-3 py-2.5 text-teal-600 tabular-nums">{NUM(t.pools_created)}</td>
+                  <td className="px-3 py-2.5 text-slate-700 tabular-nums">{NUM(t.draws)}</td>
+                  <td className="px-3 py-2.5 text-amber-600 tabular-nums">{NUM(t.winners)}</td>
+                  <td className="px-3 py-2.5 text-slate-300">—</td>
+                  <td className="px-3 py-2.5 text-emerald-600 tabular-nums">{INR(t.cash_in_inr)}</td>
+                  <td className="px-3 py-2.5 text-rose-600 tabular-nums">{INR(t.cash_out_inr)}</td>
+                  <td className={`px-3 py-2.5 tabular-nums ${fP(t.net_cash_inr)>=0?'text-emerald-700':'text-red-700'}`}>{INR(t.net_cash_inr)}</td>
+                </tr>
+              </tfoot>
+            </table>
+          ) : (
+            <table className="w-full text-sm min-w-[900px]">
+              <thead>
+                <tr className="border-b border-slate-100 bg-slate-50/50">
+                  {['Week','Period','Σ Users In','Σ Users Out','Σ Net Members','Σ Pools','Σ Draws','Σ Winners','Σ Cash In','Σ Cash Out','Σ Net Cash'].map(h=>(
+                    <th key={h} className="text-left px-3 py-2.5 text-[11px] font-semibold text-slate-400 uppercase tracking-wider whitespace-nowrap">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {weeks.map((w,i)=>(
+                  <tr key={w.week} className={`border-b border-slate-50 hover:bg-slate-50 transition-colors ${i%2?'bg-slate-50/30':''}`}>
+                    <td className="px-3 py-2 font-bold text-slate-700">W{w.week}</td>
+                    <td className="px-3 py-2 text-[11px] text-slate-400 whitespace-nowrap">{w.week_start} → {w.week_end}</td>
+                    <td className="px-3 py-2 text-emerald-600 tabular-nums">{NUM(w.cumulative_users_in)}</td>
+                    <td className="px-3 py-2 text-rose-600 tabular-nums">{NUM(w.cumulative_users_out)}</td>
+                    <td className={`px-3 py-2 font-semibold tabular-nums ${w.cumulative_net_users>=0?'text-blue-600':'text-red-600'}`}>{NUM(w.cumulative_net_users)}</td>
+                    <td className="px-3 py-2 text-teal-600 tabular-nums">{NUM(w.cumulative_pools_created)}</td>
+                    <td className="px-3 py-2 text-slate-700 tabular-nums">{NUM(w.cumulative_draws)}</td>
+                    <td className="px-3 py-2 text-amber-600 tabular-nums">{NUM(w.cumulative_winners)}</td>
+                    <td className="px-3 py-2 text-emerald-600 tabular-nums">{INR(w.cumulative_cash_in_inr)}</td>
+                    <td className="px-3 py-2 text-rose-600 tabular-nums">{INR(w.cumulative_cash_out_inr)}</td>
+                    <td className={`px-3 py-2 font-bold tabular-nums ${fP(w.cumulative_net_cash_inr)>=0?'text-emerald-700':'text-red-700'}`}>{INR(w.cumulative_net_cash_inr)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </SectionCard>
+
+      {/* Cash composition note */}
+      <div className="flex items-start gap-3 bg-slate-50 border border-slate-200 rounded-xl p-4">
+        <Info className="w-4 h-4 text-slate-400 flex-shrink-0 mt-0.5"/>
+        <p className="text-[11px] text-slate-500 leading-relaxed">
+          <span className="font-semibold text-slate-600">Cash In</span> = deposits (join + weekly) + grace fees + late-fee settlements.{' '}
+          <span className="font-semibold text-slate-600">Cash Out</span> = winner net payouts + referral withdrawals.{' '}
+          Late-fee <em>accruals</em> (unsettled liabilities) and the per-winner platform fee retained from gross payouts are tracked separately and excluded from net cash to prevent double-counting.
+        </p>
+      </div>
+    </motion.div>
+  )
+}
+
+
 export default function Statistics() {
   const toast = useToast()
 
@@ -2316,6 +2583,8 @@ export default function Statistics() {
   // S-01 to S-08: Added new enhanced analytics sub-tabs
   const SUB_TABS = [
     { id: 'overview',       label: 'Overview',              icon: BarChart3    },
+    // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    { id: 'weekly_timeline',label: 'Weekly Timeline',       icon: TableProperties },
     { id: 'weekly_pools',   label: 'Weekly Pool Reports',   icon: CalendarRange },
     { id: 'live_stats',     label: 'Live Stats',            icon: Activity     },
     { id: 'level_map',      label: 'Level Map',             icon: Layers       },
@@ -2366,6 +2635,8 @@ export default function Statistics() {
           ))}
         </div>
         {/* Panel content */}
+        {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
+        {subTab === 'weekly_timeline' && <WeeklyTimelinePanel  toast={toast} />}
         {subTab === 'weekly_pools'   && <WeeklyPoolReportsPanel toast={toast} />}
         {subTab === 'live_stats'     && <LiveStatsPanel   toast={toast} />}
         {subTab === 'level_map'      && <LevelMapPanel    toast={toast} />}

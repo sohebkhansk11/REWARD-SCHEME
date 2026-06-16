@@ -459,6 +459,13 @@ export const getPauseCalendar = () =>
 export const getWeeklyPoolReports = (weeks = 24) =>
   api.get('/admin/stats/weekly-pool-reports', { params: { weeks } })
 
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+/** GET /admin/stats/weekly-timeline — system-birth-anchored week-by-week cumulative
+ *  timeline (users in/out, cash in/out, pools created, draws, winners + running totals).
+ *  Week 1 begins the instant the first user joins. */
+export const getWeeklyTimeline = () =>
+  api.get('/admin/stats/weekly-timeline')
+
 /** GET /admin/stats/referral-trend — weekly RDR% trend for S-04 Referral Heatmap */
 export const getReferralTrend = (weeks = 52) =>
   api.get('/admin/stats/referral-trend', { params: { weeks } })

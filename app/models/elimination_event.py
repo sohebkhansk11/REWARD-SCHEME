@@ -30,6 +30,12 @@ from sqlalchemy import (
 from sqlalchemy.sql import func
 
 from app.database import Base
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Python-side default that yields the SIMULATED instant during a Chronos run and
+# real UTC in production, so an elimination's created_at follows the simulated week
+# (this is the "users out / week" series).  ORM db.add(EliminationEvent(...)) is the
+# only creation path.  server_default=func.now() retained as raw-SQL fallback.
+from app.core.sim_clock import now as _sim_now
 
 
 class EliminationReason(str, enum.Enum):
@@ -83,6 +89,7 @@ class EliminationEvent(Base):
     # ── Timestamp ────────────────────────────────────────────────────────────────
     created_at = Column(
         DateTime(timezone=True),
+        default=_sim_now,
         server_default=func.now(),
         nullable=False,
         index=True,

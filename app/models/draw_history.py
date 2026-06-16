@@ -1,6 +1,11 @@
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, Numeric, String
 from sqlalchemy.sql import func
 from app.database import Base
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Python-side default that yields the SIMULATED instant during a Chronos run and
+# real UTC in production, so draw_timestamp follows the simulated week instead of
+# the real PostgreSQL clock.  server_default=func.now() retained as raw-SQL fallback.
+from app.core.sim_clock import now as _sim_now
 
 
 class DrawHistory(Base):
@@ -8,7 +13,7 @@ class DrawHistory(Base):
 
     id                  = Column(Integer, primary_key=True, index=True)
     pool_id             = Column(Integer, ForeignKey("pools.id"), nullable=False, index=True)
-    draw_timestamp      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    draw_timestamp      = Column(DateTime(timezone=True), default=_sim_now, server_default=func.now(), nullable=False)
     edge_case_triggered = Column(Boolean, default=False, nullable=False)
 
     # Winner 1 — core payout fields

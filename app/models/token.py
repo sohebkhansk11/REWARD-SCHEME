@@ -3,6 +3,13 @@ from sqlalchemy import Column, Integer, String, Numeric, ForeignKey, Enum, DateT
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Python-side default that yields the SIMULATED instant during a Chronos run and
+# real UTC in production, so a token's created_at follows the simulated week
+# instead of the real PostgreSQL clock.  Governs every ORM db.add(Token(...)) path
+# (RW / LF / GF / LFC / grace-WK tokens); the 5 bulk sa_insert(Token) sites set
+# created_at explicitly because core bulk inserts bypass this default.
+from app.core.sim_clock import now as _sim_now
 
 
 class TokenType(str, enum.Enum):
@@ -52,7 +59,7 @@ class Token(Base):
     pool_id = Column(Integer, ForeignKey("pools.id"), nullable=True)
 
     # Audit trail
-    created_at          = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at          = Column(DateTime(timezone=True), default=_sim_now, server_default=func.now(), nullable=False)
     redeemed_at         = Column(DateTime(timezone=True), nullable=True)   # set when status → Burned
     redeemed_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # who initiated the burn
 

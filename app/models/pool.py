@@ -3,6 +3,12 @@ from sqlalchemy import Boolean, Column, Integer, String, DateTime, Enum
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Python-side default that yields the SIMULATED instant during a Chronos run and
+# real UTC in production, so pool.created_at follows the simulated week.  The
+# waitlist Phase-2 bulk insert already sets created_at explicitly (and overrides
+# this default); this covers every other ORM pool-creation path for consistency.
+from app.core.sim_clock import now as _sim_now
 
 
 class PoolStatus(str, enum.Enum):
@@ -21,7 +27,7 @@ class Pool(Base):
     status = Column(Enum(PoolStatus), default=PoolStatus.Waiting, nullable=False)
     total_members = Column(Integer, default=0, nullable=False)
     # Timestamp used for FIFO pool-fill ordering (oldest pool gets vacancies filled first)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_sim_now, server_default=func.now(), nullable=False)
 
     # ── Draw-cycle tracking ───────────────────────────────────────────────────
     # draw_completed_this_week: TRUE after this pool's winners have been selected

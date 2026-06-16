@@ -28,7 +28,7 @@ import {
 import Spinner from '../components/Spinner'
 import {
   forceDrawDev, simulateCycleDev, simulateUsersDev,
-  resetDataDev, advancedSimulationDev,
+  resetDataDev,
   startRealSimulation, getRealSimStatus, getRealSimResult,
   devInjectTimed, devMarkAllPaid,
   devSetPaymentScenario, getInjectionStatus,
@@ -851,24 +851,24 @@ function DrawAnalysisChart({ weekly }) {
 
 function StressTestTab({ toast }) {
   const [cycles,       setCycles]       = useState(50)
-  // ── Engine Mode ────────────────────────────────────────────────────────────
-  // Real Engine: calls actual production services (draw, SDE, waitlist, Brain 2/3/5)
-  //   on an isolated in-memory SQLite DB with mocked time — ZERO logic duplication.
-  // Fast Preview: uses _AdvSimEngine (in-memory duplicate logic) — faster but may drift.
-  const [useRealEngine, setUseRealEngine] = useState(true)
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // Engine Mode toggle removed. The Fast Preview (in-memory _AdvSimEngine) was
+  // deleted completely; this tab now runs ONLY the Real Engine, which calls the
+  // actual production services (draw, SDE, waitlist, finance manager, Brain 2/3/5)
+  // on an isolated SQLite DB with Chronos time-travel — ZERO logic duplication.
   // ── A/B/C Circular Late-Fee Parameters (A-2) ──────────────────────────────
   // A — Elimination %: what % of unpaid members are eliminated (don't attempt grace)
-  // B — Late Fee Rate %: fee per day as % of ₹1000 deposit (min 5% = ₹50/day)
+  // B — Late Fee Rate: PRODUCTION-FIXED at ₹50/day (cap ₹500); shown read-only.
   // C — Grace Saver %: of at-risk members, what % actually pay the grace fee
   // Circular: B cost → affects C willingness → affects effective A elimination rate
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // lateFeeB / rdr state removed — they fed ONLY the deleted Fast Preview engine.
   const [elimPctA,  setElimPctA]  = useState(80.0)   // A: 0.05–100%
-  const [lateFeeB,  setLateFeeB]  = useState(5.0)    // B: 5–100% per day of deposit
   const [gracePctC, setGracePctC] = useState(15.0)   // C: 0.05–100%
   // late_users_ratio_pct: % of active members who miss the payment due date
   const [lateRatio, setLateRatio] = useState(2.0)
   const [vol,       setVol]       = useState(false)
   const [volMax,    setVolMax]    = useState(100)
-  const [rdr,       setRdr]       = useState(40.0)
   // Real-engine–specific params
   const [usersPerWeek,  setUsersPerWeek]  = useState(24)
   const [initialUsers,  setInitialUsers]  = useState(24)
@@ -893,7 +893,6 @@ function StressTestTab({ toast }) {
 
   // Derived: effective elimination = those who fail + those in grace who don't pay
   const effectiveElim = ((elimPctA / 100) + (1 - elimPctA / 100) * (1 - gracePctC / 100)) * 100
-  const lateFeeINR    = Math.round(lateFeeB / 100 * 1000)
 
   // ── Real Engine polling ────────────────────────────────────────────────────
   // Polls every 3 s while simJobId is set and running is true.
@@ -991,187 +990,107 @@ function StressTestTab({ toast }) {
     setSimDebugger(null)
     setSimProgress({ week: 0, total: cycles, percent: 0 })
 
-    if (useRealEngine) {
-      // ── Real Engine: background job mode ────────────────────────────────────
-      // POST returns job_id immediately — no Render proxy timeout possible.
-      // Polling useEffect drives progress; calls setRunning(false) when done.
-      try {
-        const jobRes = await startRealSimulation({
-          weeks:                   cycles,
-          users_per_week:          usersPerWeek,
-          initial_users:           initialUsers,
-          organic_ratio:           organicRatio / 100.0,
-          late_users_ratio_pct:    lateRatio,
-          elim_pct_a:              elimPctA,
-          grace_saver_pct_c:       gracePctC,
-          volatility_mode:         vol,
-          volatility_max_inflow:   volMax,
-          // K-12 to K-17: Extended Injection Knobs
-          inflow_pattern:          inflowPattern,
-          referral_burst_week:     referralBurstWeek,
-          payment_shock_week:      paymentShockWeek,
-          waitlist_dropout_pct:    waitlistDropoutPct,
-          organic_decay_rate:      organicDecayRate / 100.0,
-          simulation_label:        simulationLabel || '',
-        })
-        setSimJobId(jobRes.data.job_id)
-        // setRunning stays true — polling useEffect clears it when job completes
-      } catch (startErr) {
-        const status = startErr.response?.status
-        const raw    = startErr.response?.data?.detail ?? startErr.message ?? 'Unknown error'
-        const detail = typeof raw === 'string' ? raw.slice(0, 300) : JSON.stringify(raw).slice(0, 300)
-        const msg =
-          status === 401 ? 'Session expired — re-login and try again.' :
-          status === 403 ? 'Dev mode disabled on server (ENABLE_DEV_MODE must be true).' :
-          status === 422 ? `Validation error: ${detail}` :
-          `Failed to start simulation (HTTP ${status ?? 'network'}): ${detail}`
-        console.error('[Simulation start]', status, startErr.response?.data)
-        toast(msg, 'error')
-        setResult({ _error: true, _msg: msg, _status: status })
-        setRunning(false)
-      }
-      return   // do NOT fall through — polling handles the rest
-    }
-
-    // ── Fast Preview: synchronous in-memory engine ──────────────────────────
+    // ── Real Engine: background job mode ────────────────────────────────────
+    // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    // Fast Preview (legacy in-memory _AdvSimEngine) removed completely — the Real
+    // Engine is now the sole simulation path: it runs the actual production
+    // strategy (draw, SDE, waitlist, finance manager) on an isolated SQLite DB.
+    // POST returns job_id immediately — no Render proxy timeout possible.
+    // Polling useEffect drives progress; calls setRunning(false) when done.
     try {
-      const res = await advancedSimulationDev({
-        total_cycles:          cycles,
-        late_fee_pct:          lateFeeB,
-        late_users_ratio_pct:  lateRatio,
-        elim_pct_a:            elimPctA,
-        grace_saver_pct_c:     gracePctC,
-        volatility_mode:       vol,
-        volatility_max_inflow: volMax,
-        avg_rdr_pct:           rdr,
+      const jobRes = await startRealSimulation({
+        weeks:                   cycles,
+        users_per_week:          usersPerWeek,
+        initial_users:           initialUsers,
+        organic_ratio:           organicRatio / 100.0,
+        late_users_ratio_pct:    lateRatio,
+        elim_pct_a:              elimPctA,
+        grace_saver_pct_c:       gracePctC,
+        volatility_mode:         vol,
+        volatility_max_inflow:   volMax,
+        // K-12 to K-17: Extended Injection Knobs
+        inflow_pattern:          inflowPattern,
+        referral_burst_week:     referralBurstWeek,
+        payment_shock_week:      paymentShockWeek,
+        waitlist_dropout_pct:    waitlistDropoutPct,
+        organic_decay_rate:      organicDecayRate / 100.0,
+        simulation_label:        simulationLabel || '',
       })
-      setResult(res.data)
-      const s = res.data.simulation_summary
-      toast(
-        `⚡ Fast Preview — ${s.total_cycles_run} cycles · ${INR(s.final_virtual_liquidity_float)} liquidity`,
-        'success'
-      )
-    } catch (err) {
-      const status = err.response?.status
-      const raw    = err.response?.data?.detail ?? err.message ?? 'Unknown error'
+      setSimJobId(jobRes.data.job_id)
+      // setRunning stays true — polling useEffect clears it when job completes
+    } catch (startErr) {
+      const status = startErr.response?.status
+      const raw    = startErr.response?.data?.detail ?? startErr.message ?? 'Unknown error'
       const detail = typeof raw === 'string' ? raw.slice(0, 300) : JSON.stringify(raw).slice(0, 300)
       const msg =
         status === 401 ? 'Session expired — re-login and try again.' :
         status === 403 ? 'Dev mode disabled on server (ENABLE_DEV_MODE must be true).' :
-        status === 504 ? 'Server timeout — reduce cycles and retry.' :
-        status === 500 ? `Server error (500): ${detail}` :
-        status === 422 ? `Validation: ${detail}` :
-        `Simulation failed (HTTP ${status ?? 'network'}): ${detail}`
-      console.error('[Simulation]', status, err.response?.data)
+        status === 422 ? `Validation error: ${detail}` :
+        `Failed to start simulation (HTTP ${status ?? 'network'}): ${detail}`
+      console.error('[Simulation start]', status, startErr.response?.data)
       toast(msg, 'error')
       setResult({ _error: true, _msg: msg, _status: status })
-    } finally {
       setRunning(false)
     }
   }
 
   return (
     <div className="relative bg-slate-900 border border-slate-700/60 rounded-2xl overflow-hidden shadow-2xl shadow-violet-950/20">
-      {running && <SimLockout progress={simProgress} isRealEngine={useRealEngine}/>}
-      <div className="flex items-center gap-3 px-6 py-5 border-b border-slate-700/60 bg-gradient-to-r from-violet-950/50 via-slate-900/80 to-slate-900">
-        <div className={`p-3 rounded-xl border ${useRealEngine ? 'bg-emerald-900/40 border-emerald-700/50' : 'bg-violet-900/40 border-violet-700/50'}`}>
-          <FlaskConical className={`w-5 h-5 ${useRealEngine ? 'text-emerald-400' : 'text-violet-400'}`}/>
+      {running && <SimLockout progress={simProgress} isRealEngine={true}/>}
+      {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+          Engine toggle removed — Fast Preview deleted; Real Engine is the only mode. */}
+      <div className="flex items-center gap-3 px-6 py-5 border-b border-slate-700/60 bg-gradient-to-r from-emerald-950/40 via-slate-900/80 to-slate-900">
+        <div className="p-3 rounded-xl border bg-emerald-900/40 border-emerald-700/50">
+          <FlaskConical className="w-5 h-5 text-emerald-400"/>
         </div>
         <div className="flex-1">
           <div className="flex items-center gap-2">
-            <p className="font-extrabold text-slate-100 text-base leading-none">AI Platform Stress-Tester</p>
-            {useRealEngine
-              ? <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-emerald-900/60 border border-emerald-700/60 text-emerald-300 uppercase tracking-wider">🔬 Real Engine</span>
-              : <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-violet-900/60 border border-violet-700/60 text-violet-300 uppercase tracking-wider">⚡ Fast Preview</span>
-            }
+            <p className="font-extrabold text-slate-100 text-base leading-none">Real-Engine Simulation</p>
+            <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-emerald-900/60 border border-emerald-700/60 text-emerald-300 uppercase tracking-wider">🔬 Real Engine</span>
           </div>
           <p className="text-xs text-slate-500 mt-0.5">
-            {useRealEngine
-              ? 'Zero-duplication · Calls real production services · Isolated SQLite DB · Chronos time-travel'
-              : 'In-memory engine · FIFO refill · Condensation · Draw safeguards'}
+            Zero-duplication · Calls real production services · Isolated SQLite DB · Chronos time-travel
           </p>
-        </div>
-        {/* Engine toggle */}
-        <div className="flex items-center bg-slate-800/80 border border-slate-700/60 rounded-xl p-1 gap-1">
-          <button
-            onClick={() => setUseRealEngine(true)} disabled={running}
-            className={`text-[11px] font-bold px-3 py-1.5 rounded-lg transition-all ${useRealEngine ? 'bg-emerald-700 text-emerald-100 shadow-sm' : 'text-slate-400 hover:text-emerald-400'}`}
-          >🔬 Real</button>
-          <button
-            onClick={() => setUseRealEngine(false)} disabled={running}
-            className={`text-[11px] font-bold px-3 py-1.5 rounded-lg transition-all ${!useRealEngine ? 'bg-violet-700 text-violet-100 shadow-sm' : 'text-slate-400 hover:text-violet-400'}`}
-          >⚡ Fast</button>
         </div>
       </div>
       <div className="p-6 space-y-6">
-        {/* Cycles slider — Real Engine capped at 15; Fast Preview up to 1000 */}
+        {/* Cycles slider — Real Engine: 1–200 weeks (background job, no proxy timeout) */}
         <div>
           <div className="flex items-center justify-between mb-3">
             <label className="text-xs font-bold text-slate-300 uppercase tracking-wider">Test Rounds (Weeks)</label>
-            <div className={`flex items-center gap-1.5 rounded-xl px-3 py-1.5 border ${
-              useRealEngine
-                ? 'bg-emerald-950/60 border-emerald-700/60'
-                : 'bg-violet-950/60 border-violet-700/60'
-            }`}>
-              <span className={`text-xl font-black tabular-nums ${useRealEngine ? 'text-emerald-200' : 'text-violet-200'}`}>
-                {Math.min(cycles, useRealEngine ? 200 : 1000).toLocaleString()}
+            <div className="flex items-center gap-1.5 rounded-xl px-3 py-1.5 border bg-emerald-950/60 border-emerald-700/60">
+              <span className="text-xl font-black tabular-nums text-emerald-200">
+                {Math.min(cycles, 200).toLocaleString()}
               </span>
               <span className="text-[10px] text-slate-500 font-semibold">cycles</span>
             </div>
           </div>
 
-          {useRealEngine ? (
-            /* ── Real Engine: 1–200 weeks — background job, no proxy timeout ── */
-            <>
-              <input type="range" min={1} max={200} step={1}
-                value={Math.min(cycles, 200)} disabled={running}
-                onChange={e => setCycles(parseInt(e.target.value))}
-                className="w-full h-2 rounded-full appearance-none cursor-pointer accent-emerald-500 disabled:opacity-40"
-                style={{background:`linear-gradient(to right,#059669 ${Math.min(cycles,200)/200*100}%,#334155 ${Math.min(cycles,200)/200*100}%)`}}
-              />
-              <div className="flex justify-between text-[10px] text-slate-600 mt-1.5 select-none">
-                {[8,15,24,52,100,200].map(v=>(
-                  <button key={v} onClick={()=>!running&&setCycles(v)} disabled={running}
-                    className="hover:text-emerald-400 transition-colors">{v}</button>
-                ))}
-              </div>
-              <div className="mt-3 flex items-start gap-2 p-2.5 rounded-xl border border-emerald-800/50 bg-emerald-950/20">
-                <Activity className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5"/>
-                <p className="text-[11px] text-emerald-300 leading-snug">
-                  <span className="font-bold">Real Engine — background job mode.</span>{' '}
-                  Runs in a daemon thread; no HTTP proxy timeout. Live week progress shown while running.
-                  Each week calls real production services (draw, SDE, waitlist, A/B/C, Brain 2/3/5).
-                  52 weeks ≈ 2–4 min on shared CPU.
-                </p>
-              </div>
-            </>
-          ) : (
-            /* ── Fast Preview: 1–1000 cycles ──────────────────────────────── */
-            <>
-              <input type="range" min={1} max={1000} step={1}
-                value={cycles} disabled={running}
-                onChange={e=>setCycles(parseInt(e.target.value))}
-                className="w-full h-2 rounded-full appearance-none cursor-pointer accent-violet-500 disabled:opacity-40"
-                style={{background:`linear-gradient(to right,#7c3aed ${cycles/10}%,#334155 ${cycles/10}%)`}}
-              />
-              <div className="flex justify-between text-[10px] text-slate-600 mt-1.5 select-none">
-                {[1,250,500,750,1000].map(v=>(
-                  <button key={v} onClick={()=>!running&&setCycles(v)} disabled={running}
-                    className="hover:text-violet-400 transition-colors">{v.toLocaleString()}</button>
-                ))}
-              </div>
-              {cycles>=500&&!running&&(
-                <p className="text-[11px] text-amber-400 flex items-center gap-1.5 mt-2">
-                  <AlertTriangle className="w-3.5 h-3.5"/>
-                  {cycles>=800?`${cycles} cycles — expect 45–90s`:`${cycles} cycles — expect 20–45s`}
-                </p>
-              )}
-            </>
-          )}
+          <input type="range" min={1} max={200} step={1}
+            value={Math.min(cycles, 200)} disabled={running}
+            onChange={e => setCycles(parseInt(e.target.value))}
+            className="w-full h-2 rounded-full appearance-none cursor-pointer accent-emerald-500 disabled:opacity-40"
+            style={{background:`linear-gradient(to right,#059669 ${Math.min(cycles,200)/200*100}%,#334155 ${Math.min(cycles,200)/200*100}%)`}}
+          />
+          <div className="flex justify-between text-[10px] text-slate-600 mt-1.5 select-none">
+            {[8,15,24,52,100,200].map(v=>(
+              <button key={v} onClick={()=>!running&&setCycles(v)} disabled={running}
+                className="hover:text-emerald-400 transition-colors">{v}</button>
+            ))}
+          </div>
+          <div className="mt-3 flex items-start gap-2 p-2.5 rounded-xl border border-emerald-800/50 bg-emerald-950/20">
+            <Activity className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5"/>
+            <p className="text-[11px] text-emerald-300 leading-snug">
+              <span className="font-bold">Real Engine — background job mode.</span>{' '}
+              Runs in a daemon thread; no HTTP proxy timeout. Live week progress shown while running.
+              Each week calls real production services (draw, SDE, waitlist, A/B/C, Brain 2/3/5).
+              52 weeks ≈ 2–4 min on shared CPU.
+            </p>
+          </div>
         </div>
 
-        {/* ── Real Engine Config (only visible when Real Engine is active) ──── */}
-        {useRealEngine && (
+          {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+              Real Engine — Load Configuration (always shown; Fast Preview removed). */}
           <div className="border border-emerald-800/50 rounded-xl overflow-hidden bg-emerald-950/10">
             <button
               onClick={() => setShowRealCfg(v => !v)}
@@ -1240,10 +1159,8 @@ function StressTestTab({ toast }) {
               </div>
             </div>
           </div>
-        )}
 
-        {/* ── K-12 to K-17: Advanced Injection Knobs (collapsible) ─────────── */}
-        {useRealEngine && (
+          {/* ── K-12 to K-17: Advanced Injection Knobs (collapsible) ─────────── */}
           <div className="border border-cyan-800/40 rounded-xl overflow-hidden bg-cyan-950/10">
             <button
               onClick={() => setShowKnobs(v => !v)}
@@ -1336,7 +1253,6 @@ function StressTestTab({ toast }) {
               </div>
             )}
           </div>
-        )}
 
         {/* ── A/B/C Circular Late-Fee Parameters ───────────────────────────── */}
         <div className="border border-slate-600/60 rounded-xl overflow-hidden">
@@ -1373,21 +1289,23 @@ function StressTestTab({ toast }) {
               <div className="flex justify-between text-[10px] text-slate-600 mt-1 select-none"><span>0.05%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div>
             </div>
 
-            {/* B — Late Fee Rate */}
+            {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                B — Late Fee Rate is PRODUCTION-FIXED (₹50/day, ₹500 cap). It was a
+                Fast-Preview-only tunable knob; the Real Engine applies the real
+                strategy's fixed late-fee rule, so B is shown read-only here to keep
+                the A⟷B⟷C circular model intact. */}
             <div className="p-3 rounded-xl border border-amber-900/50 bg-amber-950/20">
               <div className="flex items-center justify-between mb-2">
-                <label className="text-xs font-bold text-amber-300 uppercase tracking-wider">B — Late Fee Rate <span className="text-amber-500/60 font-normal normal-case">(% of ₹1000 deposit per day)</span></label>
+                <label className="text-xs font-bold text-amber-300 uppercase tracking-wider">B — Late Fee Rate <span className="text-amber-500/60 font-normal normal-case">(production-fixed rule)</span></label>
                 <div className="flex items-center gap-1.5">
-                  <div className="bg-amber-950 border border-amber-800 rounded-lg px-2.5 py-1 text-sm font-black text-amber-300">{lateFeeB.toFixed(1)}%</div>
-                  <div className="text-[10px] text-amber-600 font-semibold">= ₹{lateFeeINR}/day</div>
+                  <div className="bg-amber-950 border border-amber-800 rounded-lg px-2.5 py-1 text-sm font-black text-amber-300">₹50/day</div>
+                  <div className="text-[10px] text-amber-600 font-semibold">cap ₹500</div>
                 </div>
               </div>
-              <input type="range" min={5} max={100} step={0.5} value={lateFeeB} disabled={running}
-                onChange={e=>setLateFeeB(parseFloat(e.target.value))}
-                className="w-full h-2 rounded-full appearance-none cursor-pointer disabled:opacity-40"
-                style={{background:`linear-gradient(to right,#f59e0b ${(lateFeeB-5)/95*100}%,#334155 ${(lateFeeB-5)/95*100}%)`}}/>
-              <div className="flex justify-between text-[10px] text-slate-600 mt-1 select-none"><span>5% min (₹50/day)</span><span>50%</span><span>100% (₹1000/day)</span></div>
-              <p className="text-[10px] text-amber-700/80 mt-1">Higher B → fewer members attempt grace period (C↓ follows B↑)</p>
+              <div className="flex items-start gap-2 text-[10px] text-amber-700/80 mt-1">
+                <ShieldAlert className="w-3 h-3 flex-shrink-0 mt-0.5"/>
+                <span>The Real Engine applies the production late-fee rule (LATE_FEE_DAILY ₹50/day, capped ₹500) — not a tunable simulation knob. In the real world, a higher B would reduce C (grace willingness).</span>
+              </div>
             </div>
 
             {/* C — Grace Saver % */}
@@ -1407,7 +1325,7 @@ function StressTestTab({ toast }) {
             <div className="flex items-center gap-3 p-3 bg-slate-800/60 rounded-xl border border-slate-700/40">
               <div className="text-[10px] text-slate-400 flex-1 space-y-0.5">
                 <p>↳ <span className="text-red-400 font-bold">A={elimPctA.toFixed(1)}%</span> eliminated directly · remaining <span className="text-violet-400 font-bold">{(100-elimPctA).toFixed(1)}%</span> enter grace period</p>
-                <p>↳ Of grace-eligible: <span className="text-violet-400 font-bold">C={gracePctC.toFixed(1)}%</span> pay B=₹{lateFeeINR}/day + ₹500 seat fee → saved</p>
+                <p>↳ Of grace-eligible: <span className="text-violet-400 font-bold">C={gracePctC.toFixed(1)}%</span> pay B=₹50/day late fee + ₹500 seat fee → saved</p>
                 <p>↳ <span className="text-orange-400 font-bold">Effective total elim = {effectiveElim.toFixed(1)}%</span> of late payers ({(effectiveElim/100*lateRatio).toFixed(2)}% of all active)</p>
               </div>
             </div>
@@ -1428,26 +1346,10 @@ function StressTestTab({ toast }) {
           </div>}
         </div>
 
-        {/* RDR */}
-        <div>
-          <div className="flex items-center justify-between mb-1.5">
-            <label className="text-xs text-slate-400 font-medium">Avg RDR % (Referral Density Ratio)</label>
-            <div className="bg-cyan-950/60 border border-cyan-800/60 rounded-xl px-3 py-1.5 min-w-[60px] text-center">
-              <span className="text-sm font-black text-cyan-300">{rdr.toFixed(0)}</span>
-              <span className="text-[10px] text-slate-500 font-semibold ml-0.5">%</span>
-            </div>
-          </div>
-          <input type="range" min={0} max={100} step={1} value={rdr} disabled={running}
-            onChange={e=>setRdr(parseFloat(e.target.value))}
-            className="w-full h-2 rounded-full appearance-none cursor-pointer accent-cyan-500 disabled:opacity-40"
-            style={{background:`linear-gradient(to right,#06b6d4 ${rdr}%,#334155 ${rdr}%)`}}
-          />
-          <div className="flex justify-between text-[10px] text-slate-600 mt-1 select-none">
-            <span>Organic</span>
-            <span className={rdr>70?'text-amber-400':''}>{rdr>70?'⚡ Flash Flood':rdr<30?'🌊 Sustainable Wave':'⚖️ Mixed'}</span>
-            <span>Referral</span>
-          </div>
-        </div>
+        {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            Avg RDR slider removed — it fed ONLY the deleted Fast Preview engine. The
+            Real Engine derives referral density from the "Organic %" knob in the
+            Real Engine — Load Configuration block above (organic_ratio). */}
 
         {/* ── Pre-Test Setup (collapsible) ─────────────────────────────────── */}
         <div className={`border rounded-xl overflow-hidden transition-colors ${showSetup ? 'border-slate-600' : 'border-slate-700/40'}`}>
@@ -1492,10 +1394,7 @@ function StressTestTab({ toast }) {
                 <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-widest">
                   Simulation Complete — {result.simulation_summary.total_cycles_run.toLocaleString()} cycles
                 </p>
-                {result.engine === 'real'
-                  ? <span className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-emerald-900/60 border border-emerald-700/60 text-emerald-300 uppercase tracking-wider">🔬 Real Engine</span>
-                  : <span className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-violet-900/60 border border-violet-700/60 text-violet-300 uppercase tracking-wider">⚡ Fast Preview</span>
-                }
+                <span className="text-[9px] font-black px-1.5 py-0.5 rounded-full bg-emerald-900/60 border border-emerald-700/60 text-emerald-300 uppercase tracking-wider">🔬 Real Engine</span>
                 {result.simulation_summary.simulation_label && result.simulation_summary.simulation_label !== 'default' && (
                   <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-cyan-900/60 border border-cyan-700/60 text-cyan-300">
                     K-17: "{result.simulation_summary.simulation_label}"

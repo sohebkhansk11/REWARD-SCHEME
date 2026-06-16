@@ -208,19 +208,11 @@ export const simulateUsersDev = (count, autoPool = true) =>
 export const resetDataDev = () =>
   api.delete('/dev/reset-data', { data: { confirm: 'CONFIRM_NUKE' } })
 
-/**
- * POST /dev/advanced-simulation — isolated stress-test engine
- * @param {Object} params
- * @param {number} params.total_cycles        1–1000
- * @param {number} params.late_fee_pct        default 5.0
- * @param {number} params.late_users_ratio_pct default 2.0
- * @param {boolean} params.volatility_mode    default false
- * @param {number} params.volatility_max_inflow default 100
- */
-export const advancedSimulationDev = (params) =>
-  api.post('/dev/advanced-simulation', params, {
-    timeout: 120_000,   // 120 s — sufficient for 1000-cycle in-memory run
-  })
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// advancedSimulationDev (POST /dev/advanced-simulation) removed — the Fast Preview
+// in-memory engine it called was deleted completely (Point 4: "fast stress test
+// remove completely that is useless"). The Real-Engine background-job API below
+// (startRealSimulation + polling) is the only simulation path now.
 
 /**
  * POST /dev/real-simulation — Zero-duplication Real-Strategy Stress-Test Engine
@@ -229,7 +221,7 @@ export const advancedSimulationDev = (params) =>
  * isolated in-memory SQLite database with mocked time (Chronos Engine).
  *
  * DRY guarantee: any rule change in production is automatically reflected.
- * Returns the same schema as advancedSimulationDev for full frontend compatibility.
+ * Returns the canonical simulation-result schema consumed by the Stress Test panel.
  *
  * @param {Object} params
  * @param {number}  params.weeks                  1–200 (weekly draw cycles)
@@ -280,7 +272,7 @@ export const getRealSimStatus = (jobId) =>
 
 /**
  * GET /dev/real-simulation-result/{jobId}
- * Returns the full simulation result dict (same schema as advancedSimulationDev).
+ * Returns the full simulation result dict (the canonical Stress Test result schema).
  * Only call after getRealSimStatus() returns status == "done".
  * Returns 202 if still running, 500 with debugger info if failed.
  */

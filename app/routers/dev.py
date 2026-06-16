@@ -3159,7 +3159,17 @@ def _background_real_simulation(job_id: str, params: dict) -> None:
     the worker's first status write.
     """
     import traceback as _tb_mod
-    from app.services.real_simulation import RealSimEngine
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # The `from app.services.real_simulation import RealSimEngine` import was
+    # MOVED from here (module top of the worker, BEFORE the try) to INSIDE the
+    # try block below. Rationale: a pre-existing IndentationError in
+    # real_simulation.py made it un-importable; because the import sat before
+    # the try, the ImportError killed this daemon thread BEFORE the except
+    # handler (which records error_type/line/traceback for the Debugger Panel)
+    # could capture anything — so the UI froze at "Week 0 / 0.0%" with NO error
+    # shown, for ~10 sessions. With the import inside the try, any future
+    # import-time regression surfaces as a visible "error" status with full
+    # traceback in the DevTools Debugger Panel instead of a silent freeze.
 
     def _on_week(week_num: int, total_weeks: int, _metrics: dict) -> None:
         """Called by RealSimEngine after each week completes."""
@@ -3178,6 +3188,12 @@ def _background_real_simulation(job_id: str, params: dict) -> None:
         _SIM_STATUS[job_id]["status"] = "running"
 
     try:
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Import lives HERE (inside try) so an un-importable engine becomes a
+        # captured "error" status (visible in the Debugger Panel) rather than a
+        # silent daemon-thread death that freezes the UI at 0%. See the comment
+        # at the top of this function for the full rationale.
+        from app.services.real_simulation import RealSimEngine
         # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
         # Pass job_id as run_id so MassLoadInjector prefixes all usernames/tokens
         # with rsim_{job_id[:8]} — collision-safe on real PostgreSQL.

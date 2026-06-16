@@ -91,6 +91,64 @@ except Exception as _mig_exc:
         "non-PostgreSQL dialect): %s", _mig_exc,
     )
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ── CRITICAL SCHEMA REPAIR: misspelled PostgreSQL enum type ────────────────────
+# The production DB's enum type for users.weekly_payment_status was created long
+# ago (when the Python enum class was once misspelled) as "weeklypaymentsatus"
+# — note the MISSING second 't'. The model now correctly generates the name
+# "weeklypaymentstatus". Single-row INSERTs coerce string→column-type and so they
+# worked, but the simulator's bulk insertmanyvalues emits an explicit
+# ::weeklypaymentstatus cast which PostgreSQL rejects against a weeklypaymentsatus
+# column (psycopg2 DatatypeMismatch, sqlalche.me/e/20/f405). NOTE: a TRUNCATE /
+# "nuke" does NOT fix this — it is a TYPE DEFINITION, not table data. This block
+# aligns the DB type name with the model. Fully idempotent and finance-safe:
+#   • only-misspelled-exists → ALTER TYPE ... RENAME (zero data movement)
+#   • both-exist             → re-point the column onto the correct type (cast via
+#                              text; labels 'Paid'/'Unpaid' are identical), then
+#                              the orphaned misspelled type is dropped below
+#   • only-correct / neither → no-op
+# Wrapped so any failure is logged and can never block API startup.
+try:
+    from sqlalchemy import text as _enum_text
+    with engine.begin() as _enum_conn:
+        _enum_conn.execute(_enum_text(
+            "DO $$\n"
+            "BEGIN\n"
+            "    IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'weeklypaymentsatus') THEN\n"
+            "        IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'weeklypaymentstatus') THEN\n"
+            "            ALTER TABLE users\n"
+            "                ALTER COLUMN weekly_payment_status TYPE weeklypaymentstatus\n"
+            "                USING weekly_payment_status::text::weeklypaymentstatus;\n"
+            "        ELSE\n"
+            "            ALTER TYPE weeklypaymentsatus RENAME TO weeklypaymentstatus;\n"
+            "        END IF;\n"
+            "    END IF;\n"
+            "END $$;"
+        ))
+    _logger.info(
+        "main: weekly_payment_status enum-type repair OK "
+        "(DB type aligned to 'weeklypaymentstatus')."
+    )
+except Exception as _enum_exc:
+    _logger.warning(
+        "main: weekly_payment_status enum-type repair skipped/failed "
+        "(may already be correct or non-PostgreSQL dialect): %s", _enum_exc,
+    )
+
+# Cleanup: drop the orphaned misspelled type if it survived the repair above
+# (i.e. the both-exist branch re-pointed the column off it). Best-effort and in a
+# SEPARATE transaction so a lingering dependency can never roll back the repair.
+try:
+    from sqlalchemy import text as _drop_text
+    with engine.begin() as _drop_conn:
+        _drop_conn.execute(_drop_text("DROP TYPE IF EXISTS weeklypaymentsatus"))
+    _logger.info("main: orphaned 'weeklypaymentsatus' enum type dropped (or already absent).")
+except Exception as _drop_exc:
+    _logger.warning(
+        "main: could not drop orphaned 'weeklypaymentsatus' type "
+        "(still referenced somewhere — harmless): %s", _drop_exc,
+    )
+
 _IS_DEV_MODE        = os.getenv("ENABLE_DEV_MODE")   == "true"
 _SCHEDULER_ENABLED  = os.getenv("SCHEDULER_ENABLED", "false").lower() == "true"
 
@@ -264,4 +322,33 @@ def version_info():
         info["engine_importable"] = True
     except Exception as exc:  # defensive: report, never raise
         info["engine_error"] = f"{type(exc).__name__}: {exc}"
+
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Live schema probe for the weekly_payment_status enum-type repair. Reports
+    # the ACTUAL PostgreSQL type backing users.weekly_payment_status plus which
+    # of the (mis)spelled type names still exist, so the startup repair can be
+    # verified in one GET. Must read "weeklypaymentstatus", and the misspelled
+    # "weeklypaymentsatus" must be gone once the fix has deployed. Fully guarded.
+    info["weekly_payment_status_db_type"] = None
+    info["enum_types_present"] = None
+    try:
+        from app.database import engine as _ver_engine
+        from sqlalchemy import text as _ver_text
+        with _ver_engine.connect() as _ver_conn:
+            info["weekly_payment_status_db_type"] = _ver_conn.execute(_ver_text(
+                "SELECT t.typname "
+                "FROM pg_attribute a "
+                "JOIN pg_class c ON a.attrelid = c.oid "
+                "JOIN pg_type  t ON a.atttypid = t.oid "
+                "WHERE c.relname = 'users' AND a.attname = 'weekly_payment_status'"
+            )).scalar()
+            info["enum_types_present"] = [
+                r[0] for r in _ver_conn.execute(_ver_text(
+                    "SELECT typname FROM pg_type "
+                    "WHERE typname IN ('weeklypaymentstatus', 'weeklypaymentsatus') "
+                    "ORDER BY typname"
+                )).fetchall()
+            ]
+    except Exception as exc:  # defensive: report, never raise
+        info["schema_check_error"] = f"{type(exc).__name__}: {exc}"
     return info

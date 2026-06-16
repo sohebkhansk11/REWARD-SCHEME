@@ -1281,7 +1281,13 @@ def dev_winners_analytics(db: Session = Depends(get_db)):
         is_sde = bool(dh.targeted_early_exit)
         for slot in (1, 2):
             lvl  = (dh.winner_1_level if slot == 1 else dh.winner_2_level) or 1
-            pay  = float(dh.winner_1_net_payout if slot == 1 else dh.winner_2_net_payout or 0)
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Precedence fix: parenthesize the slot ternary so the `or 0` None-guard
+            # applies to BOTH winner slots, not just slot 2. Previously
+            # `float(A if c else B or 0)` parsed as `float(A if c else (B or 0))`, so a
+            # None winner_1_net_payout (column is nullable) would raise
+            # float(None) → TypeError → HTTP 500 on the Winners statistics tab.
+            pay  = float((dh.winner_1_net_payout if slot == 1 else dh.winner_2_net_payout) or 0)
             uid  = dh.winner_1_user_id if slot == 1 else dh.winner_2_user_id
 
             if 1 <= lvl <= 6:

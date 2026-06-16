@@ -51,6 +51,12 @@ from unittest.mock import patch
 from sqlalchemy import func, insert as sa_insert
 from sqlalchemy.orm import Session
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Virtual DB-write clock.  ChronosEngine installs it for the run's lifespan; the
+# 5 bulk sa_insert(Token) sites below stamp created_at from it explicitly because
+# core bulk inserts bypass the model's Python-side default=.
+from app.core import sim_clock
+
 _logger = logging.getLogger(__name__)
 
 # ── Modules whose datetime.now() calls must be intercepted ───────────────────
@@ -166,9 +172,30 @@ class ChronosEngine:
                 self._patches.append(p)
             except Exception as exc:
                 _logger.debug("ChronosEngine: skip %s — %s", mod, exc)
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Install the DB-WRITE virtual clock in lockstep with the datetime patches.
+        # The patches above govern what the strategy READS (its decisions); this
+        # governs what the strategy WRITES (audit-row timestamps).  Without it,
+        # DrawHistory.draw_timestamp / Token.created_at / Pool.created_at /
+        # EliminationEvent.created_at fall back to server_default=func.now() (the
+        # real PostgreSQL clock), so every simulated week collapses onto the single
+        # real instant the run executed and week-by-week statistics are impossible.
+        # The lambda reads _self._t at call time, so every chronos.jump_to() is
+        # immediately reflected in the timestamps written after it.
+        from app.core import sim_clock as _sim_clock
+        _sim_clock.install(lambda: _self._t)
         return self
 
     def __exit__(self, *_) -> None:
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Uninstall the DB-write virtual clock FIRST (in a guarded block) so that
+        # even if a patch.stop() raises, production code immediately reverts to the
+        # real wall-clock.  Clock lifespan must never outlive the datetime patches.
+        try:
+            from app.core import sim_clock as _sim_clock
+            _sim_clock.uninstall()
+        except Exception:
+            pass
         for p in reversed(self._patches):
             try:
                 p.stop()
@@ -370,6 +397,11 @@ class MassLoadInjector:
                 "value_inr": _DEPOSIT_DEC,
                 "user_id":   u.id,
                 "pool_id":   None,
+                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Bulk insert bypasses Token.created_at's Python default=, so stamp
+                # the DEP token at the user's (Chronos-accurate) join instant — the
+                # deposit is paid exactly when the user joins.
+                "created_at": u.join_date,
             }
             for u in new_users
         ]
@@ -457,6 +489,10 @@ class MassLoadInjector:
                 "value_inr": _DEPOSIT_DEC,
                 "user_id":   u.id,
                 "pool_id":   None,
+                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Bulk insert bypasses Token.created_at's Python default=, so stamp
+                # the DEP token at the user's (Chronos-accurate) join instant.
+                "created_at": u.join_date,
             }
             for u in new_users
         ]
@@ -512,7 +548,13 @@ class MassLoadInjector:
         if not unpaid:
             return 0
 
-        now = datetime.now(timezone.utc)
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # real_simulation.py is NOT in _TIME_PATCHED, so datetime.now() here returns
+        # the REAL wall-clock.  sim_clock.now() returns the simulated instant while a
+        # ChronosEngine is active (the whole run is), making both created_at and
+        # redeemed_at land in the correct virtual week.  Bulk insert bypasses the
+        # model default=, hence created_at is set explicitly here too.
+        now = sim_clock.now()
         token_rows = []
         for member in unpaid:
             member.weekly_payment_status = WeeklyPaymentStatus.Paid
@@ -526,6 +568,7 @@ class MassLoadInjector:
                 "value_inr":   _DEPOSIT_DEC,
                 "user_id":     member.id,
                 "pool_id":     member.current_pool_id,
+                "created_at":  now,
                 "redeemed_at": now,
             })
 
@@ -673,6 +716,9 @@ class MassLoadInjector:
             m.weekly_payment_status = WeeklyPaymentStatus.Paid
 
         # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # created_at = simulated instant (bulk insert bypasses the model default=).
+        _paid_ts = sim_clock.now()
         token_rows = [
             {
                 "code":        f"WK{self._pfx}{week_num:04d}U{m.id:010d}",
@@ -681,6 +727,7 @@ class MassLoadInjector:
                 "value_inr":   _DEPOSIT_DEC,
                 "user_id":     m.id,
                 "pool_id":     m.current_pool_id,
+                "created_at":  _paid_ts,
             }
             for m in batch
         ]
@@ -784,6 +831,9 @@ class MassLoadInjector:
             m.late_fees_inr         = _zero
 
         # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # created_at = simulated instant (bulk insert bypasses the model default=).
+        _typeb_ts = sim_clock.now()
         token_rows = [
             {
                 "code":      f"WK{self._pfx}{week_num:04d}U{m.id:010d}",
@@ -792,6 +842,7 @@ class MassLoadInjector:
                 "value_inr": _DEPOSIT_DEC,
                 "user_id":   m.id,
                 "pool_id":   m.current_pool_id,
+                "created_at": _typeb_ts,
             }
             for m in b_batch
         ]

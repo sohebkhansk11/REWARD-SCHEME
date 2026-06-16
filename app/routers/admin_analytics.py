@@ -1303,6 +1303,275 @@ def get_weekly_pool_reports(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# 10b. GET /admin/stats/weekly-timeline
+#      System-birth-anchored week-by-week cumulative timeline.
+#      Week 1 begins the instant the FIRST user joins (system birth); week N spans
+#      [anchor + (N-1)*7d, anchor + N*7d).  Powers the "cumulative summary" the
+#      Statistics tab requires: users in/out, cash in/out, draws, pools — week wise.
+#      This is now meaningful because the Chronos virtual-clock fix (app/core/
+#      sim_clock.py) makes every audit row (DrawHistory.draw_timestamp,
+#      Token.created_at, Pool.created_at, EliminationEvent.created_at) carry the
+#      SIMULATED instant instead of the real PostgreSQL clock.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_WEEK_SECONDS = 7 * 24 * 3600
+
+
+def _aware_utc(dt):
+    """Coerce a possibly-naive datetime to timezone-aware UTC (never None-safe)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+@router.get("/admin/stats/weekly-timeline")
+def get_weekly_timeline(db: Session = Depends(get_db)):
+    """
+    System-birth-anchored, week-by-week cumulative activity timeline.
+
+    Week 1 starts at MIN(User.join_date) — the moment the first member arrived.
+    Every event is bucketed into contiguous 7-day windows from that anchor and a
+    running cumulative total is carried forward, so the Statistics tab can show
+    exactly "what happened every week" since the system began.
+
+    Per-week series
+    ---------------
+      users_in              new joins (User.join_date in week)
+      exits_nonpay          non-payment removals (EliminationEvent.created_at)
+      exits_won             winners who exited (2 per draw, counted from DrawHistory)
+      users_out             exits_nonpay + exits_won
+      net_users             users_in - users_out
+      pools_created         Pool.created_at in week
+      draws                 DrawHistory rows in week (by draw_timestamp)
+      winners               winner rows in week
+      draw_types            {regular, type_a, type_b, sde, accelerated, ...}
+      winner_levels         {L1..L6}
+      sde_exits             draws with targeted_early_exit = True
+      deposits_in_inr       Deposit (DEP+WK) Burned, by created_at
+      grace_in_inr          Grace_Fee Burned, by created_at
+      late_fee_in_inr       Late_Fee SETTLEMENTS only (code LFC-%), by created_at
+      cash_in_inr           deposits_in + grace_in + late_fee_in
+      payouts_out_inr       winner net payouts (DrawHistory), by draw_timestamp
+      referral_out_inr      Referral_Withdraw Burned, by created_at
+      cash_out_inr          payouts_out + referral_out
+      net_cash_inr          cash_in - cash_out
+      app_fees_retained_inr ₹PAYOUT_FEE × winners (informational — already inside
+                            net payouts; NOT added to cash flow)
+      late_fees_accrued_inr Late_Fee ACCRUALS (code LF-%) recorded this week —
+                            a liability, NOT cash (informational only)
+
+    Each week also carries cumulative_* running totals.  Empty weeks are emitted
+    with zeros so the timeline is contiguous (no gaps).
+    """
+    from app.models.draw_history import DrawHistory
+    from app.models.elimination_event import EliminationEvent
+
+    # ── Anchor: the first user's join instant = system birth = Week 1 start ──────
+    anchor_raw = db.query(func.min(User.join_date)).scalar()
+    if anchor_raw is None:
+        return {"anchor_date": None, "total_weeks": 0, "weeks": [], "totals": {}}
+    anchor = _aware_utc(anchor_raw)
+
+    def _wk(dt) -> int:
+        """1-based week index of an event relative to the anchor (clamped ≥ 1)."""
+        delta = (_aware_utc(dt) - anchor).total_seconds()
+        idx = int(delta // _WEEK_SECONDS) + 1
+        return idx if idx >= 1 else 1
+
+    # ── Determine how many weeks the data spans ──────────────────────────────────
+    # Consider the latest timestamp across every event source so the timeline ends
+    # on the last week that actually has activity.
+    max_week = 1
+    tails = [
+        db.query(func.max(User.join_date)).scalar(),
+        db.query(func.max(DrawHistory.draw_timestamp)).scalar(),
+        db.query(func.max(Pool.created_at)).scalar(),
+        db.query(func.max(EliminationEvent.created_at)).scalar(),
+        db.query(func.max(Token.created_at)).filter(Token.status == TokenStatus.Burned).scalar(),
+    ]
+    for t in tails:
+        if t is not None:
+            max_week = max(max_week, _wk(t))
+
+    # ── Per-week accumulators (1-based dict; gaps filled later) ───────────────────
+    def _blank_week() -> dict:
+        return {
+            "users_in": 0, "exits_nonpay": 0, "exits_won": 0,
+            "pools_created": 0, "draws": 0, "winners": 0, "sde_exits": 0,
+            "draw_types": {"regular": 0, "type_a": 0, "type_b": 0, "sde": 0, "accelerated": 0, "other": 0},
+            "winner_levels": {f"L{l}": 0 for l in range(1, 7)},
+            "deposits_in_inr": _ZERO, "grace_in_inr": _ZERO, "late_fee_in_inr": _ZERO,
+            "payouts_out_inr": _ZERO, "referral_out_inr": _ZERO,
+            "app_fees_retained_inr": _ZERO, "late_fees_accrued_inr": _ZERO,
+        }
+
+    acc: dict[int, dict] = {w: _blank_week() for w in range(1, max_week + 1)}
+
+    # ── Users IN (joins) ──────────────────────────────────────────────────────────
+    for (jd,) in db.query(User.join_date).filter(User.join_date.isnot(None)).all():
+        acc[_wk(jd)]["users_in"] += 1
+
+    # ── Users OUT — non-payment eliminations ─────────────────────────────────────
+    for (ts,) in db.query(EliminationEvent.created_at).all():
+        if ts is not None:
+            acc[_wk(ts)]["exits_nonpay"] += 1
+
+    # ── Pools created ─────────────────────────────────────────────────────────────
+    for (ts,) in db.query(Pool.created_at).all():
+        if ts is not None:
+            acc[_wk(ts)]["pools_created"] += 1
+
+    # ── Draws, winners, payouts (cash OUT to winners) ────────────────────────────
+    _FEE = Decimal(str(PAYOUT_FEE_INR))   # ₹ app fee retained per winner (informational)
+    _draw_type_keys = {"regular", "type_a", "type_b", "sde", "accelerated"}
+    for dh in db.query(DrawHistory).all():
+        w = _wk(dh.draw_timestamp)
+        wk = acc[w]
+        wk["draws"] += 1
+        raw_type = (dh.draw_type or "regular").lower().replace("-", "_")
+        # Collapse SDE variants (sde_case_c, sde_ext2, sde_preventive_l3, ...) into "sde";
+        # map accelerated_dissolution → accelerated; anything unknown → "other".
+        if raw_type in _draw_type_keys:
+            mapped = raw_type
+        elif raw_type.startswith("sde"):
+            mapped = "sde"
+        elif raw_type.startswith("accel"):
+            mapped = "accelerated"
+        else:
+            mapped = "other"
+        wk["draw_types"][mapped] += 1
+        if dh.targeted_early_exit:
+            wk["sde_exits"] += 1
+        for lvl, pay in (
+            (dh.winner_1_level, dh.winner_1_net_payout),
+            (dh.winner_2_level, dh.winner_2_net_payout),
+        ):
+            if lvl and 1 <= lvl <= 6:
+                wk["winner_levels"][f"L{lvl}"] += 1
+                wk["winners"] += 1
+                wk["exits_won"] += 1
+                wk["payouts_out_inr"] += _d(pay)
+                wk["app_fees_retained_inr"] += _FEE
+
+    # ── Cash flows from Burned tokens (single query, classified in Python) ───────
+    token_rows = (
+        db.query(Token.created_at, Token.type, Token.value_inr, Token.code)
+        .filter(
+            Token.status == TokenStatus.Burned,
+            Token.type.in_([
+                TokenType.Deposit, TokenType.Grace_Fee,
+                TokenType.Late_Fee, TokenType.Referral_Withdraw,
+            ]),
+        )
+        .all()
+    )
+    for created_at, ttype, value, code in token_rows:
+        if created_at is None:
+            continue
+        wk = acc[_wk(created_at)]
+        val = _d(value)
+        if ttype == TokenType.Deposit:
+            wk["deposits_in_inr"] += val
+        elif ttype == TokenType.Grace_Fee:
+            wk["grace_in_inr"] += val
+        elif ttype == TokenType.Referral_Withdraw:
+            wk["referral_out_inr"] += val
+        elif ttype == TokenType.Late_Fee:
+            # LFC- = settlement (cash actually received); LF- = accrual (liability)
+            if (code or "").startswith("LFC-"):
+                wk["late_fee_in_inr"] += val
+            else:
+                wk["late_fees_accrued_inr"] += val
+
+    # ── Materialise weeks 1..max_week with derived + cumulative fields ───────────
+    cum = {
+        "users_in": 0, "users_out": 0, "net_users": 0,
+        "draws": 0, "winners": 0, "pools_created": 0,
+        "cash_in_inr": _ZERO, "cash_out_inr": _ZERO, "net_cash_inr": _ZERO,
+    }
+    weeks_out = []
+    for w in range(1, max_week + 1):
+        d = acc[w]
+        users_out = d["exits_nonpay"] + d["exits_won"]
+        net_users = d["users_in"] - users_out
+        cash_in   = d["deposits_in_inr"] + d["grace_in_inr"] + d["late_fee_in_inr"]
+        cash_out  = d["payouts_out_inr"] + d["referral_out_inr"]
+        net_cash  = cash_in - cash_out
+
+        cum["users_in"]      += d["users_in"]
+        cum["users_out"]     += users_out
+        cum["net_users"]     += net_users
+        cum["draws"]         += d["draws"]
+        cum["winners"]       += d["winners"]
+        cum["pools_created"] += d["pools_created"]
+        cum["cash_in_inr"]   += cash_in
+        cum["cash_out_inr"]  += cash_out
+        cum["net_cash_inr"]  += net_cash
+
+        wk_start = anchor + timedelta(days=7 * (w - 1))
+        wk_end   = anchor + timedelta(days=7 * w)
+        weeks_out.append({
+            "week":            w,
+            "week_start":      wk_start.strftime("%Y-%m-%d"),
+            "week_end":        (wk_end - timedelta(seconds=1)).strftime("%Y-%m-%d"),
+            # Flows — people
+            "users_in":        d["users_in"],
+            "exits_nonpay":    d["exits_nonpay"],
+            "exits_won":       d["exits_won"],
+            "users_out":       users_out,
+            "net_users":       net_users,
+            # Pools & draws
+            "pools_created":   d["pools_created"],
+            "draws":           d["draws"],
+            "winners":         d["winners"],
+            "sde_exits":       d["sde_exits"],
+            "draw_types":      d["draw_types"],
+            "winner_levels":   d["winner_levels"],
+            # Cash — inflow breakdown
+            "deposits_in_inr": round(d["deposits_in_inr"], 2),
+            "grace_in_inr":    round(d["grace_in_inr"], 2),
+            "late_fee_in_inr": round(d["late_fee_in_inr"], 2),
+            "cash_in_inr":     round(cash_in, 2),
+            # Cash — outflow breakdown
+            "payouts_out_inr":  round(d["payouts_out_inr"], 2),
+            "referral_out_inr": round(d["referral_out_inr"], 2),
+            "cash_out_inr":     round(cash_out, 2),
+            "net_cash_inr":     round(net_cash, 2),
+            # Informational (not part of net cash)
+            "app_fees_retained_inr": round(d["app_fees_retained_inr"], 2),
+            "late_fees_accrued_inr": round(d["late_fees_accrued_inr"], 2),
+            # Cumulative running totals
+            "cumulative_users_in":      cum["users_in"],
+            "cumulative_users_out":     cum["users_out"],
+            "cumulative_net_users":     cum["net_users"],
+            "cumulative_draws":         cum["draws"],
+            "cumulative_winners":       cum["winners"],
+            "cumulative_pools_created": cum["pools_created"],
+            "cumulative_cash_in_inr":   round(cum["cash_in_inr"], 2),
+            "cumulative_cash_out_inr":  round(cum["cash_out_inr"], 2),
+            "cumulative_net_cash_inr":  round(cum["net_cash_inr"], 2),
+        })
+
+    return {
+        "anchor_date": anchor.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "total_weeks": max_week,
+        "weeks":       weeks_out,
+        "totals": {
+            "users_in":       cum["users_in"],
+            "users_out":      cum["users_out"],
+            "net_users":      cum["net_users"],
+            "draws":          cum["draws"],
+            "winners":        cum["winners"],
+            "pools_created":  cum["pools_created"],
+            "cash_in_inr":    round(cum["cash_in_inr"], 2),
+            "cash_out_inr":   round(cum["cash_out_inr"], 2),
+            "net_cash_inr":   round(cum["net_cash_inr"], 2),
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 11.  GET  /admin/draw/state            — Current WeeklyDrawState
 #      POST /admin/draw/prepare          — Trigger T-2H preparation (manual)
 #      POST /admin/draw/cleanup          — Trigger post-draw cleanup (manual)

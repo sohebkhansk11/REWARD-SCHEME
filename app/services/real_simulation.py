@@ -1673,8 +1673,9 @@ class RealSimEngine:
             progress reporting.  Any exception raised by the callback is swallowed so
             it cannot abort the simulation.
 
-        Returns a dict with the SAME structure as the legacy _AdvSimEngine so
-        existing frontend charts work without modification.
+        Returns a dict with the canonical Stress Test result structure (formerly
+        produced by the now-removed _AdvSimEngine Fast Preview) so existing
+        frontend charts work without modification.
 
         Real execution order per week:
           a. inject_week()            — users + DEP tokens → Waitlist
@@ -2377,7 +2378,9 @@ class RealSimEngine:
                         "System operated within normal parameters throughout simulation."
                     )
 
-                # Build summary — same schema as legacy _AdvSimEngine.summary()
+                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Build summary — canonical Stress Test schema (formerly _AdvSimEngine.summary(),
+                # now removed; this Real Engine is the sole producer of this schema).
                 simulation_summary = {
                     # ── K-17: simulation label ─────────────────────────────────────────
                     "simulation_label":              self.simulation_label or "default",

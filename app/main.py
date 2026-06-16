@@ -227,4 +227,41 @@ def server_time():
 @app.get("/health", tags=["Health"])
 def health_check():
     """Render health-check probe. Returns 200 when the process is alive."""
-    return {"status": "healthy"}
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Include the deployed git commit so a single GET /health confirms WHICH
+    # build is live. Kept trivial (no imports beyond os) so it can never
+    # destabilise Render's health probe.
+    import os
+    return {
+        "status": "healthy",
+        "commit": os.environ.get("RENDER_GIT_COMMIT", "local"),
+    }
+
+
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+@app.get("/version", tags=["Health"])
+def version_info():
+    """
+    Deploy-verification endpoint.
+
+    Returns the exact git commit Render deployed (RENDER_GIT_COMMIT) PLUS a
+    live check that the RealSimEngine module can be imported in THIS running
+    process. This exists because a pre-existing IndentationError once made
+    real_simulation.py un-importable in production, silently breaking EVERY
+    simulation for ~10 sessions with no visible error. With this endpoint the
+    question "is my fix actually deployed and is the engine loadable?" is
+    answerable in one HTTP GET. Always returns 200 (import wrapped in
+    try/except) so it can never destabilise health probing.
+    """
+    import os
+    info: dict = {
+        "commit":            os.environ.get("RENDER_GIT_COMMIT", "local"),
+        "engine_importable": False,
+        "engine_error":      None,
+    }
+    try:
+        from app.services.real_simulation import RealSimEngine  # noqa: F401
+        info["engine_importable"] = True
+    except Exception as exc:  # defensive: report, never raise
+        info["engine_error"] = f"{type(exc).__name__}: {exc}"
+    return info

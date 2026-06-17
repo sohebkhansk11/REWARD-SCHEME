@@ -610,6 +610,100 @@ function WeeklyReportTable({ rows }) {
   )
 }
 
+// ── Draw-Gate Diagnostics (draw-stall catch instrument) ──────────────────────
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// Surfaces the per-week draw-gate outcomes the RealSimEngine now emits into
+// weekly_detail (gate_* keys, populated read-only from the MassDrawResult the draw
+// engine already returns — no change to draw/refill logic). It answers the question
+// "is the strategy broken or the stress test broken, and WHY do draws stall?" by
+// separating the two pool-lifecycle failure modes the codebase documents:
+//   • gate_paused_over_cap > 0  → permanent OVER-CAPACITY DEADLOCK: a pool with >12
+//     active members is paused (actual≠12), and Phase-1 refill computes
+//     vacancy = 12 − actual < 0 and skips it forever (brain5_lpi_engine.py:396).
+//     Signature of a hard 0-draw flatline. STRATEGY bug, not the harness.
+//   • gate_paused_under_cap persisting while gate_refill_phase1 == 0 → REFILL LAG:
+//     pools dropped below 12 after a draw but no Phase-1 assignment topped them back
+//     up, so they stay paused and miss the next draw (real_simulation.py:1302-1309).
+function DrawGateDiagnostics({ rows }) {
+  if (!rows?.length) return null
+  // Older sim runs (pre-instrumentation) won't carry gate_* — render nothing then.
+  const hasGate = rows.some(r =>
+    r.gate_pools_paused !== undefined || r.gate_paused_over_cap !== undefined)
+  if (!hasGate) return null
+
+  const n = v => (v ?? 0)
+  // Auto-detect the failure mode across the whole run.
+  const deadlockWeeks = rows.filter(r => n(r.gate_paused_over_cap)  > 0).map(r => r.week)
+  const lagWeeks      = rows.filter(r => n(r.gate_paused_under_cap) > 0 && n(r.gate_refill_phase1) === 0).map(r => r.week)
+  const stallWeeks    = rows.filter(r => n(r.draws_this_week) === 0 && n(r.pools_active) > 0).map(r => r.week)
+
+  let verdict, vClass
+  if (deadlockWeeks.length) {
+    verdict = `⛔ OVER-CAPACITY DEADLOCK in week(s) ${deadlockWeeks.join(', ')} — pools with >12 active members are paused and Phase-1 refill (vacancy = 12 − actual < 0) skips them permanently, so they never draw again. This is a STRATEGY bug in the pool-lifecycle, not the stress-test harness.`
+    vClass  = 'bg-red-950/40 border-red-700 text-red-200'
+  } else if (lagWeeks.length) {
+    verdict = `⚠️ REFILL LAG in week(s) ${lagWeeks.join(', ')} — pools dropped below 12 after a draw but Phase-1 assigned 0 refills, so they stay paused and miss the next draw. Refill velocity is not keeping pace with draw drawdown. STRATEGY-side (refill), harness is faithful.`
+    vClass  = 'bg-amber-950/40 border-amber-700 text-amber-200'
+  } else if (stallWeeks.length) {
+    verdict = `ℹ️ Draws reached 0 in week(s) ${stallWeeks.join(', ')} while Active pools exist, but neither an over-cap deadlock nor a zero-refill lag was flagged — inspect the per-week gate columns below to locate the failing gate.`
+    vClass  = 'bg-slate-800 border-slate-600 text-slate-300'
+  } else {
+    verdict = '✅ No draw-gate stall detected — every week with Active pools produced draws and refill kept pools at capacity.'
+    vClass  = 'bg-emerald-950/30 border-emerald-700 text-emerald-200'
+  }
+
+  const cols = [
+    { key:'week',                  label:'Wk'     },
+    { key:'draws_this_week',       label:'Draws'  },   // all draw types (DrawHistory delta)
+    { key:'gate_pools_drawn',      label:'Reg'    },   // regular pools drawn at T-0H
+    { key:'gate_pools_paused',     label:'Paused' },   // newly paused this run (Active, <12)
+    { key:'gate_paused_under_cap', label:'<12'    },   // paused & under capacity → refill LAG
+    { key:'gate_paused_at_cap',    label:'=12'    },   // paused at 12 → should self-heal
+    { key:'gate_paused_over_cap',  label:'>12'    },   // paused & over capacity → DEADLOCK
+    { key:'gate_refill_phase1',    label:'RF·P1'  },   // Phase-1 Double-FIFO assignments
+    { key:'gate_refill_phase2',    label:'RF·P2'  },   // Phase-2 new pools created
+    { key:'gate_refill_phase3',    label:'RF·P3'  },   // Phase-3 condensation transfers
+  ]
+  const cellClass = (key, val) => {
+    if (key === 'gate_paused_over_cap'  && n(val) > 0) return 'text-red-400 font-bold'
+    if (key === 'gate_paused_under_cap' && n(val) > 0) return 'text-amber-400 font-semibold'
+    if (key === 'draws_this_week' && n(val) === 0)     return 'text-slate-500'
+    if (key === 'week') return 'text-slate-400 font-semibold'
+    return 'text-slate-300'
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className={`rounded-xl border px-4 py-3 text-xs leading-relaxed ${vClass}`}>{verdict}</div>
+      <p className="text-[10px] text-slate-500 leading-relaxed">
+        <b>How to read this:</b> after every draw a pool drops by 2 winners (12→10) and pauses until
+        refill tops it back to exactly 12. <b className="text-amber-400">&lt;12</b> = paused awaiting refill (lag if it
+        persists with RF·P1 = 0). <b className="text-red-400">&gt;12</b> = permanent deadlock (Phase-1 can&apos;t remove
+        members). <b>=12</b> should self-heal (the draw engine restores it to Active). RF·P1/P2/P3 are the
+        waitlist refill phases — if these stay 0 while pools are paused, the waitlist isn&apos;t feeding pools back to capacity.
+      </p>
+      <div className="overflow-auto max-h-96 rounded-xl border border-slate-700/60">
+        <table className="w-full text-xs whitespace-nowrap">
+          <thead className="bg-slate-800 sticky top-0 z-10">
+            <tr>{cols.map(c => <th key={c.key} className="text-left px-3 py-2.5 text-slate-400 font-semibold">{c.label}</th>)}</tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <tr key={r.week} className="border-b border-slate-800/50">
+                {cols.map(c => (
+                  <td key={c.key} className={`px-3 py-2 ${cellClass(c.key, r[c.key])}`}>
+                    {r[c.key] ?? '—'}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
 // ── Pool Activity Chart ───────────────────────────────────────────────────────
 function PoolActivityChart({ logs }) {
   if (!logs?.length) return null
@@ -1478,6 +1572,13 @@ function StressTestTab({ toast }) {
                       </button>
                     </div>
                     <WeeklyReportTable rows={result.weekly_detail}/>
+                    {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        Draw-stall catch instrument — per-week draw-gate outcomes so the exact
+                        failing gate (over-cap deadlock vs refill lag) is visible, not inferred. */}
+                    <div className="mt-5">
+                      <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-3">Draw-Gate Diagnostics — why draws did / didn&apos;t happen each week</p>
+                      <DrawGateDiagnostics rows={result.weekly_detail}/>
+                    </div>
                   </div>
                 )}
 

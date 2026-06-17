@@ -1,0 +1,126 @@
+Traceback (most recent call last):
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\engine\base.py", line 2118, in _exec_insertmany_context
+    dialect.do_execute(
+    ~~~~~~~~~~~~~~~~~~^
+        cursor,
+        ^^^^^^^
+    ...<2 lines>...
+        context,
+        ^^^^^^^^
+    )
+    ^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\engine\default.py", line 951, in do_execute
+    cursor.execute(statement, parameters)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+psycopg2.errors.UniqueViolation: duplicate key value violates unique constraint "ix_users_mobile"
+DETAIL:  Key (mobile)=(SIMrsim_abt000001) already exists.
+
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\amosd\Downloads\REWARD SCHEME\_sim_ab_harness.py", line 57, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\amosd\Downloads\REWARD SCHEME\_sim_ab_harness.py", line 28, in main
+    result = engine.run()
+  File "C:\Users\amosd\Downloads\REWARD SCHEME\app\services\real_simulation.py", line 1805, in run
+    seed_users = injector.inject_distributed(
+        db, self.initial_users, seed_win_start, seed_win_end,
+        self.organic_ratio, [], chronos,
+    )
+  File "C:\Users\amosd\Downloads\REWARD SCHEME\app\services\real_simulation.py", line 483, in inject_distributed
+    db.flush()
+    ~~~~~~~~^^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\orm\session.py", line 4331, in flush
+    self._flush(objects)
+    ~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\orm\session.py", line 4466, in _flush
+    with util.safe_reraise():
+         ~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\util\langhelpers.py", line 224, in __exit__
+    raise exc_value.with_traceback(exc_tb)
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\orm\session.py", line 4427, in _flush
+    flush_context.execute()
+    ~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\orm\unitofwork.py", line 466, in execute
+    rec.execute(self)
+    ~~~~~~~~~~~^^^^^^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\orm\unitofwork.py", line 642, in execute
+    util.preloaded.orm_persistence.save_obj(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self.mapper,
+        ^^^^^^^^^^^^
+        uow.states_for_mapper_hierarchy(self.mapper, False, False),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        uow,
+        ^^^^
+    )
+    ^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\orm\persistence.py", line 93, in save_obj
+    _emit_insert_statements(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        base_mapper,
+        ^^^^^^^^^^^^
+    ...<3 lines>...
+        insert,
+        ^^^^^^^
+    )
+    ^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\orm\persistence.py", line 1143, in _emit_insert_statements
+    result = connection.execute(
+        statement, multiparams, execution_options=execution_options
+    )
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\engine\base.py", line 1419, in execute
+    return meth(
+        self,
+        distilled_parameters,
+        execution_options or NO_OPTIONS,
+    )
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\sql\elements.py", line 526, in _execute_on_connection
+    return connection._execute_clauseelement(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self, distilled_params, execution_options
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\engine\base.py", line 1641, in _execute_clauseelement
+    ret = self._execute_context(
+        dialect,
+    ...<8 lines>...
+        cache_hit=cache_hit,
+    )
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\engine\base.py", line 1844, in _execute_context
+    return self._exec_insertmany_context(dialect, context)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\engine\base.py", line 2126, in _exec_insertmany_context
+    self._handle_dbapi_exception(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        e,
+        ^^
+    ...<4 lines>...
+        is_sub_exec=True,
+        ^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\engine\base.py", line 2355, in _handle_dbapi_exception
+    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\engine\base.py", line 2118, in _exec_insertmany_context
+    dialect.do_execute(
+    ~~~~~~~~~~~~~~~~~~^
+        cursor,
+        ^^^^^^^
+    ...<2 lines>...
+        context,
+        ^^^^^^^^
+    )
+    ^
+  File "C:\Users\amosd\AppData\Roaming\Python\Python314\site-packages\sqlalchemy\engine\default.py", line 951, in do_execute
+    cursor.execute(statement, parameters)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+sqlalchemy.exc.IntegrityError: (psycopg2.errors.UniqueViolation) duplicate key value violates unique constraint "ix_users_mobile"
+DETAIL:  Key (mobile)=(SIMrsim_abt000001) already exists.
+
+[SQL: INSERT INTO users (name, mobile, username, join_date, current_pool_id, current_level, status, weekly_payment_status, late_fees_inr, referred_by_user_id, hashed_password, telegram_chat_id, referral_code, total_referrals_count, accumulated_referral_bon ... 15672 characters truncated ... 19, p20, p21, p22, p23, p24, sen_counter) ORDER BY sen_counter RETURNING users.id, users.id AS id__1]
+[parameters: {'case_e_deferred_week__0': None, 'total_deposited_inr__0': 1000, 'dynamic_merges_experienced__0': 0, 'weekly_payment_status__0': 'Paid', 'sde_flagged_week__0': None, 'join_date__0': datetime.datetime(2023, 12, 31, 1, 44, 35, tzinfo=datetime.timezone.utc), 'accumulated_referral_bonus_inr__0': 0, 'grace_active__0': False, 'pauses_experienced__0': 0, 'telegram_chat_id__0': None, 'total_referrals_count__0': 0, 'referral_code__0': None, 'sde_required__0': False, 'mobile__0': 'SIMrsim_abt000001', 'referred_by_user_id__0': None, 'elimination_risk__0': False, 'status__0': 'Waitlist', 'current_level__0': 1, 'grace_fee_paid__0': False, 'username__0': 'rsim_abt_000001', 'hashed_password__0': None, 'name__0': 'SimUserrsim_abt1', 'grace_expires_at__0': None, 'late_fees_inr__0': 0, 'current_pool_id__0': None, 'case_e_deferred_week__1': None, 'total_deposited_inr__1': 1000, 'dynamic_merges_experienced__1': 0, 'weekly_payment_status__1': 'Paid', 'sde_flagged_week__1': None, 'join_date__1': datetime.datetime(2023, 12, 31, 1, 57, 51, tzinfo=datetime.timezone.utc), 'accumulated_referral_bonus_inr__1': 0, 'grace_active__1': False, 'pauses_experienced__1': 0, 'telegram_chat_id__1': None, 'total_referrals_count__1': 0, 'referral_code__1': None, 'sde_required__1': False, 'mobile__1': 'SIMrsim_abt000002', 'referred_by_user_id__1': None, 'elimination_risk__1': False, 'status__1': 'Waitlist', 'current_level__1': 1, 'grace_fee_paid__1': False, 'username__1': 'rsim_abt_000002', 'hashed_password__1': None, 'name__1': 'SimUserrsim_abt2', 'grace_expires_at__1': None, 'late_fees_inr__1': 0, 'current_pool_id__1': None ... 500 parameters truncated ... 'case_e_deferred_week__22': None, 'total_deposited_inr__22': 1000, 'dynamic_merges_experienced__22': 0, 'weekly_payment_status__22': 'Paid', 'sde_flagged_week__22': None, 'join_date__22': datetime.datetime(2024, 1, 2, 14, 48, 6, tzinfo=datetime.timezone.utc), 'accumulated_referral_bonus_inr__22': 0, 'grace_active__22': False, 'pauses_experienced__22': 0, 'telegram_chat_id__22': None, 'total_referrals_count__22': 0, 'referral_code__22': None, 'sde_required__22': False, 'mobile__22': 'SIMrsim_abt000023', 'referred_by_user_id__22': None, 'elimination_risk__22': False, 'status__22': 'Waitlist', 'current_level__22': 1, 'grace_fee_paid__22': False, 'username__22': 'rsim_abt_000023', 'hashed_password__22': None, 'name__22': 'SimUserrsim_abt23', 'grace_expires_at__22': None, 'late_fees_inr__22': 0, 'current_pool_id__22': None, 'case_e_deferred_week__23': None, 'total_deposited_inr__23': 1000, 'dynamic_merges_experienced__23': 0, 'weekly_payment_status__23': 'Paid', 'sde_flagged_week__23': None, 'join_date__23': datetime.datetime(2024, 1, 2, 21, 5, 57, tzinfo=datetime.timezone.utc), 'accumulated_referral_bonus_inr__23': 0, 'grace_active__23': False, 'pauses_experienced__23': 0, 'telegram_chat_id__23': None, 'total_referrals_count__23': 0, 'referral_code__23': None, 'sde_required__23': False, 'mobile__23': 'SIMrsim_abt000024', 'referred_by_user_id__23': None, 'elimination_risk__23': False, 'status__23': 'Waitlist', 'current_level__23': 1, 'grace_fee_paid__23': False, 'username__23': 'rsim_abt_000024', 'hashed_password__23': None, 'name__23': 'SimUserrsim_abt24', 'grace_expires_at__23': None, 'late_fees_inr__23': 0, 'current_pool_id__23': None}]
+(Background on this error at: https://sqlalche.me/e/20/gkpj)

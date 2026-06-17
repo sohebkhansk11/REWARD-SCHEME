@@ -3,7 +3,8 @@ TEMP A/B harness (not committed) — confirms the draw-stall deadlock fix.
 Runs RealSimEngine on isolated in-memory SQLite (no production DB touched).
 Seeds `random` for a reproducible structural comparison pre-fix vs post-fix.
 """
-import random, json, sys
+import random, json, sys, logging
+logging.disable(logging.CRITICAL)   # silence verbose engine logs — keep stdout clean
 
 SEED   = 4242
 PARAMS = dict(
@@ -45,6 +46,12 @@ def main():
     zero_weeks  = sum(1 for w in wd if w.get("draws_this_week", 0) == 0)
     print(f"\nSUMMARY: total_draws={total_draws}  zero_draw_weeks={zero_weeks}/{len(wd)}  "
           f"max_consecutive_zero_streak={max_streak}")
+    # Persist a clean copy for inspection regardless of stdout capture.
+    with open("_sim_ab_result.json", "w") as fh:
+        json.dump({"params": PARAMS, "seed": SEED, "weekly_detail": wd,
+                   "summary": {"total_draws": total_draws, "zero_draw_weeks": zero_weeks,
+                               "weeks": len(wd), "max_consecutive_zero_streak": max_streak}},
+                  fh, default=str)
 
 if __name__ == "__main__":
     main()

@@ -2147,6 +2147,18 @@ class RealSimEngine:
 
                     draws_this_week  = 0
                     pauses_this_week = 0
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # DRAW-STALL GATE TELEMETRY (read-only diagnostics — no change to draw logic).
+                    # These per-week counters surface WHY draws did/did-not happen each week so the
+                    # Weekly Timeline can pinpoint the exact failing gate (capacity gate vs refill).
+                    # Initialised to zero here so they remain well-defined if the draw aborts
+                    # (ValueError "no eligible pools" or any Exception) before mass_result is set.
+                    gate_pools_drawn   = 0   # regular pools drawn at T-0H (mass_result.pools_drawn)
+                    gate_pools_skipped = 0   # pools that errored mid-draw (mass_result.skipped_pools)
+                    gate_refill_phase1 = 0   # Phase-1 Bulk Double-FIFO refill assignments
+                    gate_refill_phase2 = 0   # Phase-2 Bulk Auto-Scale new pools created
+                    gate_refill_phase3 = 0   # Phase-3 Condensation inter-pool transfers
+                    gate_paused_names  = []  # names of pools paused this run (Active, <12)
 
                     try:
                         mass_result      = execute_weekly_draw(db, auto_pay_unpaid=False)
@@ -2162,6 +2174,17 @@ class RealSimEngine:
                             + mass_result.preventive_l3_draws_this_week
                         )
                         pauses_this_week = len(mass_result.paused_pools)
+                        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        # DRAW-STALL GATE TELEMETRY — capture per-week gate outcomes from the
+                        # MassDrawResult the draw engine already returns (draw.py:140-150). All
+                        # read-only; does not alter draw/refill behaviour. .get() guards the refill
+                        # dict in case a code path returns it partially populated.
+                        gate_pools_drawn   = mass_result.pools_drawn
+                        gate_pools_skipped = len(mass_result.skipped_pools)
+                        gate_refill_phase1 = mass_result.refill.get("phase1_assigned",    0)
+                        gate_refill_phase2 = mass_result.refill.get("phase2_pools_count", 0)
+                        gate_refill_phase3 = mass_result.refill.get("phase3_transfers",   0)
+                        gate_paused_names  = list(mass_result.paused_pools)
                         # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
                         # Bug #1 — total_draws now accumulated AFTER T+5M using all-types
                         # DrawHistory delta instead of mass_result.pools_drawn (regular only).
@@ -2294,6 +2317,51 @@ class RealSimEngine:
                     phase2_new          = total_p2_pools - _week_p2_start
                     phase1_restored     = max(0, _week_paused_before - _week_paused_after)
                     metrics["pools_formed"] = phase2_new + phase1_restored
+
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # DRAW-STALL GATE TELEMETRY — classify every currently-paused pool by its
+                    # active-member count so the Weekly Timeline distinguishes the two failure
+                    # modes that stop draws (read-only; mirrors the gate's own count at
+                    # draw.py:676-680 exactly — current_pool_id == pool.id AND status==Active):
+                    #   • under_cap (<12)  — refill LAG: Phase 1/2/3 can still fill these; if they
+                    #                        persist week-over-week, refill velocity is too slow.
+                    #   • at_cap   (==12)  — should self-heal (draw.py:686-693 restores Paused→Active);
+                    #                        a non-zero value here means that restore path isn't firing.
+                    #   • over_cap (>12)   — permanent DEADLOCK: Phase 1 vacancy=12-actual<0 skips
+                    #                        them forever (brain5_lpi_engine.py:396). The signature of
+                    #                        a hard 0-draw flatline.
+                    from app.core.config import POOL_CAPACITY as _PC_diag
+                    _paused_ids = [
+                        r[0] for r in db.query(_P6m.id)
+                        .filter(_P6m.status == _PS6m.Paused_Awaiting_Members).all()
+                    ]
+                    _paused_under = _paused_at = _paused_over = 0
+                    if _paused_ids:
+                        _active_by_pool = dict(
+                            db.query(_U6m.current_pool_id, func.count(_U6m.id))
+                            .filter(_U6m.current_pool_id.in_(_paused_ids),
+                                    _U6m.status == _US6m.Active)
+                            .group_by(_U6m.current_pool_id)
+                            .all()
+                        )
+                        for _pid in _paused_ids:
+                            _cnt = _active_by_pool.get(_pid, 0)
+                            if   _cnt <  _PC_diag: _paused_under += 1
+                            elif _cnt == _PC_diag: _paused_at    += 1
+                            else:                  _paused_over  += 1
+
+                    # Inject gate telemetry into the weekly row (mirrors the pools_formed pattern
+                    # above — direct dict assignment, no change to _snapshot's signature).
+                    metrics["gate_pools_drawn"]      = gate_pools_drawn
+                    metrics["gate_pools_paused"]     = pauses_this_week      # newly paused this run
+                    metrics["gate_pools_skipped"]    = gate_pools_skipped
+                    metrics["gate_paused_under_cap"] = _paused_under
+                    metrics["gate_paused_at_cap"]    = _paused_at
+                    metrics["gate_paused_over_cap"]  = _paused_over
+                    metrics["gate_refill_phase1"]    = gate_refill_phase1
+                    metrics["gate_refill_phase2"]    = gate_refill_phase2
+                    metrics["gate_refill_phase3"]    = gate_refill_phase3
+                    metrics["gate_paused_pool_names"] = gate_paused_names
 
                     # Bug #6: advance cumulative trackers for next week's delta computation
                     _prev_cumul_ext2  = cumul_ext2

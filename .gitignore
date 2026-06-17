@@ -43,3 +43,11 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+
+# ── Local diagnostic / simulation harnesses (NEVER commit) ─────
+# Throwaway, isolated-SQLite diagnostic scripts and their regenerable
+# artifacts. Kept out of the repo so the auto-commit session updater can
+# never pollute this finance-system repo with temp tooling or sim captures.
+_diag_*
+_sim_ab_*
+*.sqlite3

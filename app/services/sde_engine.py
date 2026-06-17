@@ -946,7 +946,12 @@ def _execute_case_d_single_pair(
                 crud_user.update_user(db, s.id, UserUpdate(
                     current_level         = new_lvl,
                     weekly_payment_status = WeeklyPaymentStatus.Unpaid,
-                    sde_required          = (True   if new_lvl == 4 else None),
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # sde_required is NOT NULL (Column(Boolean, nullable=False)). update_user uses
+                    # model_dump(exclude_unset=True), so an explicit None IS written -> IntegrityError
+                    # ("NOT NULL constraint failed: users.sde_required") which poisons the session and
+                    # silently kills the entire weekly draw. Must be False (un-flagged), never None.
+                    sde_required          = (True   if new_lvl == 4 else False),
                     sde_flagged_week      = (wk_id  if new_lvl == 4 else None),
                 ))
             pool.draw_completed_this_week = True
@@ -1577,7 +1582,12 @@ def execute_staged_sde_draws(db: Session) -> int:
                     UserUpdate(
                         current_level         = new_level,
                         weekly_payment_status = WeeklyPaymentStatus.Unpaid,
-                        sde_required          = (True         if reaching_l4 else None),
+                        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        # sde_required is NOT NULL; writing None (via update_user's exclude_unset
+                        # dump) raises IntegrityError, poisons the Session, and makes every later
+                        # query in the weekly draw fail with PendingRollbackError -> 0 draws for the
+                        # week (the multi-week draw stall). Must be False when not reaching L4.
+                        sde_required          = (True         if reaching_l4 else False),
                         sde_flagged_week      = (sde_flag_week if reaching_l4 else None),
                     ),
                 )
@@ -1971,7 +1981,11 @@ def execute_sde_ext2_draw(
             UserUpdate(
                 current_level         = new_level,
                 weekly_payment_status = WeeklyPaymentStatus.Unpaid,
-                sde_required          = (True    if reaching_l4 else None),
+                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # sde_required is NOT NULL; an explicit None is persisted by update_user and
+                # raises IntegrityError -> poisoned Session -> PendingRollbackError -> the weekly
+                # draw produces 0 results (multi-week stall). Must be False when not reaching L4.
+                sde_required          = (True    if reaching_l4 else False),
                 sde_flagged_week      = (week_id if reaching_l4 else None),
             ),
         )

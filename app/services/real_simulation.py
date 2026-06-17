@@ -2161,7 +2161,16 @@ class RealSimEngine:
                     gate_paused_names  = []  # names of pools paused this run (Active, <12)
 
                     try:
-                        mass_result      = execute_weekly_draw(db, auto_pay_unpaid=False)
+                        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        # Pass the run-prefix so every internal assign_waitlist_to_pools()
+                        # refill inside execute_weekly_draw (incl. the new pre-draw refill
+                        # that resolves the draw-stall deadlock) is scoped to THIS run's
+                        # users only — preventing the 10-min hang from scanning thousands
+                        # of real Waitlist users (consistent with the Jun-15 scoping on the
+                        # standalone weekly refill above).
+                        mass_result      = execute_weekly_draw(
+                            db, auto_pay_unpaid=False, user_prefix=injector._pfx,
+                        )
                         _logger.info("RealSimEngine [%s]: TICK7-done week=%d — pools_drawn=%d", self._run_id, week_num, mass_result.pools_drawn)
                         # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
                         # Temporary value — overwritten by DrawHistory delta below (Bug #1 fix

@@ -523,6 +523,14 @@ def execute_weekly_draw(
     db: Session,
     *,
     auto_pay_unpaid: bool = False,
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # user_prefix scopes every internal assign_waitlist_to_pools() refill call.
+    # Production passes None → full unscoped refill (identical to prior behaviour).
+    # The simulation passes its run-prefix (e.g. "rsim_") so refills touch ONLY the
+    # run's users — preventing the 10-min hang from scanning thousands of real
+    # Waitlist users (matches the Jun-15 scoping already applied at the sim's
+    # standalone weekly refill).  See deadlock-fix block below the SDE pre-passes.
+    user_prefix: str | None = None,
 ) -> MassDrawResult:
     """
     Global Mass Draw — the production Sunday-draw entry point.
@@ -580,7 +588,8 @@ def execute_weekly_draw(
             _ext_draws_count = len(ext_results)
             # Run a quick partial refill so ext-II/III pools get replacements
             # before the main draw checks pool capacity.
-            _wl_refill(db)
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            _wl_refill(db, user_prefix=user_prefix)
             _logger.info(
                 "execute_weekly_draw: SDE Ext-II/III ran %d draw(s) before main loop.",
                 _ext_draws_count,
@@ -604,7 +613,8 @@ def execute_weekly_draw(
         if _prev_l3_results:
             _preventive_l3_count = len(_prev_l3_results)
             from app.services.waitlist import assign_waitlist_to_pools as _wl_refill_pl3
-            _wl_refill_pl3(db)
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            _wl_refill_pl3(db, user_prefix=user_prefix)
             _logger.info(
                 "execute_weekly_draw: Preventive L3 ran %d draw(s) before main loop.",
                 _preventive_l3_count,
@@ -635,6 +645,50 @@ def execute_weekly_draw(
         _logger.error(
             "execute_weekly_draw: execute_staged_sde_draws failed (non-fatal): %s",
             _staged_exc, exc_info=True,
+        )
+
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # ══ PRODUCTION DRAW-STALL DEADLOCK FIX (root-cause resolution) ════════════
+    #
+    # CONFIRMED ROOT CAUSE (20-week stress telemetry, run 1781663467789):
+    #   On any cycle where no pool holds exactly 12 Active members AND no SDE
+    #   pre-pass fired, the eligibility gate at the bottom of section 1 raises
+    #   ValueError("No active pools with exactly 12 members ...") and ABORTS this
+    #   function.  The Double-FIFO refill in section 4 (assign_waitlist_to_pools)
+    #   — the ONLY code path that fills under-capacity pools back to 12 and spawns
+    #   new pools from the paid waitlist — sits BELOW that gate and is therefore
+    #   skipped on the abort.  Result: a self-reinforcing deadlock — no refill →
+    #   pools never reach 12 → ValueError → no refill — that stalls every draw for
+    #   weeks while the waitlist grows unbounded.  In production the autonomous
+    #   weekly scheduler (app/services/scheduler.py) hits this exact path: with no
+    #   user-registration event to trigger an out-of-band refill, the Sunday draw
+    #   stays permanently stalled.  This is a real money-system defect, not a
+    #   simulation artifact.
+    #
+    # FIX (faithful to documented intent — NOT a behaviour change to draw math):
+    #   Run the refill UNCONDITIONALLY here, BEFORE the eligibility gate, so the
+    #   pool set is filled/spawned first and the draw is always evaluated against
+    #   freshly-filled pools.  This is exactly what the section-1 comment already
+    #   PROMISES ("re-enter Active status automatically once assign_waitlist_to_pools
+    #   fills them") and what the ValueError's own message instructs the admin to do
+    #   manually ("Run 'Fill Pool Vacancies' first, then retry the draw") — now done
+    #   automatically and atomically so production self-heals with zero manual steps.
+    #
+    # MONEY-SAFETY INVARIANTS (unchanged):
+    #   • Draw eligibility is still EXACTLY 12 Active members (gate logic untouched).
+    #   • No payout / level / token math is altered; this only places already-paid
+    #     waitlist members into vacancies — the documented recovery path.
+    #   • Idempotent: if pools are already full this is a near-no-op; the section-4
+    #     post-draw refill still runs to backfill winner-vacated seats.
+    #   • Failure-isolated: wrapped non-fatal so a refill error can never abort the
+    #     draw cycle (matches the SDE pre-pass error-handling pattern above).
+    try:
+        assign_waitlist_to_pools(db, user_prefix=user_prefix)
+    except Exception as _predraw_refill_exc:
+        _logger.error(
+            "execute_weekly_draw: pre-draw refill failed (non-fatal) — proceeding to "
+            "eligibility check with current pool state: %s",
+            _predraw_refill_exc, exc_info=True,
         )
 
     # ── 1. Discover eligible pools + apply draw-protection safeguard ─────────
@@ -939,7 +993,9 @@ def execute_weekly_draw(
     )
 
     # ── 4. Single combined FIFO refill after ALL draws ────────────────────────
-    refill = assign_waitlist_to_pools(db)
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # user_prefix threaded through (None in production → unchanged; run-scoped in sim).
+    refill = assign_waitlist_to_pools(db, user_prefix=user_prefix)
 
     # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # Winner reveal ordering fix (E1+E2) — unified broadcast AFTER all draws and

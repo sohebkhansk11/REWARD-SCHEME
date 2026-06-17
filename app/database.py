@@ -53,14 +53,16 @@ engine = create_engine(
 @event.listens_for(engine, "checkout")
 def _on_checkout(dbapi_conn, conn_record, conn_proxy):
     pool = engine.pool
-    checked_out = pool.checkedout()
-    pool_sz     = pool.size()
-    overflow    = pool.overflow()
-    # Warn when 80% of total capacity is in use
-    if (checked_out + overflow) >= int((pool_sz + pool.overflow()) * 0.8):
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Warn when 80% of total capacity is in use. checkedout() already counts
+    # in-use overflow connections, so compare it directly against the static
+    # capacity (pool_size + max_overflow), not the live overflow count.
+    checked_out    = pool.checkedout()
+    total_capacity = pool.size() + pool._max_overflow
+    if checked_out >= int(total_capacity * 0.8):
         _log.warning(
-            "[DB-POOL] High utilisation — checkedout=%d  pool_size=%d  overflow=%d",
-            checked_out, pool_sz, overflow,
+            "[DB-POOL] High utilisation — checkedout=%d / capacity=%d",
+            checked_out, total_capacity,
         )
 
 

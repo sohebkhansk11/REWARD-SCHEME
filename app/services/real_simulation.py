@@ -1989,7 +1989,24 @@ class RealSimEngine:
                             "K-14: Payment shock week %d — late_ratio spiked to 20%%",
                             week_num,
                         )
-                    type_b_fraction = effective_late * (1.0 - self.elim_pct_a)
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # UNIT-BUG FIX (stress-test A/B/C compliance model). elim_pct_a / grace_pct_c
+                    # are PERCENTAGES (e.g. 80.0 / 15.0), but the 9-tick refactor consumed them as
+                    # raw fractions: tick3's `effective_late * (1.0 - 80.0)` went negative -> 0, and
+                    # tick4 grace-saved `unpaid * 15.0` -> 100% of late payers, so tick5's guillotine
+                    # always found 0 -> eliminations were IMPOSSIBLE for any setting. Restored the
+                    # /100 scaling (the original apply_abc_model semantics, lines ~1150-1151). Each
+                    # tick runs on the *remaining* unpaid set, so the per-tick fractions must be the
+                    # CONDITIONAL shares that resolve A/B/C to exactly elim_pct_a% / grace_pct_c% /
+                    # remainder of the ORIGINAL late-payer cohort:
+                    #   late = L ; a = elim_pct_a/100 ; c = grace_pct_c/100
+                    #   tick3 Type-B share (of L)            = 1 - a - c
+                    #   remaining after tick3               = L*(a+c)   (the A + C cohort)
+                    #   tick4 grace share (of that remnant) = c / (a+c)  -> grace-saves L*c
+                    #   tick5 eliminates the rest           = L*a
+                    _abc_a = self.elim_pct_a / 100.0          # Type A: direct-elimination share of late
+                    _abc_c = self.grace_pct_c / 100.0          # Type C: grace-saved share of late
+                    type_b_fraction = max(0.0, 1.0 - _abc_a - _abc_c)   # Type B: late-fee-then-pay remainder
                     t3 = injector.tick3_late_fee_window(
                         db, type_b_fraction, chronos,
                         m.DUE_DATE, m.GRACE_PERIOD_START, week_num,
@@ -1997,8 +2014,13 @@ class RealSimEngine:
                     db.commit()
 
                     # ── TICK 4: GRACE PERIOD (GRACE_PERIOD_START → G_CLOSE) ──────
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # tick4 operates on the post-tick3 remnant (= A + C of original late), so pass the
+                    # CONDITIONAL grace share c/(a+c) — not the raw grace_pct_c — to grace-save exactly
+                    # grace_pct_c% of the original late cohort and leave elim_pct_a% for the guillotine.
+                    _abc_grace_cond = (_abc_c / (_abc_a + _abc_c)) if (_abc_a + _abc_c) > 0.0 else 0.0
                     t4 = injector.tick4_grace_period(
-                        db, self.grace_pct_c, chronos,
+                        db, _abc_grace_cond, chronos,
                         m.GRACE_PERIOD_START, m.G_CLOSE, week_num,
                     )
                     db.commit()

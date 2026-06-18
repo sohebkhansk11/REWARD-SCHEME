@@ -45,6 +45,9 @@ from app.core.config import (
     BRAIN2_FAST_VELOCITY_HOURS,
     BRAIN2_WEIGHT_SLOW, BRAIN2_WEIGHT_FAST, BRAIN2_WEIGHT_FORWARD,
     BRAIN2_CLIFF_REFERENCE_DAYS, BRAIN2_CLIFF_FACTOR,
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVER 3b — POOL_CAPACITY needed for the gated dynamic-reserve helper below.
+    POOL_CAPACITY,
 )
 
 _logger = logging.getLogger(__name__)
@@ -62,6 +65,39 @@ _M_STANDARD     = 1.00   # VELOCITY_CLIFF / NEUTRAL: normal 1:1 reserve ratio
 _M_CAUTIOUS     = 1.50   # FLASH_FLOOD: referral-volatile, hold extra cushion
 _M_STANDARD_75  = 0.75   # BOOM_GOLDEN_CROSS: mixed traffic, moderate optimism
 _M_PROTECTION   = 2.00   # DRY_PHASE / REFERRAL_LIFELINE: double reserve
+
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ── LEVER 3b — Gated dynamic-reserve floor ──────────────────────────────────────
+# In a HEALTHY market (organic growth, draining waitlist) the protective
+# (operational_pools × 12 × multiplier) spawn reserve is far larger than needed and
+# starves the live pools of supply. The user's design caps the reserve at a lean
+# 4 members/pool ONLY while the AI scenario is one of the two healthy regimes; in
+# every other (FLASH_FLOOD / VELOCITY_CLIFF / DRY_PHASE / REFERRAL_LIFELINE /
+# NEUTRAL) scenario the original × 12 × multiplier solvency-defense reserve stands
+# UNCHANGED. The scenario strings here MUST match determine_reserve_multiplier()'s
+# exact return labels (verified below in this same module).
+HEALTHY_RESERVE_SCENARIOS = frozenset({"SUSTAINABLE_WAVE", "BOOM_GOLDEN_CROSS"})
+HEALTHY_RESERVE_PER_POOL  = 4   # lean reserve floor (members/pool) in healthy regimes
+
+
+def compute_dynamic_reserve(
+    operational_pool_count: int,
+    multiplier: float,
+    scenario: str,
+) -> int:
+    """LEVER 3b — single source of truth for the spawn-reserve floor.
+
+    Healthy scenario  → operational_pools × HEALTHY_RESERVE_PER_POOL (lean 4/pool).
+    Any other scenario → int(operational_pools × POOL_CAPACITY × multiplier)
+                          (the original protective solvency-defense reserve).
+
+    Both the Phase-2 spawn gate (waitlist.py) and the admin telemetry snapshot
+    (get_system_snapshot below) call THIS function so the live gate and the
+    displayed reserve target can never drift apart.
+    """
+    if scenario in HEALTHY_RESERVE_SCENARIOS:
+        return int(operational_pool_count) * HEALTHY_RESERVE_PER_POOL
+    return int(operational_pool_count * POOL_CAPACITY * multiplier)
 
 
 # ── Query helpers ─────────────────────────────────────────────────────────────
@@ -374,7 +410,10 @@ def get_system_snapshot(db: Session) -> dict:
         .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
         .scalar()
     ) or 0
-    dynamic_reserve_needed = int(operational_pools * 12 * multiplier)
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVER 3b — mirror the gated reserve in admin telemetry so the displayed
+    # "dynamic_reserve_needed" can never diverge from the live Phase-2 spawn gate.
+    dynamic_reserve_needed = compute_dynamic_reserve(operational_pools, multiplier, scenario)
 
     phase = (
         "BOOM"    if blended_vel > burn_rate and momentum > 0 else

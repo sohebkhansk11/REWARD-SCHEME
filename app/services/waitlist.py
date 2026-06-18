@@ -44,7 +44,10 @@ from sqlalchemy import func, insert as sa_insert
 from sqlalchemy.orm import Session
 
 from app.core.config import WAITLIST_TRIGGER, NEW_POOL_INTAKE, POOL_CAPACITY  # noqa: F401
-from app.services.ai_quant_engine import determine_reserve_multiplier
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# LEVER 3b — compute_dynamic_reserve is the shared gated-reserve helper; importing
+# it keeps the Phase-2 spawn gate below in lockstep with admin telemetry.
+from app.services.ai_quant_engine import determine_reserve_multiplier, compute_dynamic_reserve
 from app.core.pool_settings import get_auto_pool_creation
 from app.crud import user as crud_user, pool as crud_pool
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
@@ -361,7 +364,14 @@ def assign_waitlist_to_pools(db: Session, *, user_prefix: str | None = None) -> 
             .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
             .scalar()
         ) or 0
-        _dynamic_reserve     = int(_operational_pool_count * POOL_CAPACITY * _ai_multiplier)
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # LEVER 3b — gated reserve: healthy scenarios (SUSTAINABLE_WAVE /
+        # BOOM_GOLDEN_CROSS) hold a lean 4/pool floor so live pools are not starved
+        # of supply; every other scenario keeps the protective × 12 × multiplier
+        # solvency-defense reserve. Single source of truth in ai_quant_engine.
+        _dynamic_reserve     = compute_dynamic_reserve(
+            _operational_pool_count, _ai_multiplier, _ai_scenario
+        )
         _available_to_spawn  = max(0, remaining - _dynamic_reserve)
         _logger.info(
             "Phase 2 AI: scenario=%-20s  multiplier=%.2f  "

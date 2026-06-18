@@ -1405,7 +1405,14 @@ def run_accelerated_dissolution_draw(
             },
             synchronize_session=False,
         )
-        pool.status = PoolStatus.Dissolved
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # LATENT BUG FIX — PoolStatus has no member `Dissolved` (pool.py defines
+        # only `Merged_Dissolved`).  The old reference raised AttributeError at
+        # runtime on the accelerated-dissolution path, aborting the dissolution
+        # mid-transaction.  Use the real enum member, which also matches the
+        # Phase-3 condensation dissolution semantics (status + total_members=0).
+        pool.status        = PoolStatus.Merged_Dissolved
+        pool.total_members = 0   # all members demoted to Waitlist above (Phase-3 contract)
         db.commit()
         pool_dissolved = True
         _logger.info(

@@ -1414,8 +1414,29 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
                 .scalar()
             ) or 0
 
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # LEVER 1 — normalize overflow bookkeeping before re-deciding fate.
+            # The batch-reduction step provisionally counted overflow_from_batch as
+            # overflow (meta_result.overflow_*).  Remove every all_uncleared member
+            # from that bookkeeping now so the final overflow_* reflects ONLY the
+            # genuinely-deferred (Case E) members after Case D + the single-member
+            # ladder below.  Guards membership so the not-yet-counted `remaining`
+            # members are skipped — prevents double-counting cleared L4s.
+            for _norm_m in all_uncleared:
+                if _norm_m.id in meta_result.overflow_user_ids:
+                    meta_result.overflow_user_ids.remove(_norm_m.id)
+                    meta_result.overflow_l4_count -= 1
+
             paired_ids: set[int] = set()
-            if wl_count == 0 and len(all_uncleared) >= 2:
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # LEVER 1 — CASE D decoupled from wl_count.  Lever 2's Meta Pool Buffer
+            # has already drained all eligible (Paid) waitlist supply into the L4
+            # pools, so any L4 still uncleared here is genuinely unsupplied.  The old
+            # guard `wl_count == 0` was half of Bug #11: a non-zero waitlist (capped
+            # Gate-5 could not drain it) suppressed Case D and leaked pairable L4s to
+            # Case E.  Pair them cross-pool AGGRESSIVELY on count alone — each paired
+            # L4 takes its own-level payout; this prevents L4→L5 escalation at any cost.
+            if len(all_uncleared) >= 2:
                 pairs = _case_d_pair_l4_members(all_uncleared)
                 for upper_l4, lower_l4 in pairs:
                     if _execute_case_d_single_pair(db, session_num, upper_l4, lower_l4):
@@ -1430,14 +1451,45 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
                         len(paired_ids) // 2, len(paired_ids),
                     )
 
-            # Any L4 members not paired → CASE E True Defer
-            unpaired = [m for m in all_uncleared if m.id not in paired_ids]
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # LEVER 1 — odd-leftover final single-member supply attempt.  After Case D
+            # pairs ⌊n/2⌋ pairs at most one L4 remains unpaired (and the n < 2 case —
+            # the design's "Solo-L4, L4 == 1 in the entire system" — lands here
+            # directly).  Give each such member ONE last clearing attempt through the
+            # full single-member SDE ladder: run_sde_session() → execute_sde_sub_draw()
+            # internally tries same-pool lower supply, then a WL emergency promotion,
+            # then a Case C cross-pool donor transfer, and only raises (→ overflow) on
+            # TRUE exhaustion.  Members it clears exit normally; only the genuinely
+            # unsupplied remainder falls through to Case E below.
+            leftover = [m for m in all_uncleared if m.id not in paired_ids]
+            unpaired: list[User] = []
+            if leftover:
+                _ll_session = run_sde_session(db, week_id, session_num, leftover, lpi)
+                meta_result.sessions.append(_ll_session)
+                meta_result.total_l4_cleared      += _ll_session.total_l4_cleared
+                meta_result.total_pools_processed += len(_ll_session.sub_draws)
+                session_num += 1
+                _ll_overflow = set(_ll_session.overflow_user_ids)
+                if _ll_session.total_l4_cleared:
+                    _logger.info(
+                        "SDE Meta-Pool: LEVER 1 leftover route cleared %d L4(s) via the "
+                        "single-member SDE supply ladder (Case C donor / WL).  "
+                        "remaining_unsupplied=%d",
+                        _ll_session.total_l4_cleared, len(_ll_overflow),
+                    )
+                unpaired = [m for m in leftover if m.id in _ll_overflow]
+
+            # Any L4 members STILL uncleared (no cross-pool pair, no single-member
+            # supply anywhere) → CASE E True Defer.  After Lever 1+2 this is genuine
+            # exhaustion only — the design's lone L4 with zero supply system-wide —
+            # not a weekly occurrence.
             if unpaired:
                 meta_result.overflow_l4_count += len(unpaired)
                 meta_result.overflow_user_ids.extend(m.id for m in unpaired)
                 _logger.warning(
                     "SDE Meta-Pool: %d L4 member(s) → CASE E TRUE DEFER "
-                    "(CASE D cleared %d, wl=%d, all supply routes A→B→C→D exhausted).",
+                    "(CASE D cleared %d, Paid wl=%d, all supply routes "
+                    "A→B→C→D + single-member ladder exhausted).",
                     len(unpaired), len(paired_ids) // 2, wl_count,
                 )
                 # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:

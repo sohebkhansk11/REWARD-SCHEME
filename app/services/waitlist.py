@@ -569,208 +569,17 @@ def assign_waitlist_to_pools(db: Session, *, user_prefix: str | None = None) -> 
             wl_remaining,
         )
     else:
-        # Re-query pools to get the post-Phase-1/2 state
-        p3_candidates: list[Pool] = (
-            db.query(Pool)
-            .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
-            .order_by(Pool.created_at.asc())
-            .all()
-        )
-
-        p3_targets: list[tuple[Pool, int]] = []
-        for pool in p3_candidates:
-            actual: int = (
-                db.query(User)
-                .filter(User.current_pool_id == pool.id, User.status == UserStatus.Active)
-                .count()
-            )
-            if actual < POOL_CAPACITY:
-                p3_targets.append((pool, actual))
-
-        if not p3_targets:
-            _logger.info(
-                "Phase 3: All pools at capacity after Phase 1/2 — condensation not needed."
-            )
-        else:
-            target_ids: set[int] = {pool.id for pool, _ in p3_targets}
-
-            # Source pools: Active pools NOT in target set AND not L4-flagged.
-            # SDE IMMUNITY (BUG 2 / CONDENSATION GUARD):
-            #   Any pool with contains_flagged_l4=True must not be used as a
-            #   condensation source.  Dissolving such a pool would scatter the
-            #   L4 member(s) into random pools, breaking the SDE session plan
-            #   that was built at T-2H.
-            source_pools: list[Pool] = (
-                db.query(Pool)
-                .filter(
-                    Pool.status == PoolStatus.Active,
-                    Pool.id.notin_(target_ids),
-                    Pool.contains_flagged_l4 == False,   # noqa: E712
-                )
-                .order_by(Pool.created_at.desc())
-                .all()
-            )
-
-            if not source_pools:
-                _logger.info(
-                    "Phase 3: %d pool(s) under capacity but no full source pools available "
-                    "(all active pools are under capacity — condensation cannot proceed).",
-                    len(p3_targets),
-                )
-            else:
-                # Cache live member counts per source pool to avoid N+1 queries
-                src_counts: dict[int, int] = {
-                    sp.id: (
-                        db.query(User)
-                        .filter(User.current_pool_id == sp.id, User.status == UserStatus.Active)
-                        .count()
-                    )
-                    for sp in source_pools
-                }
-
-                _logger.info(
-                    "Phase 3: %d target pool(s) need filling — "
-                    "harvesting from %d source pool(s): %s",
-                    len(p3_targets),
-                    len(source_pools),
-                    ", ".join(
-                        f"{sp.name}({src_counts[sp.id]}/12)" for sp in source_pools
-                    ),
-                )
-
-                _MAX_P3_ITERS = 10_000   # explicit safety ceiling (#189)
-                src_idx  = 0             # rolling pointer into source_pools list
-                _p3_iter = 0             # iteration guard counter
-
-                for target_pool, target_actual in p3_targets:
-                    vacancies = POOL_CAPACITY - target_actual
-
-                    while vacancies > 0 and src_idx < len(source_pools) and _p3_iter < _MAX_P3_ITERS:
-                        _p3_iter += 1
-                        source_pool = source_pools[src_idx]
-
-                        if src_counts[source_pool.id] == 0:
-                            src_idx += 1
-                            continue
-
-                        to_take = min(vacancies, src_counts[source_pool.id])
-
-                        # FIFO within source: transfer oldest members first
-                        transfer_batch: list[User] = (
-                            db.query(User)
-                            .filter(
-                                User.current_pool_id == source_pool.id,
-                                User.status == UserStatus.Active,
-                            )
-                            .order_by(User.join_date.asc())
-                            .limit(to_take)
-                            .all()
-                        )
-
-                        for member in transfer_batch:
-                            # ── LEVEL & STATE PRESERVATION (CRITICAL) ──────────
-                            # Only pool_id and journey counter change.
-                            # current_level, weekly_payment_status, join_date: NEVER touched.
-                            member.current_pool_id           = target_pool.id
-                            member.dynamic_merges_experienced = (
-                                (member.dynamic_merges_experienced or 0) + 1
-                            )
-                            _logger.info(
-                                "[P3-XFER]  @%-20s  (id=%5d  L%d  %s)  %s → %s",
-                                member.username,
-                                member.id,
-                                member.current_level,
-                                member.weekly_payment_status.value,
-                                source_pool.name,
-                                target_pool.name,
-                            )
-
-                        moved = len(transfer_batch)
-                        vacancies                  -= moved
-                        target_actual              += moved
-                        src_counts[source_pool.id] -= moved
-                        phase3_transfers           += moved
-
-                        dissolved_this = (src_counts[source_pool.id] == 0)
-
-                        if dissolved_this:
-                            source_pool.status        = PoolStatus.Merged_Dissolved
-                            source_pool.total_members = 0
-                            phase3_dissolved.append(source_pool.name)
-                            src_idx += 1
-
-                        condensation_msg = (
-                            f"Condensation Event: Moved {moved} member(s) from "
-                            f"{source_pool.name} to {target_pool.name}."
-                            + (f" {source_pool.name} dissolved." if dissolved_this else "")
-                        )
-                        _logger.info("[P3] %s", condensation_msg)
-
-                        phase3_events.append({
-                            "from_pool":     source_pool.name,
-                            "to_pool":       target_pool.name,
-                            "members_moved": moved,
-                            "dissolved":     dissolved_this,
-                        })
-
-                    if vacancies > 0:
-                        _logger.info(
-                            "[P3] %s still needs %d member(s) — all source pools exhausted.",
-                            target_pool.name, vacancies,
-                        )
-
-                if _p3_iter >= _MAX_P3_ITERS:
-                    _logger.error(
-                        "Phase 3: safety limit reached (%d iterations) — "
-                        "condensation halted early to prevent runaway loop.",
-                        _MAX_P3_ITERS,
-                    )
-
-                # ── Persist + sync all affected pools ──────────────────────────
-                if phase3_transfers:
-                    db.flush()   # push all pool_id changes to DB before counting
-
-                    all_affected_ids = target_ids | {sp.id for sp in source_pools}
-                    for pid in all_affected_ids:
-                        pool_obj: Pool | None = (
-                            db.query(Pool).filter(Pool.id == pid).first()
-                        )
-                        if not pool_obj:
-                            continue
-
-                        if pool_obj.status == PoolStatus.Merged_Dissolved:
-                            pool_obj.total_members = 0
-                            continue
-
-                        new_actual: int = (
-                            db.query(User)
-                            .filter(
-                                User.current_pool_id == pid,
-                                User.status == UserStatus.Active,
-                            )
-                            .count()
-                        )
-                        pool_obj.total_members = new_actual
-
-                        # Restore Paused → Active if condensation filled it to capacity
-                        if (
-                            pool_obj.status == PoolStatus.Paused_Awaiting_Members
-                            and new_actual >= POOL_CAPACITY
-                        ):
-                            pool_obj.status = PoolStatus.Active
-                            _logger.info(
-                                "[P3] %s restored from Paused_Awaiting_Members → Active (%d/12).",
-                                pool_obj.name, new_actual,
-                            )
-
-                    db.commit()
-
-                _logger.info(
-                    "Phase 3 COMPLETE — %d member(s) transferred | %d event(s) | dissolved: [%s]",
-                    phase3_transfers,
-                    len(phase3_events),
-                    ", ".join(phase3_dissolved) if phase3_dissolved else "none",
-                )
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # LEVER 3a — Phase 3 condensation core extracted into _condense_pools_once()
+        # so this waitlist-exhaustion-gated Phase 3 and the new proactive every-week
+        # Pool Merger Engine (run_pool_merger_engine) share ONE implementation.  The
+        # wl_remaining gate and the draw-engine SystemLock check ABOVE remain here
+        # (Phase-3 semantics); the merger calls the same core at its own controlled
+        # in-draw point, deliberately without those gates.
+        _p3 = _condense_pools_once(db)
+        phase3_transfers = _p3["transfers"]
+        phase3_events    = _p3["events"]
+        phase3_dissolved = _p3["dissolved"]
 
     _logger.info(
         "══ assign_waitlist_to_pools DONE  "
@@ -790,6 +599,281 @@ def assign_waitlist_to_pools(db: Session, *, user_prefix: str | None = None) -> 
         "phase3_events":       phase3_events,
         "phase3_dissolved":    phase3_dissolved,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# LEVER 3a — Inter-Pool Condensation core + proactive Pool Merger Engine.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _condense_pools_once(db: Session) -> dict:
+    """
+    Shared inter-pool condensation core (donor → adopt → dissolve).
+
+    Moves Active members FIFO out of full, non-L4-flagged SOURCE pools
+    (created_at DESC) into under-capacity TARGET pools (created_at ASC) to fill
+    vacancies, dissolves emptied source pools (status = Merged_Dissolved,
+    total_members = 0), restores Paused_Awaiting_Members → Active when a pool is
+    refilled to capacity, and keeps pool.total_members in sync.
+
+    MONEY-GRADE PRESERVATION: every moved member keeps current_level,
+    weekly_payment_status and join_date untouched — only current_pool_id changes and
+    dynamic_merges_experienced increments (the Phase-3 contract).  No pool ever
+    exceeds POOL_CAPACITY (targets are filled exactly to 12).
+
+    SDE IMMUNITY: a pool with contains_flagged_l4 == True is NEVER used as a source,
+    so an L4 member is never scattered out of the pool its SDE session was planned
+    against.
+
+    This is the single implementation shared by:
+      • Phase 3 inside assign_waitlist_to_pools (gated on an exhausted waitlist +
+        the draw-engine SystemLock check), and
+      • run_pool_merger_engine (Lever 3a, proactive, every-week, in-draw).
+    The caller owns the gating decisions and the surrounding transaction; this core
+    flushes and commits only when it actually performs transfers.
+
+    Returns {transfers, events, dissolved}.
+    """
+    phase3_transfers: int        = 0
+    phase3_events:    list[dict] = []
+    phase3_dissolved: list[str]  = []
+
+    # Re-query pools to get the current state (post draw / post Phase-1/2).
+    p3_candidates: list[Pool] = (
+        db.query(Pool)
+        .filter(Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]))
+        .order_by(Pool.created_at.asc())
+        .all()
+    )
+
+    p3_targets: list[tuple[Pool, int]] = []
+    for pool in p3_candidates:
+        actual: int = (
+            db.query(User)
+            .filter(User.current_pool_id == pool.id, User.status == UserStatus.Active)
+            .count()
+        )
+        if actual < POOL_CAPACITY:
+            p3_targets.append((pool, actual))
+
+    if not p3_targets:
+        _logger.info(
+            "Condensation: all pools at capacity — condensation not needed."
+        )
+        return {"transfers": 0, "events": [], "dissolved": []}
+
+    target_ids: set[int] = {pool.id for pool, _ in p3_targets}
+
+    # Source pools: full Active pools NOT in the target set AND not L4-flagged.
+    source_pools: list[Pool] = (
+        db.query(Pool)
+        .filter(
+            Pool.status == PoolStatus.Active,
+            Pool.id.notin_(target_ids),
+            Pool.contains_flagged_l4 == False,   # noqa: E712  (SDE immunity)
+        )
+        .order_by(Pool.created_at.desc())
+        .all()
+    )
+
+    if not source_pools:
+        _logger.info(
+            "Condensation: %d pool(s) under capacity but no eligible full source "
+            "pools available — condensation cannot proceed.",
+            len(p3_targets),
+        )
+        return {"transfers": 0, "events": [], "dissolved": []}
+
+    # Cache live member counts per source pool to avoid N+1 queries.
+    src_counts: dict[int, int] = {
+        sp.id: (
+            db.query(User)
+            .filter(User.current_pool_id == sp.id, User.status == UserStatus.Active)
+            .count()
+        )
+        for sp in source_pools
+    }
+
+    _logger.info(
+        "Condensation: %d target pool(s) need filling — harvesting from "
+        "%d source pool(s): %s",
+        len(p3_targets),
+        len(source_pools),
+        ", ".join(f"{sp.name}({src_counts[sp.id]}/12)" for sp in source_pools),
+    )
+
+    _MAX_P3_ITERS = 10_000   # explicit safety ceiling (#189)
+    src_idx  = 0             # rolling pointer into source_pools list
+    _p3_iter = 0             # iteration guard counter
+
+    for target_pool, target_actual in p3_targets:
+        vacancies = POOL_CAPACITY - target_actual
+
+        while vacancies > 0 and src_idx < len(source_pools) and _p3_iter < _MAX_P3_ITERS:
+            _p3_iter += 1
+            source_pool = source_pools[src_idx]
+
+            if src_counts[source_pool.id] == 0:
+                src_idx += 1
+                continue
+
+            to_take = min(vacancies, src_counts[source_pool.id])
+
+            # FIFO within source: transfer oldest members first.
+            transfer_batch: list[User] = (
+                db.query(User)
+                .filter(
+                    User.current_pool_id == source_pool.id,
+                    User.status == UserStatus.Active,
+                )
+                .order_by(User.join_date.asc())
+                .limit(to_take)
+                .all()
+            )
+
+            for member in transfer_batch:
+                # ── LEVEL & STATE PRESERVATION (CRITICAL) ──────────────────────
+                # Only pool_id and journey counter change.
+                # current_level, weekly_payment_status, join_date: NEVER touched.
+                member.current_pool_id            = target_pool.id
+                member.dynamic_merges_experienced = (
+                    (member.dynamic_merges_experienced or 0) + 1
+                )
+                _logger.info(
+                    "[MERGE-XFER]  @%-20s  (id=%5d  L%d  %s)  %s → %s",
+                    member.username,
+                    member.id,
+                    member.current_level,
+                    member.weekly_payment_status.value,
+                    source_pool.name,
+                    target_pool.name,
+                )
+
+            moved = len(transfer_batch)
+            vacancies                  -= moved
+            target_actual              += moved
+            src_counts[source_pool.id] -= moved
+            phase3_transfers           += moved
+
+            dissolved_this = (src_counts[source_pool.id] == 0)
+
+            if dissolved_this:
+                source_pool.status        = PoolStatus.Merged_Dissolved
+                source_pool.total_members = 0
+                phase3_dissolved.append(source_pool.name)
+                src_idx += 1
+
+            condensation_msg = (
+                f"Condensation Event: Moved {moved} member(s) from "
+                f"{source_pool.name} to {target_pool.name}."
+                + (f" {source_pool.name} dissolved." if dissolved_this else "")
+            )
+            _logger.info("[MERGE] %s", condensation_msg)
+
+            phase3_events.append({
+                "from_pool":     source_pool.name,
+                "to_pool":       target_pool.name,
+                "members_moved": moved,
+                "dissolved":     dissolved_this,
+            })
+
+        if vacancies > 0:
+            _logger.info(
+                "[MERGE] %s still needs %d member(s) — all source pools exhausted.",
+                target_pool.name, vacancies,
+            )
+
+    if _p3_iter >= _MAX_P3_ITERS:
+        _logger.error(
+            "Condensation: safety limit reached (%d iterations) — "
+            "halted early to prevent runaway loop.",
+            _MAX_P3_ITERS,
+        )
+
+    # ── Persist + sync all affected pools ─────────────────────────────────────
+    if phase3_transfers:
+        db.flush()   # push all pool_id changes to DB before counting
+
+        all_affected_ids = target_ids | {sp.id for sp in source_pools}
+        for pid in all_affected_ids:
+            pool_obj: Pool | None = (
+                db.query(Pool).filter(Pool.id == pid).first()
+            )
+            if not pool_obj:
+                continue
+
+            if pool_obj.status == PoolStatus.Merged_Dissolved:
+                pool_obj.total_members = 0
+                continue
+
+            new_actual: int = (
+                db.query(User)
+                .filter(
+                    User.current_pool_id == pid,
+                    User.status == UserStatus.Active,
+                )
+                .count()
+            )
+            pool_obj.total_members = new_actual
+
+            # Restore Paused → Active if condensation filled it to capacity.
+            if (
+                pool_obj.status == PoolStatus.Paused_Awaiting_Members
+                and new_actual >= POOL_CAPACITY
+            ):
+                pool_obj.status = PoolStatus.Active
+                _logger.info(
+                    "[MERGE] %s restored from Paused_Awaiting_Members → Active (%d/12).",
+                    pool_obj.name, new_actual,
+                )
+
+        db.commit()
+
+    _logger.info(
+        "Condensation COMPLETE — %d member(s) transferred | %d event(s) | "
+        "dissolved: [%s]",
+        phase3_transfers,
+        len(phase3_events),
+        ", ".join(phase3_dissolved) if phase3_dissolved else "none",
+    )
+
+    return {
+        "transfers": phase3_transfers,
+        "events":    phase3_events,
+        "dissolved": phase3_dissolved,
+    }
+
+
+def run_pool_merger_engine(db: Session) -> dict:
+    """
+    Lever 3a — Proactive Pool Merger Smart Engine (runs EVERY week, in-draw).
+
+    Invoked from execute_weekly_draw immediately AFTER the dual-draw loop ejects
+    winners (leaving vacancies) and BEFORE the residual assign_waitlist_to_pools()
+    refill.  Fills those vacancies from INTERNAL surplus first — moving members FIFO
+    out of full, non-L4-flagged source pools into under-capacity targets and
+    dissolving emptied sources — so the waitlist is only drawn down for vacancies
+    that internal surplus could not cover (the user's residual rule).  This is what
+    dynamically controls pool count and waitlist size.
+
+    Unlike Phase 3 inside assign_waitlist_to_pools this is NOT gated on a fully
+    exhausted waitlist and deliberately does NOT re-check the draw-engine SystemLock:
+    it is called by execute_weekly_draw, which already holds that lock, at a single
+    controlled point in the draw sequence.  L4 immunity is enforced inside the shared
+    core (_condense_pools_once never sources a contains_flagged_l4 pool).
+
+    Returns the same {transfers, events, dissolved} dict as the condensation core.
+    """
+    _logger.info(
+        "POOL MERGER ENGINE (proactive, every-week) — filling post-draw vacancies "
+        "from internal pool surplus before the residual waitlist refill.",
+    )
+    result = _condense_pools_once(db)
+    _logger.info(
+        "POOL MERGER ENGINE DONE — %d member(s) merged | %d pool(s) dissolved.",
+        result["transfers"], len(result["dissolved"]),
+    )
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

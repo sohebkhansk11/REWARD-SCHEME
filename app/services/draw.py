@@ -555,7 +555,9 @@ def execute_weekly_draw(
     Raises ValueError if no eligible full pools are found.
     Returns MassDrawResult with per-pool draw traces, event_trace, and refill summary.
     """
-    from app.services.waitlist import assign_waitlist_to_pools
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVER 3a — import the proactive Pool Merger Engine alongside the refill.
+    from app.services.waitlist import assign_waitlist_to_pools, run_pool_merger_engine
     from app.services.engine_snapshot import (
         get_system_snapshot_atomic, MIN_LPI_DELTA, MAX_REEVALS,
         _evt,
@@ -992,7 +994,30 @@ def execute_weekly_draw(
         len(draw_results), len(skipped),
     )
 
-    # ── 4. Single combined FIFO refill after ALL draws ────────────────────────
+    # ── 4. Proactive Pool Merger Engine, THEN single combined FIFO refill ──────
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVER 3a — run the proactive every-week Pool Merger Engine BEFORE the residual
+    # waitlist refill.  The dual-draw loop above just ejected winners, leaving
+    # vacancies; the merger fills those from internal surplus first (full non-L4
+    # pools → under-capacity pools, dissolving emptied sources), so the residual
+    # assign_waitlist_to_pools() refill that follows only consumes the waitlist for
+    # vacancies internal surplus could NOT cover (the residual rule).  Non-fatal:
+    # a merger failure is logged and the refill still runs (it back-fills from WL).
+    try:
+        merger_summary = run_pool_merger_engine(db)
+        _logger.info(
+            "execute_weekly_draw: pool merger filled %d vacancy-seat(s) from internal "
+            "surplus, dissolved %d pool(s) before residual refill.",
+            merger_summary["transfers"], len(merger_summary["dissolved"]),
+        )
+    except Exception as _merge_exc:
+        db.rollback()
+        _logger.error(
+            "execute_weekly_draw: proactive pool merger failed (non-fatal) — "
+            "residual waitlist refill will still run: %s",
+            _merge_exc, exc_info=True,
+        )
+
     # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # user_prefix threaded through (None in production → unchanged; run-scoped in sim).
     refill = assign_waitlist_to_pools(db, user_prefix=user_prefix)

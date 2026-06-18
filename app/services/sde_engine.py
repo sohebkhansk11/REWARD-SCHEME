@@ -984,6 +984,175 @@ def _execute_case_d_single_pair(
 
 # ── Meta-pool orchestration ───────────────────────────────────────────────────
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# LEVER 2 — Unified Meta Pool Buffer helper (design: SVG sde_framework_meta_pool).
+def _inject_meta_pool_buffer(db: Session, allow_l3_supply: bool) -> dict:
+    """
+    Lever 2 — Unified Meta Pool Buffer.
+
+    Replaces the fragmented, capped supply mechanisms (in particular the Gate-5
+    capped WL emergency promotion, removed in run_sde_meta_pool) with ONE
+    deficit-sized waitlist draw.  For every pool that currently holds a flagged L4,
+    compute how many lower-tier (L1/L2 [+ L3 when allow_l3_supply]) members it is
+    short of SDE_L1L2_THRESHOLD_PER_L4, clamp that to the pool's remaining capacity,
+    sum the per-pool allocations, then pull exactly that many Paid waitlist members
+    FIFO (join_date ASC) and activate them into the deficient L4 pools — oldest L4
+    pool first.
+
+    ROOT-CAUSE FIX FOR BUG #11:  Gate 5 capped promotion at SDE_WL_EMERGENCY_PROMOTE
+    per pool, so when the waitlist held members the supply could not fully drain,
+    wl_count stayed > 0, and cross-pool Case-D pairing (guarded by wl_count == 0) was
+    skipped → pairable L4s leaked to Case E True Defer → L5.  This buffer drains the
+    *actual* deficit with NO per-pool cap, so after it runs any still-uncleared L4 is
+    genuinely unsupplied and is correctly routed to Lever-1 Case D → Case E.
+
+    ADMISSION POLICY (identical to assign_waitlist_to_pools):  only
+    status == Waitlist AND weekly_payment_status == Paid members are eligible, FIFO by
+    join_date ASC.  Activation goes through the canonical _activate_user primitive
+    (status → Active, current_pool_id, current_level = 1, weekly_payment_status = Paid,
+    Rule-39 referral credit, join_date preserved).  Each activation is committed by
+    crud_user.update_user, consistent with the old Gate-5 path (durable, no orphans).
+
+    CAPACITY INVARIANT:  per-pool allocation is clamped to POOL_CAPACITY - live
+    headcount, so no pool ever exceeds 12.  A full L4 pool with no room simply
+    receives no supply and its L4 routes to Case D/E.
+
+    VACANCIES (winners' empty seats) are deliberately NOT filled here — those are
+    owned by Lever 3's proactive merger + residual waitlist refill at the post-draw
+    point.  This buffer supplies lower-tier members only, at T-2H, so flagged L4s can
+    be cleared by the normal SDE path.
+
+    Returns an audit dict:
+        {buffer_size, total_deficit, total_alloc, wl_available, pools, per_pool}.
+    Never raises a controlled no-op — a buffer of size 0 (no deficit, no room, or no
+    Paid WL) is valid.  Does not open/close the outer transaction (caller owns the
+    final commit; individual activations are committed by crud_user.update_user).
+    """
+    from app.services.brain5_lpi_engine import get_flagged_l4_members
+    from app.services.waitlist import _activate_user
+
+    _empty = {"buffer_size": 0, "total_deficit": 0, "total_alloc": 0,
+              "wl_available": 0, "pools": 0, "per_pool": {}}
+
+    _lower_max = 3 if allow_l3_supply else 2
+
+    # Distinct pools holding a flagged L4, de-duplicated preserving first-seen order.
+    l4_members = get_flagged_l4_members(db)
+    l4_pool_ids: list[int] = []
+    _seen: set[int] = set()
+    for _m in l4_members:
+        _pid = _m.current_pool_id
+        if _pid is None or _pid in _seen:
+            continue
+        _seen.add(_pid)
+        l4_pool_ids.append(_pid)
+    if not l4_pool_ids:
+        return dict(_empty)
+
+    # Deterministic FIFO supply order — oldest pool first.
+    pool_objs_list = (
+        db.query(Pool)
+        .filter(Pool.id.in_(l4_pool_ids))
+        .order_by(Pool.created_at.asc(), Pool.id.asc())
+        .all()
+    )
+    pool_objs = {p.id: p for p in pool_objs_list}
+    ordered_pool_ids = [p.id for p in pool_objs_list]
+
+    # Per-pool lower-tier headcount → raw deficit vs threshold.
+    local_lower = {
+        pid: (
+            db.query(func.count(User.id))
+            .filter(
+                User.current_pool_id == pid,
+                User.status          == UserStatus.Active,
+                User.current_level   <= _lower_max,
+            )
+            .scalar()
+        ) or 0
+        for pid in ordered_pool_ids
+    }
+    # Per-pool live headcount → remaining capacity (POOL_CAPACITY hard ceiling).
+    pool_headcount = {
+        pid: (
+            db.query(func.count(User.id))
+            .filter(
+                User.current_pool_id == pid,
+                User.status          == UserStatus.Active,
+            )
+            .scalar()
+        ) or 0
+        for pid in ordered_pool_ids
+    }
+
+    pool_deficit = {
+        pid: max(0, SDE_L1L2_THRESHOLD_PER_L4 - local_lower[pid])
+        for pid in ordered_pool_ids
+    }
+    pool_alloc = {
+        pid: min(pool_deficit[pid], max(0, POOL_CAPACITY - pool_headcount[pid]))
+        for pid in ordered_pool_ids
+    }
+    total_deficit = sum(pool_deficit.values())
+    total_alloc   = sum(pool_alloc.values())
+    if total_alloc <= 0:
+        return {**_empty, "total_deficit": total_deficit,
+                "pools": len(ordered_pool_ids)}
+
+    # Eligible waitlist supply — Paid only, FIFO by join_date (admission policy).
+    paid_wl = (
+        db.query(User)
+        .filter(
+            User.status                == UserStatus.Waitlist,
+            User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+        )
+        .order_by(User.join_date.asc())
+        .limit(total_alloc)
+        .all()
+    )
+    wl_available = len(paid_wl)
+
+    # Distribute FIFO: fill each deficient pool's allocation, oldest pool first.
+    wl_idx = 0
+    per_pool: dict[int, int] = {}
+    for pid in ordered_pool_ids:
+        need = pool_alloc[pid]
+        if need <= 0:
+            continue
+        pool = pool_objs.get(pid)
+        if pool is None:
+            continue
+        for _ in range(need):
+            if wl_idx >= wl_available:
+                break
+            _activate_user(db, paid_wl[wl_idx], pool, phase="META_BUFFER")
+            wl_idx += 1
+            per_pool[pid] = per_pool.get(pid, 0) + 1
+        if wl_idx >= wl_available:
+            break
+
+    db.flush()
+    buffer_size = wl_idx
+
+    if buffer_size > 0:
+        _logger.warning(
+            "SDE META POOL BUFFER: injected %d Paid WL member(s) as lower-tier supply "
+            "into %d L4 pool(s)  (raw_deficit=%d  capacity_clamped_alloc=%d  "
+            "wl_available=%d).  Uncapped deficit-sized draw replaces Gate-5 cap "
+            "(Bug #11 root-cause fix).",
+            buffer_size, len(per_pool), total_deficit, total_alloc, wl_available,
+        )
+
+    return {
+        "buffer_size":   buffer_size,
+        "total_deficit": total_deficit,
+        "total_alloc":   total_alloc,
+        "wl_available":  wl_available,
+        "pools":         len(ordered_pool_ids),
+        "per_pool":      per_pool,
+    }
+
+
 def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
     """
     Master SDE orchestrator for one draw week.
@@ -1101,6 +1270,23 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
         cascade_risk, _l3_sys, _l1l2_sys, allow_l3_supply, lpi,
     )
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVER 2 — Unified Meta Pool Buffer.  Before partitioning L4s into batches,
+    # drain the *actual* lower-tier deficit from the Paid waitlist (FIFO, uncapped,
+    # capacity-clamped) into the L4 pools.  This is the single deficit-sized supply
+    # mechanism that replaces the capped Gate-5 WL promotion (removed below) and is
+    # the root-cause fix for Bug #11 (capped supply left wl_count > 0 → Case D
+    # skipped → Case E leak).  Vacancies are NOT filled here (owned by Lever 3).
+    _meta_buffer = _inject_meta_pool_buffer(db, allow_l3_supply)
+    if _meta_buffer["buffer_size"] > 0:
+        _logger.info(
+            "SDE Meta-Pool: META BUFFER injected %d WL member(s) into %d L4 pool(s) "
+            "(raw_deficit=%d  alloc=%d  wl_available=%d) before batch processing.",
+            _meta_buffer["buffer_size"], len(_meta_buffer["per_pool"]),
+            _meta_buffer["total_deficit"], _meta_buffer["total_alloc"],
+            _meta_buffer["wl_available"],
+        )
+
     meta_result = SDEMetaPoolResult(week_id=week_id)
     session_num  = 1
     remaining    = list(l4_members)
@@ -1206,102 +1392,27 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
             all_uncleared = overflow_from_batch + remaining
             remaining     = []  # all consumed; remaining repopulated below
 
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # LEVER 1 + LEVER 2 — Gate 5 REMOVED.  The capped batch-level WL
+            # emergency promotion (≤ SDE_WL_EMERGENCY_PROMOTE per pool) was the
+            # ROOT CAUSE of Bug #11: when the waitlist held members it could not
+            # fully drain, wl_count stayed > 0, and cross-pool Case D below (guarded
+            # by wl_count == 0) was skipped → pairable L4s leaked to Case E → L5.
+            # Supply is now drained — uncapped and deficit-sized — by
+            # _inject_meta_pool_buffer() (Lever 2) BEFORE batch processing, so by the
+            # time control reaches here the eligible (Paid) waitlist has already been
+            # consumed into the L4 pools.  wl_count is now recomputed counting ONLY
+            # Paid (usable) waitlist members so the Case D guard / odd-leftover route
+            # (Lever 1) makes its supply decision against real, drawable supply rather
+            # than stranded unpaid members that could never be promoted.
             wl_count = (
                 db.query(func.count(User.id))
-                .filter(User.status == UserStatus.Waitlist)
+                .filter(
+                    User.status                == UserStatus.Waitlist,
+                    User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+                )
                 .scalar()
             ) or 0
-
-            # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
-            # Gate 5 — Batch-level WL emergency promotion.
-            # Root cause of "Case E every week no skip": when clearable=0 and
-            # wl_count > 0, Case D's guard (wl_count == 0) evaluates False and
-            # routes directly to Case E despite WL members being available as
-            # lower-tier supply.  Fix: promote WL members (FIFO, up to
-            # SDE_WL_EMERGENCY_PROMOTE per L4 pool) into the overflow L4 pools,
-            # re-count supply, and fire run_sde_session() for any newly-clearable
-            # L4s.  Re-queries wl_count so Case D below sees the current value.
-            # Zero L4 escalation guarantee: Case E is only reached after this
-            # gate exhausts ALL available WL supply.
-            if wl_count > 0 and all_uncleared:
-                _g5_pool_ids = [m.current_pool_id for m in all_uncleared if m.current_pool_id]
-                _g5_promoted_ids: set[int] = set()
-                _g5_total_promoted: int = 0
-                for _g5_l4 in list(all_uncleared):
-                    _g5_pid = _g5_l4.current_pool_id
-                    if _g5_pid is None:
-                        continue
-                    _g5_filter = [User.status == UserStatus.Waitlist]
-                    if _g5_promoted_ids:
-                        _g5_filter.append(User.id.notin_(_g5_promoted_ids))
-                    _g5_wl_candidates = (
-                        db.query(User)
-                        .filter(*_g5_filter)
-                        .order_by(User.join_date.asc())
-                        .limit(SDE_WL_EMERGENCY_PROMOTE)
-                        .all()
-                    )
-                    for _g5_wl_m in _g5_wl_candidates:
-                        crud_user.update_user(
-                            db, _g5_wl_m.id,
-                            UserUpdate(
-                                status=UserStatus.Active,
-                                current_pool_id=_g5_pid,
-                                current_level=1,
-                            ),
-                        )
-                        _g5_promoted_ids.add(_g5_wl_m.id)
-                        _g5_total_promoted += 1
-                        _logger.warning(
-                            "SDE Meta-Pool: GATE 5 WL PROMO — @%s WL→L1 pool=%d  "
-                            "(session=%d  total_promoted=%d)",
-                            _g5_wl_m.username, _g5_pid,
-                            session_num, _g5_total_promoted,
-                        )
-                if _g5_total_promoted > 0:
-                    _g5_lower_supply = (
-                        db.query(func.count(User.id))
-                        .filter(
-                            User.current_pool_id.in_(_g5_pool_ids),
-                            User.status        == UserStatus.Active,
-                            User.current_level <= _lower_max_level,
-                        )
-                        .scalar()
-                    ) or 0
-                    _g5_clearable = _g5_lower_supply // SDE_L1L2_THRESHOLD_PER_L4
-                    if _g5_clearable > 0:
-                        _g5_new_batch  = all_uncleared[:_g5_clearable]
-                        all_uncleared  = all_uncleared[_g5_clearable:]
-                        meta_result.overflow_l4_count -= len(_g5_new_batch)
-                        for _g5_m in _g5_new_batch:
-                            try:
-                                meta_result.overflow_user_ids.remove(_g5_m.id)
-                            except ValueError:
-                                pass
-                        _g5_session = run_sde_session(
-                            db, week_id, session_num, _g5_new_batch, lpi,
-                        )
-                        meta_result.sessions.append(_g5_session)
-                        meta_result.total_l4_cleared += _g5_session.l4_count_completed
-                        session_num += 1
-                        _logger.info(
-                            "SDE Meta-Pool: GATE 5 WL PROMO recovered %d L4(s) into "
-                            "session %d (%d WL member(s) promoted).  Resuming SDE path.",
-                            len(_g5_new_batch), session_num - 1, _g5_total_promoted,
-                        )
-                    # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
-                    # BUG 1 FIX — Gate 5 stale wl_count: must re-query after ANY Gate 5
-                    # promotion, not only when _g5_clearable > 0 launched an SDE session.
-                    # When WL members were promoted but _g5_clearable == 0 (supply still
-                    # insufficient to pair with all L4s), the pre-promotion wl_count is
-                    # stale.  Case D below reads wl_count == 0 to decide whether to pair
-                    # overflow L4s directly; with the stale value it incorrectly sees
-                    # wl_count > 0 and skips Case D, falling through to Case E instead.
-                    wl_count = (
-                        db.query(func.count(User.id))
-                        .filter(User.status == UserStatus.Waitlist)
-                        .scalar()
-                    ) or 0
 
             paired_ids: set[int] = set()
             if wl_count == 0 and len(all_uncleared) >= 2:

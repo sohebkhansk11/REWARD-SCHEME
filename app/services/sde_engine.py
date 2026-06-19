@@ -1387,6 +1387,34 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
     # Step 3: re-read after redistribution
     l4_members = get_flagged_l4_members(db)
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # GAP-D FIX (T-2H half) — RESERVE >=60%-L4+ POOLS FOR ACCELERATED DISSOLUTION.
+    # Any pool already at >= ACCEL_DISS_TRIGGER_RATIO (60%) L4+ is too L4-dense for the
+    # normal shed rate — even Lever 4's same-pool 2/week pair would clear only 2 of
+    # (say) 9 L4 and leave 7 to advance L4 -> L5.  These pools are drained at T-0H by
+    # the Accelerated Dissolution pre-pass in execute_weekly_draw() (2 L4+ exit AND the
+    # remainder demoted / the pool dissolved).  For that relief valve to reach them they
+    # must stay UNLOCKED at T-2H, so we drop their flagged L4 from the SDE batch now: no
+    # normal sub-draw, no Lever 4 same-pool pair, and therefore no draw_completed lock is
+    # applied to them here.  (check_accelerated_dissolution is imported at function scope
+    # to avoid a draw.py <-> sde_engine.py import cycle — same pattern as the other
+    # cross-module calls in this engine.)
+    from app.services.draw import check_accelerated_dissolution as _check_accel_diss
+    _accel_pool_ids: set[int] = set()
+    for _pid in {m.current_pool_id for m in l4_members if m.current_pool_id is not None}:
+        _pool_obj = db.query(Pool).filter(Pool.id == _pid).first()
+        if _pool_obj is not None and _check_accel_diss(db, _pool_obj):
+            _accel_pool_ids.add(_pid)
+    if _accel_pool_ids:
+        _before_excl = len(l4_members)
+        l4_members = [m for m in l4_members if m.current_pool_id not in _accel_pool_ids]
+        _logger.warning(
+            "SDE Meta-Pool: GAP-D — reserved %d pool(s) (>=60%% L4+) for T-0H "
+            "Accelerated Dissolution; excluded %d flagged L4 from SDE staging "
+            "(left UNLOCKED so the relief valve can drain the whole pool).",
+            len(_accel_pool_ids), _before_excl - len(l4_members),
+        )
+
     if not l4_members:
         _logger.info("SDE Meta-Pool: no flagged L4 members — nothing to process.")
         return SDEMetaPoolResult(week_id=week_id)

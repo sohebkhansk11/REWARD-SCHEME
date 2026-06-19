@@ -627,6 +627,65 @@ def execute_weekly_draw(
             _pl3_exc, exc_info=True,
         )
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # GAP-D FIX — ACCELERATED DISSOLUTION AUTO-WIRE (relief valve, was dead-wired).
+    # check_accelerated_dissolution()/run_accelerated_dissolution_draw() existed but
+    # were ONLY reachable from the admin panel (admin.py) — the 60%-L4+ relief valve
+    # NEVER fired automatically in the weekly cycle (wire-diagram GAP-D).  When a pool
+    # crosses ACCEL_DISS_TRIGGER_RATIO (60%) L4+, the normal 1-or-2-L4/week shed rate
+    # cannot keep pace and the surplus L4 advance to L5/L6.  This pre-pass auto-runs
+    # the dissolution on every Active pool that is >=60% L4+ and has NOT yet drawn
+    # this week (the run_sde_meta_pool T-2H exclusion below deliberately leaves these
+    # pools UNLOCKED so this valve can reach them).  Each dissolution clears 2 L4+ and,
+    # if the pool falls below ACCEL_DISS_DISSOLVE_BELOW (8), demotes the remainder to
+    # the waitlist and dissolves the pool — fully draining an L4-dense pool in one shot
+    # so no L4 survives to advance.  Same pre-pass contract as Ext-II/III + Preventive
+    # L3: runs BEFORE staged SDE, sets draw_completed_this_week, skipped by the main
+    # candidate loop.  Failure-isolated (non-fatal) so it can never abort the cycle.
+    _accel_diss_count: int = 0
+    try:
+        _accel_candidates: list[Pool] = (
+            db.query(Pool)
+            .filter(
+                Pool.status                  == PoolStatus.Active,
+                Pool.draw_completed_this_week == False,   # noqa: E712
+            )
+            .all()
+        )
+        for _ap in _accel_candidates:
+            if not check_accelerated_dissolution(db, _ap):
+                continue
+            try:
+                _ad_res = run_accelerated_dissolution_draw(db, _ap.id)
+                _accel_diss_count += 1
+                _logger.warning(
+                    "execute_weekly_draw: ACCEL DISSOLUTION fired on pool '%s' "
+                    "(L4+ ratio=%.0f%%) — 2 L4+ exits, dissolved=%s, relief_pool=%s.",
+                    _ad_res.pool_name, _ad_res.l4plus_ratio * 100,
+                    _ad_res.pool_dissolved, _ad_res.relief_pool_id,
+                )
+            except ValueError as _ad_exc:
+                # <2 L4+ at execution time, pool no longer Active, or already drew —
+                # benign race; leave the pool for the normal path.
+                _logger.warning(
+                    "execute_weekly_draw: accel dissolution skipped pool '%s': %s",
+                    _ap.name, _ad_exc,
+                )
+        if _accel_diss_count:
+            # Prefix-scoped refill (run_accelerated_dissolution_draw's internal refill
+            # is unscoped — production-correct, but the simulation threads user_prefix).
+            assign_waitlist_to_pools(db, user_prefix=user_prefix)
+            _logger.info(
+                "execute_weekly_draw: Accelerated Dissolution ran %d draw(s) before "
+                "staged SDE (60%%-L4+ relief valve).",
+                _accel_diss_count,
+            )
+    except Exception as _accel_exc:
+        _logger.error(
+            "execute_weekly_draw: Accelerated Dissolution pre-pass failed (non-fatal): %s",
+            _accel_exc, exc_info=True,
+        )
+
     # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # Bug #9 — Step 5: T-0H execution of all staged SDE sub-draws.
     # Called here — after Ext-II/III but BEFORE the main candidate loop — so all

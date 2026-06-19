@@ -54,6 +54,11 @@ from app.core.config import (
     SDE_MAX_POOLS_PER_SESSION,
     SDE_L1L2_THRESHOLD_PER_L4,
     SDE_WL_EMERGENCY_PROMOTE,
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVER 5 — Meta-Pool Receiver sizing constants.
+    META_POOL_LOWER_MIN_NORMAL,
+    META_POOL_LOWER_MIN_WORST,
+    META_POOL_MAX_PER_WEEK,
     SDE_CASE_C_MIN_DONOR_L1L2,
     SDE_LEVEL_LOWER_NORMAL, SDE_LEVEL_LOWER_EXCEPTION, SDE_LEVEL_UPPER,
     SDE_EXT2_LEVEL_UPPER, SDE_EXT2_LEVEL_LOWER,
@@ -73,11 +78,15 @@ from app.services.global_config import (
     get_cascade_prevent_thresh,
 )
 from app.crud import token as crud_token, user as crud_user
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# LEVER 5 — crud_pool + Pool schemas for temporary meta-pool creation.
+from app.crud import pool as crud_pool
 from app.models.draw_history import DrawHistory
 from app.models.pool import Pool, PoolStatus
 from app.models.sde_session import SDESession, SDECheckpoint, SDESessionStatus
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.schemas.token import TokenCreate
+from app.schemas.pool import PoolCreate, PoolUpdate
 from app.schemas.user import UserUpdate
 
 _logger = logging.getLogger(__name__)
@@ -1181,6 +1190,323 @@ def _run_same_pool_dual_l4_sweep(
     }
 
 
+# ── LEVER 5: Meta-Pool Receiver (surplus-L4 drain venue) ──────────────────────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# LEVER 5 — closes the residual GAP-A/Question-B leak that survives Lever 4.
+# redistribute_multi_l4_pools() spreads excess L4 to zero-L4 receiver pools; under
+# saturation it finds NO receiver and Lever 4 then clears the two oldest flagged L4
+# of each over-dense pool (one draw / pool / week).  A pool that held 3+ flagged L4
+# is now LOCKED with its 3rd+ L4 still inside — there is no unlocked venue to draw
+# it this week, so it survives that pool's T-0H survivor advancement and escalates
+# L4 -> L5 -> L6 unboundedly.  The documented fix (Discussion.md Q3 / Question B):
+# when all pools carry L4 and no zero-L4 receiver exists, CREATE a temporary meta
+# pool from the Paid waitlist to act as the surplus L4's draw venue so EVERY L4
+# exits in its first week as L4 ("No L4 person should ever reach L5").
+def _stage_meta_pool_single_l4(
+    db:              Session,
+    session_id:      int,
+    sub_draw_number: int,
+    upper_l4:        User,
+    lower_member:    User,
+) -> bool:
+    """
+    Stage (T-2H) ONE meta-pool sub-draw.
+
+    Upper winner = a surplus flagged L4 relocated into a fresh temporary meta pool.
+    Lower winner = a lower-tier (L1/L2/L3) member of that SAME meta pool — normally
+    a just-activated Paid waitlist member.
+
+    Mirrors _stage_same_pool_dual_l4 / the staging tail of execute_sde_sub_draw
+    exactly: writes an SDECheckpoint(executed=False) so execute_staged_sde_draws()
+    commits it at T-0H together with every other sub-draw (simultaneous reveal
+    preserved), and sets the meta pool's one-draw-per-week lock.  The upper winner
+    exits at its L4 net payout (Rs.5,500); the lower winner exits at its own level's
+    net payout.  Because the lower winner is < L4, execute_staged_sde_draws() logs
+    this as a NORMAL SDE draw (edge_case_triggered=False).
+
+    Returns True if staged, False if the pool/members are no longer stageable.
+    """
+    pool: Pool | None = db.query(Pool).filter(Pool.id == upper_l4.current_pool_id).first()
+    if pool is None:
+        return False
+    if pool.draw_completed_this_week:
+        return False
+    if upper_l4.id == lower_member.id:
+        return False
+    if lower_member.current_pool_id != upper_l4.current_pool_id:
+        return False
+    if upper_l4.current_level not in (4, 5):
+        return False
+
+    _, upper_net = get_level_payout(db, upper_l4.current_level)
+    _, lower_net = get_level_payout(db, lower_member.current_level)
+    upper_net_d  = Decimal(str(upper_net))
+    lower_net_d  = Decimal(str(lower_net))
+
+    rng_hash = _compute_rng_seed_hash(pool.id, session_id, sub_draw_number)
+
+    db.add(SDECheckpoint(
+        session_id                 = session_id,
+        sub_draw_number            = sub_draw_number,
+        pool_id                    = pool.id,
+        upper_winner_user_id       = upper_l4.id,
+        upper_winner_level         = upper_l4.current_level,
+        upper_payout_inr           = upper_net_d,
+        lower_winner_user_id       = lower_member.id,
+        lower_winner_level         = lower_member.current_level,
+        lower_payout_inr           = lower_net_d,
+        lower_winner_tier_override = False,
+        rng_seed_hash              = rng_hash,
+        executed                   = False,
+        case_c_transfer            = False,
+        case_c_donor_pool_id       = None,
+    ))
+
+    pool.draw_completed_this_week = True
+    pool.pool_draw_type           = POOL_DRAW_SDE
+    db.commit()
+
+    _logger.info(
+        "SDE Meta-Pool RECEIVER STAGED (T-2H): meta_pool='%s'  upper=@%s(L%d Rs.%s)  "
+        "lower=@%s(L%d Rs.%s)  seed=%s…  [surplus L4 drained — exit deferred to T-0H]",
+        pool.name,
+        upper_l4.username, upper_l4.current_level, upper_net_d,
+        lower_member.username, lower_member.current_level, lower_net_d,
+        rng_hash[:12],
+    )
+    return True
+
+
+def _create_meta_pool_for_surplus_l4(
+    db:                Session,
+    week_id:           str,
+    surplus_l4:        list[User],
+    start_session_num: int,
+) -> dict:
+    """
+    LEVER 5 — META-POOL RECEIVER orchestrator.
+
+    Input: surplus_l4 = flagged L4 members whose own pool ALREADY drew this week
+    (draw_completed_this_week=True — its Lever-4 same-pool pair, or a regular draw)
+    and therefore have NO unlocked venue to exit through.  Left untouched, each such
+    member survives its locked pool's T-0H survivor advancement and escalates
+    L4 -> L5 -> L6 unboundedly (the measured leak).
+
+    For each surplus L4 spawn a TEMPORARY meta pool that gives it an UNLOCKED draw
+    venue so it EXITS this week (Discussion.md Q3 / Question B):
+
+      • Single-L4 form (primary — the user's documented spec):
+          1 surplus L4 (upper)  +  lower tier pulled from the Paid waitlist FIFO.
+          lower_n = MIN(META_POOL_LOWER_MIN_NORMAL, paid_wl_available); the meta
+          pool can form with as few as META_POOL_LOWER_MIN_WORST lower members
+          (worst case: only 2 Paid waitlist members remain).  Below that floor the
+          single-L4 form cannot be built.
+
+      • Dual-L4 fallback (waitlist-dry):
+          when the waitlist cannot supply even the worst-case floor BUT >= 2 surplus
+          L4 remain, relocate two surplus L4 into one fresh meta pool and pair them
+          same-pool (Lever-4 dual-L4 staging) — both exit, ZERO waitlist consumed.
+
+    Bounded by META_POOL_MAX_PER_WEEK temporary pools per cycle.  Two-phase staged
+    (T-2H); revealed simultaneously at T-0H.  Each meta pool's surviving lower-tier
+    members are ordinary pool members afterward — the refill engine / Lever-3 merger
+    reconciles them (self-balancing, zero orphans).
+
+    Returns dict(meta_pools, l4_drained, handled_ids, next_session_num).
+    """
+    # Local imports — avoid the draw <-> waitlist <-> sde_engine module cycle.
+    from app.services.waitlist import _next_pool_name
+
+    handled_ids: set[int] = set()
+    meta_pools:  int      = 0
+    l4_drained:  int      = 0
+    session_num: int      = start_session_num
+
+    _epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    queue: list[User] = sorted(surplus_l4, key=lambda u: (u.join_date or _epoch, u.id))
+
+    while queue and meta_pools < META_POOL_MAX_PER_WEEK:
+        # Live Paid-waitlist availability — recomputed each iteration because
+        # prior meta pools in this loop have already consumed waitlist members.
+        paid_wl: list[User] = (
+            db.query(User)
+            .filter(
+                User.status                == UserStatus.Waitlist,
+                User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+            )
+            .order_by(User.join_date.asc())
+            .limit(META_POOL_LOWER_MIN_NORMAL)
+            .all()
+        )
+
+        # ── Primary: single-L4 meta pool with a Paid-waitlist lower tier ───────
+        if len(paid_wl) >= META_POOL_LOWER_MIN_WORST:
+            upper_l4 = queue.pop(0)
+            lower_n  = len(paid_wl)   # already capped at NORMAL by the .limit()
+
+            meta_pool = crud_pool.create_pool(
+                db,
+                PoolCreate(name=_next_pool_name(db), status=PoolStatus.Active, total_members=0),
+            )
+            _origin_pid = upper_l4.current_pool_id
+
+            # Relocate the surplus L4 OUT of its locked pool into the meta pool.
+            # Level stays 4 and sde_required stays True (still a flagged L4 — now in
+            # an UNLOCKED venue); it is no longer a survivor of its old pool's staged
+            # draw, so it cannot advance L4->L5 there at T-0H.
+            crud_user.update_user(db, upper_l4.id, UserUpdate(current_pool_id=meta_pool.id))
+
+            # Activate the Paid-waitlist lower tier into the meta pool as L1.
+            for wl_m in paid_wl:
+                crud_user.update_user(
+                    db, wl_m.id,
+                    UserUpdate(
+                        status          = UserStatus.Active,
+                        current_pool_id = meta_pool.id,
+                        current_level   = 1,
+                    ),
+                )
+                if wl_m.referred_by_user_id:
+                    from app.services.draw import _credit_referral_bonus
+                    _credit_referral_bonus(db, wl_m.referred_by_user_id)
+            db.flush()
+
+            _sess = SDESession(
+                week_id          = week_id,
+                session_number   = session_num,
+                status           = SDESessionStatus.Running,
+                l4_count_planned = 1,
+                started_at       = datetime.now(timezone.utc),
+            )
+            db.add(_sess)
+            db.flush()
+
+            lower_winner = paid_wl[0]   # FIFO-oldest WL member exits as lower winner
+            staged = _stage_meta_pool_single_l4(
+                db,
+                session_id      = _sess.id,
+                sub_draw_number = 1,
+                upper_l4        = upper_l4,
+                lower_member    = lower_winner,
+            )
+
+            crud_pool.update_pool(db, meta_pool.id, PoolUpdate(total_members=1 + lower_n))
+
+            if staged:
+                _sess.status             = SDESessionStatus.Completed
+                _sess.l4_count_completed = 1
+                _sess.completed_at       = datetime.now(timezone.utc)
+                db.commit()
+                handled_ids.add(upper_l4.id)
+                meta_pools  += 1
+                l4_drained  += 1
+                session_num += 1
+                _logger.warning(
+                    "SDE Meta-Pool: LEVER 5 RECEIVER — spawned meta pool '%s' (id=%d) "
+                    "for surplus L4 @%s (origin pool %s was locked, no redistribution "
+                    "receiver); pulled %d Paid-WL lower-tier member(s) (lower winner "
+                    "@%s).  Surplus L4 EXITS at T-0H instead of advancing L4->L5.",
+                    meta_pool.name, meta_pool.id, upper_l4.username, _origin_pid,
+                    lower_n, lower_winner.username,
+                )
+            else:
+                # Staging race (member/pool became unstageable) — close the empty
+                # session and advance session_num so the (week_id, session_number)
+                # UNIQUE constraint is never violated by the next iteration.
+                _sess.status             = SDESessionStatus.Completed
+                _sess.l4_count_completed = 0
+                _sess.completed_at       = datetime.now(timezone.utc)
+                db.commit()
+                session_num += 1
+                _logger.error(
+                    "SDE Meta-Pool: LEVER 5 — staging failed for surplus L4 @%s into "
+                    "meta pool '%s'; member falls through to the normal ladder.",
+                    upper_l4.username, meta_pool.name,
+                )
+            continue
+
+        # ── Fallback: waitlist below worst-case floor — dual-L4 meta pool ──────
+        # Relocate two surplus L4 into ONE fresh meta pool and pair them same-pool
+        # (reuses Lever-4 dual-L4 staging).  Both exit; zero waitlist consumed.
+        if len(queue) >= 2:
+            up = queue.pop(0)
+            lo = queue.pop(0)
+
+            meta_pool = crud_pool.create_pool(
+                db,
+                PoolCreate(name=_next_pool_name(db), status=PoolStatus.Active, total_members=0),
+            )
+            crud_user.update_user(db, up.id, UserUpdate(current_pool_id=meta_pool.id))
+            crud_user.update_user(db, lo.id, UserUpdate(current_pool_id=meta_pool.id))
+            db.flush()
+
+            _sess = SDESession(
+                week_id          = week_id,
+                session_number   = session_num,
+                status           = SDESessionStatus.Running,
+                l4_count_planned = 2,
+                started_at       = datetime.now(timezone.utc),
+            )
+            db.add(_sess)
+            db.flush()
+
+            staged = _stage_same_pool_dual_l4(
+                db,
+                session_id      = _sess.id,
+                sub_draw_number = 1,
+                upper_l4        = up,
+                lower_l4        = lo,
+            )
+            crud_pool.update_pool(db, meta_pool.id, PoolUpdate(total_members=2))
+
+            if staged:
+                _sess.status             = SDESessionStatus.Completed
+                _sess.l4_count_completed = 2
+                _sess.completed_at       = datetime.now(timezone.utc)
+                db.commit()
+                handled_ids.add(up.id)
+                handled_ids.add(lo.id)
+                meta_pools  += 1
+                l4_drained  += 2
+                session_num += 1
+                _logger.warning(
+                    "SDE Meta-Pool: LEVER 5 RECEIVER (DUAL-L4 fallback) — waitlist "
+                    "below worst-case floor; paired surplus L4 @%s + @%s into fresh "
+                    "meta pool '%s' (id=%d).  BOTH exit at T-0H (Rs.11,000), zero WL.",
+                    up.username, lo.username, meta_pool.name, meta_pool.id,
+                )
+            else:
+                _sess.status             = SDESessionStatus.Completed
+                _sess.l4_count_completed = 0
+                _sess.completed_at       = datetime.now(timezone.utc)
+                db.commit()
+                session_num += 1
+                _logger.error(
+                    "SDE Meta-Pool: LEVER 5 DUAL-L4 staging failed for @%s + @%s.",
+                    up.username, lo.username,
+                )
+            continue
+
+        # Neither single-L4 (WL < worst-case floor) nor dual-L4 (< 2 surplus) is
+        # possible — genuine exhaustion.  Leave the remainder to Case D / Case E.
+        break
+
+    if queue:
+        _logger.warning(
+            "SDE Meta-Pool: LEVER 5 — %d surplus L4 could not be drained into a meta "
+            "pool this cycle (meta_pools=%d/%d; waitlist + pairing exhausted); they "
+            "route to the normal supply ladder (Case D / Case E).",
+            len(queue), meta_pools, META_POOL_MAX_PER_WEEK,
+        )
+
+    return {
+        "meta_pools":       meta_pools,
+        "l4_drained":       l4_drained,
+        "handled_ids":      handled_ids,
+        "next_session_num": session_num,
+    }
+
+
 # ── Meta-pool orchestration ───────────────────────────────────────────────────
 
 # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
@@ -1541,6 +1867,50 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
         )
 
     session_num  = _sweep["next_session_num"]
+
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVER 5 — META-POOL RECEIVER (residual GAP-A / Question-B leak fix).
+    # After Lever 4, any flagged L4 still sitting in a pool that ALREADY drew this
+    # week (draw_completed_this_week=True — its Lever-4 same-pool pair, or a regular
+    # draw) has NO unlocked venue to exit through.  In the normal batch loop below
+    # it overflows on its locked pool AND — worse — survives that pool's T-0H
+    # survivor advancement, escalating L4->L5->L6 unboundedly (the measured leak).
+    # Detect every such SURPLUS L4 and drain it through a TEMPORARY meta pool
+    # spawned from the Paid waitlist (Discussion.md Q3 / Question B): "if all pools
+    # carry L4 and no zero-L4 receiver exists, create a meta pool" so every L4 exits
+    # in its first week as L4.  Each meta pool is fresh + unlocked (honours
+    # one-draw-per-week) and staged two-phase (revealed simultaneously at T-0H).
+    _locked_pool_ids = {
+        pid for (pid,) in (
+            db.query(Pool.id)
+            .filter(Pool.draw_completed_this_week.is_(True))
+            .all()
+        )
+    }
+    _surplus_l4 = [
+        m for m in l4_members
+        if m.current_pool_id is not None and m.current_pool_id in _locked_pool_ids
+    ]
+    if _surplus_l4:
+        _logger.warning(
+            "SDE Meta-Pool: LEVER 5 — %d flagged L4 stuck in locked pools after "
+            "Lever 4 (no unlocked draw venue); routing to meta-pool receiver.",
+            len(_surplus_l4),
+        )
+        _mp = _create_meta_pool_for_surplus_l4(db, week_id, _surplus_l4, session_num)
+        if _mp["handled_ids"]:
+            _mp_handled = _mp["handled_ids"]
+            l4_members  = [m for m in l4_members if m.id not in _mp_handled]
+            meta_result.total_l4_cleared      += _mp["l4_drained"]
+            meta_result.total_pools_processed += _mp["meta_pools"]
+            session_num                        = _mp["next_session_num"]
+            _logger.warning(
+                "SDE Meta-Pool: LEVER 5 RECEIVER drained %d surplus L4 via %d "
+                "temporary meta pool(s) (saturated/locked pools had no draw venue). "
+                "%d flagged L4 remain for the normal supply ladder.",
+                _mp["l4_drained"], _mp["meta_pools"], len(l4_members),
+            )
+
     remaining    = list(l4_members)
 
     while remaining:

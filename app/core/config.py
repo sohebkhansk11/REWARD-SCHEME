@@ -114,6 +114,21 @@ SDE_L1L2_THRESHOLD_PER_L4:  int = 2   # minimum L1/L2 candidates needed per L4 m
 # Emergency WL promotion: when L1/L2 < 1 for lower tier, pull this many WL members
 SDE_WL_EMERGENCY_PROMOTE:   int = 2   # max WL members to pull per emergency draw
 
+# ── LEVER 5 — Meta-Pool Receiver (surplus-L4 drain venue) ─────────────────────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# When a saturated pool has shed its 2 oldest flagged L4 (Lever 4) and is LOCKED,
+# any 3rd+ flagged L4 has NO unlocked draw venue this week; left alone it survives
+# its locked pool's staged draw and advances L4->L5 at T-0H (the unbounded leak).
+# Lever 5 spawns a TEMPORARY meta pool from the Paid waitlist to give each such
+# surplus L4 an UNLOCKED venue so it EXITS this week (Discussion.md Q3 / Question B;
+# design: a meta pool needs only L4>=1 plus a small lower tier).
+#   META_POOL_LOWER_MIN_NORMAL — lower-tier size pulled from WL in normal conditions.
+#   META_POOL_LOWER_MIN_WORST  — absolute floor (worst case: WL has only 2 Paid left).
+#   META_POOL_MAX_PER_WEEK     — cap on temporary pools spawned per draw cycle.
+META_POOL_LOWER_MIN_NORMAL: int = 6   # 1 L4 + 6 lower = healthy meta pool (Q3 ~8)
+META_POOL_LOWER_MIN_WORST:  int = 2   # 1 L4 + 2 lower = worst-case minimum pool
+META_POOL_MAX_PER_WEEK:     int = 6   # bound spawned meta pools (== max pools/session)
+
 # ── Condensation / draw window ────────────────────────────────────────────────
 # System pauses only when confirmed new member inflow drops below this threshold.
 SYSTEM_PAUSE_INFLOW_THRESHOLD:    int = 2    # confirmed DEP token burns per week

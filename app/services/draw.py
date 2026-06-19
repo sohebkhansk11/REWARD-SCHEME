@@ -153,6 +153,13 @@ class MassDrawResult:
     # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
     preventive_l3_draws_this_week: int = 0   # Q4 preventive L3 draws this cycle
     # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # PHASE C1 (correctness) — Accelerated-Dissolution pre-pass draws this cycle.
+    # The DrawHistory delta that becomes the authoritative draws_this_week total
+    # COUNTS these (POOL_DRAW_ACCELERATED rows), so the per-type composition must
+    # carry them too for the row to reconcile exactly:
+    #   regular + sde + ext + preventive_l3 + accel == draws_this_week.
+    accel_draws_this_week:        int  = 0   # 60%-L4+ relief-valve dissolution draws
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # PHASE B — situational draw lean used this cycle (THROUGHPUT/BALANCED/
     # LIABILITY_CONTROL).  Reporting-only; surfaced in the sim metrics + dashboard
     # so the per-type draw composition is legible against the posture that drove it.
@@ -1308,6 +1315,10 @@ def execute_weekly_draw(
         sde_draws_this_week=_staged_executed,
         ext_draws_this_week=_ext_draws_count,
         preventive_l3_draws_this_week=_preventive_l3_count,
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # PHASE C1 (correctness) — accel-dissolution pre-pass count completes the
+        # per-type composition so it reconciles with the DrawHistory delta total.
+        accel_draws_this_week=_accel_diss_count,
         # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
         # PHASE B — surface this cycle's situational lean for telemetry/dashboard.
         draw_posture=_draw_posture,

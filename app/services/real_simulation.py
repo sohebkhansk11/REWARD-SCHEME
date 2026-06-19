@@ -1694,6 +1694,18 @@ class RealSimEngine:
         from app.models.system_lock import SystemLock
         from app.models.draw_history import DrawHistory
         from app.core.config import POOL_DRAW_SDE_EXT2, POOL_DRAW_SDE_EXT3, POOL_DRAW_ACCELERATED
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # PHASE C1 (accel/Case-D correctness) — the remaining draw_type constants needed
+        # to compute the per-type DrawHistory-delta composition as an EXACT PARTITION of
+        # the authoritative draws_this_week window (see TICK7 metrics section). type_a /
+        # type_b ride in the 'regular' bucket (run_dual_draw immediate T-0H draws);
+        # sde + sde_case_c form the 'sde' bucket so T-2H INLINE cross-pool Case-D draws
+        # (sde_engine._execute_case_d_single_pair) — which the T-0H staged-execution
+        # counter structurally cannot see — are counted. This is the money-grade source.
+        from app.core.config import (
+            POOL_DRAW_REGULAR, POOL_DRAW_TYPE_A, POOL_DRAW_TYPE_B,
+            POOL_DRAW_SDE, POOL_DRAW_SDE_CASE_C, POOL_DRAW_SDE_PREVENTIVE_L3,
+        )
 
         # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
         # ── REAL PostgreSQL session — replaces sqlite:///:memory: ─────────────
@@ -2092,6 +2104,19 @@ class RealSimEngine:
                     # Post-T+5M delta gives exact per-week draw count, winner count, and
                     # cash outflow covering ALL draw types (SDE, Ext-II, Ext-III, Regular).
                     _draws_total_before  = db.query(func.count(DrawHistory.id)).scalar() or 0
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # PHASE C1 (accel/Case-D correctness) — capture the per-draw_type row
+                    # counts at the EXACT SAME instant as the all-types baseline above
+                    # (T-2H, before any draw this week). The composition is then a delta over
+                    # this IDENTICAL window, so regular+sde+ext+prev_l3+accel == draws_this_week
+                    # holds EXACTLY (a partition of the DrawHistory rows by draw_type). This is
+                    # what closes the SDE undercount: mass_result.sde_draws_this_week only sees
+                    # T-0H STAGED executions and misses T-2H INLINE cross-pool Case-D draws,
+                    # whereas this window-delta counts every sde-family row regardless of phase.
+                    _dtype_before = dict(
+                        db.query(DrawHistory.draw_type, func.count(DrawHistory.id))
+                        .group_by(DrawHistory.draw_type).all()
+                    )
                     _payout_total_before = float(
                         db.query(func.sum(
                             DrawHistory.winner_1_net_payout + DrawHistory.winner_2_net_payout,
@@ -2193,6 +2218,7 @@ class RealSimEngine:
                     comp_sde_draws           = 0   # SDE sub-draws (incl. Lever 4 / Lever 5 / meta)
                     comp_ext_draws           = 0   # Ext-II/III L5/L6 clearance draws
                     comp_preventive_l3_draws = 0   # Preventive-L3 cascade pre-pass draws
+                    comp_accel_draws         = 0   # Accel-Dissolution (60%-L4+ relief) draws
                     comp_draw_posture        = "BALANCED"   # Phase B situational lean this week
 
                     try:
@@ -2211,11 +2237,16 @@ class RealSimEngine:
                         # Temporary value — overwritten by DrawHistory delta below (Bug #1 fix
                         # from Jun-13 session).  Summing all MassDrawResult draw-type counters
                         # for correctness in case the delta computation path is skipped.
+                        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        # Include accel-dissolution so this temporary fallback total matches
+                        # the authoritative DrawHistory delta (which counts accel rows) in the
+                        # rare path where the delta recompute below is skipped (exception).
                         draws_this_week  = (
                             mass_result.pools_drawn
                             + mass_result.sde_draws_this_week
                             + mass_result.ext_draws_this_week
                             + mass_result.preventive_l3_draws_this_week
+                            + mass_result.accel_draws_this_week
                         )
                         pauses_this_week = len(mass_result.paused_pools)
                         # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
@@ -2231,12 +2262,13 @@ class RealSimEngine:
                         gate_paused_names  = list(mass_result.paused_pools)
                         # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
                         # PHASE C1 — capture the per-type draw counts the engine already
-                        # returns (regular == gate_pools_drawn above). These reconcile by
-                        # construction with draws_this_week computed at line ~2213:
-                        #   regular + sde + ext + preventive_l3 == draws_this_week.
+                        # returns (regular == gate_pools_drawn above). The FIVE typed counts
+                        # reconcile exactly with the authoritative DrawHistory-delta total:
+                        #   regular + sde + ext + preventive_l3 + accel == draws_this_week.
                         comp_sde_draws           = mass_result.sde_draws_this_week
                         comp_ext_draws           = mass_result.ext_draws_this_week
                         comp_preventive_l3_draws = mass_result.preventive_l3_draws_this_week
+                        comp_accel_draws         = mass_result.accel_draws_this_week
                         # PHASE B — situational draw lean the engine ran this cycle.
                         comp_draw_posture        = mass_result.draw_posture
                         # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
@@ -2312,6 +2344,51 @@ class RealSimEngine:
                     draws_this_week        = _draws_total_after  - _draws_total_before
                     cash_outflow_this_week = _payout_total_after - _payout_total_before
                     total_draws           += draws_this_week
+
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # PHASE C1 (accel/Case-D correctness) — AUTHORITATIVE draw-composition.
+                    # Recompute the per-draw_type snapshot at the SAME after-instant used for
+                    # draws_this_week, then bucket the window delta. Because every DrawHistory
+                    # row carries exactly one draw_type and the buckets below partition the
+                    # ENTIRE draw_type space, the five buckets sum to draws_this_week EXACTLY —
+                    # no draw type (incl. T-2H inline cross-pool Case-D, sde_case_c) can escape
+                    # the count the way the T-0H staged-execution counter did.
+                    #   regular bucket : regular + type_a + type_b  (run_dual_draw immediate)
+                    #   sde     bucket : sde + sde_case_c           (staged T-0H + INLINE T-2H Case-D)
+                    #   ext     bucket : sde_ext2 + sde_ext3        (L5/L6 forced-exit valve)
+                    #   prev_l3 bucket : sde_preventive_l3          (cascade pre-pass)
+                    #   accel   bucket : accelerated_dissolution    (≥60% L4+ relief)
+                    _dtype_after = dict(
+                        db.query(DrawHistory.draw_type, func.count(DrawHistory.id))
+                        .group_by(DrawHistory.draw_type).all()
+                    )
+                    def _dtype_delta(*types):
+                        return sum(
+                            (_dtype_after.get(t, 0) - _dtype_before.get(t, 0)) for t in types
+                        )
+                    comp_regular_draws       = _dtype_delta(
+                        POOL_DRAW_REGULAR, POOL_DRAW_TYPE_A, POOL_DRAW_TYPE_B)
+                    comp_sde_draws           = _dtype_delta(POOL_DRAW_SDE, POOL_DRAW_SDE_CASE_C)
+                    comp_ext_draws           = _dtype_delta(POOL_DRAW_SDE_EXT2, POOL_DRAW_SDE_EXT3)
+                    comp_preventive_l3_draws = _dtype_delta(POOL_DRAW_SDE_PREVENTIVE_L3)
+                    comp_accel_draws         = _dtype_delta(POOL_DRAW_ACCELERATED)
+                    # MONEY-GRADE GUARD — the five buckets MUST exhaust the window. A non-zero
+                    # residual means a draw_type was written that no bucket claims (a telemetry
+                    # gap of exactly the class we just fixed). Log it LOUDLY rather than paper
+                    # over it; the isolated harness folds the same check into its PASS/FAIL gate.
+                    comp_other_draws = draws_this_week - (
+                        comp_regular_draws + comp_sde_draws + comp_ext_draws
+                        + comp_preventive_l3_draws + comp_accel_draws
+                    )
+                    if comp_other_draws != 0:
+                        _logger.error(
+                            "Week %d DRAW-COMPOSITION GAP: %d unclassified draw(s) — "
+                            "regular=%d sde=%d ext=%d prev_l3=%d accel=%d total=%d "
+                            "(per-type snapshot before=%s after=%s)",
+                            week_num, comp_other_draws, comp_regular_draws, comp_sde_draws,
+                            comp_ext_draws, comp_preventive_l3_draws, comp_accel_draws,
+                            draws_this_week, _dtype_before, _dtype_after,
+                        )
 
                     # Bug #4: member flow deltas — who joined active pools, who exited as winners
                     _week_elim_won_after  = db.query(func.count(_U6m.id)).filter(
@@ -2420,14 +2497,23 @@ class RealSimEngine:
                     # PHASE C1 — DRAW-COMPOSITION row. Splits the single draws total into its
                     # draw-type components so the "1:10 regular:SDE" the admin saw is legible as
                     # SDE legitimately replacing the regular draw on flagged pools (not phantom
-                    # "out-of-code draws"). These four keys reconcile exactly with the row's
-                    # total: regular + sde + ext + preventive_l3 == draws_this_week. 'scenario'
-                    # already lives in metrics (set in _snapshot); 'draw_posture' is added in
-                    # Phase B once draw_priority.py surfaces the posture on MassDrawResult.
-                    metrics["regular_draws_this_week"]       = gate_pools_drawn          # mass_result.pools_drawn
+                    # "out-of-code draws"). All FIVE keys are the authoritative per-draw_type
+                    # DrawHistory-window deltas computed above, so they reconcile EXACTLY:
+                    #   regular + sde + ext + preventive_l3 + accel == draws_this_week
+                    # by construction (a partition of the window's rows by draw_type). 'regular'
+                    # is the DB delta of {regular,type_a,type_b} — equal to gate_pools_drawn in
+                    # the normal path but resilient on the no-eligible-pools abort path where
+                    # mass_result is unset yet T-2H SDE/Case-D rows already landed. 'scenario'
+                    # already lives in metrics (set in _snapshot); 'draw_posture' is Phase B's lean.
+                    metrics["regular_draws_this_week"]       = comp_regular_draws
                     metrics["sde_draws_this_week"]           = comp_sde_draws
                     metrics["ext_draws_this_week"]           = comp_ext_draws
                     metrics["preventive_l3_draws_this_week"] = comp_preventive_l3_draws
+                    metrics["accel_draws_this_week"]         = comp_accel_draws
+                    # MONEY-GRADE GUARD KEY — must be 0; non-zero ⇒ an unbucketed draw_type
+                    # leaked into the window (telemetry gap). Surfaced for dashboard/audit and
+                    # asserted == 0 by the isolated reconciliation harness.
+                    metrics["unclassified_draws_this_week"]  = comp_other_draws
                     # PHASE B — situational draw posture this week (THROUGHPUT / BALANCED /
                     # LIABILITY_CONTROL). Pairs with 'scenario' already in metrics so the
                     # composition row reads against the lean + quant scenario that drove it.

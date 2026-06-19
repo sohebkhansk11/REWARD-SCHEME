@@ -2110,8 +2110,11 @@ class RealSimEngine:
                     admin_ovr   = False
 
                     try:
+                        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        # Jun-19 dual-tick: thread the run-scope prefix so STEP 3b's
+                        # T-2H merger refill only touches THIS run's waitlist users.
                         prep_state = start_draw_preparation(
-                            db, draw_time_utc=m.T_00H,
+                            db, draw_time_utc=m.T_00H, user_prefix=injector._pfx,
                         )
                         prep_ok   = True
                         admin_ovr = bool(prep_state.admin_override_required)

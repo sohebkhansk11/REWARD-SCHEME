@@ -574,7 +574,10 @@ def execute_weekly_draw(
     """
     # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # LEVER 3a — import the proactive Pool Merger Engine alongside the refill.
-    from app.services.waitlist import assign_waitlist_to_pools, run_pool_merger_engine
+    # Jun-19 dual-tick: run_merger_refill_converge loops compaction+refill to capacity.
+    from app.services.waitlist import (
+        assign_waitlist_to_pools, run_pool_merger_engine, run_merger_refill_converge,
+    )
     from app.services.engine_snapshot import (
         get_system_snapshot_atomic, MIN_LPI_DELTA, MAX_REEVALS,
         _evt,
@@ -1070,20 +1073,25 @@ def execute_weekly_draw(
         len(draw_results), len(skipped),
     )
 
-    # ── 4. Proactive Pool Merger Engine, THEN single combined FIFO refill ──────
+    # ── 4. Post-draw merger CONVERGENCE, THEN single combined FIFO refill ──────
     # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
-    # LEVER 3a — run the proactive every-week Pool Merger Engine BEFORE the residual
-    # waitlist refill.  The dual-draw loop above just ejected winners, leaving
-    # vacancies; the merger fills those from internal surplus first (full non-L4
-    # pools → under-capacity pools, dissolving emptied sources), so the residual
-    # assign_waitlist_to_pools() refill that follows only consumes the waitlist for
-    # vacancies internal surplus could NOT cover (the residual rule).  Non-fatal:
-    # a merger failure is logged and the refill still runs (it back-fills from WL).
+    # Jun-19 dual-tick (Point 1): the dual-draw loop above just ejected winners,
+    # leaving vacancies.  run_merger_refill_converge loops two-pointer compaction +
+    # waitlist refill UNTIL every consolidatable pool is full and the remainder pool
+    # is topped up from the waitlist (the user's "run the merger until all pools are
+    # full, then resync+refill the remainder" rule).  This replaces the old single
+    # inert run_pool_merger_engine(db) call (which could only source 12/12 surplus
+    # pools — structurally inert post-draw when every pool sits at 10/12).  The
+    # residual assign_waitlist_to_pools() below then produces the clean final refill
+    # snapshot for MassDrawResult.  Non-fatal: a merger failure is logged and the
+    # refill still runs (it back-fills from the waitlist).
     try:
-        merger_summary = run_pool_merger_engine(db)
+        merger_summary = run_merger_refill_converge(db, user_prefix=user_prefix)
         _logger.info(
-            "execute_weekly_draw: pool merger filled %d vacancy-seat(s) from internal "
-            "surplus, dissolved %d pool(s) before residual refill.",
+            "execute_weekly_draw: post-draw merger convergence packed pools in %d "
+            "round(s) — %d member(s) compacted, %d pool(s) dissolved before residual "
+            "refill.",
+            merger_summary["rounds"],
             merger_summary["transfers"], len(merger_summary["dissolved"]),
         )
     except Exception as _merge_exc:

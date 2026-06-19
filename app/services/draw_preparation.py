@@ -211,6 +211,7 @@ def _count_consecutive_type_b_weeks(db: Session) -> int:
 def start_draw_preparation(
     db: Session,
     draw_time_utc: datetime,
+    user_prefix: str | None = None,
 ) -> WeeklyDrawState:
     """
     T-2H draw preparation.  Call this exactly 2 hours before the draw.
@@ -223,6 +224,9 @@ def start_draw_preparation(
     Args:
       db:            SQLAlchemy session.
       draw_time_utc: UTC datetime of the draw (e.g. Sunday 13:30 UTC = 7 PM IST).
+      user_prefix:   Optional run-scope prefix (None in production → all paid waitlist
+                     users; set by the isolated sim so the STEP 3b merger refill only
+                     touches that run's users).
 
     Returns:
       WeeklyDrawState with preparation_valid=True on success.
@@ -262,7 +266,9 @@ def start_draw_preparation(
     _logger.info("start_draw_preparation: draw engine lock acquired for week %s.", week_id)
 
     try:
-        state = _run_preparation(db, week_id, draw_time_utc, idem_key, existing)
+        state = _run_preparation(
+            db, week_id, draw_time_utc, idem_key, existing, user_prefix=user_prefix,
+        )
         return state
     except Exception as exc:
         _logger.error(
@@ -282,6 +288,7 @@ def _run_preparation(
     draw_time_utc: datetime,
     idem_key: str,
     existing: WeeklyDrawState | None,
+    user_prefix: str | None = None,
 ) -> WeeklyDrawState:
     """
     Core preparation logic.  Called only when the lock is held.
@@ -340,6 +347,36 @@ def _run_preparation(
             "Preparation STEP 3: catch-up flagged %d L4 member(s) "
             "(should be 0 in normal operation — indicates draw.py flag may have missed them).",
             newly_flagged,
+        )
+
+    # ── STEP 3b: T-2H merger convergence (Jun-19 dual-tick, Point 2) ──────────
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # After grace closes (TICK5) and L4 flagging is final (STEP 3, so
+    # contains_flagged_l4 is accurate for SDE immunity), pack every non-flagged pool
+    # to 12 BEFORE the eligibility gate runs at T-0H.  run_merger_refill_converge
+    # loops two-pointer compaction + waitlist refill until all consolidatable pools
+    # are full and the remainder is topped up from the waitlist — so more pools sit at
+    # exactly 12/12 and become draw-eligible this week (the user's "merger also runs
+    # in T-2H preparation, same as Point 1" rule).  Runs BEFORE STEP 8 SDE staging so
+    # the SDE draw operates on packed pools.  Non-fatal: a failure here is logged and
+    # preparation continues (the draw still runs; refill back-fills at T-0H).
+    from app.services.waitlist import run_merger_refill_converge
+    try:
+        _conv = run_merger_refill_converge(db, user_prefix=user_prefix)
+        _logger.info(
+            "Preparation STEP 3b: T-2H merger convergence packed pools in %d round(s) "
+            "— %d member(s) compacted, %d pool(s) dissolved.",
+            _conv["rounds"], _conv["transfers"], len(_conv["dissolved"]),
+        )
+    except Exception as _conv_exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _logger.error(
+            "Preparation STEP 3b: T-2H merger convergence failed (non-fatal) — "
+            "preparation continues, T-0H refill will back-fill: %s",
+            _conv_exc, exc_info=True,
         )
 
     # ── STEP 4: Quantify SDE demand ───────────────────────────────────────────

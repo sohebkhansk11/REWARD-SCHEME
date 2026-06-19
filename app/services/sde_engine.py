@@ -982,6 +982,205 @@ def _execute_case_d_single_pair(
         return False
 
 
+# ── LEVER 4: Same-Pool Dual-L4 Pre-Sweep (GAP-A realistic-density leak fix) ────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# LEVER 4 — closes GAP-A (REWARD_SCHEME__COMPLETE_STRATEGY_WIRE_DIAGRAM.md §17).
+# redistribute_multi_l4_pools() spreads EXCESS L4 to zero-L4 receiver pools, but
+# under system saturation it "runs out of receiver pools" (brain5 logs that and
+# breaks) and a pool is left holding >= 2 flagged L4.  The normal SDE sub-draw
+# clears only ONE L4 per pool per week (upper winner + one L1/L2/L3 lower); the
+# 2nd flagged L4 survives, the pool's one-draw-per-week lock fires, and at T-0H
+# that survivor advances L4 -> L5 -> L6 unboundedly (the measured leak: L6+ grew
+# 0 -> 6 -> 14 -> ... while the waitlist stayed flat == throughput-bound, not
+# supply-bound).  This sweep raises the per-pool L4 shed rate 1 -> 2 by pairing
+# the two oldest flagged L4 of each over-saturated pool into a SAME-POOL Dual-L4
+# sub-draw — design clause svg:94 "Or same pool if it has 2+ L4 members".  BOTH
+# winners exit at their own L4 net payout (Rs.5,500 each = Rs.11,000 vs Rs.7,500
+# normal) — the deliberate, cost-aware price of "L5 PREVENTION AT ALL COSTS"
+# (svg:97), paid ONLY when redistribution found no zero-L4 receiver.
+
+def _stage_same_pool_dual_l4(
+    db:              Session,
+    session_id:      int,
+    sub_draw_number: int,
+    upper_l4:        User,
+    lower_l4:        User,
+) -> bool:
+    """
+    Stage (T-2H) ONE Same-Pool Dual-L4 sub-draw checkpoint.  Both winners are
+    flagged L4 members of the SAME pool.
+
+    Mirrors the staging tail of execute_sde_sub_draw() exactly: writes an
+    SDECheckpoint with executed=False so execute_staged_sde_draws() commits it at
+    T-0H together with every normal sub-draw (simultaneous reveal preserved), and
+    sets the pool's one-draw-per-week lock.  Both winners receive their own L4 net
+    payout.  No lower-tier supply is consumed (the "lower winner" is the 2nd L4).
+
+    Returns True if the checkpoint was staged, False if the pool/members are no
+    longer in a stageable state (already drew, members moved, or identical ids).
+    """
+    pool: Pool | None = db.query(Pool).filter(Pool.id == upper_l4.current_pool_id).first()
+    if pool is None:
+        return False
+    if pool.draw_completed_this_week:
+        return False
+    if upper_l4.id == lower_l4.id:
+        return False
+    if lower_l4.current_pool_id != upper_l4.current_pool_id:
+        return False
+    if upper_l4.current_level not in (4, 5) or lower_l4.current_level not in (4, 5):
+        return False
+
+    # Both winners exit at their own level's net payout (L4 = Rs.5,500).
+    _, upper_net = get_level_payout(db, upper_l4.current_level)
+    _, lower_net = get_level_payout(db, lower_l4.current_level)
+    upper_net_d  = Decimal(str(upper_net))
+    lower_net_d  = Decimal(str(lower_net))
+
+    rng_hash = _compute_rng_seed_hash(pool.id, session_id, sub_draw_number)
+
+    # (e) SDE checkpoint — staged with executed=False; T-0H sets executed=True.
+    # case_c_transfer stays False (no cross-pool transfer); the lower winner being
+    # an L4 is what execute_staged_sde_draws() keys on to mark edge_case_triggered.
+    db.add(SDECheckpoint(
+        session_id                 = session_id,
+        sub_draw_number            = sub_draw_number,
+        pool_id                    = pool.id,
+        upper_winner_user_id       = upper_l4.id,
+        upper_winner_level         = upper_l4.current_level,
+        upper_payout_inr           = upper_net_d,
+        lower_winner_user_id       = lower_l4.id,
+        lower_winner_level         = lower_l4.current_level,
+        lower_payout_inr           = lower_net_d,
+        lower_winner_tier_override = False,
+        rng_seed_hash              = rng_hash,
+        executed                   = False,
+        case_c_transfer            = False,
+        case_c_donor_pool_id       = None,
+    ))
+
+    # (g) Draw-lock — prevents execute_weekly_draw() from re-drawing this pool at T-0H.
+    pool.draw_completed_this_week = True
+    pool.pool_draw_type           = POOL_DRAW_SDE
+
+    db.commit()
+
+    _logger.info(
+        "SDE Same-Pool Dual-L4 STAGED (T-2H): pool='%s'  upper=@%s(L%d Rs.%s)  "
+        "lower=@%s(L%d Rs.%s)  seed=%s…  [both L4 — exits deferred to T-0H]",
+        pool.name,
+        upper_l4.username, upper_l4.current_level, upper_net_d,
+        lower_l4.username, lower_l4.current_level, lower_net_d,
+        rng_hash[:12],
+    )
+    return True
+
+
+def _run_same_pool_dual_l4_sweep(
+    db:              Session,
+    week_id:         str,
+    l4_members:      list[User],
+    start_session_num: int,
+) -> dict:
+    """
+    LEVER 4 orchestrator — Same-Pool Dual-L4 Pre-Sweep.
+
+    Runs AFTER redistribute_multi_l4_pools() + the re-read of flagged L4.  Groups
+    the flagged L4 by pool; for every pool STILL holding >= 2 flagged L4 (i.e.
+    redistribution could not place them — saturation), pairs the two oldest
+    (FIFO by join_date) into a same-pool Dual-L4 sub-draw and stages it.
+
+    Constraint honoured: one draw per pool per week.  A pool with 3+ flagged L4
+    can shed only its oldest two this week; any 3rd+ remains for the normal supply
+    ladder (and ultimately Lever-2 accelerated dissolution for genuinely L4-dense
+    pools).  This deliberately raises the shed rate to 2/pool/week — enough to
+    out-pace L4 creation at realistic density — without violating the draw lock.
+
+    Returns dict(pairs, l4_cleared, handled_ids, next_session_num).
+    """
+    by_pool: dict[int, list[User]] = {}
+    for m in l4_members:
+        if m.current_pool_id is None:
+            continue
+        by_pool.setdefault(m.current_pool_id, []).append(m)
+
+    handled_ids: set[int] = set()
+    pairs:       int      = 0
+    l4_cleared:  int      = 0
+    session_num: int      = start_session_num
+    sweep_session_id: int | None = None
+    sub_draw_num:     int        = 0
+
+    _epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    for pool_id, members in by_pool.items():
+        if len(members) < 2:
+            continue
+
+        # Two oldest flagged L4 (FIFO) form the same-pool Dual-L4 pair.
+        members_sorted = sorted(members, key=lambda u: (u.join_date or _epoch, u.id))
+        upper_l4 = members_sorted[0]
+        lower_l4 = members_sorted[1]
+
+        # Lazily create ONE sweep session the first time a pair is actually staged.
+        if sweep_session_id is None:
+            _sess = SDESession(
+                week_id          = week_id,
+                session_number   = session_num,
+                status           = SDESessionStatus.Running,
+                l4_count_planned = 0,
+                started_at       = datetime.now(timezone.utc),
+            )
+            db.add(_sess)
+            db.flush()   # obtain id without committing
+            sweep_session_id = _sess.id
+
+        sub_draw_num += 1
+        if _stage_same_pool_dual_l4(
+            db,
+            session_id      = sweep_session_id,
+            sub_draw_number = sub_draw_num,
+            upper_l4        = upper_l4,
+            lower_l4        = lower_l4,
+        ):
+            handled_ids.add(upper_l4.id)
+            handled_ids.add(lower_l4.id)
+            pairs      += 1
+            l4_cleared += 2
+            _logger.warning(
+                "SDE Meta-Pool: LEVER 4 SAME-POOL DUAL-L4 — pool=%d  upper=@%s  "
+                "lower=@%s  (pool held %d flagged L4, no zero-L4 receiver after "
+                "redistribution; clearing BOTH this week to prevent L4->L5 leak).",
+                pool_id, upper_l4.username, lower_l4.username, len(members),
+            )
+            if len(members) > 2:
+                _logger.warning(
+                    "SDE Meta-Pool: LEVER 4 — pool=%d still holds %d flagged L4 after "
+                    "the same-pool pair (one-draw-per-week lock); the remaining %d will "
+                    "route to the normal ladder / accelerated dissolution.",
+                    pool_id, len(members), len(members) - 2,
+                )
+        else:
+            sub_draw_num -= 1   # reclaim the number we optimistically consumed
+
+    if sweep_session_id is not None:
+        _sess = db.query(SDESession).filter(SDESession.id == sweep_session_id).first()
+        if _sess is not None:
+            _sess.status             = SDESessionStatus.Completed
+            _sess.l4_count_planned   = pairs * 2
+            _sess.l4_count_completed = l4_cleared
+            _sess.completed_at       = datetime.now(timezone.utc)
+        db.commit()
+        session_num += 1   # consumed start_session_num for the sweep session
+
+    return {
+        "pairs":            pairs,
+        "l4_cleared":       l4_cleared,
+        "handled_ids":      handled_ids,
+        "next_session_num": session_num,
+    }
+
+
 # ── Meta-pool orchestration ───────────────────────────────────────────────────
 
 # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
@@ -1288,7 +1487,32 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
         )
 
     meta_result = SDEMetaPoolResult(week_id=week_id)
-    session_num  = 1
+
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVER 4 — SAME-POOL DUAL-L4 PRE-SWEEP (GAP-A realistic-density leak fix).
+    # redistribute_multi_l4_pools() above already spread excess L4 to zero-L4
+    # receiver pools; the Meta Pool Buffer (Lever 2) already drained the Paid
+    # waitlist into the deficient L4 pools.  Any pool STILL holding >= 2 flagged
+    # L4 at this point had NO redistribution receiver (saturation) — clearing only
+    # one L4 / pool / week leaks the 2nd L4 -> L5 -> L6 unboundedly.  Pair the two
+    # oldest flagged L4 of each such pool into a same-pool Dual-L4 sub-draw (both
+    # exit this week), lift the per-pool shed rate 1 -> 2, and drop both from the
+    # normal batch list so the 2nd is NOT re-processed (which would overflow on the
+    # now-locked pool and leak anyway).  Staged two-phase; revealed at T-0H.
+    _sweep = _run_same_pool_dual_l4_sweep(db, week_id, l4_members, start_session_num=1)
+    if _sweep["pairs"] > 0:
+        _handled = _sweep["handled_ids"]
+        l4_members = [m for m in l4_members if m.id not in _handled]
+        meta_result.total_l4_cleared      += _sweep["l4_cleared"]
+        meta_result.total_pools_processed += _sweep["pairs"]
+        _logger.warning(
+            "SDE Meta-Pool: LEVER 4 PRE-SWEEP staged %d same-pool L4 pair(s) "
+            "(%d L4 exits) across saturated pools with no redistribution receiver. "
+            "%d flagged L4 remain for the normal supply ladder.",
+            _sweep["pairs"], _sweep["l4_cleared"], len(l4_members),
+        )
+
+    session_num  = _sweep["next_session_num"]
     remaining    = list(l4_members)
 
     while remaining:
@@ -1685,9 +1909,25 @@ def execute_staged_sde_draws(db: Session) -> int:
                     case_e_deferred_week = None,
                 ),
             )
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # LEVER 4 — generic lower-winner exit cleanup.  Clear the SDE / Case-E
+            # flags on the lower winner too.  For a NORMAL sub-draw the lower winner
+            # is an L1/L2/L3 member whose flags are already False/None (no-op, and
+            # safe: sde_required is written False — never None — so the NOT NULL
+            # column is honoured).  For a SAME-POOL DUAL-L4 sub-draw (Lever 4) the
+            # lower winner is itself a flagged L4, so this prevents an Eliminated_Won
+            # member leaving with a dangling sde_required=True / sde_flagged_week /
+            # case_e_deferred_week (which post-draw cleanup would otherwise have to
+            # reconcile).  Mirrors the upper-winner exit above exactly.
             crud_user.update_user(
                 db, lower.id,
-                UserUpdate(status=UserStatus.Eliminated_Won, current_pool_id=None),
+                UserUpdate(
+                    status               = UserStatus.Eliminated_Won,
+                    current_pool_id      = None,
+                    sde_required         = False,
+                    sde_flagged_week     = None,
+                    case_e_deferred_week = None,
+                ),
             )
 
             # (d) DrawHistory row — simultaneous reveal with all T-0H regular draws
@@ -1695,11 +1935,18 @@ def execute_staged_sde_draws(db: Session) -> int:
             # Case C draws use POOL_DRAW_SDE_CASE_C draw type + edge_case_triggered=True
             # so the cross-pool supply transfer is fully captured in the financial audit trail.
             _is_case_c = getattr(cp, "case_c_transfer", False)
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # LEVER 4 — a SAME-POOL DUAL-L4 sub-draw is distinguished in the audit
+            # trail by its lower winner being an L4 (level >= 4).  Mark it as an edge
+            # case (migration-free: derived from the staged lower_winner_level) so the
+            # Rs.11,000 dual-L4 exits are explicit in DrawHistory alongside cross-pool
+            # Case D, without overloading the Case-C draw_type.
+            _is_dual_l4 = (cp.lower_winner_level or lower.current_level) >= 4
             db.add(DrawHistory(
                 pool_id             = pool.id,
                 draw_type           = POOL_DRAW_SDE_CASE_C if _is_case_c else POOL_DRAW_SDE,
                 targeted_early_exit = True,
-                edge_case_triggered = _is_case_c,
+                edge_case_triggered = (_is_case_c or _is_dual_l4),
                 sde_session_id      = cp.session_id,
                 winner_1_user_id            = upper.id,
                 winner_1_level              = cp.upper_winner_level,

@@ -122,14 +122,27 @@ _RNG_SECRET = os.getenv("DRAW_RNG_SECRET", "dev-insecure-secret-replace-in-prod"
 # only on the advancing (Paid / SDE-winner-pool) path.
 def _advance_survivor_level(current_level: int, sde_required: bool) -> tuple[int, bool]:
     """
-    Compute a draw survivor's post-draw level, enforcing 'No L4 reaches L5'.
+    Compute a draw survivor's post-draw level, enforcing 'No L4 reaches L5'
+    (and, defensively, 'no L5/L6 climbs the leak band further').
 
-    Returns (new_level, case_e_deferred):
-      • (4, True)             — flagged L4 HELD at L4 (Case-E true defer).
-      • (min(level+1, 6), False) — normal +1 advancement, capped at L6.
+    Returns (new_level, held):
+      • flagged L4 (current_level == 4 AND sde_required) -> (4, True)
+            HELD at L4 — documented Case-E true defer; get_flagged_l4_members()
+            re-queues it FIFO next week and it exits when supply returns.
+      • any L5/L6 survivor (current_level >= 5)          -> (current_level, True)
+            HELD at its level — L5/L6 "should never exist" and must EXIT via the
+            Ext-II/III valve (which drains by LEVEL, not sde_required), never
+            climb on a survivor advancement.  This branch is intentionally
+            INDEPENDENT of sde_required: a LEGACY member that leaked before this
+            guard existed had its sde_required cleared by the old buggy loop, so
+            keying on level alone is what actually catches it.
+      • everyone else                                    -> (min(level+1, 6), False)
+            normal +1 advancement (L1->L2->L3->L4 ...), capped at L6.
     """
     if current_level == 4 and sde_required:
         return 4, True
+    if current_level >= 5:
+        return current_level, True
     return min(current_level + 1, 6), False
 
 
@@ -990,15 +1003,15 @@ def _execute_case_d_single_pair(
                 # LEVER 6 — Case-E true-defer guard: a flagged L4 survivor of this
                 # cross-pool Case-D draw is HELD at L4 (never advanced to L5).
                 new_lvl, _case_e_def = _advance_survivor_level(s.current_level, s.sde_required)
+                if _case_e_def:
+                    _logger.warning(
+                        "SDE CASE D: SDE-band HOLD — @%s (id=%d) survived pool '%s' draw with "
+                        "no drawable supply; HELD at L%d (NOT advanced — L4->L5->L6 leak band "
+                        "sealed). Re-queued next week (SDE for L4 / Ext-II/III for L5-L6).",
+                        s.username, s.id, pool.name, s.current_level,
+                    )
                 if new_lvl == 4:
                     new_l4_created = True
-                    if _case_e_def:
-                        _logger.warning(
-                            "SDE CASE D: Case-E TRUE DEFER — flagged L4 @%s (id=%d) survived "
-                            "pool '%s' draw with no drawable supply; HELD at L4 (NOT advanced "
-                            "to L5). Re-queued for SDE next week.",
-                            s.username, s.id, pool.name,
-                        )
                 crud_user.update_user(db, s.id, UserUpdate(
                     current_level         = new_lvl,
                     weekly_payment_status = WeeklyPaymentStatus.Unpaid,
@@ -2435,16 +2448,17 @@ def execute_staged_sde_draws(db: Session) -> int:
                     survivor.current_level, survivor.sde_required
                 )
                 reaching_l4 = (new_level == 4)
+                if _case_e_def:
+                    _logger.warning(
+                        "execute_staged_sde_draws: SDE-band HOLD — @%s (id=%d) survived pool "
+                        "'%s' staged draw with no drawable supply; HELD at L%d (NOT advanced "
+                        "— L4->L5->L6 leak band sealed). Re-queued next week "
+                        "(SDE for L4 / Ext-II/III for L5-L6).",
+                        survivor.username, survivor.id, pool.name, survivor.current_level,
+                    )
                 if reaching_l4:
                     new_l4_created = True
-                    if _case_e_def:
-                        _logger.warning(
-                            "execute_staged_sde_draws: Case-E TRUE DEFER — flagged L4 @%s "
-                            "(id=%d) survived pool '%s' staged draw with no drawable supply; "
-                            "HELD at L4 (NOT advanced to L5). Re-queued for SDE next week.",
-                            survivor.username, survivor.id, pool.name,
-                        )
-                    else:
+                    if not _case_e_def:
                         _logger.info(
                             "execute_staged_sde_draws: pool '%s' survivor %d (%s) → L4; "
                             "sde_required=True, flagged week=%s.",
@@ -2860,10 +2874,10 @@ def execute_sde_ext2_draw(
             new_escalation_in_pool = True
         if _case_e_def:
             _logger.warning(
-                "SDE Ext draw: Case-E TRUE DEFER — flagged L4 @%s (id=%d) survived pool "
-                "'%s' draw with no drawable supply; HELD at L4 (NOT advanced to L5). "
-                "Re-queued for SDE next week.",
-                survivor.username, survivor.id, pool.name,
+                "SDE Ext draw: SDE-band HOLD — @%s (id=%d) survived pool '%s' draw with no "
+                "drawable supply; HELD at L%d (NOT advanced — L4->L5->L6 leak band sealed). "
+                "Re-queued next week (SDE for L4 / Ext-II/III for L5-L6).",
+                survivor.username, survivor.id, pool.name, survivor.current_level,
             )
         crud_user.update_user(
             db, survivor.id,
@@ -3179,10 +3193,10 @@ def run_preventive_l3_draw(
                 new_l4_flagged = True
             if _case_e_def:
                 _logger.warning(
-                    "Preventive L3 draw: Case-E TRUE DEFER — flagged L4 @%s (id=%d) survived "
-                    "pool '%s' draw with no drawable supply; HELD at L4 (NOT advanced to L5). "
-                    "Re-queued for SDE next week.",
-                    member.username, member.id, pool.name,
+                    "Preventive L3 draw: SDE-band HOLD — @%s (id=%d) survived pool '%s' draw "
+                    "with no drawable supply; HELD at L%d (NOT advanced — L4->L5->L6 leak band "
+                    "sealed). Re-queued next week (SDE for L4 / Ext-II/III for L5-L6).",
+                    member.username, member.id, pool.name, member.current_level,
                 )
             _upd: dict = {
                 "current_level":         new_level,

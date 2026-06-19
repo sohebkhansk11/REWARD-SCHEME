@@ -443,16 +443,16 @@ def run_dual_draw(
             # If this member just advanced to L4, set sde_required=True in the
             # SAME database write as the level change.  This is a hard guarantee —
             # there is no window between "member is L4" and "member is flagged".
+            if _case_e_def:
+                _logger.warning(
+                    "run_dual_draw: SDE-band HOLD — @%s (id=%d) survived pool '%s' draw with "
+                    "no drawable supply; HELD at L%d (NOT advanced — L4->L5->L6 leak band "
+                    "sealed). Re-queued next week (SDE for L4 / Ext-II/III for L5-L6).",
+                    member.username, member.id, pool.name, member.current_level,
+                )
             if reaching_l4:
                 new_l4_flagged = True
-                if _case_e_def:
-                    _logger.warning(
-                        "run_dual_draw: Case-E TRUE DEFER — flagged L4 @%s (id=%d) survived "
-                        "pool '%s' draw with no drawable supply; HELD at L4 (NOT advanced to "
-                        "L5). Re-queued for SDE next week.",
-                        member.username, member.id, pool.name,
-                    )
-                else:
+                if not _case_e_def:
                     _logger.info(
                         "Anti-Maturity: member %d (%s) advanced to L4 — "
                         "sde_required=True flagged atomically (week %s).",
@@ -1440,10 +1440,10 @@ def run_accelerated_dissolution_draw(
                 new_l4_flagged = True
             if _case_e_def:
                 _logger.warning(
-                    "Accel-dissolution: Case-E TRUE DEFER — flagged L4 @%s (id=%d) survived "
-                    "pool '%s' draw with no drawable supply; HELD at L4 (NOT advanced to L5). "
-                    "Re-queued for SDE next week.",
-                    member.username, member.id, pool.name,
+                    "Accel-dissolution: SDE-band HOLD — @%s (id=%d) survived pool '%s' draw "
+                    "with no drawable supply; HELD at L%d (NOT advanced — L4->L5->L6 leak band "
+                    "sealed). Re-queued next week (SDE for L4 / Ext-II/III for L5-L6).",
+                    member.username, member.id, pool.name, member.current_level,
                 )
             _upd: dict = {
                 "current_level":         new_level,

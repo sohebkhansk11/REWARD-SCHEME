@@ -1253,6 +1253,173 @@ def _run_same_pool_dual_l4_sweep(
     }
 
 
+# ── LEVER 4-PREP: Lone-L4 Pod Consolidation (supply-free frozen-L4 unfreeze) ───
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# LEVER 4-PREP — closes the residual FROZEN-L4 fragmentation that survives every
+# other lever once the Paid waitlist is dry (flow-balance steady state).
+#
+# MEASURED SYMPTOM (isolated 52-wk harness, upw=18): pools_paused climbs 0->17 and
+# keeps growing; 16 of 17 paused pools are single-member flagged "lone-L4 pods" —
+# one flagged L4, no lower-tier member, empty waitlist.  These do NOT leak to L5
+# (Lever 6 holds them at L4) but they NEVER EXIT either: the member is frozen at L4
+# (its Rs.5,500 payout never lands) and the pod can never reach 12/12 to draw, so
+# both pool count AND frozen-L4 liability grow without bound.
+#
+# WHY THE EXISTING LEVERS MISS THEM:
+#   • Lever 4 same-pool Dual-L4 (the only ZERO-supply exit) needs >= 2 flagged L4
+#     in ONE pool — a lone pod has exactly 1.
+#   • Single-L4 SDE / Lever 5 meta-pool receiver both need lower-tier supply that
+#     the dry waitlist / empty pod cannot provide.
+#   So a lone pod falls through to the supply-starved batch loop and sticks forever.
+#
+# THE FIX (user-approved Jun-19, "Add consolidation pass"):  Two lone pods that
+# EACH hold one frozen L4 and ZERO local lower-tier supply are merged into ONE
+# 2-L4 pod by relocating the donor pod's lone L4 into the receiver pod.  The very
+# next step (Lever 4 _run_same_pool_dual_l4_sweep) then sheds BOTH L4 in a single
+# same-pool Dual-L4 sub-draw — consuming NO supply (sde_engine.py: "the lower
+# winner is the 2nd L4").  Result: 2 frozen pods -> 0 (donor dissolves, receiver
+# drains at its dual draw), 2 L4 unfrozen and paid, with no waitlist supply.
+#
+# SELF-GATING / SAFETY:
+#   • Fires ONLY on pods with local lower-tier supply == 0 — i.e. genuinely frozen.
+#     A pod that CAN self-supply a single-L4 lower winner is left untouched, so the
+#     abundant-supply path (which rightly gives a lower-tier member that win) is
+#     never pre-empted.  The zero-local-supply test IS the supply-starvation gate.
+#   • Runs AFTER Lever 2 (meta-pool buffer) has already drained the waitlist into
+#     deficient L4 pools, so any pod still at supply==0 here is truly starved.
+#   • Only touches UNLOCKED (draw_completed_this_week == False) pods.
+#   • MONEY PATHS UNTOUCHED: relocates current_pool_id + journey counter + pool
+#     status/total_members/contains_flagged_l4 only — no level, payment, payout,
+#     SDE-flag, join_date, or winner math is altered.  Conservation holds (members
+#     only change pool); capacity is guarded (receiver live + 1 <= POOL_CAPACITY).
+def _consolidate_lone_l4_for_dual_sweep(
+    db:              Session,
+    l4_members:      list[User],
+    allow_l3_supply: bool,
+) -> dict:
+    """
+    Pair supply-starved lone-L4 pods so the immediately-following Lever 4 same-pool
+    Dual-L4 sweep can shed them with ZERO lower-tier supply.
+
+    A "lone-L4 pod" here = an UNLOCKED pool holding exactly ONE member of the
+    current flagged working set `l4_members` AND ZERO live lower-tier members
+    (current_level <= supply ceiling), i.e. it cannot self-supply a single-L4 SDE
+    lower winner and the waitlist is already drained (Lever 2 ran first).
+
+    Donor pods are merged pairwise into receiver pods (oldest-first, stable) so each
+    receiver ends with 2 flagged L4.  The donor's flagged L4 object in `l4_members`
+    is mutated in place (current_pool_id := receiver) so the subsequent
+    `_run_same_pool_dual_l4_sweep` re-groups it onto the receiver and pairs it.
+
+    Returns dict(pairs_formed, l4_relocated, dissolved_pool_ids).
+    """
+    _epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    # Lower-tier supply ceiling matches the batch-loop / meta-buffer definition:
+    # L3 counts as supply only when cascade/LPI opened the L3 exception this week.
+    supply_ceiling = 3 if allow_l3_supply else 2
+
+    # Group the current flagged working set by pool.
+    by_pool: dict[int, list[User]] = {}
+    for m in l4_members:
+        if m.current_pool_id is not None:
+            by_pool.setdefault(m.current_pool_id, []).append(m)
+
+    # Identify frozen lone pods: exactly 1 flagged L4 here, unlocked, supply == 0.
+    lone: list[tuple[Pool, User]] = []
+    for pid, members in by_pool.items():
+        if len(members) != 1:
+            continue
+        pool = db.query(Pool).filter(Pool.id == pid).first()
+        if pool is None or pool.draw_completed_this_week:
+            continue
+        local_supply = (
+            db.query(func.count(User.id))
+            .filter(
+                User.current_pool_id == pid,
+                User.status          == UserStatus.Active,
+                User.current_level   <= supply_ceiling,
+            )
+            .scalar()
+        ) or 0
+        if local_supply > 0:
+            continue                      # can self-supply normal single-L4 SDE — leave it
+        lone.append((pool, members[0]))
+
+    if len(lone) < 2:
+        return {"pairs_formed": 0, "l4_relocated": 0, "dissolved_pool_ids": []}
+
+    # Oldest receiver first (stable, deterministic).
+    lone.sort(key=lambda t: (t[0].created_at or _epoch, t[0].id))
+
+    pairs_formed:        int       = 0
+    l4_relocated:        int       = 0
+    dissolved_pool_ids:  list[int] = []
+
+    i = 0
+    while i + 1 < len(lone):
+        recv_pool, _recv_l4   = lone[i]
+        donor_pool, donor_l4  = lone[i + 1]
+
+        recv_live = (
+            db.query(func.count(User.id))
+            .filter(
+                User.current_pool_id == recv_pool.id,
+                User.status          == UserStatus.Active,
+            )
+            .scalar()
+        ) or 0
+        if recv_live + 1 > POOL_CAPACITY:
+            i += 2
+            continue                      # capacity guard (cannot overflow a pool)
+
+        # Relocate the donor pod's lone frozen L4 into the receiver pod (in place,
+        # so _run_same_pool_dual_l4_sweep re-groups it onto the receiver).
+        donor_l4.current_pool_id          = recv_pool.id
+        donor_l4.dynamic_merges_experienced = (donor_l4.dynamic_merges_experienced or 0) + 1
+        l4_relocated += 1
+        pairs_formed += 1
+        recv_pool.contains_flagged_l4 = True
+
+        # Donor pod: recount; dissolve if now empty, else clear its (now absent) flag.
+        donor_remaining = (
+            db.query(func.count(User.id))
+            .filter(
+                User.current_pool_id == donor_pool.id,
+                User.status          == UserStatus.Active,
+            )
+            .scalar()
+        ) or 0
+        if donor_remaining == 0:
+            donor_pool.status               = PoolStatus.Merged_Dissolved
+            donor_pool.total_members        = 0
+            donor_pool.contains_flagged_l4  = False
+            dissolved_pool_ids.append(donor_pool.id)
+        else:
+            donor_pool.total_members        = donor_remaining
+            donor_pool.contains_flagged_l4  = False
+
+        # Receiver recount (now 2-L4 pod).
+        recv_pool.total_members = (
+            db.query(func.count(User.id))
+            .filter(
+                User.current_pool_id == recv_pool.id,
+                User.status          == UserStatus.Active,
+            )
+            .scalar()
+        ) or 0
+
+        i += 2
+
+    if pairs_formed:
+        db.commit()
+
+    return {
+        "pairs_formed":       pairs_formed,
+        "l4_relocated":       l4_relocated,
+        "dissolved_pool_ids": dissolved_pool_ids,
+    }
+
+
 # ── LEVER 5: Meta-Pool Receiver (surplus-L4 drain venue) ──────────────────────
 # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
 # LEVER 5 — closes the residual GAP-A/Question-B leak that survives Lever 4.
@@ -1788,11 +1955,33 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
     # applied to them here.  (check_accelerated_dissolution is imported at function scope
     # to avoid a draw.py <-> sde_engine.py import cycle — same pattern as the other
     # cross-module calls in this engine.)
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # GAP-D RESERVE TIGHTENING (frozen-L4 dead-zone fix).  The reserve below excludes
+    # a pool's flagged L4 from SDE on the promise that the T-0H Accelerated Dissolution
+    # pre-pass will drain it instead.  But that pre-pass can ONLY fire on a pool that is
+    # (a) Active status AND (b) holds >= 2 L4+ members (run_accelerated_dissolution_draw
+    # raises ValueError on a non-Active pool or on < 2 L4+).  check_accelerated_dissolution
+    # alone returns True purely on the >=60% ratio, so a single-member all-L4 pod (ratio
+    # 100%, but Paused and/or only 1 L4+) was being RESERVED OUT of SDE yet NEVER drawn by
+    # accel — a dead zone that froze the L4 at L4 forever and grew pools_paused unbounded.
+    # Reserve now requires Active + >= 2 L4+ so those frozen lone pods fall through to the
+    # Lone-L4 consolidation + Lever 4 dual sweep (supply-free) below instead of limbo.
     from app.services.draw import check_accelerated_dissolution as _check_accel_diss
     _accel_pool_ids: set[int] = set()
     for _pid in {m.current_pool_id for m in l4_members if m.current_pool_id is not None}:
         _pool_obj = db.query(Pool).filter(Pool.id == _pid).first()
-        if _pool_obj is not None and _check_accel_diss(db, _pool_obj):
+        if _pool_obj is None or _pool_obj.status != PoolStatus.Active:
+            continue
+        _l4plus_in_pool = (
+            db.query(func.count(User.id))
+            .filter(
+                User.current_pool_id == _pid,
+                User.status          == UserStatus.Active,
+                User.current_level   >= 4,
+            )
+            .scalar()
+        ) or 0
+        if _l4plus_in_pool >= 2 and _check_accel_diss(db, _pool_obj):
             _accel_pool_ids.add(_pid)
     if _accel_pool_ids:
         _before_excl = len(l4_members)
@@ -1904,6 +2093,37 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
         )
 
     meta_result = SDEMetaPoolResult(week_id=week_id)
+
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVER 4-PREP — LONE-L4 POD CONSOLIDATION (frozen-L4 fragmentation fix).
+    # Runs AFTER the Lever 2 meta-pool buffer has drained the Paid waitlist into the
+    # deficient L4 pools, and BEFORE the Lever 4 same-pool Dual-L4 sweep below.  Any
+    # pool still holding exactly one flagged L4 with ZERO local lower-tier supply is
+    # genuinely frozen (cannot self-supply a single-L4 lower winner, waitlist dry).
+    # Pair such pods two-at-a-time into 2-L4 pods so the Lever 4 sweep immediately
+    # below sheds BOTH L4 in one supply-free same-pool draw — unfreezing the stuck
+    # L4 payouts and collapsing the unbounded lone-pod fragmentation.  Self-gating
+    # (only fires at local_supply==0), money-paths untouched, failure-isolated.
+    try:
+        _lone = _consolidate_lone_l4_for_dual_sweep(db, l4_members, allow_l3_supply)
+        if _lone["pairs_formed"] > 0:
+            _logger.warning(
+                "SDE Meta-Pool: LEVER 4-PREP consolidated %d frozen lone-L4 pod pair(s) "
+                "(%d L4 relocated, %d donor pool(s) dissolved) into 2-L4 pods for the "
+                "supply-free Lever 4 dual sweep.",
+                _lone["pairs_formed"], _lone["l4_relocated"],
+                len(_lone["dissolved_pool_ids"]),
+            )
+    except Exception as _lone_exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _logger.error(
+            "SDE Meta-Pool: LEVER 4-PREP lone-L4 consolidation failed (non-fatal) — "
+            "continuing with un-consolidated pods: %s",
+            _lone_exc, exc_info=True,
+        )
 
     # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # LEVER 4 — SAME-POOL DUAL-L4 PRE-SWEEP (GAP-A realistic-density leak fix).

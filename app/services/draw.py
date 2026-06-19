@@ -416,6 +416,11 @@ def run_dual_draw(
     week_id = _current_week_id()
     new_l4_flagged = False  # tracks whether any survivor just became L4
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVER 6 — Case-E true-defer guard.  Local import matches draw.py's existing
+    # cycle-safe pattern of importing sde_engine helpers at the use-site.
+    from app.services.sde_engine import _advance_survivor_level
+
     for member_id in surviving_ids:
         member = crud_user.get_user(db, member_id)
         if member and member.status == UserStatus.Active and member.current_pool_id == pool_id:
@@ -425,11 +430,14 @@ def run_dual_draw(
             # current_level; reaching_l4 is forced False to prevent a spurious
             # sde_required flag on a member at L4 who simply didn't pay this week.
             if member.weekly_payment_status == WeeklyPaymentStatus.Paid:
-                new_level   = min(member.current_level + 1, 6)
+                new_level, _case_e_def = _advance_survivor_level(
+                    member.current_level, member.sde_required
+                )
                 reaching_l4 = (new_level == 4)
             else:
                 new_level   = member.current_level   # no advancement for unpaid
                 reaching_l4 = False
+                _case_e_def = False
 
             # ANTI-MATURITY PROTOCOL — ATOMIC L4 FLAG (BUG 1 / REAL-TIME FLAGGING):
             # If this member just advanced to L4, set sde_required=True in the
@@ -437,11 +445,19 @@ def run_dual_draw(
             # there is no window between "member is L4" and "member is flagged".
             if reaching_l4:
                 new_l4_flagged = True
-                _logger.info(
-                    "Anti-Maturity: member %d (%s) advanced to L4 — "
-                    "sde_required=True flagged atomically (week %s).",
-                    member.id, member.username, week_id,
-                )
+                if _case_e_def:
+                    _logger.warning(
+                        "run_dual_draw: Case-E TRUE DEFER — flagged L4 @%s (id=%d) survived "
+                        "pool '%s' draw with no drawable supply; HELD at L4 (NOT advanced to "
+                        "L5). Re-queued for SDE next week.",
+                        member.username, member.id, pool.name,
+                    )
+                else:
+                    _logger.info(
+                        "Anti-Maturity: member %d (%s) advanced to L4 — "
+                        "sde_required=True flagged atomically (week %s).",
+                        member.id, member.username, week_id,
+                    )
 
             _upd: dict = {
                 "current_level":         new_level,
@@ -449,7 +465,8 @@ def run_dual_draw(
             }
             if reaching_l4:
                 _upd["sde_required"]     = True
-                _upd["sde_flagged_week"] = week_id
+                # Held (deferred) L4 keeps its ORIGINAL flagged week.
+                _upd["sde_flagged_week"] = member.sde_flagged_week if _case_e_def else week_id
             crud_user.update_user(db, member_id, UserUpdate(**_upd))
 
     # If any survivor reached L4, mark the pool as containing a flagged L4 member.
@@ -1398,6 +1415,10 @@ def run_accelerated_dissolution_draw(
     week_id         = _current_week_id()
     new_l4_flagged  = False
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEVER 6 — Case-E true-defer guard (cycle-safe local import, use-site pattern).
+    from app.services.sde_engine import _advance_survivor_level
+
     for member_id in surviving_ids:
         member = crud_user.get_user(db, member_id)
         if member and member.status == UserStatus.Active and member.current_pool_id == pool_id:
@@ -1406,21 +1427,32 @@ def run_accelerated_dissolution_draw(
             # run_dual_draw — Unpaid survivors do not advance level, reaching_l4
             # forced False to prevent spurious sde_required on existing L4 holders.
             if member.weekly_payment_status == WeeklyPaymentStatus.Paid:
-                new_level   = min(member.current_level + 1, 6)
+                new_level, _case_e_def = _advance_survivor_level(
+                    member.current_level, member.sde_required
+                )
                 reaching_l4 = (new_level == 4)
             else:
                 new_level   = member.current_level
                 reaching_l4 = False
+                _case_e_def = False
 
             if reaching_l4:
                 new_l4_flagged = True
+            if _case_e_def:
+                _logger.warning(
+                    "Accel-dissolution: Case-E TRUE DEFER — flagged L4 @%s (id=%d) survived "
+                    "pool '%s' draw with no drawable supply; HELD at L4 (NOT advanced to L5). "
+                    "Re-queued for SDE next week.",
+                    member.username, member.id, pool.name,
+                )
             _upd: dict = {
                 "current_level":         new_level,
                 "weekly_payment_status": WeeklyPaymentStatus.Unpaid,
             }
             if reaching_l4:
                 _upd["sde_required"]     = True
-                _upd["sde_flagged_week"] = week_id
+                # Held (deferred) L4 keeps its ORIGINAL flagged week.
+                _upd["sde_flagged_week"] = member.sde_flagged_week if _case_e_def else week_id
             crud_user.update_user(db, member_id, UserUpdate(**_upd))
 
     if new_l4_flagged:

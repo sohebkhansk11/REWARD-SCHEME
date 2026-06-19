@@ -96,6 +96,43 @@ _logger = logging.getLogger(__name__)
 _RNG_SECRET = os.getenv("DRAW_RNG_SECRET", "dev-insecure-secret-replace-in-prod")
 
 
+# ── SDE INVARIANT BACKSTOP — "No L4 person should ever reach L5" ───────────────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# LEVER 6 — Case-E TRUE-DEFER advancement guard (single source of truth).
+#
+# The documented SDE guarantee (Discussion.md L164 / Q3 Question-B) is absolute:
+# "No L4 person should ever reach L5."  Every survivor-advancement site in the
+# engine previously did an unconditional `min(current_level + 1, 6)`, so a
+# FLAGGED L4 (current_level == 4 AND sde_required) that was NOT one of the two
+# winners — i.e. the supply ladder (meta pool → Lever 4 → Case C → Case D →
+# Lever 5 meta-pool receiver) could not drain it this week — advanced straight
+# into the L5/L6 leak band.  That was the residual, measured leak.
+#
+# This pure helper is the LAST-RESORT safety net that closes it: a flagged L4
+# survivor is HELD at L4 (the documented Case-E "true defer") instead of
+# advancing.  It keeps sde_required=True, so get_flagged_l4_members() re-queues
+# it FIFO next week and it exits the moment drawable supply returns — typically
+# the very next week (its pool unlocks and draws it as the upper winner).  It is
+# NEVER a substitute for the supply mechanisms; it only fires AFTER all of them
+# are genuinely exhausted (waitlist dry + no pairable partner), and it makes the
+# L4→L5→L6 escalation path structurally unreachable.
+#
+# Callers must apply the SAME payment gate they already use: an Unpaid survivor
+# does not advance at all (handled at the call site), so this guard is consulted
+# only on the advancing (Paid / SDE-winner-pool) path.
+def _advance_survivor_level(current_level: int, sde_required: bool) -> tuple[int, bool]:
+    """
+    Compute a draw survivor's post-draw level, enforcing 'No L4 reaches L5'.
+
+    Returns (new_level, case_e_deferred):
+      • (4, True)             — flagged L4 HELD at L4 (Case-E true defer).
+      • (min(level+1, 6), False) — normal +1 advancement, capped at L6.
+    """
+    if current_level == 4 and sde_required:
+        return 4, True
+    return min(current_level + 1, 6), False
+
+
 # ── Data Transfer Objects ─────────────────────────────────────────────────────
 
 @dataclass
@@ -949,19 +986,32 @@ def _execute_case_d_single_pair(
                 )
                 .all()
             ):
-                new_lvl = min(s.current_level + 1, 6)
+                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # LEVER 6 — Case-E true-defer guard: a flagged L4 survivor of this
+                # cross-pool Case-D draw is HELD at L4 (never advanced to L5).
+                new_lvl, _case_e_def = _advance_survivor_level(s.current_level, s.sde_required)
                 if new_lvl == 4:
                     new_l4_created = True
+                    if _case_e_def:
+                        _logger.warning(
+                            "SDE CASE D: Case-E TRUE DEFER — flagged L4 @%s (id=%d) survived "
+                            "pool '%s' draw with no drawable supply; HELD at L4 (NOT advanced "
+                            "to L5). Re-queued for SDE next week.",
+                            s.username, s.id, pool.name,
+                        )
                 crud_user.update_user(db, s.id, UserUpdate(
                     current_level         = new_lvl,
                     weekly_payment_status = WeeklyPaymentStatus.Unpaid,
-                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
                     # sde_required is NOT NULL (Column(Boolean, nullable=False)). update_user uses
                     # model_dump(exclude_unset=True), so an explicit None IS written -> IntegrityError
                     # ("NOT NULL constraint failed: users.sde_required") which poisons the session and
                     # silently kills the entire weekly draw. Must be False (un-flagged), never None.
                     sde_required          = (True   if new_lvl == 4 else False),
-                    sde_flagged_week      = (wk_id  if new_lvl == 4 else None),
+                    # Held (deferred) L4 keeps its ORIGINAL flagged week for defer-age audit;
+                    # a survivor freshly reaching L4 is flagged with the current week.
+                    sde_flagged_week      = (
+                        (s.sde_flagged_week if _case_e_def else wk_id) if new_lvl == 4 else None
+                    ),
                 ))
             pool.draw_completed_this_week = True
             pool.pool_draw_type           = POOL_DRAW_SDE
@@ -2376,27 +2426,46 @@ def execute_staged_sde_draws(db: Session) -> int:
                 )
                 .all()
             ):
-                new_level   = min(survivor.current_level + 1, 6)
+                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # LEVER 6 — Case-E true-defer guard.  This staged T-0H survivor loop
+                # was THE residual leak point: a surplus flagged L4 stranded in a
+                # locked pool (the 3rd+ L4 after Lever 4 shed two) survived here and
+                # advanced L4->L5.  Now it is HELD at L4 and re-queued for next week.
+                new_level, _case_e_def = _advance_survivor_level(
+                    survivor.current_level, survivor.sde_required
+                )
                 reaching_l4 = (new_level == 4)
                 if reaching_l4:
                     new_l4_created = True
-                    _logger.info(
-                        "execute_staged_sde_draws: pool '%s' survivor %d (%s) → L4; "
-                        "sde_required=True, flagged week=%s.",
-                        pool.name, survivor.id, survivor.username, sde_flag_week,
-                    )
+                    if _case_e_def:
+                        _logger.warning(
+                            "execute_staged_sde_draws: Case-E TRUE DEFER — flagged L4 @%s "
+                            "(id=%d) survived pool '%s' staged draw with no drawable supply; "
+                            "HELD at L4 (NOT advanced to L5). Re-queued for SDE next week.",
+                            survivor.username, survivor.id, pool.name,
+                        )
+                    else:
+                        _logger.info(
+                            "execute_staged_sde_draws: pool '%s' survivor %d (%s) → L4; "
+                            "sde_required=True, flagged week=%s.",
+                            pool.name, survivor.id, survivor.username, sde_flag_week,
+                        )
                 crud_user.update_user(
                     db, survivor.id,
                     UserUpdate(
                         current_level         = new_level,
                         weekly_payment_status = WeeklyPaymentStatus.Unpaid,
-                        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
                         # sde_required is NOT NULL; writing None (via update_user's exclude_unset
                         # dump) raises IntegrityError, poisons the Session, and makes every later
                         # query in the weekly draw fail with PendingRollbackError -> 0 draws for the
                         # week (the multi-week draw stall). Must be False when not reaching L4.
-                        sde_required          = (True         if reaching_l4 else False),
-                        sde_flagged_week      = (sde_flag_week if reaching_l4 else None),
+                        sde_required          = (True if reaching_l4 else False),
+                        # Held (deferred) L4 keeps its ORIGINAL flagged week; a survivor freshly
+                        # reaching L4 is flagged with the current week.
+                        sde_flagged_week      = (
+                            (survivor.sde_flagged_week if _case_e_def else sde_flag_week)
+                            if reaching_l4 else None
+                        ),
                     ),
                 )
 
@@ -2779,22 +2848,37 @@ def execute_sde_ext2_draw(
         .all()
     )
     for survivor in surviving_members:
-        new_level    = min(survivor.current_level + 1, 6)
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # LEVER 6 — Case-E true-defer guard: a flagged L4 survivor of an Ext-II/III
+        # draw is HELD at L4 (never advanced to L5).
+        new_level, _case_e_def = _advance_survivor_level(
+            survivor.current_level, survivor.sde_required
+        )
         reaching_l4  = (new_level == 4)
         reaching_l5  = (new_level == 5)
         if reaching_l4 or reaching_l5:
             new_escalation_in_pool = True
+        if _case_e_def:
+            _logger.warning(
+                "SDE Ext draw: Case-E TRUE DEFER — flagged L4 @%s (id=%d) survived pool "
+                "'%s' draw with no drawable supply; HELD at L4 (NOT advanced to L5). "
+                "Re-queued for SDE next week.",
+                survivor.username, survivor.id, pool.name,
+            )
         crud_user.update_user(
             db, survivor.id,
             UserUpdate(
                 current_level         = new_level,
                 weekly_payment_status = WeeklyPaymentStatus.Unpaid,
-                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
                 # sde_required is NOT NULL; an explicit None is persisted by update_user and
                 # raises IntegrityError -> poisoned Session -> PendingRollbackError -> the weekly
                 # draw produces 0 results (multi-week stall). Must be False when not reaching L4.
-                sde_required          = (True    if reaching_l4 else False),
-                sde_flagged_week      = (week_id if reaching_l4 else None),
+                sde_required          = (True if reaching_l4 else False),
+                # Held (deferred) L4 keeps its ORIGINAL flagged week.
+                sde_flagged_week      = (
+                    (survivor.sde_flagged_week if _case_e_def else week_id)
+                    if reaching_l4 else None
+                ),
             ),
         )
 
@@ -3078,21 +3162,36 @@ def run_preventive_l3_draw(
     for member_id in surviving_ids:
         member = crud_user.get_user(db, member_id)
         if member and member.status == UserStatus.Active and member.current_pool_id == pool_id:
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # LEVER 6 — Case-E true-defer guard (Paid path only; Unpaid already holds
+            # at current_level and never sets sde_required, so an Unpaid flagged L4
+            # is already safe).
             if member.weekly_payment_status == WeeklyPaymentStatus.Paid:
-                new_level   = min(member.current_level + 1, 6)
+                new_level, _case_e_def = _advance_survivor_level(
+                    member.current_level, member.sde_required
+                )
                 reaching_l4 = (new_level == 4)
             else:
                 new_level   = member.current_level
                 reaching_l4 = False
+                _case_e_def = False
             if reaching_l4:
                 new_l4_flagged = True
+            if _case_e_def:
+                _logger.warning(
+                    "Preventive L3 draw: Case-E TRUE DEFER — flagged L4 @%s (id=%d) survived "
+                    "pool '%s' draw with no drawable supply; HELD at L4 (NOT advanced to L5). "
+                    "Re-queued for SDE next week.",
+                    member.username, member.id, pool.name,
+                )
             _upd: dict = {
                 "current_level":         new_level,
                 "weekly_payment_status": WeeklyPaymentStatus.Unpaid,
             }
             if reaching_l4:
                 _upd["sde_required"]     = True
-                _upd["sde_flagged_week"] = week_id
+                # Held (deferred) L4 keeps its ORIGINAL flagged week.
+                _upd["sde_flagged_week"] = member.sde_flagged_week if _case_e_def else week_id
             crud_user.update_user(db, member_id, UserUpdate(**_upd))
 
     if new_l4_flagged:

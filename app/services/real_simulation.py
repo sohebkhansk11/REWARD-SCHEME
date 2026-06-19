@@ -2193,6 +2193,7 @@ class RealSimEngine:
                     comp_sde_draws           = 0   # SDE sub-draws (incl. Lever 4 / Lever 5 / meta)
                     comp_ext_draws           = 0   # Ext-II/III L5/L6 clearance draws
                     comp_preventive_l3_draws = 0   # Preventive-L3 cascade pre-pass draws
+                    comp_draw_posture        = "BALANCED"   # Phase B situational lean this week
 
                     try:
                         # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
@@ -2236,6 +2237,8 @@ class RealSimEngine:
                         comp_sde_draws           = mass_result.sde_draws_this_week
                         comp_ext_draws           = mass_result.ext_draws_this_week
                         comp_preventive_l3_draws = mass_result.preventive_l3_draws_this_week
+                        # PHASE B — situational draw lean the engine ran this cycle.
+                        comp_draw_posture        = mass_result.draw_posture
                         # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
                         # Bug #1 — total_draws now accumulated AFTER T+5M using all-types
                         # DrawHistory delta instead of mass_result.pools_drawn (regular only).
@@ -2425,6 +2428,10 @@ class RealSimEngine:
                     metrics["sde_draws_this_week"]           = comp_sde_draws
                     metrics["ext_draws_this_week"]           = comp_ext_draws
                     metrics["preventive_l3_draws_this_week"] = comp_preventive_l3_draws
+                    # PHASE B — situational draw posture this week (THROUGHPUT / BALANCED /
+                    # LIABILITY_CONTROL). Pairs with 'scenario' already in metrics so the
+                    # composition row reads against the lean + quant scenario that drove it.
+                    metrics["draw_posture"]                  = comp_draw_posture
 
                     # Bug #6: advance cumulative trackers for next week's delta computation
                     _prev_cumul_ext2  = cumul_ext2

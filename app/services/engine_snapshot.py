@@ -174,6 +174,44 @@ class SystemSnapshot:
         return "sde"
 
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# PHASE B — posture-aware per-pool routing.  This is the situational sibling of the
+# static ``pool_type_decision`` property above: same three-bucket routing, but the
+# LPI cutoffs come from a quant-adaptive ``DrawPriorityPlan`` instead of the fixed
+# config constants.  Kept as a module-level function (not a SystemSnapshot method)
+# because the caller already holds a fresh LPI + the plan, and so the admin-panel /
+# legacy callers of ``pool_type_decision`` are never disturbed.
+#
+# ``plan`` is duck-typed (reads ``plan.regular_max`` / ``plan.sde_min``) to avoid a
+# module-load import cycle with draw_priority.py.  ``plan is None`` ⇒ fall back to
+# the EXACT static config cutoffs, so any failure to build a plan degrades safely to
+# today's behaviour.  BALANCED plans carry those same cutoffs, so BALANCED == today.
+def decide_pool_draw_type(lpi: float, plan) -> str:
+    """
+    Posture-aware routing string for a single pool's current LPI.
+
+      lpi <  plan.regular_max          → 'regular'
+      plan.regular_max ≤ lpi < sde_min → 'type_a'
+      lpi ≥  plan.sde_min              → 'sde'
+
+    plan=None falls back to the static LPI_REGULAR_MAX / LPI_SDE_PROACTIVE config.
+    Pure function — no DB access, no side effects.
+    """
+    if plan is None:
+        from app.core.config import LPI_REGULAR_MAX, LPI_SDE_PROACTIVE
+        if lpi < LPI_REGULAR_MAX:
+            return "regular"
+        if lpi < LPI_SDE_PROACTIVE:
+            return "type_a"
+        return "sde"
+
+    if lpi < plan.regular_max:
+        return "regular"
+    if lpi < plan.sde_min:
+        return "type_a"
+    return "sde"
+
+
 # ══════════════════════════════���══════════════════════════��════════════════════
 # Atomic Snapshot Reader (U-01)
 # ══════════════════���═══════════════════════════════════════════════════════════

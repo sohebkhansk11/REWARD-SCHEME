@@ -3483,6 +3483,12 @@ def run_preventive_l3_draw(
 def check_and_run_preventive_l3_draws(
     db: Session,
     week_id: str,
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # PHASE B — optional posture override of the cascade trigger. When the weekly
+    # draw passes the quant-adaptive plan's cascade_threshold it REPLACES the DB
+    # getter for THIS cycle, hard-clamped to [1.5, 2.5] so no posture can disable
+    # cascade protection (too high) or fire it on noise (too low). None ⇒ DB getter.
+    cascade_threshold: float | None = None,
 ) -> list[SDEPreventiveL3DrawResult]:
     """
     Check system cascade_risk and execute Preventive L3 draws if threshold exceeded.
@@ -3523,6 +3529,18 @@ def check_and_run_preventive_l3_draws(
     # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # CASCADE_PREVENT_L3_THRESH replaced with DB-backed dynamic getter.
     _cascade_thresh = get_cascade_prevent_thresh(db)
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # PHASE B — posture override REPLACES the DB getter for this cycle, hard-clamped
+    # to the safe band [1.5, 2.5]. None ⇒ admin/DB value (BALANCED-equivalent).
+    if cascade_threshold is not None:
+        _eff_cascade = max(1.5, min(2.5, float(cascade_threshold)))
+        if abs(_eff_cascade - _cascade_thresh) > 1e-9:
+            _logger.info(
+                "Preventive L3 (week %s): posture cascade override %.2f → effective "
+                "%.2f (DB default was %.2f).",
+                week_id, cascade_threshold, _eff_cascade, _cascade_thresh,
+            )
+        _cascade_thresh = _eff_cascade
 
     if cascade_risk <= _cascade_thresh:
         _logger.info(

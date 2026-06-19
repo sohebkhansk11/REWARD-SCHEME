@@ -152,6 +152,11 @@ class MassDrawResult:
     ext_draws_this_week:          int  = 0   # Ext-II + Ext-III draws this cycle
     # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
     preventive_l3_draws_this_week: int = 0   # Q4 preventive L3 draws this cycle
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # PHASE B — situational draw lean used this cycle (THROUGHPUT/BALANCED/
+    # LIABILITY_CONTROL).  Reporting-only; surfaced in the sim metrics + dashboard
+    # so the per-type draw composition is legible against the posture that drove it.
+    draw_posture:                 str  = "BALANCED"
     # U-02: EngineEvent trace — one immutable record per draw sub-step.
     # Callers can inspect this to verify LPI monotonicity (CON-2 proof) and
     # diagnose why each pool was routed to a specific draw type.
@@ -580,7 +585,7 @@ def execute_weekly_draw(
     )
     from app.services.engine_snapshot import (
         get_system_snapshot_atomic, MIN_LPI_DELTA, MAX_REEVALS,
-        _evt,
+        decide_pool_draw_type, _evt,
     )
 
     # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
@@ -589,6 +594,39 @@ def execute_weekly_draw(
     week_id_str:       str = _current_week_id()
     _staged_executed:  int = 0
     _ext_draws_count:  int = 0
+
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # PHASE B — QUANT-ADAPTIVE DRAW-PRIORITY PLAN.  Compute the situational lean ONCE,
+    # up front, so EVERY downstream decision this cycle reads the SAME posture:
+    #   • Preventive-L3 pre-pass     → plan.cascade_threshold  (clamped 1.5–2.5)
+    #   • Accel-Dissolution pre-pass → plan.accel_ratio        (clamped 0.50–0.70)
+    #   • main routing (U-03 re-eval)→ decide_pool_draw_type(lpi, plan)
+    #   • eligible-pool draw order   → plan.pool_order_key
+    # Posture derives from the quant multiplier (already blends velocity/burn/RDR/
+    # cascade).  BALANCED reproduces today's static config EXACTLY → no-op in NEUTRAL.
+    # HARD-SAFETY ordering (Ext-II/III first, SDE staging→execution, 12/12-only
+    # eligibility) is NOT touched — only valve intensity + per-pool routing/order.
+    # Failure-isolated: any error ⇒ _draw_plan=None ⇒ static-config fallback everywhere.
+    _draw_plan = None                 # DrawPriorityPlan | None (None ⇒ static fallback)
+    _draw_posture: str = "BALANCED"
+    try:
+        from app.services.draw_priority import compute_draw_priority
+        _draw_plan    = compute_draw_priority(get_system_snapshot_atomic(db))
+        _draw_posture = _draw_plan.posture.value
+        _logger.info(
+            "execute_weekly_draw: 🎚 Draw posture=%s — regular<%.0f type_a[%.0f-%.0f) "
+            "sde≥%.0f  cascade>%.2f  accel≥%.0f%%  order=%s",
+            _draw_posture, _draw_plan.regular_max, _draw_plan.regular_max,
+            _draw_plan.sde_min, _draw_plan.sde_min, _draw_plan.cascade_threshold,
+            _draw_plan.accel_ratio * 100, _draw_plan.pool_order_key,
+        )
+    except Exception as _plan_exc:
+        _logger.warning(
+            "execute_weekly_draw: draw-priority plan failed — falling back to static "
+            "BALANCED config (non-fatal): %s", _plan_exc,
+        )
+        _draw_plan    = None
+        _draw_posture = "BALANCED"
 
     # ── 0. SDE Extension II/III pre-pass — clear any L5/L6 members FIRST ───────
     #
@@ -631,7 +669,13 @@ def execute_weekly_draw(
     _preventive_l3_count: int = 0
     try:
         from app.services.sde_engine import check_and_run_preventive_l3_draws
-        _prev_l3_results = check_and_run_preventive_l3_draws(db, week_id_str)
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # PHASE B — pass the posture cascade threshold (clamped 1.5–2.5 inside the
+        # callee). None ⇒ admin/DB getter (BALANCED-equivalent, unchanged behaviour).
+        _eff_cascade = _draw_plan.cascade_threshold if _draw_plan is not None else None
+        _prev_l3_results = check_and_run_preventive_l3_draws(
+            db, week_id_str, cascade_threshold=_eff_cascade,
+        )
         if _prev_l3_results:
             _preventive_l3_count = len(_prev_l3_results)
             from app.services.waitlist import assign_waitlist_to_pools as _wl_refill_pl3
@@ -672,8 +716,12 @@ def execute_weekly_draw(
             )
             .all()
         )
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # PHASE B — posture accel trigger (clamped 0.50–0.70 inside the callee).
+        # None ⇒ admin/DB getter (BALANCED-equivalent, unchanged behaviour).
+        _eff_accel = _draw_plan.accel_ratio if _draw_plan is not None else None
         for _ap in _accel_candidates:
-            if not check_accelerated_dissolution(db, _ap):
+            if not check_accelerated_dissolution(db, _ap, trigger_ratio=_eff_accel):
                 continue
             try:
                 _ad_res = run_accelerated_dissolution_draw(db, _ap.id)
@@ -959,6 +1007,37 @@ def execute_weekly_draw(
         prev_lpi     = 0.0
         reeval_count = 0
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # PHASE B — situational eligible-pool draw ORDER.  THROUGHPUT/BALANCED keep FIFO
+    # (oldest pool first — seniority fairness, identical to the prior id-asc order).
+    # LIABILITY_CONTROL draws the MOST L4-dense pools first so the highest-liability
+    # pools shed before the weekly draw budget is spent.  This is a PURE re-ordering:
+    # it never changes WHICH pools draw (every eligible pool is still drawn) — only the
+    # sequence.  Hard-safety phases already ran in the pre-passes above, untouched.
+    _epoch_min = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    if _draw_plan is not None and _draw_plan.pool_order_key == "l4_density_desc":
+        def _l4_density_key(_p: Pool) -> tuple:
+            _l4plus = (
+                db.query(User)
+                .filter(
+                    User.current_pool_id == _p.id,
+                    User.status          == UserStatus.Active,
+                    User.current_level   >= 4,
+                )
+                .count()
+            )
+            # most L4-dense first; FIFO (oldest, then id) as the stable tie-break.
+            return (-_l4plus, _p.created_at or _epoch_min, _p.id)
+        eligible.sort(key=_l4_density_key)
+        _logger.info(
+            "execute_weekly_draw: 🎚 LIABILITY_CONTROL order — %d eligible pool(s) "
+            "sorted by L4-density desc (shed highest-liability pools first).",
+            len(eligible),
+        )
+    else:
+        # THROUGHPUT / BALANCED / fallback → FIFO (oldest pool first).
+        eligible.sort(key=lambda _p: (_p.created_at or _epoch_min, _p.id))
+
     # ── 3. Draw every eligible pool — no inline replacement, no intermediate fill
     draw_results: list[DrawResult] = []
     skipped:      list[str]        = []
@@ -985,9 +1064,13 @@ def execute_weekly_draw(
                 fresh_snap = get_system_snapshot_atomic(db)
                 lpi_delta  = abs(fresh_snap.lpi - prev_lpi)
                 if lpi_delta >= MIN_LPI_DELTA:
-                    # LPI shifted meaningfully — re-decide draw type for this pool
+                    # LPI shifted meaningfully — re-decide draw type for this pool.
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # PHASE B — route through the posture-aware decision so the re-eval
+                    # respects this cycle's lean. _draw_plan=None ⇒ identical to the old
+                    # static fresh_snap.pool_type_decision (verified equal for BALANCED).
                     reeval_count += 1
-                    new_draw_type = fresh_snap.pool_type_decision
+                    new_draw_type = decide_pool_draw_type(fresh_snap.lpi, _draw_plan)
                     event_trace.append(_evt(
                         event_type     = "lpi_reeval",
                         pool_id        = pool.id,
@@ -1225,6 +1308,9 @@ def execute_weekly_draw(
         sde_draws_this_week=_staged_executed,
         ext_draws_this_week=_ext_draws_count,
         preventive_l3_draws_this_week=_preventive_l3_count,
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # PHASE B — surface this cycle's situational lean for telemetry/dashboard.
+        draw_posture=_draw_posture,
         event_trace=event_trace,   # U-02: full EngineEvent trace
     )
 
@@ -1334,12 +1420,25 @@ def post_draw_cleanup(db: Session) -> dict:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def check_accelerated_dissolution(db: Session, pool: Pool) -> bool:
+def check_accelerated_dissolution(
+    db: Session,
+    pool: Pool,
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # PHASE B — optional posture override of the L4+ trigger fraction. When the
+    # weekly draw passes the quant-adaptive plan's accel_ratio, it REPLACES the DB
+    # getter for THIS cycle, hard-clamped to [0.50, 0.70] so no posture can dissolve
+    # healthy pools (too low) or let L4 pile up past safety (too high). None ⇒ the
+    # admin/DB getter — so the admin-panel callers keep their exact prior behaviour.
+    trigger_ratio: float | None = None,
+) -> bool:
     """
     Check if a pool qualifies for Accelerated Dissolution mode.
 
-    Returns True if ≥ ACCEL_DISS_TRIGGER_RATIO (60%) of active members are L4+.
-    Called after each draw's level advancement to detect newly-triggered pools.
+    Returns True if ≥ the effective trigger fraction (default 60%) of active members
+    are L4+.  The effective fraction is `trigger_ratio` (posture override, clamped
+    0.50–0.70) when supplied, else the DB-backed getter.  Called after each draw's
+    level advancement to detect newly-triggered pools, and as the weekly relief-valve
+    pre-pass gate.
     """
     members: list[User] = (
         db.query(User)
@@ -1356,7 +1455,13 @@ def check_accelerated_dissolution(db: Session, pool: Pool) -> bool:
     ratio        = l4plus_count / len(members)
     # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # ACCEL_DISS_TRIGGER_RATIO replaced with DB-backed dynamic getter.
-    return ratio >= get_accel_diss_trigger_ratio(db)
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # PHASE B — posture override hard-clamped to the safe band; None ⇒ DB getter.
+    if trigger_ratio is not None:
+        _eff_ratio = max(0.50, min(0.70, float(trigger_ratio)))
+    else:
+        _eff_ratio = get_accel_diss_trigger_ratio(db)
+    return ratio >= _eff_ratio
 
 
 @dataclass

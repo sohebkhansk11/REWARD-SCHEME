@@ -2184,6 +2184,15 @@ class RealSimEngine:
                     gate_refill_phase2 = 0   # Phase-2 Bulk Auto-Scale new pools created
                     gate_refill_phase3 = 0   # Phase-3 Condensation inter-pool transfers
                     gate_paused_names  = []  # names of pools paused this run (Active, <12)
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # PHASE C1 — DRAW-COMPOSITION TELEMETRY (read-only).  Splits the single
+                    # draws_this_week total into its draw-type components so the dashboard can
+                    # show that the "1:10 regular:SDE" the admin observed is SDE LEGITIMATELY
+                    # replacing the regular draw on flagged pools (Discussion.md Q-M) — not
+                    # "out-of-code draws".  regular == gate_pools_drawn (mass_result.pools_drawn).
+                    comp_sde_draws           = 0   # SDE sub-draws (incl. Lever 4 / Lever 5 / meta)
+                    comp_ext_draws           = 0   # Ext-II/III L5/L6 clearance draws
+                    comp_preventive_l3_draws = 0   # Preventive-L3 cascade pre-pass draws
 
                     try:
                         # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
@@ -2219,6 +2228,14 @@ class RealSimEngine:
                         gate_refill_phase2 = mass_result.refill.get("phase2_pools_count", 0)
                         gate_refill_phase3 = mass_result.refill.get("phase3_transfers",   0)
                         gate_paused_names  = list(mass_result.paused_pools)
+                        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                        # PHASE C1 — capture the per-type draw counts the engine already
+                        # returns (regular == gate_pools_drawn above). These reconcile by
+                        # construction with draws_this_week computed at line ~2213:
+                        #   regular + sde + ext + preventive_l3 == draws_this_week.
+                        comp_sde_draws           = mass_result.sde_draws_this_week
+                        comp_ext_draws           = mass_result.ext_draws_this_week
+                        comp_preventive_l3_draws = mass_result.preventive_l3_draws_this_week
                         # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
                         # Bug #1 — total_draws now accumulated AFTER T+5M using all-types
                         # DrawHistory delta instead of mass_result.pools_drawn (regular only).
@@ -2396,6 +2413,18 @@ class RealSimEngine:
                     metrics["gate_refill_phase2"]    = gate_refill_phase2
                     metrics["gate_refill_phase3"]    = gate_refill_phase3
                     metrics["gate_paused_pool_names"] = gate_paused_names
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # PHASE C1 — DRAW-COMPOSITION row. Splits the single draws total into its
+                    # draw-type components so the "1:10 regular:SDE" the admin saw is legible as
+                    # SDE legitimately replacing the regular draw on flagged pools (not phantom
+                    # "out-of-code draws"). These four keys reconcile exactly with the row's
+                    # total: regular + sde + ext + preventive_l3 == draws_this_week. 'scenario'
+                    # already lives in metrics (set in _snapshot); 'draw_posture' is added in
+                    # Phase B once draw_priority.py surfaces the posture on MassDrawResult.
+                    metrics["regular_draws_this_week"]       = gate_pools_drawn          # mass_result.pools_drawn
+                    metrics["sde_draws_this_week"]           = comp_sde_draws
+                    metrics["ext_draws_this_week"]           = comp_ext_draws
+                    metrics["preventive_l3_draws_this_week"] = comp_preventive_l3_draws
 
                     # Bug #6: advance cumulative trackers for next week's delta computation
                     _prev_cumul_ext2  = cumul_ext2

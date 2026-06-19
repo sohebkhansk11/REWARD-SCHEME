@@ -864,6 +864,42 @@ def execute_weekly_draw(
     # and the WINNERS REVEALED broadcast still execute correctly.
     _total_pre_pass_draws = _ext_draws_count + _preventive_l3_count + _staged_executed
     if not eligible and _total_pre_pass_draws == 0:
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # PHASE C2 — ZERO-DRAW SELF-DIAGNOSTIC.  This branch is the user-reported
+        # "week 7 no draw even with active pools" symptom: pools EXIST in the system
+        # yet none were drawable and no pre-pass (Ext-II/III / Preventive-L3 / staged
+        # SDE) ran either.  Before raising, dump exactly WHY each candidate pool was
+        # rejected so any future zero-draw week is self-explaining in the logs instead
+        # of an opaque "no eligible pools".  Pure diagnostics — no state change. The
+        # per-pool live-count query only runs on this rare zero-draw path.
+        if candidate_pools:
+            _zero_draw_rows: list[str] = []
+            for _cp in candidate_pools:
+                _cp_live = (
+                    db.query(User)
+                    .filter(
+                        User.current_pool_id == _cp.id,
+                        User.status == UserStatus.Active,
+                    )
+                    .count()
+                )
+                _zero_draw_rows.append(
+                    "%s[live=%d/%d status=%s flagged_l4=%s drew_this_week=%s]" % (
+                        _cp.name,
+                        _cp_live,
+                        POOL_CAPACITY,
+                        getattr(_cp.status, "value", _cp.status),
+                        bool(_cp.contains_flagged_l4),
+                        bool(_cp.draw_completed_this_week),
+                    )
+                )
+            _logger.warning(
+                "execute_weekly_draw: ZERO-DRAW WEEK — %d candidate pool(s) present but "
+                "NONE drew and NO pre-pass (ext/preventive_l3/staged_sde) ran. Per-pool "
+                "rejection reasons: %s",
+                len(candidate_pools),
+                "  ".join(_zero_draw_rows),
+            )
         raise ValueError(
             "No active pools with exactly 12 members found. "
             "Run 'Fill Pool Vacancies' (POST /admin/waitlist/check) first, "

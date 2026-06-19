@@ -587,7 +587,17 @@ function WeeklyReportTable({ rows }) {
     { key: 'draws_this_week', label: 'Draws' },
     { key: 'late_payers', label: 'Late' },
     { key: 'scenario', label: 'AI Phase' },
+    // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    // PHASE B — situational draw lean (posture) that drove this week's draw-type
+    // intensity. Pairs with 'AI Phase' (scenario): one quant brain, one signal.
+    { key: 'draw_posture', label: 'Posture' },
   ]
+  // Posture colour: growth (green) / neutral (slate) / defensive (amber).
+  const postureClass = (p) =>
+    p === 'THROUGHPUT'        ? 'text-emerald-300'
+  : p === 'LIABILITY_CONTROL' ? 'text-amber-300'
+  : p === 'BALANCED'          ? 'text-slate-300'
+  : 'text-slate-500'
   return (
     <div className="overflow-auto max-h-96 rounded-xl border border-slate-700/60">
       <table className="w-full text-xs whitespace-nowrap">
@@ -598,7 +608,7 @@ function WeeklyReportTable({ rows }) {
           {rows.map((r,i)=>(
             <tr key={r.week} className={`border-b border-slate-800/50 ${r.high_pressure_mode?'bg-red-950/20':'i%2===0?bg-slate-900:bg-slate-900/50'}`}>
               {cols.map(c=>(
-                <td key={c.key} className={`px-3 py-2 ${c.key==='lpi'?(parseFloat(r.lpi)>=50?'text-red-400 font-bold':parseFloat(r.lpi)>=25?'text-orange-400':parseFloat(r.lpi)>=14?'text-amber-400':'text-emerald-400'):c.key==='scenario'?'text-cyan-300 text-[10px]':'text-slate-300'}`}>
+                <td key={c.key} className={`px-3 py-2 ${c.key==='lpi'?(parseFloat(r.lpi)>=50?'text-red-400 font-bold':parseFloat(r.lpi)>=25?'text-orange-400':parseFloat(r.lpi)>=14?'text-amber-400':'text-emerald-400'):c.key==='scenario'?'text-cyan-300 text-[10px]':c.key==='draw_posture'?`${postureClass(r.draw_posture)} text-[10px] font-semibold`:'text-slate-300'}`}>
                   {c.key==='lpi'?`${r.lpi}%`:r[c.key]??'—'}
                 </td>
               ))}
@@ -656,6 +666,15 @@ function DrawGateDiagnostics({ rows }) {
     { key:'week',                  label:'Wk'     },
     { key:'draws_this_week',       label:'Draws'  },   // all draw types (DrawHistory delta)
     { key:'gate_pools_drawn',      label:'Reg'    },   // regular pools drawn at T-0H
+    // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    // PHASE C1 — per-week DRAW COMPOSITION (authoritative per-draw_type deltas). These
+    // four + 'Reg' reconcile EXACTLY with 'Draws': Reg + SDE + Ext + PL3 + Acc == Draws.
+    // Makes the "1:10 regular:SDE" legible as SDE legitimately replacing the regular
+    // draw on flagged pools (Discussion.md Q-M), not phantom out-of-code draws.
+    { key:'sde_draws_this_week',           label:'SDE' },   // staged T-0H + INLINE Case-C/D
+    { key:'ext_draws_this_week',           label:'Ext' },   // SDE Ext-II/III (L5/L6 valve)
+    { key:'preventive_l3_draws_this_week', label:'PL3' },   // Preventive-L3 cascade pre-pass
+    { key:'accel_draws_this_week',         label:'Acc' },   // Accel-Dissolution (≥60% L4+)
     { key:'gate_pools_paused',     label:'Paused' },   // newly paused this run (Active, <12)
     { key:'gate_paused_under_cap', label:'<12'    },   // paused & under capacity → refill LAG
     { key:'gate_paused_at_cap',    label:'=12'    },   // paused at 12 → should self-heal
@@ -669,6 +688,11 @@ function DrawGateDiagnostics({ rows }) {
     if (key === 'gate_paused_under_cap' && n(val) > 0) return 'text-amber-400 font-semibold'
     if (key === 'draws_this_week' && n(val) === 0)     return 'text-slate-500'
     if (key === 'week') return 'text-slate-400 font-semibold'
+    // PHASE C1 — composition columns: tint only when non-zero so empties stay quiet.
+    if (key === 'sde_draws_this_week')           return n(val) > 0 ? 'text-sky-300'    : 'text-slate-600'
+    if (key === 'ext_draws_this_week')           return n(val) > 0 ? 'text-amber-300'  : 'text-slate-600'
+    if (key === 'preventive_l3_draws_this_week') return n(val) > 0 ? 'text-purple-300' : 'text-slate-600'
+    if (key === 'accel_draws_this_week')         return n(val) > 0 ? 'text-red-300'    : 'text-slate-600'
     return 'text-slate-300'
   }
 
@@ -907,22 +931,36 @@ function CashFlowChart({ weekly }) {
 // ── Draw Analysis Chart ───────────────────────────────────────────────────────
 function DrawAnalysisChart({ weekly }) {
   if (!weekly?.length) return null
-  // D3 FIX [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
-  // draw_type_breakdown was never populated in _snapshot() so all bars were zero.
-  // Derive per-week counts from cumulative fields already present in weekly_detail:
-  //   accel_diss_this_week  — cumulative accelerated dissolution draws (SDE-Accel)
-  //   ext2_exits_this_week  — cumulative SDE Ext-II draws
-  //   ext3_exits_this_week  — cumulative SDE Ext-III draws
-  //   draws_this_week       — total draws this week (regular + all SDE types)
-  // Per-week value = current_cumulative - previous_cumulative (delta decode).
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // PHASE C1 — prefer the AUTHORITATIVE per-draw_type composition keys the engine
+  // now emits (regular/sde/ext/preventive_l3/accel_draws_this_week). Each is the
+  // per-draw_type DrawHistory-window delta, so the five PARTITION draws_this_week and
+  // reconcile EXACTLY. This fixes the old derivation below, which computed
+  //   regular = draws − (accel+ext2+ext3)
+  // and therefore mislabeled EVERY normal SDE draw (staged/Case-C/Case-D) as "Regular"
+  // — the exact reason the admin's "1:10 regular:SDE" looked like phantom out-of-code
+  // draws. Now SDE has its own bar and the stack height == draws_this_week.
+  // Legacy fallback (pre-C1 sim runs that lack the explicit keys) keeps the cumulative-
+  // delta decode so historical reports still render.
   const data = weekly.map((w, i) => {
-    const prev      = i > 0 ? weekly[i - 1] : null
-    const accel     = Math.max(0, (w.accel_diss_this_week ?? 0) - (prev?.accel_diss_this_week ?? 0))
-    const ext2      = Math.max(0, (w.ext2_exits_this_week  ?? 0) - (prev?.ext2_exits_this_week  ?? 0))
-    const ext3      = Math.max(0, (w.ext3_exits_this_week  ?? 0) - (prev?.ext3_exits_this_week  ?? 0))
-    const sde_total = accel + ext2 + ext3
-    const regular   = Math.max(0, (w.draws_this_week ?? 0) - sde_total)
-    return { week: w.week, regular, accel, ext2, ext3 }
+    if (w.regular_draws_this_week !== undefined) {
+      return {
+        week:          w.week,
+        regular:       w.regular_draws_this_week       ?? 0,
+        sde:           w.sde_draws_this_week           ?? 0,
+        preventive_l3: w.preventive_l3_draws_this_week ?? 0,
+        ext:           w.ext_draws_this_week           ?? 0,
+        accel:         w.accel_draws_this_week         ?? 0,
+      }
+    }
+    // ── legacy fallback (old runs) — note: lumps normal SDE into 'regular' ──
+    const prev  = i > 0 ? weekly[i - 1] : null
+    const accel = Math.max(0, (w.accel_diss_this_week ?? 0) - (prev?.accel_diss_this_week ?? 0))
+    const ext2  = Math.max(0, (w.ext2_exits_this_week  ?? 0) - (prev?.ext2_exits_this_week  ?? 0))
+    const ext3  = Math.max(0, (w.ext3_exits_this_week  ?? 0) - (prev?.ext3_exits_this_week  ?? 0))
+    const ext   = ext2 + ext3
+    const regular = Math.max(0, (w.draws_this_week ?? 0) - (accel + ext))
+    return { week: w.week, regular, sde: 0, preventive_l3: 0, ext, accel }
   })
   return (
     <div className="h-48">
@@ -933,10 +971,11 @@ function DrawAnalysisChart({ weekly }) {
           <YAxis tick={{fill:'#64748b',fontSize:10}}/>
           <RechartTooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,fontSize:11}}/>
           <Legend wrapperStyle={{fontSize:10}}/>
-          <Bar dataKey="regular" stackId="a" fill="#10b981" name="Regular"       radius={[0,0,0,0]}/>
-          <Bar dataKey="accel"   stackId="a" fill="#3b82f6" name="SDE Accel"     radius={[0,0,0,0]}/>
-          <Bar dataKey="ext2"    stackId="a" fill="#f59e0b" name="SDE Ext-II"    radius={[0,0,0,0]}/>
-          <Bar dataKey="ext3"    stackId="a" fill="#ef4444" name="SDE Ext-III"   radius={[4,4,0,0]}/>
+          <Bar dataKey="regular"       stackId="a" fill="#10b981" name="Regular"         radius={[0,0,0,0]}/>
+          <Bar dataKey="sde"           stackId="a" fill="#3b82f6" name="SDE"             radius={[0,0,0,0]}/>
+          <Bar dataKey="preventive_l3" stackId="a" fill="#a855f7" name="Preventive-L3"   radius={[0,0,0,0]}/>
+          <Bar dataKey="ext"           stackId="a" fill="#f59e0b" name="SDE Ext-II/III"  radius={[0,0,0,0]}/>
+          <Bar dataKey="accel"         stackId="a" fill="#ef4444" name="SDE Accel"       radius={[4,4,0,0]}/>
         </BarChart>
       </ResponsiveContainer>
     </div>

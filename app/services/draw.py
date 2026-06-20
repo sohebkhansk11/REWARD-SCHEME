@@ -1466,16 +1466,71 @@ def post_draw_cleanup(db: Session) -> dict:
         )
     )
 
-    # 5: release draw engine lock
+    # ── Commit A: make the critical weekly state-resets DURABLE before anything
+    #    best-effort runs.  The draw_engine lock is deliberately STILL HELD here.
+    db.commit()
+
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # POST-SDE RE-MERGE (Enhancement 2 — Jun-20).  Step 3 above just cleared the L4
+    # flag on pools whose SDE-evicted L4 member exited this cycle.  Those pools were
+    # contains_flagged_l4 == True during the T-0H post-draw convergence, so the merger
+    # EXCLUDED them (SDE immunity) and their survivors were left under-capacity.  If we
+    # did nothing they would strand a FULL WEEK until the next T-2H prep converge.  So
+    # the instant they are de-flagged we fold their survivors into the single FIFO
+    # remainder pool with one compaction pass.
+    #   • Runs while the draw_engine lock is STILL HELD (released only in step 5 below),
+    #     so it can never race a concurrent draw or an injection-time converge.
+    #   • Runs AFTER Commit A, so a re-merge failure can never undo the essential draw/
+    #     L4 flag resets (next week's draw stays unblocked regardless).
+    #   • Compaction-only (_condense_pools_once): no waitlist refill is needed (step-4
+    #     of execute_weekly_draw already drained the waitlist into the non-flagged
+    #     pools) and it takes no user_prefix → zero cross-run contamination risk.
+    #   • Failure-isolated: non-fatal; the pods simply consolidate at next T-2H prep.
+    post_sde_remerge_transfers = 0
+    if pools_cleared > 0:
+        try:
+            from app.services.waitlist import _condense_pools_once
+            _remerge = _condense_pools_once(db)   # commits internally iff it moves anyone
+            post_sde_remerge_transfers = _remerge["transfers"]
+            _logger.info(
+                "post_draw_cleanup: post-SDE re-merge folded %d survivor(s) from %d "
+                "de-flagged pool(s) — %d pool(s) dissolved.",
+                _remerge["transfers"], pools_cleared, len(_remerge["dissolved"]),
+            )
+            try:
+                from app.services import forensic as _forensic
+                if _forensic.is_on():
+                    _forensic.system_event(
+                        "post_sde_remerge",
+                        severity="notice" if _remerge["transfers"] else "info",
+                        payload={
+                            "deflagged_pools":   pools_cleared,
+                            "members_compacted": _remerge["transfers"],
+                            "pools_dissolved":   len(_remerge["dissolved"]),
+                        },
+                        message=(f"Post-SDE re-merge: {pools_cleared} pool(s) de-flagged, "
+                                 f"{_remerge['transfers']} survivor(s) consolidated"),
+                    )
+            except Exception:
+                pass
+        except Exception as _remerge_exc:
+            db.rollback()
+            _logger.error(
+                "post_draw_cleanup: post-SDE re-merge failed (non-fatal) — de-flagged "
+                "pools will consolidate at next T-2H prep: %s",
+                _remerge_exc, exc_info=True,
+            )
+
+    # 5: release draw engine lock (Commit B — lock released LAST, after re-merge)
     from app.models.system_lock import SystemLock
     db.query(SystemLock).filter(SystemLock.lock_name == "draw_engine").delete()
-
     db.commit()
 
     summary = {
         "pools_draw_flag_reset": pools_reset,
         "pools_l4_flag_cleared": pools_cleared,
         "orphan_sde_flags_cleared": orphan_flags_cleared,
+        "post_sde_remerge_transfers": post_sde_remerge_transfers,
         "draw_lock_released": True,
     }
     _logger.info("post_draw_cleanup complete: %s", summary)

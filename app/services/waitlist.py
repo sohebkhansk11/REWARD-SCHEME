@@ -997,11 +997,78 @@ def run_merger_refill_converge(
         if not progressed:
             break
 
+    # ── SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # SINGLE-REMAINDER GUARANTEE (Enhancement 1B — Jun-20).  After a full two-pointer
+    # compaction the set of NON-FLAGGED under-capacity pools MUST collapse to AT MOST
+    # ONE remainder pool — members are fungible, so ΣM members always pack into
+    # floor(ΣM / 12) full pools + exactly one partial of (ΣM mod 12).  If more than
+    # one non-flagged partial survives, something blocked the compaction (a flagged
+    # pool interleaved — expected & excluded; a refill/lock race; or a regression).
+    # We surface it as a forensic ANOMALY so the property is self-diagnosing and never
+    # silently violated.  This block is OBSERVATION-ONLY: it moves no members, writes
+    # no pool/member state, and therefore cannot affect any payout/level math.
+    partial_pools: int = -1
+    try:
+        non_flagged = (
+            db.query(Pool)
+            .filter(
+                Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]),
+                Pool.contains_flagged_l4 == False,   # noqa: E712
+            )
+            .all()
+        )
+        partial_names: list[str] = []
+        for p in non_flagged:
+            cnt = (
+                db.query(func.count(User.id))
+                .filter(User.current_pool_id == p.id, User.status == UserStatus.Active)
+                .scalar() or 0
+            )
+            if cnt < POOL_CAPACITY:
+                partial_names.append(f"{p.name}({cnt}/12)")
+        partial_pools = len(partial_names)
+
+        if partial_pools > 1:
+            _logger.warning(
+                "[CONVERGE] SINGLE-REMAINDER INVARIANT — %d non-flagged partial pool(s) "
+                "survived convergence (expected ≤1): %s",
+                partial_pools, ", ".join(partial_names),
+            )
+            try:
+                from app.services import forensic as _forensic
+                if _forensic.is_on():
+                    _forensic.anomaly(
+                        "fragmentation_residual",
+                        severity="warning",
+                        payload={
+                            "partial_pool_count": partial_pools,
+                            "partial_pools":      partial_names[:50],
+                            "rounds":             rounds,
+                            "transfers":          tot_xfer,
+                        },
+                        message=(f"Fragmentation: {partial_pools} non-flagged partial "
+                                 f"pools survived convergence (expected ≤1)"),
+                    )
+            except Exception:
+                pass
+        else:
+            _logger.info(
+                "[CONVERGE] single-remainder OK — %d non-flagged partial pool(s) after "
+                "%d round(s).",
+                partial_pools, rounds,
+            )
+    except Exception as _verify_exc:   # observation must never break the converge
+        _logger.error(
+            "[CONVERGE] single-remainder verification failed (non-fatal): %s",
+            _verify_exc,
+        )
+
     return {
-        "transfers": tot_xfer,
-        "dissolved": dissolved,
-        "rounds":    rounds,
-        "refill":    refill,
+        "transfers":     tot_xfer,
+        "dissolved":     dissolved,
+        "rounds":        rounds,
+        "refill":        refill,
+        "partial_pools": partial_pools,
     }
 
 

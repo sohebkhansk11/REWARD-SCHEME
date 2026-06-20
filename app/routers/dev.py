@@ -44,7 +44,12 @@ from app.schemas.pool import PoolCreate
 from app.services.auth import hash_password as _hash_password
 from app.services.draw import run_dual_draw, execute_weekly_draw
 from app.services.settings import get_pool_threshold
-from app.services.waitlist import assign_waitlist_to_pools, fill_pool_vacancies, manual_create_pool
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# run_merger_refill_converge added for injection-time consolidation (Enhancement 1B).
+from app.services.waitlist import (
+    assign_waitlist_to_pools, fill_pool_vacancies, manual_create_pool,
+    run_merger_refill_converge,
+)
 
 router = APIRouter(
     prefix="/dev",
@@ -743,6 +748,9 @@ def simulate_users(body: SimulateUsersRequest, db: Session = Depends(get_db)):
                     if not new_pool:
                         break
                     pools_formed_bg += 1
+
+                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                _post_injection_consolidate(bg_db)   # Enhancement 1B (lock-gated)
 
                 wl_remaining_bg = (
                     bg_db.query(User)
@@ -1576,6 +1584,55 @@ def _build_join_dates(
     return sorted(join_dates)[:count]   # FIFO order guaranteed
 
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# INJECTION-TIME CONSOLIDATION (Enhancement 1B — Jun-20) — "merger should also fire
+# at member-join / injection time so fragments never accumulate between draws."
+def _post_injection_consolidate(db: Session) -> None:
+    """
+    After a freshly-injected batch has filled vacancies + formed new full pools, fold
+    any pre-existing post-draw partial pods (e.g. 10/12 pools awaiting refill) into the
+    single FIFO remainder pool immediately — instead of waiting for the next draw tick.
+
+    MONEY-SAFE LOCK GATE (critical):
+      The two-pointer compaction inside run_merger_refill_converge is lock-INDEPENDENT
+      (it is designed to run *inside* the draw window at T-2H / T+5M).  Calling it from
+      this async injection path WHILE a weekly draw concurrently holds the draw_engine
+      lock would race the draw engine moving the very same members — a money-grade
+      hazard.  So we SKIP whenever the draw lock is held; the draw's own T+5M
+      convergence consolidates in that case.  Failure-isolated: never raises into the
+      injection path (a consolidation hiccup must not fail user creation).
+    """
+    try:
+        from app.models.system_lock import SystemLock
+        draw_locked = (
+            db.query(SystemLock)
+            .filter(
+                SystemLock.lock_name == "draw_engine",
+                SystemLock.expires_at > datetime.now(timezone.utc),
+            )
+            .first() is not None
+        )
+        if draw_locked:
+            _logger_sim.info(
+                "inject consolidate: SKIPPED — draw engine lock active (draw in "
+                "flight; its T+5M converge will consolidate).",
+            )
+            return
+        result = run_merger_refill_converge(db)
+        _logger_sim.info(
+            "inject consolidate: merger convergence in %d round(s) — %d member(s) "
+            "compacted, %d pool(s) dissolved, %s partial pool(s) remain.",
+            result["rounds"], result["transfers"], len(result["dissolved"]),
+            result.get("partial_pools", "?"),
+        )
+    except Exception as exc:   # consolidation must never break injection
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _logger_sim.error("inject consolidate FAILED (non-fatal): %s", exc)
+
+
 def _background_pool_formation(prefix: str) -> None:
     """
     Background task: form pools from the users just injected.
@@ -1609,6 +1666,9 @@ def _background_pool_formation(prefix: str) -> None:
             if not new_pool:
                 break
             pools_formed += 1
+
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        _post_injection_consolidate(db)   # Enhancement 1B (lock-gated injection-time converge)
 
         wl_remaining = (
             db.query(func.count(User.id))
@@ -1781,6 +1841,8 @@ def dev_inject_timed(
                 if not new_pool:
                     break
                 pools_formed += 1
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            _post_injection_consolidate(db)   # Enhancement 1B (lock-gated injection-time converge)
             wl_remaining = (
                 db.query(func.count(User.id))
                 .filter(User.status == UserStatus.Waitlist)

@@ -817,6 +817,27 @@ def _condense_pools_once(db: Session) -> dict:
         counts[donor.id] -= moved
         phase3_transfers += moved
 
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # MONEY-GRADE ORPHAN-LEAK FIX (Jun-21).  The SessionLocal is autoflush=False
+        # (app/database.py:69), so the transfer-batch SELECT above
+        # (current_pool_id == donor.id, ORDER BY join_date ASC, LIMIT take) reads the
+        # *DB* state, NOT the pending in-session reassignments.  When a single donor
+        # feeds MORE THAN ONE receiver across consecutive iterations (receiver fills
+        # before the donor empties), the next iteration's SELECT re-reads the donor's
+        # rows BEFORE the prior batch's `current_pool_id = recv.id` is visible — so it
+        # re-selects the SAME senior members (oldest join_date first) and moves them
+        # again, while the donor's *junior* members are never selected.  The Python
+        # `counts[donor]` counter still ticks to 0 → the pool is dissolved (lines 777 /
+        # 822) while those unselected juniors are STILL physically inside it →
+        # permanently ORPHANED Active members (status=Active, current_pool_id → a
+        # Merged_Dissolved pool, dynamic_merges_experienced=0), invisible to every
+        # pool-based view yet still counted Active.  Flushing the batch NOW makes the
+        # reassignments visible to the very next SELECT, so each member is selected and
+        # moved exactly once and a pool is dissolved only when it is truly empty.
+        # One transaction still (commit stays at the end); flush only pushes the
+        # pending pool_id changes so the read-after-write is correct.
+        db.flush()
+
         donor_dissolved = (counts[donor.id] == 0)
         if donor_dissolved:
             donor.status        = PoolStatus.Merged_Dissolved

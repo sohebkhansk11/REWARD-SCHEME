@@ -556,6 +556,44 @@ export const getDebuggerLogs = (params = {}) =>
 export const clearDebuggerLogs = () =>
   api.delete('/dev/debugger/logs')
 
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// ── Forensic Debugger (event-level "every breath" recorder) ───────────────────
+
+/** POST /dev/forensic/toggle — { enabled: bool, run_id?: str } */
+export const toggleForensic = (enabled, runId = undefined) =>
+  api.post('/dev/forensic/toggle', { enabled, run_id: runId })
+
+/** GET /dev/forensic/status — { enabled, run_id, week, tick, buffered, event_count } */
+export const getForensicStatus = () =>
+  api.get('/dev/forensic/status')
+
+/**
+ * GET /dev/forensic/events — paginated ForensicEvent rows.
+ * @param {{ run_id?, week_id?, category?, event_type?, severity?, entity_id?,
+ *           search?, order?, limit?, offset? }} params
+ */
+export const getForensicEvents = (params = {}) =>
+  api.get('/dev/forensic/events', { params })
+
+/** GET /dev/forensic/summary — aggregate counts by category/event/severity/week */
+export const getForensicSummary = (params = {}) =>
+  api.get('/dev/forensic/summary', { params })
+
+/**
+ * GET /dev/forensic/export — full filtered dump as a downloadable blob.
+ * @param {'csv'|'json'} format
+ * @param {object} filters — same filter keys as getForensicEvents
+ */
+export const exportForensicEvents = (format = 'csv', filters = {}) =>
+  api.get('/dev/forensic/export', {
+    params: { format, ...filters },
+    responseType: 'blob',
+  })
+
+/** DELETE /dev/forensic/events — clear events (optionally scoped to one run_id) */
+export const clearForensicEvents = (runId = undefined) =>
+  api.delete('/dev/forensic/events', { params: runId ? { run_id: runId } : {} })
+
 // ── Auth (no JWT needed for these calls) ──────────────────────────────────────
 export const adminLogin     = (username, password) =>
   api.post('/admin/auth/login',      { username, password })

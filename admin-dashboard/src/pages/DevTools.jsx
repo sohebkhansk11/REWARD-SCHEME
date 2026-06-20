@@ -18,6 +18,8 @@ import {
   DollarSign, Database, RefreshCw, Layers, Trophy, Target,
   Cpu, Settings, CalendarDays, Activity, ToggleLeft, ToggleRight,
   Shuffle, ChevronRight, Download, TableProperties,
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  ScrollText, Search, Trash2, Filter, FileJson, Radio,
 } from 'lucide-react'
 import {
   AreaChart, Area, LineChart, Line, BarChart, Bar,
@@ -34,6 +36,9 @@ import {
   devSetPaymentScenario, getInjectionStatus,
   // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
   getDebuggerStatus, toggleDebugger, getDebuggerLogs, clearDebuggerLogs,
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  getForensicStatus, toggleForensic, getForensicEvents, getForensicSummary,
+  exportForensicEvents, clearForensicEvents,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -2271,11 +2276,351 @@ function DangerTab({ toast }) {
 // TAB NAV
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// TAB 4 — FORENSIC DEBUGGER (event-level "every breath of the system" recorder)
+// -----------------------------------------------------------------------------
+// Surfaces the forensic_events stream the engine now emits (member join / win,
+// level advance, elimination, pool create / merge / dissolve, L4 SDE flag,
+// SDE meta-pool, Case-E hold, posture decision, per-week heartbeat, anomalies).
+// Toggle ON → the backend recorder buffers + bulk-flushes every domain event;
+// toggle OFF → zero rows, zero overhead. Filter, paginate, export (CSV/JSON),
+// and clear. All /dev/forensic/* calls are dev-mode gated server-side.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const FX_CATEGORIES = ['', 'MEMBERSHIP', 'POOL', 'DRAW', 'SDE', 'MERGER',
+  'PAYMENT', 'LEVEL', 'ELIMINATION', 'GRACE', 'REFILL', 'POSTURE', 'SYSTEM', 'ANOMALY']
+const FX_SEVERITIES = ['', 'info', 'notice', 'warning', 'critical']
+
+const fxCatColor = (c) => ({
+  MEMBERSHIP: 'text-sky-300',   POOL: 'text-indigo-300', DRAW: 'text-emerald-300',
+  SDE: 'text-rose-300',         MERGER: 'text-orange-300', PAYMENT: 'text-cyan-300',
+  LEVEL: 'text-violet-300',     ELIMINATION: 'text-red-300', GRACE: 'text-amber-300',
+  REFILL: 'text-teal-300',      POSTURE: 'text-fuchsia-300', SYSTEM: 'text-slate-300',
+  ANOMALY: 'text-red-400 font-bold',
+}[c] || 'text-slate-300')
+
+const fxSevPill = (s) => ({
+  info:     'bg-slate-800 text-slate-400 border-slate-700',
+  notice:   'bg-emerald-950 text-emerald-300 border-emerald-800',
+  warning:  'bg-amber-950 text-amber-300 border-amber-800',
+  critical: 'bg-red-950 text-red-300 border-red-800',
+}[s] || 'bg-slate-800 text-slate-400 border-slate-700')
+
+function ForensicTab({ toast }) {
+  const FX_LIMIT = 100
+  const [status,  setStatus]  = useState(null)
+  const [on,      setOn]      = useState(false)
+  const [runId,   setRunId]   = useState('')
+  const [filters, setFilters] = useState({
+    category: '', severity: '', event_type: '', week_id: '',
+    entity_id: '', search: '', order: 'desc', run_id: '',
+  })
+  const [events,  setEvents]  = useState([])
+  const [total,   setTotal]   = useState(0)
+  const [offset,  setOffset]  = useState(0)
+  const [summary, setSummary] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [autoRefresh, setAutoRefresh] = useState(true)
+
+  // Normalise the filter object into query params (drop empties; coerce ints).
+  const queryParams = useCallback((extra = {}) => {
+    const p = {}
+    if (filters.category)   p.category   = filters.category
+    if (filters.severity)   p.severity   = filters.severity
+    if (filters.event_type) p.event_type = filters.event_type
+    if (filters.search)     p.search     = filters.search
+    if (filters.run_id)     p.run_id     = filters.run_id
+    if (filters.week_id  !== '') p.week_id   = parseInt(filters.week_id, 10)
+    if (filters.entity_id!== '') p.entity_id = parseInt(filters.entity_id, 10)
+    return { ...p, ...extra }
+  }, [filters])
+
+  const fetchStatus = useCallback(() => {
+    getForensicStatus()
+      .then(r => { setStatus(r.data); setOn(!!r.data.enabled) })
+      .catch(() => {})
+  }, [])
+
+  const fetchEvents = useCallback((off = offset) => {
+    setLoading(true)
+    getForensicEvents(queryParams({ order: filters.order, limit: FX_LIMIT, offset: off }))
+      .then(r => { setEvents(r.data.events ?? []); setTotal(r.data.total ?? 0); setOffset(off) })
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [queryParams, filters.order, offset])
+
+  const fetchSummary = useCallback(() => {
+    getForensicSummary(filters.run_id ? { run_id: filters.run_id } : {})
+      .then(r => setSummary(r.data))
+      .catch(() => {})
+  }, [filters.run_id])
+
+  // Initial + status polling.
+  useEffect(() => { fetchStatus() }, [fetchStatus])
+  useEffect(() => {
+    if (!autoRefresh) return
+    const id = setInterval(() => {
+      fetchStatus()
+      if (on) { fetchEvents(0); fetchSummary() }
+    }, 6000)
+    return () => clearInterval(id)
+  }, [autoRefresh, on, fetchStatus, fetchEvents, fetchSummary])
+
+  // First data load.
+  useEffect(() => { fetchEvents(0); fetchSummary() /* eslint-disable-next-line */ }, [])
+
+  const handleToggle = async (next) => {
+    try {
+      await toggleForensic(next, next ? (runId || undefined) : undefined)
+      setOn(next)
+      toast(next ? 'Forensic Debugger ON — recording every event' : 'Forensic Debugger OFF', next ? 'success' : 'info')
+      setTimeout(() => { fetchStatus(); fetchEvents(0); fetchSummary() }, 300)
+    } catch {
+      toast('Forensic toggle failed — check ENABLE_DEV_MODE / server logs', 'error')
+    }
+  }
+
+  const applyFilters = () => { fetchEvents(0); fetchSummary() }
+
+  const resetFilters = () => {
+    setFilters({ category: '', severity: '', event_type: '', week_id: '',
+      entity_id: '', search: '', order: 'desc', run_id: '' })
+    setTimeout(() => { fetchEvents(0); fetchSummary() }, 0)
+  }
+
+  const doExport = async (fmt) => {
+    try {
+      const res = await exportForensicEvents(fmt, queryParams())
+      const url = URL.createObjectURL(res.data)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `forensic_events.${fmt}`
+      document.body.appendChild(a); a.click(); document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      toast(`Exported forensic events (${fmt.toUpperCase()})`, 'success')
+    } catch {
+      toast('Export failed', 'error')
+    }
+  }
+
+  const doClear = async () => {
+    const scope = filters.run_id ? `run '${filters.run_id}'` : 'the ENTIRE table'
+    if (!window.confirm(`Delete forensic events for ${scope}? This cannot be undone.`)) return
+    try {
+      const r = await clearForensicEvents(filters.run_id || undefined)
+      toast(`Cleared ${r.data.deleted} event(s)`, 'success')
+      fetchEvents(0); fetchSummary(); fetchStatus()
+    } catch {
+      toast('Clear failed', 'error')
+    }
+  }
+
+  const setF = (k, v) => setFilters(f => ({ ...f, [k]: v }))
+
+  const pageStart = total === 0 ? 0 : offset + 1
+  const pageEnd   = Math.min(offset + FX_LIMIT, total)
+
+  return (
+    <div className="space-y-4">
+      {/* ── Control header ─────────────────────────────────────────────────── */}
+      <DevCard
+        icon={ScrollText} iconBg="bg-emerald-900/40" iconColor="text-emerald-300"
+        title="Forensic Debugger — Event-Level Recorder"
+        subtitle="Records every domain event the engine emits — 'every breath of the system'"
+      >
+        <div className="space-y-4">
+          <InfoBanner accent={on ? 'green' : 'blue'} text={
+            on
+              ? 'RECORDING. Every member join/win, level advance, elimination, pool create/merge/dissolve, L4 SDE flag, SDE meta-pool, Case-E hold, posture decision, per-week heartbeat and anomaly is being captured into forensic_events. Buffered events flush per Chronos tick + at week end via an independent session (the money/draw path is never coupled to a forensic write).'
+              : 'OFF — zero rows, zero overhead. Enable, then run a stress test (or live cycle) to capture the full event timeline. Disabling flushes any pending buffer first.'
+          }/>
+
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="flex-1 min-w-[180px]">
+              <DevInput
+                label="Capture run_id" hint="(optional tag)"
+                value={runId} onChange={e => setRunId(e.target.value)}
+                placeholder="e.g. reprocsv / live" disabled={on}
+              />
+            </div>
+            <button
+              onClick={() => handleToggle(!on)}
+              className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold transition-all ${
+                on ? 'bg-red-700 hover:bg-red-600 text-white' : 'bg-emerald-700 hover:bg-emerald-600 text-white'
+              }`}
+            >
+              {on ? <ToggleRight className="w-4 h-4"/> : <ToggleLeft className="w-4 h-4"/>}
+              {on ? 'Stop Recording' : 'Start Recording'}
+            </button>
+            <button
+              onClick={() => setAutoRefresh(v => !v)}
+              className={`flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-xs font-semibold border transition-colors ${
+                autoRefresh ? 'bg-emerald-950/60 border-emerald-800 text-emerald-300' : 'bg-slate-800 border-slate-700 text-slate-400'
+              }`}
+            >
+              <Radio className={`w-3.5 h-3.5 ${autoRefresh ? 'animate-pulse' : ''}`}/>
+              {autoRefresh ? 'Live' : 'Paused'}
+            </button>
+          </div>
+
+          {/* Status pills */}
+          <div className="grid grid-cols-3 sm:grid-cols-6 gap-2.5">
+            <StatPill label="State"    value={on ? 'ON' : 'OFF'} accent={on ? 'emerald' : 'slate'}/>
+            <StatPill label="Run"      value={status?.run_id || '—'} accent="cyan"/>
+            <StatPill label="Week"     value={status?.week ?? '—'} accent="blue"/>
+            <StatPill label="Tick"     value={status?.tick || '—'} accent="purple"/>
+            <StatPill label="Buffered" value={NUM(status?.buffered)} accent="amber"/>
+            <StatPill label="Total"    value={NUM(status?.event_count)} accent="slate"/>
+          </div>
+        </div>
+      </DevCard>
+
+      {/* ── Summary breakdown ──────────────────────────────────────────────── */}
+      {summary && (summary.total > 0) && (
+        <DevCard
+          icon={BarChart3} iconBg="bg-cyan-900/40" iconColor="text-cyan-300"
+          title="Event Summary" subtitle={`${NUM(summary.total)} events${filters.run_id ? ` · run '${filters.run_id}'` : ''}`}
+        >
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+              <StatPill label="Total Events" value={NUM(summary.total)} accent="slate"/>
+              <StatPill label="Alerts (warn+crit)" value={NUM(summary.alert_count)} accent={summary.alert_count > 0 ? 'amber' : 'slate'}/>
+              <StatPill label="Anomalies" value={NUM(summary.anomaly_count)} accent={summary.anomaly_count > 0 ? 'red' : 'emerald'}/>
+              <StatPill label="Categories" value={NUM(summary.by_category?.length)} accent="cyan"/>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {(summary.by_category ?? []).map(c => (
+                <button
+                  key={c.category}
+                  onClick={() => { setF('category', c.category === filters.category ? '' : c.category); setTimeout(applyFilters, 0) }}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[10px] font-semibold transition-colors ${
+                    filters.category === c.category ? 'border-emerald-600 bg-emerald-950/40' : 'border-slate-700 bg-slate-800/40 hover:border-slate-500'
+                  }`}
+                >
+                  <span className={fxCatColor(c.category)}>{c.category}</span>
+                  <span className="text-slate-500 font-black">{NUM(c.count)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </DevCard>
+      )}
+
+      {/* ── Filters + actions ──────────────────────────────────────────────── */}
+      <DevCard
+        icon={Filter} iconBg="bg-violet-900/40" iconColor="text-violet-300"
+        title="Event Timeline" subtitle={`${NUM(pageStart)}–${NUM(pageEnd)} of ${NUM(total)} matching events`}
+      >
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <DevSelect label="Category" value={filters.category} onChange={e => setF('category', e.target.value)}>
+              {FX_CATEGORIES.map(c => <option key={c} value={c}>{c || 'All categories'}</option>)}
+            </DevSelect>
+            <DevSelect label="Severity" value={filters.severity} onChange={e => setF('severity', e.target.value)}>
+              {FX_SEVERITIES.map(s => <option key={s} value={s}>{s || 'All severities'}</option>)}
+            </DevSelect>
+            <DevInput label="Event type" placeholder="member_won…" value={filters.event_type} onChange={e => setF('event_type', e.target.value)}/>
+            <DevSelect label="Order" value={filters.order} onChange={e => setF('order', e.target.value)}>
+              <option value="desc">Newest first</option>
+              <option value="asc">Chronological</option>
+            </DevSelect>
+            <DevInput label="Week" type="number" placeholder="wk #" value={filters.week_id} onChange={e => setF('week_id', e.target.value)}/>
+            <DevInput label="Entity ID" type="number" placeholder="user/pool id" value={filters.entity_id} onChange={e => setF('entity_id', e.target.value)}/>
+            <DevInput label="Run ID" placeholder="run filter" value={filters.run_id} onChange={e => setF('run_id', e.target.value)}/>
+            <DevInput label="Search message" placeholder="substring…" value={filters.search} onChange={e => setF('search', e.target.value)}/>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button onClick={applyFilters} className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-violet-700 hover:bg-violet-600 text-white text-xs font-bold transition-colors">
+              <Search className="w-3.5 h-3.5"/> Apply filters
+            </button>
+            <button onClick={resetFilters} className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition-colors">
+              <RefreshCw className="w-3.5 h-3.5"/> Reset
+            </button>
+            <div className="ml-auto flex items-center gap-2">
+              <button onClick={() => doExport('csv')} className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-emerald-300 text-xs font-semibold transition-colors">
+                <Download className="w-3.5 h-3.5"/> CSV
+              </button>
+              <button onClick={() => doExport('json')} className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-cyan-300 text-xs font-semibold transition-colors">
+                <FileJson className="w-3.5 h-3.5"/> JSON
+              </button>
+              <button onClick={doClear} className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-red-950/60 hover:bg-red-900/60 border border-red-800 text-red-300 text-xs font-semibold transition-colors">
+                <Trash2 className="w-3.5 h-3.5"/> Clear
+              </button>
+            </div>
+          </div>
+
+          {/* Timeline table */}
+          <div className="overflow-auto max-h-[32rem] rounded-xl border border-slate-700/60">
+            <table className="w-full text-[11px] whitespace-nowrap">
+              <thead className="bg-slate-800 sticky top-0 z-10">
+                <tr className="text-slate-500 uppercase text-[10px]">
+                  <th className="px-3 py-2.5 text-right">Seq</th>
+                  <th className="px-3 py-2.5 text-left">Wk</th>
+                  <th className="px-3 py-2.5 text-left">Tick</th>
+                  <th className="px-3 py-2.5 text-left">Category</th>
+                  <th className="px-3 py-2.5 text-left">Event</th>
+                  <th className="px-3 py-2.5 text-left">Sev</th>
+                  <th className="px-3 py-2.5 text-left">Entity</th>
+                  <th className="px-3 py-2.5 text-right">₹</th>
+                  <th className="px-3 py-2.5 text-left">Message</th>
+                </tr>
+              </thead>
+              <tbody>
+                {events.length === 0 ? (
+                  <tr><td colSpan={9} className="px-3 py-8 text-center text-slate-500">
+                    {loading ? 'Loading…' : on ? 'No events match — run a simulation or widen the filters.' : 'Forensic recorder is OFF — enable it and run a cycle to populate the timeline.'}
+                  </td></tr>
+                ) : events.map(ev => (
+                  <tr key={ev.id} className="border-b border-slate-800/60 hover:bg-slate-800/30 transition-colors align-top">
+                    <td className="px-3 py-1.5 text-right text-slate-600 tabular-nums">{ev.seq ?? '—'}</td>
+                    <td className="px-3 py-1.5 text-slate-400 tabular-nums">{ev.week_id ?? '—'}</td>
+                    <td className="px-3 py-1.5 text-slate-500 font-mono text-[10px]">{ev.tick ?? '—'}</td>
+                    <td className={`px-3 py-1.5 font-bold ${fxCatColor(ev.category)}`}>{ev.category}</td>
+                    <td className="px-3 py-1.5 text-slate-300 font-mono">{ev.event_type}</td>
+                    <td className="px-3 py-1.5">
+                      <span className={`inline-block px-1.5 py-0.5 rounded border text-[9px] font-bold ${fxSevPill(ev.severity)}`}>{ev.severity}</span>
+                    </td>
+                    <td className="px-3 py-1.5 text-slate-400">{ev.entity_ref || (ev.entity_id != null ? `#${ev.entity_id}` : '—')}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-emerald-400">{ev.amount_inr != null ? INR(ev.amount_inr) : ''}</td>
+                    <td className="px-3 py-1.5 text-slate-300 max-w-[420px] whitespace-normal break-words">{ev.message || '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Pagination */}
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] text-slate-500">Showing {NUM(pageStart)}–{NUM(pageEnd)} of {NUM(total)}</span>
+            <div className="flex items-center gap-2">
+              <button
+                disabled={offset <= 0 || loading}
+                onClick={() => fetchEvents(Math.max(0, offset - FX_LIMIT))}
+                className="px-3 py-1.5 rounded-lg bg-slate-800 text-slate-300 text-xs font-semibold disabled:opacity-30 disabled:cursor-not-allowed hover:bg-slate-700 transition-colors"
+              >Prev</button>
+              <button
+                disabled={pageEnd >= total || loading}
+                onClick={() => fetchEvents(offset + FX_LIMIT)}
+                className="px-3 py-1.5 rounded-lg bg-slate-800 text-slate-300 text-xs font-semibold disabled:opacity-30 disabled:cursor-not-allowed hover:bg-slate-700 transition-colors"
+              >Next</button>
+            </div>
+          </div>
+        </div>
+      </DevCard>
+    </div>
+  )
+}
+
+
 const TABS = [
   { id:0, icon:FlaskConical, label:'Stress Test',  short:'Stress'  },
   { id:1, icon:Zap,          label:'Draw Control', short:'Draw'    },
   { id:2, icon:UserPlus,     label:'Injection',    short:'Inject'  },
   { id:3, icon:Skull,        label:'Danger Zone',  short:'Danger', danger:true },
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  { id:4, icon:ScrollText,   label:'Forensic',     short:'Forensic' },
 ]
 
 function TabNav({ active, setActive }) {
@@ -2473,6 +2818,8 @@ export default function DevTools() {
           {tab===1&&<DrawControlTab toast={toast}/>}
           {tab===2&&<InjectionTab   toast={toast}/>}
           {tab===3&&<DangerTab      toast={toast}/>}
+          {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
+          {tab===4&&<ForensicTab    toast={toast}/>}
         </div>
 
         <div className="h-8"/>

@@ -479,7 +479,35 @@ def run_dual_draw(
                 _upd["sde_required"]     = True
                 # Held (deferred) L4 keeps its ORIGINAL flagged week.
                 _upd["sde_flagged_week"] = member.sde_flagged_week if _case_e_def else week_id
+            _old_level = member.current_level
             crud_user.update_user(db, member_id, UserUpdate(**_upd))
+
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Forensic: record every survivor level change (and Case-E true-defer HOLD).
+            try:
+                from app.services import forensic as _forensic
+                if _forensic.is_on():
+                    if new_level != _old_level:
+                        _forensic.level_event(
+                            member.id, member.username,
+                            from_level=_old_level, to_level=new_level,
+                            pool_id=pool_id,
+                            payload={"draw_type": draw_type,
+                                     "reached_l4": bool(reaching_l4)},
+                            message=f"{member.username} advanced L{_old_level}->L{new_level} "
+                                    f"in pool '{pool.name}'"
+                                    + (" [L4 SDE-flagged]" if reaching_l4 else ""),
+                        )
+                    elif _case_e_def:
+                        _forensic.sde_event(
+                            "case_e_hold", lever="lever6",
+                            pool_id=pool_id, ref=member.username, severity="warning",
+                            payload={"user_id": member.id, "held_at_level": _old_level},
+                            message=f"Case-E TRUE-DEFER HOLD: {member.username} held at "
+                                    f"L{_old_level} in pool '{pool.name}' (no drawable supply)",
+                        )
+            except Exception:
+                pass
 
     # If any survivor reached L4, mark the pool as containing a flagged L4 member.
     # This sets contains_flagged_l4=True in the SAME transaction as the flag itself.
@@ -527,6 +555,29 @@ def run_dual_draw(
         winner_2_journey_type       = "merged" if _w2_merges > 0 else "direct",
     ))
     db.commit()
+
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # FORENSIC — one member_won event per winner ("member win, every small moment").
+    # Captures who won, at what level, payout, and the draw type that ejected them.
+    # Toggle-gated + failure-isolated; zero-overhead no-op when the debugger is OFF.
+    try:
+        from app.services import forensic as _forensic
+        if _forensic.is_on():
+            for _res, _ref in ((result_1, getattr(winner_1, "username", None)),
+                               (result_2, getattr(winner_2, "username", None))):
+                _forensic.member_won(
+                    _res.winner_id, _ref or f"user:{_res.winner_id}",
+                    pool_id=pool.id, level=_res.winner_level, draw_type=draw_type,
+                    amount_inr=int(_res.net_payout_inr or 0),
+                    payload={"pool_name": pool.name, "edge_case": edge_case})
+            _forensic.draw_event(
+                "draw_executed", pool_id=pool.id, ref=pool.name, draw_type=draw_type,
+                payload={"winners": [result_1.winner_id, result_2.winner_id],
+                         "edge_case": edge_case},
+                message=f"DRAW {draw_type} pool {pool.name}: "
+                        f"@L{result_1.winner_level}+@L{result_2.winner_level} won")
+    except Exception:
+        pass
 
     # After a single draw, immediately run the Double-FIFO refill so vacancies
     # are filled and Phase 2 pool creation is considered.
@@ -634,6 +685,29 @@ def execute_weekly_draw(
         )
         _draw_plan    = None
         _draw_posture = "BALANCED"
+
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # FORENSIC — record the situational draw posture decided for this cycle, with the
+    # clamped valve thresholds it produced. Lets the timeline explain WHY a given week
+    # leaned THROUGHPUT vs LIABILITY_CONTROL. Failure-isolated + no-op when OFF.
+    try:
+        from app.services import forensic as _forensic
+        if _forensic.is_on():
+            _sc = None
+            try:
+                _sc = get_system_snapshot_atomic(db).scenario
+            except Exception:
+                _sc = None
+            _forensic.posture_event(
+                posture=_draw_posture, scenario=_sc,
+                payload=({"cascade_threshold": _draw_plan.cascade_threshold,
+                          "accel_ratio": _draw_plan.accel_ratio,
+                          "regular_max": _draw_plan.regular_max,
+                          "sde_min": _draw_plan.sde_min,
+                          "pool_order_key": _draw_plan.pool_order_key}
+                         if _draw_plan is not None else {"fallback": "static_BALANCED"}))
+    except Exception:
+        pass
 
     # ── 0. SDE Extension II/III pre-pass — clear any L5/L6 members FIRST ───────
     #
@@ -1613,7 +1687,25 @@ def run_accelerated_dissolution_draw(
                 _upd["sde_required"]     = True
                 # Held (deferred) L4 keeps its ORIGINAL flagged week.
                 _upd["sde_flagged_week"] = member.sde_flagged_week if _case_e_def else week_id
+            _old_level = member.current_level
             crud_user.update_user(db, member_id, UserUpdate(**_upd))
+
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Forensic: survivor level changes during accelerated dissolution.
+            try:
+                from app.services import forensic as _forensic
+                if _forensic.is_on() and new_level != _old_level:
+                    _forensic.level_event(
+                        member.id, member.username,
+                        from_level=_old_level, to_level=new_level,
+                        pool_id=member.current_pool_id,
+                        payload={"draw_type": "accelerated_dissolution",
+                                 "reached_l4": bool(reaching_l4)},
+                        message=f"{member.username} advanced L{_old_level}->L{new_level} "
+                                f"(accel-dissolution)",
+                    )
+            except Exception:
+                pass
 
     if new_l4_flagged:
         pool.contains_flagged_l4 = True

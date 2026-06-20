@@ -309,6 +309,25 @@ def flag_l4_members(db: Session) -> int:
             if pool and not pool.contains_flagged_l4:
                 pool.contains_flagged_l4 = True
 
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Forensic: record each L4 SDE-flag the moment it is set (catch-up sweep).
+        try:
+            from app.services import forensic as _forensic
+            if _forensic.is_on():
+                _forensic.sde_event(
+                    "l4_flagged", lever="flag_sweep",
+                    pool_id=member.current_pool_id,
+                    ref=getattr(member, "username", None),
+                    severity="notice",
+                    payload={"user_id": member.id,
+                             "username": getattr(member, "username", None),
+                             "sde_flagged_week": week_id},
+                    message=f"L4 SDE-flagged: {getattr(member, 'username', member.id)} "
+                            f"(pool {member.current_pool_id}) week {week_id}",
+                )
+        except Exception:
+            pass
+
     count = len(newly_flagged)
     if count:
         _logger.info(

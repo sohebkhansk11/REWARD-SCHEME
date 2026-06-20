@@ -2443,6 +2443,32 @@ def run_sde_meta_pool(db: Session, week_id: str) -> SDEMetaPoolResult:
         week_id, len(meta_result.sessions),
         meta_result.total_l4_cleared, meta_result.overflow_l4_count,
     )
+
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Forensic: one summary event per SDE meta-pool staging pass — gives the
+    # operator full visibility into the SDE clearance the user said was invisible
+    # ("until donor<>receiver merger ain't triggered I can't see what SDE does").
+    try:
+        from app.services import forensic as _forensic
+        if _forensic.is_on():
+            _forensic.sde_event(
+                "meta_pool_complete", lever="meta_pool",
+                severity="warning" if meta_result.overflow_l4_count else "notice",
+                payload={
+                    "week_id":           week_id,
+                    "sessions":          len(meta_result.sessions),
+                    "l4_cleared":        meta_result.total_l4_cleared,
+                    "pools_processed":   meta_result.total_pools_processed,
+                    "overflow_l4_count": meta_result.overflow_l4_count,
+                    "overflow_user_ids": list(meta_result.overflow_user_ids)[:50],
+                },
+                message=f"SDE meta-pool: week={week_id} sessions={len(meta_result.sessions)} "
+                        f"L4_cleared={meta_result.total_l4_cleared} "
+                        f"overflow={meta_result.overflow_l4_count}",
+            )
+    except Exception:
+        pass
+
     return meta_result
 
 

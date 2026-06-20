@@ -2557,3 +2557,308 @@ def clear_debugger_logs(
         "deleted": count,
         "message": f"Cleared {count} debug log entries from debug_logs.",
     }
+
+
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# =============================================================================
+# FORENSIC DEBUGGER — event-level audit API ("every breath of the system")
+# -----------------------------------------------------------------------------
+# Finer-grained than the function-LEVEL Global System Debugger above: this
+# records every DOMAIN event (member join/win, level advance, elimination,
+# pool create/merge/dissolve, SDE flag / meta-pool / Case-E, draw executed,
+# posture decision, per-week heartbeat, anomalies) into the forensic_events
+# table via app.services.forensic.
+#
+# POST   /dev/forensic/toggle                          — enable/disable recorder
+# GET    /dev/forensic/status                          — toggle state + row count
+# GET    /dev/forensic/events   ?filters&limit&offset  — paginated, newest-first
+# GET    /dev/forensic/summary  ?run_id&week_id        — aggregate counts
+# GET    /dev/forensic/export   ?format=csv|json       — full filtered dump
+# DELETE /dev/forensic/events   ?run_id                — clear (optionally scoped)
+# =============================================================================
+
+class ForensicToggleRequest(BaseModel):
+    enabled: bool   = Field(..., description="True to enable the Forensic Debugger.")
+    run_id:  str | None = Field(None, description="Optional run tag for captured events.")
+
+
+@router.post("/forensic/toggle")
+def toggle_forensic(
+    body: ForensicToggleRequest,
+    _: None = Depends(require_dev_mode),
+):
+    """
+    Enable or disable the Forensic Debugger (event-level recorder).
+
+    When enabled, every instrumented domain event in the engine is buffered and
+    bulk-flushed (per Chronos tick / per week) into forensic_events via an
+    independent session — engine payout/draw transactions are never touched.
+    When disabled, every recorder call is a single boolean check (zero overhead);
+    disabling first flushes any pending buffered events.
+    """
+    from app.services import forensic as _forensic
+
+    if body.enabled:
+        _forensic.enable_forensic(body.run_id or "live")
+    else:
+        _forensic.disable_forensic()
+
+    return {
+        "enabled": body.enabled,
+        "context": _forensic.get_context(),
+        "message": f"Forensic Debugger {'ENABLED' if body.enabled else 'DISABLED'}.",
+    }
+
+
+@router.get("/forensic/status")
+def forensic_status(
+    db: Session = Depends(get_db),
+    _: None = Depends(require_dev_mode),
+):
+    """Return the current forensic toggle state + total rows in forensic_events."""
+    from app.services import forensic as _forensic
+    from app.models.forensic_event import ForensicEvent
+
+    event_count = db.query(func.count(ForensicEvent.id)).scalar() or 0
+    ctx = _forensic.get_context()
+    return {
+        "enabled":     ctx["enabled"],
+        "run_id":      ctx["run_id"],
+        "week":        ctx["week"],
+        "tick":        ctx["tick"],
+        "buffered":    ctx["buffered"],
+        "event_count": event_count,
+    }
+
+
+def _forensic_apply_filters(q, *, run_id, week_id, category, event_type,
+                            severity, entity_id, search):
+    """Shared additive (AND) filter builder for events/summary/export."""
+    from app.models.forensic_event import ForensicEvent
+    if run_id     is not None: q = q.filter(ForensicEvent.run_id     == run_id)
+    if week_id    is not None: q = q.filter(ForensicEvent.week_id    == week_id)
+    if category   is not None: q = q.filter(ForensicEvent.category   == category)
+    if event_type is not None: q = q.filter(ForensicEvent.event_type == event_type)
+    if severity   is not None: q = q.filter(ForensicEvent.severity   == severity)
+    if entity_id  is not None: q = q.filter(ForensicEvent.entity_id  == entity_id)
+    if search     is not None: q = q.filter(ForensicEvent.message.contains(search))
+    return q
+
+
+def _forensic_row_dict(r) -> dict:
+    return {
+        "id":          r.id,
+        "run_id":      r.run_id,
+        "seq":         r.seq,
+        "week_id":     r.week_id,
+        "tick":        r.tick,
+        "category":    r.category,
+        "event_type":  r.event_type,
+        "severity":    r.severity,
+        "actor":       r.actor,
+        "entity_type": r.entity_type,
+        "entity_id":   r.entity_id,
+        "entity_ref":  r.entity_ref,
+        "amount_inr":  r.amount_inr,
+        "before_json":  r.before_json,
+        "after_json":   r.after_json,
+        "payload_json": r.payload_json,
+        "message":      r.message,
+        "created_at":   r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+@router.get("/forensic/events")
+def get_forensic_events(
+    run_id:     str | None = Query(None, description="Filter by capture run_id."),
+    week_id:    int | None = Query(None, description="Filter by simulated week number."),
+    category:   str | None = Query(None, description="Exact category (DRAW, SDE, MERGER, ...)."),
+    event_type: str | None = Query(None, description="Exact event_type (member_won, ...)."),
+    severity:   str | None = Query(None, description="Exact severity (info/notice/warning/critical)."),
+    entity_id:  int | None = Query(None, description="Filter by entity_id (user/pool id)."),
+    search:     str | None = Query(None, description="Substring filter on the message field."),
+    order:      str        = Query("desc", regex="^(asc|desc)$",
+                                   description="Timeline order by (seq within run, id overall)."),
+    limit:      int        = Query(200, ge=1, le=2000),
+    offset:     int        = Query(0,   ge=0),
+    db: Session = Depends(get_db),
+    _: None     = Depends(require_dev_mode),
+):
+    """
+    Return paginated forensic_events. Filters are additive (AND); all optional.
+
+    Default order is newest-first (descending id). Pass order=asc to replay the
+    timeline forward (chronological). Within a single run, `seq` is a strict
+    monotonic tiebreaker so same-millisecond events stay correctly ordered.
+    """
+    from app.models.forensic_event import ForensicEvent
+
+    q = db.query(ForensicEvent)
+    q = _forensic_apply_filters(
+        q, run_id=run_id, week_id=week_id, category=category,
+        event_type=event_type, severity=severity, entity_id=entity_id, search=search,
+    )
+
+    total = q.count()
+    if order == "asc":
+        q = q.order_by(ForensicEvent.id.asc())
+    else:
+        q = q.order_by(ForensicEvent.id.desc())
+    rows = q.offset(offset).limit(limit).all()
+
+    return {
+        "total":  total,
+        "offset": offset,
+        "limit":  limit,
+        "order":  order,
+        "events": [_forensic_row_dict(r) for r in rows],
+    }
+
+
+@router.get("/forensic/summary")
+def forensic_summary(
+    run_id:  str | None = Query(None, description="Scope the summary to one run."),
+    week_id: int | None = Query(None, description="Scope the summary to one week."),
+    db: Session = Depends(get_db),
+    _: None     = Depends(require_dev_mode),
+):
+    """
+    Aggregate counts of forensic events — by category, event_type, severity, and
+    week — for the operator dashboard. Anomalies (category=ANOMALY) and
+    warning/critical severities are surfaced separately as a quick health gauge.
+    """
+    from app.models.forensic_event import ForensicEvent
+
+    def _scoped():
+        q = db.query(ForensicEvent)
+        if run_id  is not None: q = q.filter(ForensicEvent.run_id  == run_id)
+        if week_id is not None: q = q.filter(ForensicEvent.week_id == week_id)
+        return q
+
+    total = _scoped().count()
+
+    by_category = (
+        _scoped().with_entities(ForensicEvent.category, func.count(ForensicEvent.id))
+        .group_by(ForensicEvent.category)
+        .order_by(func.count(ForensicEvent.id).desc()).all()
+    )
+    by_event = (
+        _scoped().with_entities(ForensicEvent.event_type, func.count(ForensicEvent.id))
+        .group_by(ForensicEvent.event_type)
+        .order_by(func.count(ForensicEvent.id).desc()).all()
+    )
+    by_severity = (
+        _scoped().with_entities(ForensicEvent.severity, func.count(ForensicEvent.id))
+        .group_by(ForensicEvent.severity).all()
+    )
+    by_week = (
+        _scoped().with_entities(ForensicEvent.week_id, func.count(ForensicEvent.id))
+        .group_by(ForensicEvent.week_id)
+        .order_by(ForensicEvent.week_id.asc()).all()
+    )
+
+    anomaly_count = _scoped().filter(ForensicEvent.category == "ANOMALY").count()
+    alert_count   = _scoped().filter(
+        ForensicEvent.severity.in_(["warning", "critical"])
+    ).count()
+
+    runs = (
+        db.query(ForensicEvent.run_id, func.count(ForensicEvent.id))
+        .group_by(ForensicEvent.run_id)
+        .order_by(func.max(ForensicEvent.id).desc()).limit(50).all()
+    )
+
+    return {
+        "total":         total,
+        "anomaly_count": anomaly_count,
+        "alert_count":   alert_count,
+        "by_category":   [{"category": c or "?", "count": n} for c, n in by_category],
+        "by_event_type": [{"event_type": e or "?", "count": n} for e, n in by_event],
+        "by_severity":   [{"severity": s or "?", "count": n} for s, n in by_severity],
+        "by_week":       [{"week_id": w, "count": n} for w, n in by_week],
+        "runs":          [{"run_id": r or "?", "count": n} for r, n in runs],
+    }
+
+
+@router.get("/forensic/export")
+def export_forensic_events(
+    fmt:        str        = Query("csv", regex="^(csv|json)$", alias="format"),
+    run_id:     str | None = Query(None),
+    week_id:    int | None = Query(None),
+    category:   str | None = Query(None),
+    event_type: str | None = Query(None),
+    severity:   str | None = Query(None),
+    entity_id:  int | None = Query(None),
+    search:     str | None = Query(None),
+    max_rows:   int        = Query(50000, ge=1, le=500000),
+    db: Session = Depends(get_db),
+    _: None     = Depends(require_dev_mode),
+):
+    """
+    Stream the full filtered forensic timeline (chronological) as CSV or JSON.
+    Used by the dashboard "Export" button to pull an auditable event log.
+    """
+    import csv as _csv
+    import io as _io
+    import json as _json
+    from fastapi.responses import Response
+    from app.models.forensic_event import ForensicEvent
+
+    q = db.query(ForensicEvent)
+    q = _forensic_apply_filters(
+        q, run_id=run_id, week_id=week_id, category=category,
+        event_type=event_type, severity=severity, entity_id=entity_id, search=search,
+    )
+    rows = q.order_by(ForensicEvent.id.asc()).limit(max_rows).all()
+    dicts = [_forensic_row_dict(r) for r in rows]
+
+    if fmt == "json":
+        return Response(
+            content=_json.dumps({"count": len(dicts), "events": dicts}, default=str),
+            media_type="application/json",
+            headers={"Content-Disposition": 'attachment; filename="forensic_events.json"'},
+        )
+
+    # CSV
+    cols = [
+        "id", "run_id", "seq", "week_id", "tick", "category", "event_type",
+        "severity", "actor", "entity_type", "entity_id", "entity_ref",
+        "amount_inr", "before_json", "after_json", "payload_json", "message",
+        "created_at",
+    ]
+    buf = _io.StringIO()
+    writer = _csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    writer.writeheader()
+    for d in dicts:
+        writer.writerow(d)
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="forensic_events.csv"'},
+    )
+
+
+@router.delete("/forensic/events")
+def clear_forensic_events(
+    run_id: str | None = Query(None, description="If set, only clear this run's events."),
+    db: Session = Depends(get_db),
+    _: None     = Depends(require_dev_mode),
+):
+    """
+    Delete forensic_events rows. With run_id, scope the purge to a single run;
+    without it, clear the whole table (use before a fresh forensic-capture run).
+    """
+    from app.models.forensic_event import ForensicEvent
+
+    q = db.query(ForensicEvent)
+    if run_id is not None:
+        q = q.filter(ForensicEvent.run_id == run_id)
+    count = q.count()
+    q.delete(synchronize_session=False)
+    db.commit()
+    return {
+        "deleted": count,
+        "scope":   run_id or "ALL",
+        "message": f"Cleared {count} forensic event(s)"
+                   + (f" for run '{run_id}'." if run_id else " (entire table)."),
+    }

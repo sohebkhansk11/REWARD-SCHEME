@@ -227,6 +227,8 @@ def assign_waitlist_to_pools(db: Session, *, user_prefix: str | None = None) -> 
         queue               = list(candidates)
         pool_assignments:   dict[int, list[int]] = {}   # pool_id → list of user IDs
         referrals_p1:       list[int]            = []   # referrer IDs to credit later
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        _p1_join_records:   list[tuple]          = []   # (uid, username, pool_id, pool_name)
 
         # 1d. Python FIFO distribution — oldest pool first, oldest user first.
         for pool, actual, vacancies in pools_needing_fill:
@@ -257,6 +259,13 @@ def assign_waitlist_to_pools(db: Session, *, user_prefix: str | None = None) -> 
                 if u.referred_by_user_id:
                     referrals_p1.append(u.referred_by_user_id)
 
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Forensic: capture (id, username) NOW while objects are live in memory —
+            # the bulk UPDATE below carries synchronize_session=False so the ORM cache
+            # is expired afterward. We emit the join events after the commit succeeds.
+            for u in batch:
+                _p1_join_records.append((u.id, u.username, pool.id, pool.name))
+
             _logger.info(
                 "Phase 1: %s  %d/12 → %d/12  (+%d, bulk).",
                 pool.name, actual, new_total, to_assign,
@@ -277,6 +286,20 @@ def assign_waitlist_to_pools(db: Session, *, user_prefix: str | None = None) -> 
                     synchronize_session=False,
                 )
             db.commit()
+
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Forensic: one member_joined event per filled vacancy (Phase 1 refill).
+            try:
+                from app.services import forensic as _forensic
+                if _forensic.is_on():
+                    for _uid, _uname, _pid, _pname in _p1_join_records:
+                        _forensic.member_joined(
+                            _uid, _uname, _pid, level=1,
+                            payload={"phase": "P1_vacancy_fill", "pool_name": _pname},
+                            message=f"{_uname} joined pool '{_pname}' @L1 (vacancy fill)",
+                        )
+            except Exception:
+                pass
 
             # 1f. Sync pool.total_members; restore Paused → Active if now full.
             #     total_after was computed from live GROUP BY count + to_assign,
@@ -446,6 +469,9 @@ def assign_waitlist_to_pools(db: Session, *, user_prefix: str | None = None) -> 
                 # Distribute users to new pools in Python (FIFO).
                 p2_assignments: dict[int, list[int]] = {}
                 referrals_p2:   list[int]            = []
+                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                _p2_join_records: list[tuple] = []   # (uid, username, pool_id, pool_name)
+                _p2_pool_created: list[tuple] = []   # (pool_id, pool_name, member_count)
 
                 for i, (pool_id, _pool_name) in enumerate(new_pools):
                     start = i * POOL_CAPACITY
@@ -457,6 +483,9 @@ def assign_waitlist_to_pools(db: Session, *, user_prefix: str | None = None) -> 
                     for u in batch:
                         if u.referred_by_user_id:
                             referrals_p2.append(u.referred_by_user_id)
+                        # Capture (id, username) live — bulk UPDATE below expires the cache.
+                        _p2_join_records.append((u.id, u.username, pool_id, _pool_name))
+                    _p2_pool_created.append((pool_id, _pool_name, len(batch)))
                     _logger.info(
                         "Phase 2: %s ← %d user(s) (bulk).", pool_names[i], len(batch)
                     )
@@ -475,6 +504,27 @@ def assign_waitlist_to_pools(db: Session, *, user_prefix: str | None = None) -> 
                         synchronize_session=False,
                     )
                 db.commit()
+
+                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Forensic: pool_created per new pool + member_joined per founding member.
+                try:
+                    from app.services import forensic as _forensic
+                    if _forensic.is_on():
+                        for _pid, _pname, _cnt in _p2_pool_created:
+                            _forensic.pool_event(
+                                "pool_created", _pid, ref=_pname, severity="notice",
+                                after={"member_count": _cnt, "status": "Active"},
+                                payload={"phase": "P2_new_pool"},
+                                message=f"POOL CREATED: '{_pname}' (id={_pid}) with {_cnt} founding member(s)",
+                            )
+                        for _uid, _uname, _pid, _pname in _p2_join_records:
+                            _forensic.member_joined(
+                                _uid, _uname, _pid, level=1,
+                                payload={"phase": "P2_new_pool", "pool_name": _pname},
+                                message=f"{_uname} joined NEW pool '{_pname}' @L1",
+                            )
+                except Exception:
+                    pass
 
                 # Referral bonuses for Phase 2 activations.
                 if referrals_p2:
@@ -786,6 +836,30 @@ def _condense_pools_once(db: Session) -> dict:
             "members_moved": moved,
             "dissolved":     donor_dissolved,
         })
+
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # FORENSIC — the donor↔receiver merger "trigger moment" the admin asked to
+        # see. One event per transfer batch (+ a dissolve event when the donor empties).
+        # Toggle-gated + failure-isolated; no-op zero-overhead when the debugger is OFF.
+        try:
+            from app.services import forensic as _forensic
+            _forensic.merger_event(
+                "members_merged", pool_id=recv.id, ref=recv.name, severity="notice",
+                before={"receiver_count": counts[recv.id] - moved, "donor_count": counts[donor.id] + moved},
+                after={"receiver_count": counts[recv.id], "donor_count": counts[donor.id]},
+                payload={"from_pool": donor.name, "from_pool_id": donor.id,
+                         "to_pool": recv.name, "members_moved": moved,
+                         "donor_dissolved": donor_dissolved},
+                message=(f"MERGER: {moved} member(s) {donor.name}→{recv.name}"
+                         + (f" · {donor.name} DISSOLVED" if donor_dissolved else "")))
+            if donor_dissolved:
+                _forensic.merger_event(
+                    "pool_dissolved", pool_id=donor.id, ref=donor.name, severity="notice",
+                    before={"members": moved}, after={"members": 0, "status": "Merged_Dissolved"},
+                    payload={"absorbed_into": recv.name, "absorbed_into_id": recv.id},
+                    message=f"POOL DISSOLVED: {donor.name} emptied into {recv.name}")
+        except Exception:
+            pass
 
         # Advance the pointers that are now exhausted.  At least one always advances
         # (take = min(rvac, donor) ⇒ either recv fills or donor empties), guaranteeing

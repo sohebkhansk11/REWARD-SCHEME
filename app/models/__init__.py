@@ -17,6 +17,10 @@ from app.models.elimination_event import EliminationEvent, EliminationReason
 # ── Global System Debugger audit trail ───────────────────────────────────────
 from app.models.debug_log import DebugLog
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ── Forensic Debugger event-level audit trail ────────────────────────────────
+from app.models.forensic_event import ForensicEvent
+
 __all__ = [
     "Pool", "User", "Token", "Admin", "SystemSettings", "DrawHistory",
     # SDE architecture
@@ -25,4 +29,6 @@ __all__ = [
     "EliminationEvent", "EliminationReason",
     # System Debugger
     "DebugLog",
+    # Forensic Debugger
+    "ForensicEvent",
 ]

@@ -1021,9 +1021,27 @@ class MassLoadInjector:
                 total_forfeited           = Decimal("1000") + late_fees_on_member,
                 was_in_grace_period       = False,
             ))
+            _elim_pool_id     = m.current_pool_id
             m.status          = UserStatus.Eliminated
             m.current_pool_id = None
             m.late_fees_inr   = _zero
+
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Forensic: record each grace-close (guillotine) elimination.
+            try:
+                from app.services import forensic as _forensic
+                if _forensic.is_on():
+                    _forensic.elimination_event(
+                        uid=m.id, ref=m.username,
+                        reason="non_payment_grace_close",
+                        level=m.current_level,
+                        payload={"pool_id": _elim_pool_id, "week_id": week_id,
+                                 "total_forfeited_inr": int(Decimal("1000") + late_fees_on_member)},
+                        message=f"ELIMINATED (grace-close non-payment): {m.username} "
+                                f"@L{m.current_level} pool {_elim_pool_id}",
+                    )
+            except Exception:
+                pass
 
         db.flush()
 
@@ -1713,6 +1731,13 @@ class RealSimEngine:
         from app.services.system_debugger import (
             DebuggerSession, log_milestone, set_debug_week,
         )
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # FORENSIC DEBUGGER — event-level recorder ("every breath of the system").
+        # Toggle-gated + failure-isolated (forensic.py); every call below is a no-op
+        # zero-overhead pass-through when the Forensic Debugger is OFF, so the money
+        # path is never coupled to a forensic write. Imported once here; the engine
+        # stamps run/week/tick context and flushes the buffer once per week.
+        from app.services import forensic as _forensic
 
         # ── Preserve + force production-compatible global state ───────────────
         _orig_auto = get_auto_pool_creation()
@@ -1773,6 +1798,16 @@ class RealSimEngine:
             # Open Global System Debugger bracket for this run (no-op when debugger OFF).
             _logger.info("RealSimEngine [%s]: PHASE-A — entering main try block", self._run_id)
             log_milestone("SIM/start", "simulation_started", {"run_id": self._run_id})
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # FORENSIC — tag this run + emit the run_started marker (no-op when OFF).
+            _forensic.set_run(self._run_id)
+            _forensic.system_event(
+                "run_started",
+                payload={"run_id": self._run_id, "weeks": self.weeks,
+                         "initial_users": self.initial_users,
+                         "users_per_week": self.users_per_week},
+                message=f"RealSimEngine run {self._run_id} started "
+                        f"({self.weeks}w, init={self.initial_users})")
 
             # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
             # Record the max pool ID that exists BEFORE the simulation creates ANY
@@ -1859,6 +1894,10 @@ class RealSimEngine:
                     # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
                     # Tell the debugger which week we're in so all log entries carry week_num.
                     set_debug_week(week_num)
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # FORENSIC — stamp the week + opening tick context for this cycle.
+                    _forensic.set_week(week_num)
+                    _forensic.set_tick("TICK1/CYCLE_START")
 
                     # ── Compute all 7 milestones for this cycle (ZERO hardcoding) ──
                     # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
@@ -2097,6 +2136,8 @@ class RealSimEngine:
                             self._run_id, _pre_sim_max_pool_id, week_num,
                         )
                     _logger.info("RealSimEngine [%s]: TICK6-start week=%d — start_draw_preparation", self._run_id, week_num)
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    _forensic.set_tick("TICK6/T-2H")
                     chronos.jump_to(m.T_02H)
                     # SESSION EDIT [Claude Session Jun-13 — Soheb Khan User 2 / Sohebkhan.sk11]:
                     # Bug #1/#2/#3 — snapshot DrawHistory row count and total payout BEFORE
@@ -2193,6 +2234,8 @@ class RealSimEngine:
                     # This runs the Ext-II/III pre-pass THEN draws all eligible pools.
                     # SDE-processed pools are skipped (draw_completed_this_week=True).
                     _logger.info("RealSimEngine [%s]: TICK7-start week=%d — execute_weekly_draw", self._run_id, week_num)
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    _forensic.set_tick("TICK7/T-0H")
                     chronos.jump_to(m.T_00H)
 
                     draws_this_week  = 0
@@ -2525,6 +2568,73 @@ class RealSimEngine:
                     _prev_cumul_accel = cumul_accel
                     weekly_detail.append(metrics)
 
+                    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                    # FORENSIC — per-week HEARTBEAT ("the system breathing"). One summary
+                    # event capturing the full reconciled state of the week, then flush the
+                    # week's buffered events to forensic_events in a single bulk insert. The
+                    # draw-composition is included so the timeline self-reconciles
+                    # (regular+sde+ext+prev_l3+accel == draws_this_week). Money-grade
+                    # self-diagnostic: if the partition does not reconcile, an ANOMALY row is
+                    # written too so the discrepancy is impossible to miss in the trail.
+                    try:
+                        _forensic.set_tick("TICK9/WEEK_CLOSE")
+                        _comp_sum5 = (comp_regular_draws + comp_sde_draws + comp_ext_draws
+                                      + comp_preventive_l3_draws + comp_accel_draws)
+                        _forensic.system_event(
+                            "week_summary",
+                            severity=("warning" if (comp_other_draws or
+                                      metrics.get("l5_count") or metrics.get("l6_count"))
+                                      else "info"),
+                            payload={
+                                "week": week_num, "week_id": week_id,
+                                "scenario": metrics.get("scenario"),
+                                "posture": comp_draw_posture,
+                                "active_users": metrics.get("active_users"),
+                                "waitlist": metrics.get("waitlist_count"),
+                                "pools_active": metrics.get("pools_active"),
+                                "pools_paused": metrics.get("pools_paused"),
+                                "pools_formed": metrics.get("pools_formed"),
+                                "draws_this_week": draws_this_week,
+                                "draw_composition": {
+                                    "regular": comp_regular_draws, "sde": comp_sde_draws,
+                                    "ext": comp_ext_draws, "preventive_l3": comp_preventive_l3_draws,
+                                    "accel": comp_accel_draws, "unclassified": comp_other_draws,
+                                },
+                                "winners": metrics.get("winners_this_week"),
+                                "members_joined": metrics.get("members_joined_this_week"),
+                                "members_exited": metrics.get("members_exited_this_week"),
+                                "eliminated": metrics.get("eliminated"),
+                                "grace_saved": metrics.get("grace_saved"),
+                                "l5_count": metrics.get("l5_count"),
+                                "l6_count": metrics.get("l6_count"),
+                                "cash_inflow_inr": metrics.get("cash_inflow_inr"),
+                                "cash_outflow_inr": metrics.get("cash_outflow_inr"),
+                            },
+                            message=(f"W{week_num} {week_id}: {draws_this_week} draw(s) "
+                                     f"[reg{comp_regular_draws}/sde{comp_sde_draws}/"
+                                     f"ext{comp_ext_draws}/pl3{comp_preventive_l3_draws}/"
+                                     f"acc{comp_accel_draws}] · {metrics.get('active_users')} active · "
+                                     f"{metrics.get('pools_active')}A/{metrics.get('pools_paused')}P pools · "
+                                     f"{comp_draw_posture}/{metrics.get('scenario')}"))
+                        if comp_other_draws:
+                            _forensic.anomaly(
+                                "draw_composition_unreconciled", severity="critical",
+                                payload={"week": week_num, "sum5": _comp_sum5,
+                                         "draws_this_week": draws_this_week,
+                                         "unclassified": comp_other_draws},
+                                message=(f"W{week_num}: {comp_other_draws} unclassified draw(s) — "
+                                         f"composition partition does NOT reconcile"))
+                        if metrics.get("l5_count") or metrics.get("l6_count"):
+                            _forensic.anomaly(
+                                "active_l5l6_present", severity="warning",
+                                payload={"week": week_num, "l5": metrics.get("l5_count"),
+                                         "l6": metrics.get("l6_count")},
+                                message=(f"W{week_num}: active L5={metrics.get('l5_count')} "
+                                         f"L6={metrics.get('l6_count')} — SDE band leak signal"))
+                        _forensic.flush(f"week{week_num}")
+                    except Exception:
+                        pass  # forensic must never abort a simulation week
+
                     cycle_logs.append({
                         "week":      week_num,
                         "pauses":    pauses_this_week,
@@ -2677,6 +2787,18 @@ class RealSimEngine:
             # Close SIM bracket + close real DB session.
             # engine_db.dispose() REMOVED — no longer using an isolated SQLite engine.
             log_milestone("SIM/end", "simulation_ended", {"run_id": self._run_id})
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # FORENSIC — emit run_ended marker + final flush of any residual events
+            # (no-op when OFF; never raises into the engine teardown).
+            try:
+                _forensic.set_tick("SIM/END")
+                _forensic.system_event(
+                    "run_ended",
+                    payload={"run_id": self._run_id, "weeks": self.weeks},
+                    message=f"RealSimEngine run {self._run_id} ended")
+                _forensic.flush("run_end")
+            except Exception:
+                pass
             db.close()
             set_auto_pool_creation(_orig_auto)
 

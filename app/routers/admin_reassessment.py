@@ -83,6 +83,46 @@ def _loads(s):
         return s   # surface the raw string rather than hide a decode problem
 
 
+def _serialize_result(result) -> dict:
+    """
+    Full view of a NON-PERSISTED ReassessResult (dataclass) — same shape as
+    ``_serialize`` so the dashboard panel renders a dry-run preview identically.
+    Has no DB id / run_at / approval because nothing was written: this is a pure,
+    side-effect-free preview of "what the verdict would be right now".
+    """
+    failed_hard = list(result.failed_hard_gates)
+    return {
+        "id":             None,
+        "week_id":        result.week_id,
+        "verdict":        result.verdict,
+        # A dry run never touches HOLD state; flag it so the UI labels it a preview
+        # and does NOT offer approve actions against a non-existent report row.
+        "is_active_hold": False,
+        "is_preview":     True,
+        "run_at":         datetime.now(timezone.utc).isoformat(),
+        "gates": {
+            "purity_pass":        bool(result.purity_pass),
+            "level_advance_pass": bool(result.level_advance_pass),
+            "float_pass":         bool(result.float_pass),
+            "pyramid_pass":       bool(result.pyramid_pass),
+            "reconcile_pass":     bool(result.reconcile_pass),
+        },
+        "failed_hard_gates": failed_hard,
+        "financials": {
+            "projected_payout_inr": result.projected_payout_inr,
+            "available_float_inr":  result.available_float_inr,
+            "net_float_inr":        result.net_float_inr,
+            "headroom_inr":         (result.available_float_inr or 0) - (result.projected_payout_inr or 0),
+        },
+        "member_pyramid": result.member_pyramid or {},
+        "winner_pyramid": result.winner_pyramid or {},
+        "audit":          result.audit or {},
+        "corrected_plan": result.corrected_plan or [],
+        "approval": {"approved": False, "approved_by": None, "approved_at": None, "admin_note": None},
+        "created_at":     None,
+    }
+
+
 def _serialize(rep) -> dict:
     """Full deserialized view of one ReassessmentReport row for the dashboard."""
     failed_hard = [name for name, ok in (
@@ -175,6 +215,37 @@ def get_reassessment_history(week_id: str, db: Session = Depends(get_db)):
         .all()
     )
     return {"week_id": week_id, "count": len(rows), "reports": [_serialize(r) for r in rows]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST — dry-run: compute a fresh verdict on CURRENT data WITHOUT persisting
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/{week_id}/run")
+def run_reassessment_dry(week_id: str, db: Session = Depends(get_db)):
+    """
+    Live DRY-RUN of the virtual gate against the CURRENT data — read-only.
+
+    Runs the full assessment and returns the would-be verdict WITHOUT writing a
+    report row and WITHOUT touching any HOLD state.  This lets an admin preview
+    "what would the gate say right now" at any time (not just at T-2H), e.g. after
+    fixing data or topping up float, before committing to the password-gated
+    re-assess/approve path.
+
+    Because nothing is persisted, this cannot clear or create a HOLD, so it is
+    safe to expose without a password.  To actually CLEAR a hold the admin still
+    uses POST /approve (password-gated), which persists a fresh report.
+    """
+    from app.services.pool_reassessor import run_reassessment
+    try:
+        result = run_reassessment(db, week_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Dry-run re-assessment failed: {exc}")
+    finally:
+        # A dry run must never leave pending writes — run_reassessment is a pure
+        # read pass, but roll back defensively so a stray flush can't persist.
+        db.rollback()
+    return {"preview": True, "week_id": week_id, "report": _serialize_result(result)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

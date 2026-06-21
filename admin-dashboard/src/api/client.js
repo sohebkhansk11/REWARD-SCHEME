@@ -377,6 +377,13 @@ export const getReassessment = (weekId) =>
 export const getReassessmentHistory = (weekId) =>
   api.get(`/admin/reassessment/${encodeURIComponent(weekId)}/history`)
 
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+/** POST /admin/reassessment/{week_id}/run — live DRY-RUN (read-only).
+ *  Computes the would-be verdict on CURRENT data WITHOUT persisting or touching
+ *  HOLD state.  Returns { preview:true, week_id, report }.  No password needed. */
+export const runReassessment = (weekId) =>
+  api.post(`/admin/reassessment/${encodeURIComponent(weekId)}/run`)
+
 /** POST /admin/reassessment/{week_id}/approve — clear a HOLD (admin password required).
  *  @param weekId        ISO week key (e.g. "2026-W25")
  *  @param adminPassword admin password (verified server-side)

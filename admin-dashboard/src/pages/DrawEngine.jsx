@@ -21,6 +21,7 @@ import {
   IndianRupee, Timer, Settings,
   // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
   ShieldCheck, ShieldAlert, Lock, Scale, ListChecks,
+  History, FlaskConical, ChevronDown,
 } from 'lucide-react'
 import Spinner from '../components/Spinner'
 import {
@@ -28,7 +29,7 @@ import {
   prepareWeeklyDraw, manualExecuteDraw, triggerPostDrawCleanup,
   getOverrideDashboard, submitOverrideDecision, getSchedulerStatus,
   // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
-  getReassessment, approveReassessment,
+  getReassessment, approveReassessment, getReassessmentHistory, runReassessment,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -827,6 +828,13 @@ function ReassessmentPanel({ weekId, onChanged }) {
   const [note,       setNote]       = useState('')
   const [submitting, setSubmitting] = useState(false)
 
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // dry-run preview + history audit
+  const [preview,     setPreview]     = useState(null)  // non-persisted dry-run report
+  const [running,     setRunning]     = useState(false)
+  const [history,     setHistory]     = useState(null)  // array | null (collapsed)
+  const [histLoading, setHistLoading] = useState(false)
+
   const load = useCallback(async () => {
     if (!weekId) { setLoading(false); return }
     setLoading(true)
@@ -834,6 +842,7 @@ function ReassessmentPanel({ weekId, onChanged }) {
       const res = await getReassessment(weekId)
       setExists(Boolean(res.data?.exists))
       setReport(res.data?.report ?? null)
+      setPreview(null)   // a fresh load supersedes any stale preview
       setError(null)
     } catch (err) {
       setError(err.response?.data?.detail ?? 'Failed to load re-assessment')
@@ -843,6 +852,38 @@ function ReassessmentPanel({ weekId, onChanged }) {
       setLoading(false)
     }
   }, [weekId])
+
+  // Live dry-run: read-only preview of the would-be verdict on CURRENT data.
+  const runDryRun = async () => {
+    if (!weekId) return
+    setRunning(true)
+    try {
+      const res = await runReassessment(weekId)
+      setPreview(res.data?.report ?? null)
+      const v = res.data?.report?.verdict
+      toast(`Dry-run complete — would be ${v || 'unknown'} (nothing saved).`,
+            v === 'HOLD' ? 'error' : 'success')
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Dry-run failed', 'error')
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  // History audit trail — lazy toggle.
+  const toggleHistory = async () => {
+    if (history !== null) { setHistory(null); return }
+    setHistLoading(true)
+    try {
+      const res = await getReassessmentHistory(weekId)
+      setHistory(Array.isArray(res.data?.reports) ? res.data.reports : [])
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Failed to load history', 'error')
+      setHistory([])
+    } finally {
+      setHistLoading(false)
+    }
+  }
 
   useEffect(() => { load() }, [load])
 
@@ -891,9 +932,16 @@ function ReassessmentPanel({ weekId, onChanged }) {
       </SectionCard>
     )
   }
-  if (!exists || !report) {
+  if ((!exists || !report) && !preview) {
     return (
-      <SectionCard title="Master Pool Re-assessment" icon={ShieldCheck} iconColor="text-violet-500" badge="VIRTUAL GATE">
+      <SectionCard title="Master Pool Re-assessment" icon={ShieldCheck} iconColor="text-violet-500" badge="VIRTUAL GATE"
+        action={
+          <button onClick={runDryRun} disabled={running}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white text-[11px] font-bold rounded-lg transition">
+            {running ? <Spinner className="w-3 h-3" /> : <FlaskConical className="w-3 h-3" />}
+            {running ? 'Running…' : 'Run dry-run now'}
+          </button>
+        }>
         <div className="p-6 text-center">
           <Shield className="w-8 h-8 text-slate-300 mx-auto mb-2" />
           <p className="text-sm font-semibold text-slate-500">
@@ -902,7 +950,8 @@ function ReassessmentPanel({ weekId, onChanged }) {
           <p className="text-xs text-slate-400 mt-1">
             The virtual integrity gate runs automatically at T-2H draw preparation
             (STEP 8b). It dissolves every pool, projects the full week, and cross-verifies
-            draw purity before any real draw is allowed to deploy.
+            draw purity before any real draw is allowed to deploy. Use “Run dry-run now”
+            to preview the would-be verdict on current data (nothing is saved).
           </p>
         </div>
       </SectionCard>
@@ -910,14 +959,18 @@ function ReassessmentPanel({ weekId, onChanged }) {
   }
 
   // ── Loaded ────────────────────────────────────────────────────────────────
-  const isHold     = report.verdict === 'HOLD'
-  const activeHold = report.is_active_hold
-  const g          = report.gates ?? {}
-  const fin        = report.financials ?? {}
+  // A dry-run preview (non-persisted) takes visual precedence over the stored
+  // report; isPreview suppresses approve actions (there is no row to approve).
+  const isPreview  = Boolean(preview)
+  const view       = preview ?? report
+  const isHold     = view.verdict === 'HOLD'
+  const activeHold = !isPreview && view.is_active_hold
+  const g          = view.gates ?? {}
+  const fin        = view.financials ?? {}
   const headroom   = Number(fin.headroom_inr ?? 0)
-  const audit      = report.audit ?? {}
-  const plan       = Array.isArray(report.corrected_plan) ? report.corrected_plan : []
-  const approval   = report.approval ?? {}
+  const audit      = view.audit ?? {}
+  const plan       = Array.isArray(view.corrected_plan) ? view.corrected_plan : []
+  const approval   = view.approval ?? {}
   const fAudit     = audit.float    ?? {}
   const pAudit     = audit.pyramid  ?? {}
   const purAudit   = audit.purity   ?? {}
@@ -930,17 +983,45 @@ function ReassessmentPanel({ weekId, onChanged }) {
         iconColor={activeHold ? 'text-red-500' : 'text-emerald-500'}
         badge="VIRTUAL GATE"
         action={
-          <button onClick={load}
-                  className="text-[11px] font-medium text-slate-400 hover:text-slate-600 flex items-center gap-1">
-            <RefreshCw className="w-3 h-3" /> {weekId}
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={runDryRun} disabled={running}
+              className="flex items-center gap-1 px-2.5 py-1.5 bg-violet-50 hover:bg-violet-100 disabled:opacity-50 text-violet-700 text-[11px] font-bold rounded-lg transition">
+              {running ? <Spinner className="w-3 h-3" /> : <FlaskConical className="w-3 h-3" />}
+              Dry-run
+            </button>
+            <button onClick={toggleHistory} disabled={histLoading}
+              className="flex items-center gap-1 px-2.5 py-1.5 bg-slate-50 hover:bg-slate-100 disabled:opacity-50 text-slate-600 text-[11px] font-bold rounded-lg transition">
+              {histLoading ? <Spinner className="w-3 h-3" /> : <History className="w-3 h-3" />}
+              History
+              <ChevronDown className={`w-3 h-3 transition-transform ${history !== null ? 'rotate-180' : ''}`} />
+            </button>
+            <button onClick={load}
+              className="text-[11px] font-medium text-slate-400 hover:text-slate-600 flex items-center gap-1">
+              <RefreshCw className="w-3 h-3" /> {weekId}
+            </button>
+          </div>
         }
       >
         <div className="p-5 space-y-5">
 
+          {/* ── Dry-run preview notice ── */}
+          {isPreview && (
+            <div className="rounded-lg border border-violet-200 bg-violet-50 px-4 py-2.5 flex items-center justify-between gap-3">
+              <p className="text-[11px] text-violet-700 flex items-center gap-1.5">
+                <FlaskConical className="w-3.5 h-3.5 flex-shrink-0" />
+                <b>DRY-RUN PREVIEW</b> — computed on current data, <b>nothing saved</b>. HOLD state unchanged.
+              </p>
+              <button onClick={() => setPreview(null)}
+                className="text-[11px] font-bold text-violet-600 hover:text-violet-800">
+                Dismiss preview
+              </button>
+            </div>
+          )}
+
           {/* ── Verdict banner ── */}
           <div className={`rounded-xl px-5 py-4 flex items-center justify-between gap-4 flex-wrap border-2 ${
-            activeHold ? 'border-red-300 bg-red-50'
+            isPreview   ? 'border-violet-300 bg-violet-50/60'
+            : activeHold ? 'border-red-300 bg-red-50'
             : isHold    ? 'border-amber-300 bg-amber-50'
             : 'border-emerald-300 bg-emerald-50'
           }`}>
@@ -950,14 +1031,17 @@ function ReassessmentPanel({ weekId, onChanged }) {
                 : <ShieldCheck className="w-8 h-8 text-emerald-600 flex-shrink-0" />}
               <div>
                 <p className={`text-lg font-black leading-none ${
-                  activeHold ? 'text-red-700' : isHold ? 'text-amber-700' : 'text-emerald-700'
+                  isPreview ? (isHold ? 'text-red-700' : 'text-emerald-700')
+                  : activeHold ? 'text-red-700' : isHold ? 'text-amber-700' : 'text-emerald-700'
                 }`}>
-                  {activeHold ? '🛑 DRAW HELD' : isHold ? 'HOLD (cleared)' : '✓ DRAW CLEARED TO DEPLOY'}
+                  {isPreview ? (isHold ? '⚠ WOULD HOLD' : '✓ WOULD CLEAR')
+                   : activeHold ? '🛑 DRAW HELD' : isHold ? 'HOLD (cleared)' : '✓ DRAW CLEARED TO DEPLOY'}
                 </p>
                 <p className="text-[11px] text-slate-500 mt-1">
-                  Verdict <b>{report.verdict}</b> · report #{report.id} · assessed {fmt(report.run_at)}
-                  {report.failed_hard_gates?.length > 0 && (
-                    <> · failed: <b className="text-red-600">{report.failed_hard_gates.join(', ')}</b></>
+                  Verdict <b>{view.verdict}</b>
+                  {isPreview ? <> · live preview</> : <> · report #{view.id} · assessed {fmt(view.run_at)}</>}
+                  {view.failed_hard_gates?.length > 0 && (
+                    <> · failed: <b className="text-red-600">{view.failed_hard_gates.join(', ')}</b></>
                   )}
                 </p>
               </div>
@@ -1069,6 +1153,45 @@ function ReassessmentPanel({ weekId, onChanged }) {
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
               Cleared by <b className="text-slate-600">{approval.approved_by || '—'}</b> at {fmt(approval.approved_at)}
               {approval.admin_note && <> · note: “{approval.admin_note}”</>}
+            </div>
+          )}
+
+          {/* ── History audit trail (lazy) ── */}
+          {history !== null && (
+            <div className="border-t border-slate-100 pt-3">
+              <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2 flex items-center gap-1.5">
+                <History className="w-3.5 h-3.5" /> Decision trail ({history.length})
+              </p>
+              {history.length === 0 ? (
+                <p className="text-[11px] text-slate-400">No saved reports for {weekId} yet.</p>
+              ) : (
+                <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                  {history.map(h => {
+                    const hHold = h.verdict === 'HOLD'
+                    return (
+                      <div key={h.id} className="flex items-center gap-3 text-[11px] rounded-lg border border-slate-100 px-3 py-2">
+                        <span className={`font-black px-1.5 py-0.5 rounded text-[9px] flex-shrink-0 ${
+                          hHold ? 'bg-red-100 text-red-700' : 'bg-emerald-100 text-emerald-700'
+                        }`}>{h.verdict}</span>
+                        <span className="text-slate-400 font-mono flex-shrink-0">#{h.id}</span>
+                        <span className="text-slate-500 flex-shrink-0">{fmt(h.run_at)}</span>
+                        {h.failed_hard_gates?.length > 0 && (
+                          <span className="text-red-500 truncate">✗ {h.failed_hard_gates.join(', ')}</span>
+                        )}
+                        <span className="flex-1" />
+                        {h.is_active_hold && (
+                          <span className="text-red-600 font-bold flex-shrink-0">ACTIVE HOLD</span>
+                        )}
+                        {h.approval?.approved && (
+                          <span className="text-emerald-600 flex-shrink-0 truncate">
+                            ✓ {h.approval.approved_by || 'cleared'}
+                          </span>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </div>
           )}
         </div>

@@ -577,6 +577,20 @@ export default function PoolOversight() {
     try {
       const res = await dissolvePool(dissolveTarget.pool.id, dissolvePassword)
       toast(res.data.note ?? `Pool '${dissolveTarget.pool.name}' dissolved`, 'success')
+      // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+      // Task 2: the dissolve is now routed through the virtual integrity gate.
+      // Surface the resulting verdict defensively (field is optional on older API):
+      // on a HOLD the admin is told to review the Pool Re-assessment panel.
+      const ra = res.data.reassessment
+      if (ra && ra.is_active_hold) {
+        toast(
+          `Re-assessment HOLD after dissolve (report #${ra.report_id}) — review the `
+          + `Pool Re-assessment panel before the next draw.`,
+          'error',
+        )
+      } else if (ra && ra.verdict === 'PASS') {
+        toast('Re-assessment PASS — new pool structure verified.', 'info')
+      }
       setDissolveTarget(null)
       setDissolvePassword('')
       fetchAll(true)

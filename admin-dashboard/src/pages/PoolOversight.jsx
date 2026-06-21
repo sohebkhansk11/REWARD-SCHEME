@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { ChevronDown, ChevronRight, Zap, RefreshCw, AlertCircle, Shield, AlertTriangle, UserX, Settings, PlusCircle, ToggleLeft, ToggleRight, Layers, BarChart2 } from 'lucide-react'
+import { ChevronDown, ChevronRight, Zap, RefreshCw, AlertCircle, Shield, AlertTriangle, UserX, Settings, PlusCircle, ToggleLeft, ToggleRight, Layers, BarChart2, GitMerge, X } from 'lucide-react'
 import Spinner from '../components/Spinner'
 import StatusBadge from '../components/StatusBadge'
 import {
@@ -8,7 +8,7 @@ import {
   fillPoolVacancies, syncPoolMemberCounts,
   getThreshold, updateThreshold,
   // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
-  getReconciliation,
+  getReconciliation, dissolvePool,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -173,7 +173,7 @@ function DrawResult({ result }) {
   )
 }
 
-function PoolRow({ pool, members, onDraw }) {
+function PoolRow({ pool, members, onDraw, onRequestDissolve }) {
   const [expanded,    setExpanded]   = useState(false)
   const [hexView,     setHexView]    = useState(false)
   const [drawLoading, setDrawLoading] = useState(false)
@@ -181,6 +181,9 @@ function PoolRow({ pool, members, onDraw }) {
   const toast = useToast()
 
   const canDraw = pool.status === 'Active' && members.length === 12
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // Manual dissolver only applies to LIVE pools (a dead pool cannot be dissolved).
+  const canDissolve = pool.status !== 'Merged_Dissolved'
 
   const handleDraw = async e => {
     e.stopPropagation()
@@ -226,14 +229,28 @@ function PoolRow({ pool, members, onDraw }) {
           </span>
         </td>
         <td className="px-5 py-4 text-right">
-          <button
-            onClick={handleDraw}
-            disabled={!canDraw || drawLoading}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold disabled:opacity-40 disabled:cursor-not-allowed shadow-sm transition"
-          >
-            {drawLoading ? <Spinner className="w-3.5 h-3.5" /> : <Zap className="w-3.5 h-3.5" />}
-            Trigger Draw
-          </button>
+          <div className="flex items-center justify-end gap-2">
+            <button
+              onClick={handleDraw}
+              disabled={!canDraw || drawLoading}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold disabled:opacity-40 disabled:cursor-not-allowed shadow-sm transition"
+            >
+              {drawLoading ? <Spinner className="w-3.5 h-3.5" /> : <Zap className="w-3.5 h-3.5" />}
+              Trigger Draw
+            </button>
+            {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                Manual donor↔receiver dissolver — relocates every member into other
+                live pools (level/journey preserved), opens a password-confirm modal. */}
+            <button
+              onClick={e => { e.stopPropagation(); onRequestDissolve(pool, members.length) }}
+              disabled={!canDissolve}
+              title="Dissolve this pool — relocate every member into other live pools (no draw, no payout)"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rose-50 border border-rose-200 text-rose-700 hover:bg-rose-100 rounded-lg text-xs font-semibold disabled:opacity-40 disabled:cursor-not-allowed shadow-sm transition"
+            >
+              <GitMerge className="w-3.5 h-3.5" />
+              Dissolve
+            </button>
+          </div>
         </td>
 
         {/* ── SDE / Brain5 metadata ───────────────────────── */}
@@ -357,6 +374,12 @@ export default function PoolOversight() {
   const [thresholdInput,    setThresholdInput]    = useState('')      // controlled input
   const [thresholdPassword, setThresholdPassword] = useState('')
   const [thresholdLoading,  setThresholdLoading]  = useState(false)
+
+  // ── Manual pool dissolver (Point 5 — donor↔receiver merger) ───────────────
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  const [dissolveTarget,   setDissolveTarget]   = useState(null)   // {pool, memberCount} | null
+  const [dissolvePassword, setDissolvePassword] = useState('')
+  const [dissolveLoading,  setDissolveLoading]  = useState(false)
 
   const fetchAll = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
@@ -530,6 +553,41 @@ export default function PoolOversight() {
       toast(err.response?.data?.detail ?? 'Elimination failed', 'error')
     } finally {
       setEliminateLoading(false)
+    }
+  }
+
+  // ── Manual pool dissolver (Point 5) ───────────────────────────────────────
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  const openDissolve = (pool, memberCount) => {
+    setDissolvePassword('')
+    setDissolveTarget({ pool, memberCount })
+  }
+  const closeDissolve = () => {
+    if (dissolveLoading) return
+    setDissolveTarget(null)
+    setDissolvePassword('')
+  }
+  const handleConfirmDissolve = async () => {
+    if (!dissolveTarget) return
+    if (!dissolvePassword.trim()) {
+      toast('Admin password is required to dissolve a pool', 'error')
+      return
+    }
+    setDissolveLoading(true)
+    try {
+      const res = await dissolvePool(dissolveTarget.pool.id, dissolvePassword)
+      toast(res.data.note ?? `Pool '${dissolveTarget.pool.name}' dissolved`, 'success')
+      setDissolveTarget(null)
+      setDissolvePassword('')
+      fetchAll(true)
+    } catch (err) {
+      if (err.code === 'ECONNABORTED' || err.message?.toLowerCase().includes('timeout')) {
+        toast('Server is processing heavy load. Please wait or refresh.', 'error')
+      } else {
+        toast(err.response?.data?.detail ?? 'Pool dissolve failed', 'error')
+      }
+    } finally {
+      setDissolveLoading(false)
     }
   }
 
@@ -918,12 +976,99 @@ export default function PoolOversight() {
                   pool={pool}
                   members={membersOf(pool.id)}
                   onDraw={() => fetchAll(true)}
+                  onRequestDissolve={openDissolve}
                 />
               ))}
             </tbody>
           </table>
         )}
       </div>
+
+      {/* ── Manual Pool Dissolver modal (Point 5 — donor↔receiver merger) ─────
+          SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+          Password-gated confirm.  Spells out exactly what happens (relocate, no
+          draw, no payout, full level preservation) before the irreversible move. */}
+      {dissolveTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4"
+          onClick={closeDissolve}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-md p-6 space-y-4"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-2">
+                <div className="w-9 h-9 rounded-xl bg-rose-50 border border-rose-200 flex items-center justify-center">
+                  <GitMerge className="w-5 h-5 text-rose-600" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900">Dissolve {dissolveTarget.pool.name}</h3>
+                  <p className="text-xs text-slate-400">Donor → receiver merger</p>
+                </div>
+              </div>
+              <button
+                onClick={closeDissolve}
+                disabled={dissolveLoading}
+                className="text-slate-400 hover:text-slate-600 disabled:opacity-40"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="bg-slate-50 border border-slate-100 rounded-xl p-3.5 text-xs text-slate-600 leading-relaxed space-y-1.5">
+              <p>
+                All <b className="text-slate-800">{dissolveTarget.memberCount}</b> active member
+                {dissolveTarget.memberCount !== 1 ? 's' : ''} will be <b>relocated</b> into other live pools,
+                filling oldest under-capacity pools first (new pools are created only if needed).
+              </p>
+              <p className="flex items-start gap-1.5 text-emerald-700">
+                <Shield className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                <span>Every member <b>keeps their level, weekly-payment status and journey</b>.
+                  This runs <b>no draw</b>, pays <b>nobody</b>, and sends <b>nobody</b> back to the waitlist.</span>
+              </p>
+              <p className="text-slate-400">
+                The pool is then marked <span className="font-mono">Merged_Dissolved</span>. This cannot be undone.
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-500 mb-1">Admin password</label>
+              <input
+                type="password"
+                value={dissolvePassword}
+                onChange={e => setDissolvePassword(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !dissolveLoading) handleConfirmDissolve() }}
+                disabled={dissolveLoading}
+                autoFocus
+                autoComplete="current-password"
+                className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-rose-300 disabled:opacity-50"
+                placeholder="Required to authorise dissolution"
+              />
+            </div>
+
+            <div className="flex gap-3 pt-1">
+              <button
+                onClick={closeDissolve}
+                disabled={dissolveLoading}
+                className="flex-1 px-4 py-2.5 bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-xl text-sm font-semibold disabled:opacity-50 transition"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmDissolve}
+                disabled={dissolveLoading || !dissolvePassword.trim()}
+                className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed shadow-sm transition"
+              >
+                {dissolveLoading
+                  ? <><Spinner className="w-4 h-4" />Dissolving…</>
+                  : <><GitMerge className="w-4 h-4" />Dissolve Pool</>
+                }
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -83,6 +83,12 @@ export const fillPoolVacancies      = ()        =>
   api.post('/admin/waitlist/check', undefined, { timeout: 120_000 })
 /** POST /admin/pools/sync-member-counts — recompute + fix stale pool.total_members */
 export const syncPoolMemberCounts   = ()        => api.post('/admin/pools/sync-member-counts')
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+/** POST /admin/pools/{id}/dissolve — manual donor↔receiver dissolve (password-gated).
+ *  Relocates every Active member into other live pools with full level/journey
+ *  preservation (no draw, no payout, no waitlist demotion). */
+export const dissolvePool           = (poolId, adminPassword) =>
+  api.post(`/admin/pools/${poolId}/dissolve`, { admin_password: adminPassword }, { timeout: 120_000 })
 
 // ── Penalties ────────────────────────────────────────────────────────────────
 export const applyDailyPenalty = () => api.post('/admin/penalty/apply-daily')

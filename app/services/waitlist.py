@@ -1121,6 +1121,175 @@ def run_pool_merger_engine(db: Session, user_prefix: str | None = None) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# MANUAL POOL DISSOLVER (Point 5 — donor↔receiver merger).  Jun-21.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def dissolve_pool_manually(db: Session, pool_id: int) -> dict:
+    """
+    Admin-triggered MANUAL pool dissolver — a donor↔receiver merge.
+
+    Relocates EVERY Active member of the chosen (donor) pool into other live
+    (receiver) pools, PRESERVING each member's journey, then marks the emptied
+    donor pool Merged_Dissolved.  This is the user's Point 5 button:
+    "a manual pool dissolver who can activate / work with the donor<>receiver
+    merger system."
+
+    MONEY-SEMANTICS (identical to the automatic two-pointer merger):
+      • Per relocated member ONLY current_pool_id and dynamic_merges_experienced
+        change.  current_level / weekly_payment_status / join_date / sde_required /
+        sde_flagged_week are NEVER touched (no level reset, no payout, no draw).
+      • This is fundamentally DIFFERENT from accelerated dissolution
+        (run_accelerated_dissolution_draw), which runs a DRAW (ejects + pays 2
+        winners) and returns survivors to the WAITLIST at Level 1.  Here nobody is
+        paid, nobody is drawn, and no level is ever reset.
+
+    Receiver selection (deterministic, money-safe):
+      • oldest-first under-capacity live pools (Active / Paused_Awaiting_Members),
+        EXCLUDING the donor itself;
+      • if no live pool has a vacancy, fresh Active pools are created for the
+        overflow.  Pools are created in-transaction (db.add + db.flush, NOT
+        crud_pool.create_pool) so the WHOLE dissolve is ONE atomic transaction —
+        either every member relocates and the donor dissolves, or nothing changes.
+
+    SDE correctness: a moved sde_required member carries its flag; every receiver
+    that ends up holding ≥1 sde_required member has contains_flagged_l4 recomputed
+    to True so SDE routing/immunity stays correct.  Receivers that fill to 12 and
+    were Paused are restored to Active.
+
+    Returns {pool_id, pool_name, members_relocated, receivers:[{id,name,added}],
+             new_pools_created, dissolved}.
+
+    Raises ValueError if the pool does not exist or is already dissolved.
+    """
+    target = db.query(Pool).filter(Pool.id == pool_id).first()
+    if target is None:
+        raise ValueError(f"Pool {pool_id} not found.")
+    if target.status == PoolStatus.Merged_Dissolved:
+        raise ValueError(f"Pool '{target.name}' is already dissolved.")
+
+    # Donor members in FIFO seniority (oldest relocated first — matches merger).
+    members = (
+        db.query(User)
+        .filter(User.current_pool_id == pool_id, User.status == UserStatus.Active)
+        .order_by(User.join_date.asc(), User.id.asc())
+        .all()
+    )
+
+    # Receiver candidates: oldest-first under-cap live pools, EXCLUDING the donor.
+    candidates = (
+        db.query(Pool)
+        .filter(
+            Pool.status.in_([PoolStatus.Active, PoolStatus.Paused_Awaiting_Members]),
+            Pool.id != pool_id,
+        )
+        .order_by(Pool.created_at.asc(), Pool.id.asc())
+        .all()
+    )
+
+    def _live(pid: int) -> int:
+        return (
+            db.query(func.count(User.id))
+            .filter(User.current_pool_id == pid, User.status == UserStatus.Active)
+            .scalar() or 0
+        )
+
+    cap_left: dict[int, int] = {p.id: max(0, POOL_CAPACITY - _live(p.id)) for p in candidates}
+    added:    dict[int, int] = {}
+    new_pools_created = 0
+    relocated = 0
+
+    for member in members:
+        recv = next((p for p in candidates if cap_left.get(p.id, 0) > 0), None)
+        if recv is None:
+            # No vacancy anywhere — create a fresh Active pool IN-TRANSACTION.
+            recv = Pool(
+                name=_next_pool_name(db),
+                status=PoolStatus.Active,
+                total_members=0,
+            )
+            db.add(recv)
+            db.flush()                       # assign recv.id WITHOUT committing
+            new_pools_created += 1
+            candidates.append(recv)
+            cap_left[recv.id] = POOL_CAPACITY
+        # MONEY-SAFE relocate: ONLY pool_id + journey counter change.
+        member.current_pool_id = recv.id
+        member.dynamic_merges_experienced = (member.dynamic_merges_experienced or 0) + 1
+        cap_left[recv.id] -= 1
+        added[recv.id] = added.get(recv.id, 0) + 1
+        relocated += 1
+
+    db.flush()   # make relocations visible to the recount below (autoflush=False)
+
+    # Mark the emptied donor dissolved.
+    target.status = PoolStatus.Merged_Dissolved
+    target.total_members = 0
+    target.contains_flagged_l4 = False
+
+    # Resync every receiver: total_members, contains_flagged_l4, Paused→Active.
+    for p in db.query(Pool).filter(Pool.id.in_(added.keys())).all():
+        rc = _live(p.id)
+        p.total_members = rc
+        has_flag = (
+            db.query(func.count(User.id))
+            .filter(
+                User.current_pool_id == p.id,
+                User.status == UserStatus.Active,
+                User.sde_required == True,   # noqa: E712
+            )
+            .scalar() or 0
+        ) > 0
+        p.contains_flagged_l4 = has_flag
+        if rc >= POOL_CAPACITY and p.status == PoolStatus.Paused_Awaiting_Members:
+            p.status = PoolStatus.Active
+
+    db.commit()
+
+    receivers = [
+        {
+            "id":    pid,
+            "name":  db.query(Pool.name).filter(Pool.id == pid).scalar(),
+            "added": cnt,
+        }
+        for pid, cnt in added.items()
+    ]
+
+    _logger.info(
+        "MANUAL DISSOLVE — pool '%s' (id=%d) dissolved; %d member(s) relocated "
+        "into %d receiver(s) (%d new pool(s)), journeys preserved.",
+        target.name, pool_id, relocated, len(added), new_pools_created,
+    )
+    try:
+        from app.services import forensic as _forensic
+        if _forensic.is_on():
+            _forensic.system_event(
+                "manual_pool_dissolve",
+                severity="notice",
+                payload={
+                    "pool_id":           pool_id,
+                    "pool_name":         target.name,
+                    "members_relocated": relocated,
+                    "receivers":         len(added),
+                    "new_pools_created": new_pools_created,
+                },
+                message=(f"Manual dissolve: pool '{target.name}' → {relocated} "
+                         f"member(s) relocated across {len(added)} receiver(s)"),
+            )
+    except Exception:
+        pass
+
+    return {
+        "pool_id":           pool_id,
+        "pool_name":         target.name,
+        "members_relocated": relocated,
+        "receivers":         receivers,
+        "new_pools_created": new_pools_created,
+        "dissolved":         True,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Backward-compatible shims
 # ─────────────────────────────────────────────────────────────────────────────
 

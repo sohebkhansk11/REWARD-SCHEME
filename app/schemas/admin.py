@@ -185,6 +185,20 @@ class ThresholdResponse(BaseModel):
     message:                 str
 
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Manual pool dissolver (Point 5 — donor↔receiver merger).  Jun-21.
+class DissolvePoolRequest(BaseModel):
+    """POST /admin/pools/{pool_id}/dissolve — manual donor↔receiver dissolve."""
+    admin_password: str = Field(
+        ...,
+        description=(
+            "Current admin account password — required to authorise this manual "
+            "pool dissolution.  Every Active member is relocated into other live "
+            "pools with full level/journey preservation (no draw, no payout)."
+        ),
+    )
+
+
 class UpdateReferralRewardRequest(BaseModel):
     """PUT /admin/settings/referral-reward — change the per-referral reward amount."""
     new_amount_inr: int = Field(

@@ -23,6 +23,7 @@ from app.schemas.admin import (
     ReferralRewardResponse,
     UpdateDrawScheduleRequest,
     DrawScheduleResponse,
+    DissolvePoolRequest,
 )
 from app.schemas.token import TokenResponse
 from app.services import tokens as svc_tokens
@@ -967,6 +968,83 @@ def trigger_accelerated_dissolution(
             f"Accelerated draw complete — 2 L4+ members exited. Pool continues."
         ),
     }
+
+
+# ── Manual Pool Dissolver (Point 5 — donor↔receiver merger) ──────────────────
+
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Manual pool dissolver button backend (Point 5).  Jun-21.
+@router.post("/admin/pools/{pool_id}/dissolve")
+def dissolve_pool_manual(
+    pool_id: int,
+    body: DissolvePoolRequest,
+    admin_username: str = Depends(require_admin_jwt),
+    db: Session = Depends(get_db),
+):
+    """
+    POINT 5 — MANUAL pool dissolver (donor↔receiver merger).
+
+    Relocates EVERY Active member of the chosen pool into other live pools,
+    fully PRESERVING each member's journey (current_level, weekly_payment_status,
+    join_date, sde_required / sde_flagged_week are NEVER touched — only
+    current_pool_id and the dynamic_merges_experienced counter change), then
+    marks the emptied pool Merged_Dissolved.  No draw runs, nobody is paid,
+    nobody is demoted to the waitlist, and NO level is reset.
+
+    This is fundamentally DIFFERENT from accelerated dissolution, which runs a
+    DRAW (pays 2 L4+ winners) and returns survivors to the WAITLIST at Level 1.
+
+    Receivers are oldest-first under-capacity live pools (Active /
+    Paused_Awaiting_Members), excluding the donor; if no vacancy exists fresh
+    Active pools are created for the overflow.  SDE-flagged members carry their
+    flag and every receiver's contains_flagged_l4 is recomputed so SDE routing
+    stays correct.  The whole operation is one atomic transaction.
+
+    Security gate: the admin's account password is required in the request body
+    and is bcrypt-verified before anything is moved.  This prevents accidental
+    mis-clicks and CSRF-style tampering on a money-bearing structural change.
+    """
+    from app.models.admin import Admin as AdminModel
+    from app.models.pool import Pool as PoolModel, PoolStatus as PS
+
+    # ── Verify admin password ─────────────────────────────────────────────────
+    admin: AdminModel | None = (
+        db.query(AdminModel).filter(AdminModel.username == admin_username).first()
+    )
+    if not admin:
+        raise HTTPException(status_code=401, detail="Admin account not found — re-authenticate.")
+
+    dummy = "$2b$12$invalidhashplaceholderXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    stored = admin.hashed_password or dummy
+    from app.services.auth import verify_password
+    if not verify_password(body.admin_password, stored):
+        raise HTTPException(
+            status_code=401,
+            detail="Admin password verification failed. Pool was NOT dissolved.",
+        )
+
+    # ── Existence / state pre-check (friendly 404 / 400 before the move) ──────
+    pool = db.query(PoolModel).filter(PoolModel.id == pool_id).first()
+    if not pool:
+        raise HTTPException(status_code=404, detail=f"Pool {pool_id} not found.")
+    if pool.status == PS.Merged_Dissolved:
+        raise HTTPException(status_code=400, detail=f"Pool '{pool.name}' is already dissolved.")
+
+    # ── Execute the donor↔receiver dissolve (atomic, money-safe) ──────────────
+    try:
+        result = svc_waitlist.dissolve_pool_manually(db, pool_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    result["note"] = (
+        f"Pool '{result['pool_name']}' dissolved — {result['members_relocated']} "
+        f"member(s) relocated into {len(result['receivers'])} pool(s) "
+        f"({result['new_pools_created']} newly created). Levels & journeys preserved; "
+        "no draw, no payout."
+        if result["members_relocated"] else
+        f"Pool '{result['pool_name']}' was empty — dissolved with no members to relocate."
+    )
+    return result
 
 
 # ── Pool Settings (auto-creation toggle) ─────────────────────────────────────

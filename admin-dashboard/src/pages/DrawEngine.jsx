@@ -30,6 +30,7 @@ import {
   getOverrideDashboard, submitOverrideDecision, getSchedulerStatus,
   // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
   getReassessment, approveReassessment, getReassessmentHistory, runReassessment,
+  getAutoDeployConfig, setAutoDeployConfig,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -815,6 +816,139 @@ function RaPyramid({ member = {}, winner = {} }) {
   )
 }
 
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// AUTO-DEPLOY master toggle (Task 3, Jun-21).  Self-contained + fully defensive:
+// if the backend endpoint is not deployed yet (older build) the GET fails and the
+// strip renders NOTHING, so the panel never breaks (Rule 5 — additive endpoint,
+// frontend stays graceful).  Arming/disarming is password-gated server-side because
+// it governs whether MONEY can move at T-0H without a human in the loop.
+function AutoDeployToggle() {
+  const toast = useToast()
+  const [available, setAvailable] = useState(false)   // endpoint reachable?
+  const [loading,   setLoading]   = useState(true)
+  const [enabled,   setEnabled]   = useState(false)
+  const [desc,      setDesc]      = useState('')
+  const [showPw,    setShowPw]    = useState(false)
+  const [pendingTo, setPendingTo] = useState(false)    // value we are switching TO
+  const [password,  setPassword]  = useState('')
+  const [busy,      setBusy]      = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      try {
+        const res = await getAutoDeployConfig()
+        if (!alive) return
+        setEnabled(Boolean(res.data?.enabled))
+        setDesc(res.data?.description ?? '')
+        setAvailable(true)
+      } catch {
+        if (alive) setAvailable(false)   // older backend → hide gracefully
+      } finally {
+        if (alive) setLoading(false)
+      }
+    })()
+    return () => { alive = false }
+  }, [])
+
+  const askToggle = () => { setPendingTo(!enabled); setPassword(''); setShowPw(true) }
+  const closePw   = () => { setShowPw(false); setPassword('') }
+
+  const confirm = async () => {
+    if (!password) { toast('Admin password required', 'error'); return }
+    setBusy(true)
+    try {
+      const res = await setAutoDeployConfig(pendingTo, password)
+      setEnabled(Boolean(res.data?.enabled))
+      toast(res.data?.message || 'Auto-deploy updated.', pendingTo ? 'success' : 'info')
+      closePw()
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Failed to update auto-deploy', 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (loading || !available) return null   // never block the panel on this strip
+
+  return (
+    <>
+      <div className={`rounded-xl px-4 py-3 flex items-center justify-between gap-3 border-2 ${
+        enabled ? 'border-amber-300 bg-amber-50' : 'border-slate-200 bg-slate-50'
+      }`}>
+        <div className="flex items-start gap-2.5 min-w-0">
+          <Zap className={`w-5 h-5 flex-shrink-0 mt-0.5 ${enabled ? 'text-amber-600' : 'text-slate-400'}`} />
+          <div className="min-w-0">
+            <p className="text-xs font-black text-slate-700 flex items-center gap-2">
+              AUTO-DEPLOY ON ADMIN-UNAVAILABLE
+              <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
+                enabled ? 'bg-amber-200 text-amber-800' : 'bg-slate-200 text-slate-500'
+              }`}>{enabled ? 'ARMED' : 'OFF'}</span>
+            </p>
+            <p className="text-[10px] text-slate-500 mt-0.5 leading-snug">
+              {enabled
+                ? 'A HOLD nobody acts on by T-0H will auto-deploy the least-bad SAFE option (release prepared draw, or pyramid-safe L4-defer). Never releases an insolvent/impossible-data draw.'
+                : 'A HOLD freezes the draw until a human approves. Turn on to let the engine deploy the least-bad SAFE option if the admin is unavailable at T-0H.'}
+            </p>
+          </div>
+        </div>
+        <button
+          onClick={askToggle}
+          role="switch"
+          aria-checked={enabled}
+          className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors ${
+            enabled ? 'bg-amber-500' : 'bg-slate-300'
+          }`}>
+          <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+            enabled ? 'translate-x-6' : 'translate-x-1'
+          }`} />
+        </button>
+      </div>
+
+      {/* password confirm modal */}
+      {showPw && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={closePw}>
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center gap-2 mb-3">
+              <Lock className="w-5 h-5 text-amber-600" />
+              <h3 className="text-base font-black text-slate-800">
+                {pendingTo ? 'Arm auto-deploy?' : 'Disable auto-deploy?'}
+              </h3>
+            </div>
+            <p className="text-xs text-slate-500 mb-4 leading-snug">
+              {pendingTo
+                ? 'This lets the system release REAL money at T-0H without a human if a HOLD is left unattended — but only ever the least-bad SOLVENT, reconciled option. Confirm with your admin password.'
+                : 'A HOLD will once again freeze the draw until a human approves. Confirm with your admin password.'}
+            </p>
+            <input
+              type="password"
+              autoFocus
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') confirm() }}
+              placeholder="Admin password"
+              className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm mb-4 focus:outline-none focus:ring-2 focus:ring-amber-400"
+            />
+            <div className="flex justify-end gap-2">
+              <button onClick={closePw} disabled={busy}
+                className="px-3.5 py-2 text-xs font-bold text-slate-500 hover:text-slate-700 disabled:opacity-50">
+                Cancel
+              </button>
+              <button onClick={confirm} disabled={busy}
+                className={`flex items-center gap-1.5 px-3.5 py-2 text-white text-xs font-bold rounded-lg transition disabled:opacity-50 ${
+                  pendingTo ? 'bg-amber-600 hover:bg-amber-700' : 'bg-slate-600 hover:bg-slate-700'
+                }`}>
+                {busy ? <Spinner className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
+                {pendingTo ? 'Arm auto-deploy' : 'Disable'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
 function ReassessmentPanel({ weekId, onChanged }) {
   const toast = useToast()
   const [report,     setReport]     = useState(null)
@@ -942,7 +1076,10 @@ function ReassessmentPanel({ weekId, onChanged }) {
             {running ? 'Running…' : 'Run dry-run now'}
           </button>
         }>
-        <div className="p-6 text-center">
+        <div className="p-5 space-y-4">
+          {/* ── Auto-deploy master toggle (Task 3) — visible even before first assessment ── */}
+          <AutoDeployToggle />
+          <div className="text-center pt-1">
           <Shield className="w-8 h-8 text-slate-300 mx-auto mb-2" />
           <p className="text-sm font-semibold text-slate-500">
             No re-assessment yet for {weekId || 'this week'}.
@@ -953,6 +1090,7 @@ function ReassessmentPanel({ weekId, onChanged }) {
             draw purity before any real draw is allowed to deploy. Use “Run dry-run now”
             to preview the would-be verdict on current data (nothing is saved).
           </p>
+          </div>
         </div>
       </SectionCard>
     )
@@ -1003,6 +1141,9 @@ function ReassessmentPanel({ weekId, onChanged }) {
         }
       >
         <div className="p-5 space-y-5">
+
+          {/* ── Auto-deploy master toggle (Task 3) ── */}
+          <AutoDeployToggle />
 
           {/* ── Dry-run preview notice ── */}
           {isPreview && (

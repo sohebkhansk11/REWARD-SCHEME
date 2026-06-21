@@ -398,6 +398,24 @@ export const approveReassessment = (weekId, adminPassword, { override = false, a
     ...(adminNote ? { admin_note: adminNote } : {}),
   })
 
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// AUTO-DEPLOY toggle (Task 3, Jun-21).
+/** GET /admin/reassessment/config/auto-deploy — current master auto-deploy state.
+ *  Returns { enabled, default, description }.  Read-only (no password). */
+export const getAutoDeployConfig = () =>
+  api.get('/admin/reassessment/config/auto-deploy')
+
+/** POST /admin/reassessment/config/auto-deploy — arm/disable auto-deploy.
+ *  Password-gated (this governs whether money can move at T-0H without a human).
+ *  @param enabled        true = arm, false = disable
+ *  @param adminPassword  admin password (verified server-side)
+ *  Returns { status:"updated", enabled, message }. */
+export const setAutoDeployConfig = (enabled, adminPassword) =>
+  api.post('/admin/reassessment/config/auto-deploy', {
+    enabled: !!enabled,
+    admin_password: adminPassword,
+  })
+
 /** GET /admin/stats/brain5-lpi — Brain 5 LPI live snapshot */
 export const getBrain5Lpi = () =>
   api.get('/admin/stats/brain5-lpi')

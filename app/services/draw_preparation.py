@@ -146,8 +146,42 @@ def _calculate_projected_payout(db: Session) -> int:
         .all()
     )
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # AUTO-DEPLOY defer-correctness (Task 3, Jun-21).  A pool that is LOCKED for this
+    # cycle (draw_completed_this_week=True) pays out ONLY through its pending staged
+    # SDE checkpoint(s) — it is skipped by the regular draw.  So a locked pool that has
+    # NO pending (executed=False) checkpoint will NOT pay this cycle and must be EXCLUDED
+    # from the worst-case ceiling; otherwise this number over-counts a pool that cannot
+    # pay, and (critically) it would not respond to a deferral — the re-assessor's
+    # "defer L4 to relieve float" remediation would then never actually lower the gate.
+    #
+    # At a NORMAL T-2H assessment every locked pool is SDE-locked WITH a pending
+    # checkpoint, so NONE are excluded → this is a no-op and the conservative ceiling is
+    # unchanged.  It takes effect ONLY for a pool whose staged L4 sub-draw was deferred
+    # (checkpoint removed, pool left locked) — exactly the case it must account for.
+    from datetime import datetime, timezone
+    from app.models.sde_session import SDESession, SDECheckpoint
+    _iso     = datetime.now(timezone.utc).isocalendar()
+    _week_id = f"{_iso.year}-W{_iso.week:02d}"
+    _pending_cp_pool_ids = {
+        pid for (pid,) in (
+            db.query(SDECheckpoint.pool_id)
+            .join(SDESession, SDECheckpoint.session_id == SDESession.id)
+            .filter(
+                SDESession.week_id     == _week_id,
+                SDECheckpoint.executed == False,   # noqa: E712 — staged, still owed
+            )
+            .distinct()
+            .all()
+        )
+    }
+
     total_projected = 0
     for pool in active_pools:
+        # Locked pool with nothing staged left to pay → contributes ₹0 this cycle.
+        if pool.draw_completed_this_week and pool.id not in _pending_cp_pool_ids:
+            continue
+
         # Find the highest level member in this pool
         max_level = (
             db.query(func.max(User.current_level))

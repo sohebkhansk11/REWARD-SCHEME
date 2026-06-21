@@ -215,7 +215,13 @@ def job_weekly_draw() -> None:
       (a) Belt-and-suspenders auto_select_on_timeout() — catches the case
           where the watchdog missed the override deadline in the last 5-min
           window before the draw.
-      (b) execute_weekly_draw() — draws all eligible full pools.
+      (b) execute_weekly_draw() — draws all eligible full pools.  This is also the
+          T-0H RE-ASSESSMENT GATE + AUTO-DEPLOY deadline: if a re-assessment HOLD is
+          still standing and the admin never acted, execute_weekly_draw() (when the
+          auto_deploy_on_admin_unavailable toggle is ON) runs the auto-deploy decision
+          engine to release the least-bad SAFE option automatically; if it cannot
+          safely resolve (insolvent / impossible data / toggle OFF) it raises
+          ReassessmentHoldError and the draw stays blocked for the admin.
       (c) Mark WeeklyDrawState.draw_executed=True + draw_executed_at=now.
     """
     _logger.info("Scheduler ▶ job_weekly_draw")

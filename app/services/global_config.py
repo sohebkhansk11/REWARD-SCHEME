@@ -528,6 +528,42 @@ def set_grace_close_offset_minutes(db: Session, minutes: int) -> None:
     _C_GRACE_CLOSE_MINS["value"] = None
 
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# 31st key — auto_deploy_on_admin_unavailable (Task 3, Jun-21).
+# Master safety toggle for the Master Pool Re-assessor's AUTO-DEPLOY engine.
+#
+# When a re-assessment HOLD is raised at T-2H and NO admin acts before the draw
+# fires at T-0H (the admin is "unavailable" past the 2-hour override window), the
+# weekly draw would normally stay frozen — clearing ZERO L4 and GROWING the backlog,
+# which damages future projections.  With this toggle ON, the system instead runs
+# auto_deploy_resolve_hold(): it scores every deployable candidate by FUTURE-health
+# projection (solvency weighted so heavily that any solvent option always wins) and
+# deploys the LEAST-BAD safe option automatically — either releasing the prepared
+# draw as-is, or applying the re-assessor's pyramid-safe L4-defer first.
+#
+# Stored as value_int 0/1.  DEFAULT 0 (OFF) — admin must explicitly opt in, because
+# this lets money move without a human in the loop (locked decision: default OFF).
+# value_int 0 = OFF (HOLD freezes the draw until an admin approves — current
+#   behaviour, unchanged for every existing deployment).
+# value_int 1 = ON  (auto-deploy fires at T-0H when the admin did not act).
+_C_AUTO_DEPLOY_ON_UNAVAIL: dict = _cache()
+
+
+def get_auto_deploy_on_unavailable(db: Session) -> bool:
+    """
+    Master toggle for the re-assessor AUTO-DEPLOY engine.
+    Returns True only when the stored value_int is exactly 1.  Default: False (OFF).
+    DB key: auto_deploy_on_admin_unavailable (value_int 0/1).
+    """
+    return _read_int(db, "auto_deploy_on_admin_unavailable", 0, _C_AUTO_DEPLOY_ON_UNAVAIL) == 1
+
+
+def set_auto_deploy_on_unavailable(db: Session, enabled: bool) -> None:
+    """Enable/disable the auto-deploy engine.  Password-gated at the router layer."""
+    _upsert_int(db, "auto_deploy_on_admin_unavailable", 1 if enabled else 0)
+    _C_AUTO_DEPLOY_ON_UNAVAIL["value"] = None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BULK READ — Admin "Draw & Financial Strategy" panel
 # ══════════════════════════════════════════════════════════════════════════════

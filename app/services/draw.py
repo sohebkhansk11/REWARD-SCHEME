@@ -684,6 +684,45 @@ def execute_weekly_draw(
         )
         _hold = None
     if _hold is not None:
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # AUTO-DEPLOY (Task 3, Jun-21) — the admin is "unavailable" the moment we reach
+        # T-0H with an UNAPPROVED HOLD still standing (the 2-hour override window since
+        # the T-2H assessment has elapsed and nobody acted).  IF the master toggle is ON,
+        # let the auto-deploy decision engine pick the LEAST-BAD safe option (release the
+        # prepared draw, or apply the re-assessor's pyramid-safe L4-defer first) and clear
+        # the HOLD automatically.  It NEVER auto-releases an insolvent or impossible-data
+        # draw (money-safety floor) — those still raise below.  Failure-isolated: any error
+        # leaves the HOLD intact and we raise as before.
+        try:
+            from app.services.global_config import get_auto_deploy_on_unavailable
+            if get_auto_deploy_on_unavailable(db):
+                from app.services.pool_reassessor import auto_deploy_resolve_hold
+                _ad = auto_deploy_resolve_hold(db, week_id_str, triggered_by="auto_deploy")
+                if _ad.get("resolved"):
+                    _logger.warning(
+                        "execute_weekly_draw: 🤖 AUTO-DEPLOY resolved the HOLD for week %s "
+                        "(action=%s reason=%s report#%s deferred=%s) — proceeding with the "
+                        "draw.  %s",
+                        week_id_str, _ad.get("action"), _ad.get("reason"),
+                        _ad.get("report_id"), _ad.get("deferred"), _ad.get("rationale", ""),
+                    )
+                    # Re-read the verdict: a resolved auto-deploy clears the active hold.
+                    _hold = get_active_hold(db, week_id_str)
+                else:
+                    _logger.error(
+                        "execute_weekly_draw: 🤖 AUTO-DEPLOY did NOT resolve the HOLD for "
+                        "week %s (action=%s reason=%s) — deployment stays blocked for admin.",
+                        week_id_str, _ad.get("action"), _ad.get("reason"),
+                    )
+        except Exception as _ad_exc:
+            _logger.error(
+                "execute_weekly_draw: auto-deploy attempt failed for week %s — HOLD kept "
+                "(non-fatal; admin approval still required): %s",
+                week_id_str, _ad_exc, exc_info=True,
+            )
+
+    if _hold is not None:
+        # Recompute from the CURRENT hold — auto-deploy may have appended a newer report.
         _failed_gates = [name for name, ok in (
             ("float",     _hold.float_pass),
             ("pyramid",   _hold.pyramid_pass),

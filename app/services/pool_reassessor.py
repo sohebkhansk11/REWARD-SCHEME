@@ -111,6 +111,23 @@ LEVEL_ADVANCE_MEMBER_CEIL = 0.45
 # either non-growing OR within this multiple of the weekly L4-clear capacity.
 PYRAMID_SUSTAIN_MULT     = 2.0
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# AUTO-DEPLOY decision weights (Task 3, Jun-21).  When the admin is unavailable at
+# T-0H and the toggle is ON, auto_deploy_resolve_hold() scores every deployable
+# candidate option and picks the LEAST-BAD by FUTURE-health projection.
+#
+#   score(opt) = (SOLVENCY_WEIGHT if solvent else 0)
+#                + headroom_inr                                  # float cushion (or −shortfall)
+#                − PYRAMID_PENALTY_INR × held_L4_over_band       # backlog beyond sustain band
+#
+# AUTODEPLOY_SOLVENCY_WEIGHT is deliberately astronomical so that ANY solvent
+# option always outranks ANY insolvent one ("solvency heavily weighted so any safe
+# option always wins" — locked Q2).  Among solvent options the larger float cushion
+# and the smaller held-L4 overage win (favouring FUTURE projections — the user's
+# explicit concern that leaving L4 undrawn damages future health).
+AUTODEPLOY_SOLVENCY_WEIGHT = 10 ** 15   # ₹-equivalent; dwarfs any real headroom/penalty
+AUTODEPLOY_PYRAMID_PENALTY_INR = 5_000  # per held-L4 member beyond the sustainable band
+
 _EPS = 1e-9
 
 
@@ -845,3 +862,408 @@ def route_pool_change_via_reassessment(
                 exc_info=True,
             )
             return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# AUTO-DEPLOY (Task 3, Jun-21) — resolve a re-assessment HOLD WITHOUT a human when
+# the admin is unavailable at T-0H and the master toggle is ON.
+#
+# The user's spec: "agar user unavailable h to best condition with projection ...
+# wo choose kre — chahe pre-built draw result release krna pade (agar better h), ya
+# re-assesser ka achcha option."  i.e. pick the LEAST-BAD deployable option by
+# FUTURE-health projection — either release the prepared draw as-is, OR apply the
+# re-assessor's pyramid-safe L4-defer first — and deploy it automatically.
+#
+# Two helpers:
+#   defer_staged_sde_l4()   — surgically defer the newest staged L4 sub-draws so the
+#                             projected payout drops below the available float.
+#   auto_deploy_resolve_hold() — the decision engine (scores + applies the choice).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _autodeploy_score(*, solvent: bool, headroom_inr: int, overage: int) -> float:
+    """
+    Project-forward score for one deployable candidate.  Solvency DOMINATES (locked
+    Q2 — "solvency heavily weighted so any safe option always wins"): a solvent
+    option gets a flat astronomical base, so it always outranks any insolvent one
+    regardless of headroom.  Among SOLVENT options the headroom term is intentionally
+    NOT added — so freeing extra float by deferring more L4 is NEVER rewarded once
+    the draw is already solvent (this honours the user's concern that leaving L4
+    undrawn damages future projections: don't defer L4 you don't have to).  The held-
+    L4 over-band penalty then makes the option that keeps the pyramid healthiest win.
+    Among INSOLVENT options (when no safe option is reachable) the raw headroom
+    (= −shortfall) ranks the least-bad, but the money-safety floor still refuses to
+    auto-pay an insolvent draw.
+    """
+    base = float(AUTODEPLOY_SOLVENCY_WEIGHT) if solvent else float(headroom_inr)
+    return base - AUTODEPLOY_PYRAMID_PENALTY_INR * float(overage)
+
+
+def defer_staged_sde_l4(db: Session, week_id: str, n: int) -> dict:
+    """
+    Surgically DEFER the ``n`` most-recently-staged L4 SDE sub-draws for ``week_id``
+    so this week's projected payout drops (float relief).  Deferred L4 members stay
+    Active + flagged in their (still-locked) pool and roll to next cycle — they are
+    NOT cleared this week, NOT demoted, NOT touched financially.
+
+    SAFETY / money-conservation:
+      • Defers the NEWEST staged sub-draws first (highest session, highest sub-draw)
+        so the OLDEST / most-overdue L4 clearances are the ones KEPT — exactly the
+        opposite of growing a stale backlog.
+      • Only deletes STAGED (executed=False) checkpoints — never an executed one.
+      • Leaves pool.draw_completed_this_week=True: the pool stays LOCKED for this
+        cycle (the main draw will NOT regular-draw it) and post_draw_cleanup resets
+        the lock so next week's preparation re-flags + re-stages the held L4.  No
+        tokens, no exits, no level changes — staging never moved money in the first
+        place (two-phase commit), so removing a staged checkpoint moves none either.
+      • Recomputes each touched session's counters from the SURVIVING checkpoints so
+        the audit trail stays internally consistent (planned == #checkpoints,
+        total_payout == Σ surviving).
+
+    Caller owns the transaction (this only flushes).  Returns
+    {"deferred", "checkpoint_ids", "freed_payout_inr"}.
+    """
+    from app.models.sde_session import SDESession, SDECheckpoint
+
+    if n <= 0:
+        return {"deferred": 0, "checkpoint_ids": [], "freed_payout_inr": 0}
+
+    session_ids = [
+        sid for (sid,) in
+        db.query(SDESession.id).filter(SDESession.week_id == week_id).all()
+    ]
+    if not session_ids:
+        return {"deferred": 0, "checkpoint_ids": [], "freed_payout_inr": 0}
+
+    staged = (
+        db.query(SDECheckpoint)
+        .join(SDESession, SDECheckpoint.session_id == SDESession.id)
+        .filter(
+            SDESession.week_id        == week_id,
+            SDECheckpoint.executed    == False,   # noqa: E712 — staged only
+            SDECheckpoint.upper_winner_level == 4,  # defer L4 upper sub-draws
+        )
+        .order_by(
+            SDESession.session_number.desc(),
+            SDECheckpoint.sub_draw_number.desc(),
+        )
+        .all()
+    )
+    to_defer = staged[: int(n)]
+    if not to_defer:
+        return {"deferred": 0, "checkpoint_ids": [], "freed_payout_inr": 0}
+
+    freed = Decimal("0")
+    deferred_ids: list[int] = []
+    touched_sessions: set[int] = set()
+    for cp in to_defer:
+        freed += (cp.upper_payout_inr or Decimal("0")) + (cp.lower_payout_inr or Decimal("0"))
+        deferred_ids.append(int(cp.id))
+        touched_sessions.add(int(cp.session_id))
+        db.delete(cp)
+    db.flush()
+
+    # Re-truth each touched session from the survivors.
+    for sid in touched_sessions:
+        survivors = (
+            db.query(SDECheckpoint).filter(SDECheckpoint.session_id == sid).all()
+        )
+        sess = db.query(SDESession).filter(SDESession.id == sid).first()
+        if sess is None:
+            continue
+        sess.l4_count_planned   = len(survivors)
+        sess.l4_count_completed = min(int(sess.l4_count_completed or 0), len(survivors))
+        sess.total_payout_inr   = sum(
+            (c.upper_payout_inr or Decimal("0")) + (c.lower_payout_inr or Decimal("0"))
+            for c in survivors
+        )
+    db.flush()
+
+    _logger.warning(
+        "[AUTO-DEPLOY] deferred %d staged L4 SDE sub-draw(s) for week %s "
+        "(freed ₹%s; checkpoints=%s).",
+        len(to_defer), week_id, int(freed), deferred_ids,
+    )
+    return {
+        "deferred": len(to_defer),
+        "checkpoint_ids": deferred_ids,
+        "freed_payout_inr": int(freed),
+    }
+
+
+def _staged_l4_payouts_newest_first(db: Session, week_id: str) -> list[int]:
+    """Per-sub-draw (upper+lower) payout of every STAGED L4 sub-draw, ordered the
+    way defer_staged_sde_l4 would remove them (newest first)."""
+    from app.models.sde_session import SDESession, SDECheckpoint
+    rows = (
+        db.query(SDECheckpoint)
+        .join(SDESession, SDECheckpoint.session_id == SDESession.id)
+        .filter(
+            SDESession.week_id        == week_id,
+            SDECheckpoint.executed    == False,   # noqa: E712
+            SDECheckpoint.upper_winner_level == 4,
+        )
+        .order_by(
+            SDESession.session_number.desc(),
+            SDECheckpoint.sub_draw_number.desc(),
+        )
+        .all()
+    )
+    return [
+        int((r.upper_payout_inr or 0) + (r.lower_payout_inr or 0))
+        for r in rows
+    ]
+
+
+def auto_deploy_resolve_hold(
+    db: Session,
+    week_id: str,
+    *,
+    triggered_by: str = "auto_deploy",
+) -> dict:
+    """
+    AUTO-DEPLOY decision engine (Task 3).  Called at T-0H when the master toggle is
+    ON and an admin has NOT acted on an active re-assessment HOLD.  Picks the LEAST-
+    BAD deployable option by future-health projection and, if it is SAFE, clears the
+    HOLD automatically (recording approved_by=triggered_by + full rationale).
+
+    Candidate options:
+      • deploy_prepared — release the staged draw as-is.
+      • defer_l4        — defer the minimum number of newest staged L4 sub-draws to
+                          restore solvency (only when the HOLD is float-driven; this
+                          is "the re-assessor's better option").
+
+    MONEY-SAFETY FLOOR (overrides "always deploy"):
+      • A reconcile (impossible-data) HOLD is NEVER auto-deployed — the projection is
+        internally inconsistent; a human must investigate.
+      • The chosen option must be SOLVENT to auto-deploy.  If even the best reachable
+        option cannot cover the payout from the float, the engine REFUSES to release
+        real money it does not have and keeps the HOLD for the admin.  (Among solvent
+        options it always deploys the least-bad — Q2 fully honoured; it only declines
+        when no safe option exists at all.)
+
+    Returns a structured result dict (resolved / action / reason / scores / …).  Never
+    raises — any internal error fails CLOSED (keeps the HOLD) so a broken engine can
+    never wave money out the door.
+    """
+    from datetime import datetime, timezone
+
+    out: dict = {
+        "resolved": False, "action": "none", "reason": "",
+        "week_id": week_id, "report_id": None,
+        "deferred": 0, "scores": {}, "rationale": "",
+        "triggered_by": triggered_by,
+    }
+    try:
+        hold = get_active_hold(db, week_id)
+        if hold is None:
+            out.update(resolved=True, action="none", reason="no_active_hold")
+            return out
+
+        now = datetime.now(timezone.utc)
+
+        # ── Fresh, read-only assessment of the CURRENT data ──────────────────────
+        fresh = run_reassessment(db, week_id)
+
+        # (0) Conditions already cleared since T-2H → just deploy the prepared draw.
+        if fresh.verdict == "PASS":
+            fresh.audit["auto_deploy"] = {
+                "action": "fresh_pass", "triggered_by": triggered_by,
+            }
+            row = persist_report(db, fresh)
+            row.approved    = True
+            row.approved_by = triggered_by
+            row.approved_at = now
+            row.admin_note  = (
+                "AUTO-DEPLOY: a fresh re-assessment of the current data PASSED all "
+                "hard gates — the earlier HOLD no longer applies; the prepared draw "
+                "is released automatically."
+            )
+            db.commit()
+            db.refresh(row)
+            out.update(resolved=True, action="fresh_pass",
+                       reason="fresh_assessment_passed", report_id=row.id,
+                       rationale=row.admin_note)
+            _logger.warning("[AUTO-DEPLOY] week %s — fresh re-assessment PASSED; "
+                            "released prepared draw (report #%s).", week_id, row.id)
+            return out
+
+        # (1) Impossible-data HOLD is never auto-deployable.
+        if not fresh.reconcile_pass:
+            out.update(resolved=False, action="escalate",
+                       reason="reconcile_fail_not_auto_deployable")
+            _logger.critical(
+                "[AUTO-DEPLOY] week %s — reconcile gate FAILED (impossible/inconsistent "
+                "data). Refusing to auto-deploy; HOLD kept for admin investigation.",
+                week_id,
+            )
+            return out
+
+        # ── Pull the exact gate metrics from the fresh audit ─────────────────────
+        fa = fresh.audit
+        P  = int(fa["float"]["projected_payout_inr"])
+        F  = int(fa["float"]["available_float_inr"])
+        R  = int(fa["float"]["reserve_inr"])
+        FL = int(fa["pyramid"]["flagged_l4_now"])
+        C  = int(fa["pyramid"]["l4_cleared"])
+        S  = int(fa["pyramid"]["clear_capacity"])   # already = max(l4_cleared, sde_draws, 1)
+        B0 = int(fa["pyramid"]["l4_backlog_after"])
+
+        def _overage(backlog: int, capacity: int) -> int:
+            return max(0, int(backlog) - int(capacity * PYRAMID_SUSTAIN_MULT))
+
+        # ── Candidate A — deploy the prepared draw as-is ─────────────────────────
+        prep_solvent  = bool(fresh.float_pass)
+        prep_headroom = F - R - P
+        prep_overage  = _overage(B0, S)
+        prep_score    = _autodeploy_score(
+            solvent=prep_solvent, headroom_inr=prep_headroom, overage=prep_overage,
+        )
+
+        candidates = {"deploy_prepared": {
+            "score": prep_score, "solvent": prep_solvent,
+            "headroom_inr": prep_headroom, "overage": prep_overage, "defer": 0,
+        }}
+
+        # ── Candidate B — defer newest L4 to restore solvency (float HOLD only) ───
+        # Deferring only relieves the FLOAT gate; it WORSENS the pyramid, so we only
+        # consider it when the draw is actually insolvent (a pyramid-only HOLD must
+        # NOT defer — holding/deferring L4 is the very thing that hurts the future).
+        if not prep_solvent:
+            staged_payouts = _staged_l4_payouts_newest_first(db, week_id)
+            if staged_payouts:
+                freed = 0
+                k = 0
+                solvent_at_k = False
+                for pay in staged_payouts:
+                    freed += pay
+                    k += 1
+                    if (P - freed) + R <= F:
+                        solvent_at_k = True
+                        break
+                # post-defer projection (analytical; the real verdict is re-checked
+                # after the actual defer below)
+                new_P       = P - freed
+                new_C       = max(0, C - k)
+                new_backlog = max(0, FL - new_C)        # k fewer cleared ⇒ +k backlog
+                new_cap     = max(new_C, 1)
+                defer_score = _autodeploy_score(
+                    solvent=solvent_at_k,
+                    headroom_inr=F - R - new_P,
+                    overage=_overage(new_backlog, new_cap),
+                )
+                candidates["defer_l4"] = {
+                    "score": defer_score, "solvent": solvent_at_k,
+                    "headroom_inr": F - R - new_P,
+                    "overage": _overage(new_backlog, new_cap), "defer": k,
+                }
+
+        out["scores"] = candidates
+
+        # ── Pick the least-bad (highest score); tie ⇒ prefer deploy_prepared ─────
+        best_name = max(
+            candidates,
+            key=lambda nm: (candidates[nm]["score"], nm == "deploy_prepared"),
+        )
+        best = candidates[best_name]
+
+        # ── MONEY-SAFETY FLOOR — never auto-pay an insolvent draw ────────────────
+        if not best["solvent"]:
+            out.update(resolved=False, action="escalate",
+                       reason="no_solvent_option_admin_required")
+            _logger.critical(
+                "[AUTO-DEPLOY] week %s — NO solvent deployable option (best=%s "
+                "score=%.1f). Refusing to auto-release an insolvent draw; HOLD kept "
+                "for admin. payout=₹%d float=₹%d.",
+                week_id, best_name, best["score"], P, F,
+            )
+            return out
+
+        rationale = (
+            f"AUTO-DEPLOY [{triggered_by}] week {week_id}: chose '{best_name}' as the "
+            f"least-bad-by-projection deployable option (admin unavailable at T-0H). "
+            f"Scores: " + "; ".join(
+                f"{nm}={c['score']:.0f}(solvent={c['solvent']},"
+                f"headroom=₹{c['headroom_inr']},overband={c['overage']},defer={c['defer']})"
+                for nm, c in candidates.items()
+            ) + f". Float: payout=₹{P} float=₹{F} reserve=₹{R}. "
+            f"Pyramid: flagged_L4={FL} cleared={C} backlog_after={B0}."
+        )
+
+        # ── Apply: deploy_prepared ───────────────────────────────────────────────
+        if best_name == "deploy_prepared":
+            hold.approved    = True
+            hold.approved_by = triggered_by
+            hold.approved_at = now
+            hold.admin_note  = rationale
+            db.commit()
+            db.refresh(hold)
+            out.update(resolved=True, action="deploy_prepared",
+                       reason="prepared_draw_is_least_bad_and_solvent",
+                       report_id=hold.id, rationale=rationale)
+            _logger.warning(
+                "[AUTO-DEPLOY] week %s — released PREPARED draw as least-bad solvent "
+                "option (report #%s approved by %s).", week_id, hold.id, triggered_by,
+            )
+            return out
+
+        # ── Apply: defer_l4 (the re-assessor's better option) ────────────────────
+        k = int(best["defer"])
+        defer_info = defer_staged_sde_l4(db, week_id, k)
+        # Re-assess the ACTUAL post-defer state — the real verdict governs.
+        fresh2 = run_reassessment(db, week_id)
+        fresh2.audit["auto_deploy"] = {
+            "action": "defer_l4", "triggered_by": triggered_by,
+            "deferred": defer_info["deferred"],
+            "freed_payout_inr": defer_info["freed_payout_inr"],
+        }
+        row2 = persist_report(db, fresh2)
+        if fresh2.verdict == "PASS":
+            row2.approved    = True
+            row2.approved_by = triggered_by
+            row2.approved_at = now
+            row2.admin_note  = (
+                rationale
+                + f" Applied: deferred {defer_info['deferred']} newest L4 SDE sub-draw(s) "
+                  f"(freed ₹{defer_info['freed_payout_inr']}); post-defer re-assessment "
+                  f"PASSED — releasing the reduced draw."
+            )
+            db.commit()
+            db.refresh(row2)
+            out.update(resolved=True, action="defer_l4",
+                       reason="deferred_l4_restored_solvency",
+                       report_id=row2.id, deferred=defer_info["deferred"],
+                       rationale=row2.admin_note)
+            _logger.warning(
+                "[AUTO-DEPLOY] week %s — deferred %d L4 SDE sub-draw(s); post-defer "
+                "re-assessment PASSED (report #%s approved by %s).",
+                week_id, defer_info["deferred"], row2.id, triggered_by,
+            )
+            return out
+
+        # Projection disagreed with reality — fail CLOSED.  The defer already reduced
+        # the payout (conservative), but we do NOT auto-approve a still-HOLD result.
+        db.commit()  # persist fresh2 as an (unapproved) HOLD for the audit trail
+        db.refresh(row2)
+        out.update(resolved=False, action="defer_l4_still_hold",
+                   reason="post_defer_still_hold_admin_required",
+                   report_id=row2.id, deferred=defer_info["deferred"])
+        _logger.critical(
+            "[AUTO-DEPLOY] week %s — deferred %d L4 but post-defer re-assessment STILL "
+            "HOLDS (report #%s). Defer stands (payout reduced); HOLD kept for admin.",
+            week_id, defer_info["deferred"], row2.id,
+        )
+        return out
+
+    except Exception as exc:
+        # Fail CLOSED — never let an engine error clear a HOLD.
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _logger.critical(
+            "[AUTO-DEPLOY] week %s — engine error; failing CLOSED (HOLD kept): %s",
+            week_id, exc, exc_info=True,
+        )
+        out.update(resolved=False, action="error", reason=f"engine_error: {exc}")
+        return out

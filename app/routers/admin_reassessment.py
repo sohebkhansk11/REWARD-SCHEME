@@ -183,6 +183,19 @@ class ApproveReassessmentRequest(BaseModel):
     )
 
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# AUTO-DEPLOY toggle request (Task 3, Jun-21).  Flipping this changes whether money
+# can move at T-0H WITHOUT a human in the loop, so the setter is admin-password-gated.
+class AutoDeployToggleRequest(BaseModel):
+    admin_password: str = Field(..., description="Admin password for verification")
+    enabled:        bool = Field(
+        ...,
+        description="True = arm the auto-deploy engine (it fires at T-0H only when an "
+                    "admin did not act on a HOLD).  False = disable (a HOLD freezes the "
+                    "draw until a human approves — the default, safest behaviour).",
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # GET — latest report for a week
 # ══════════════════════════════════════════════════════════════════════════════
@@ -335,4 +348,55 @@ def approve_reassessment(
                      "not resolved. Fix the flagged gate(s) and re-assess, or override "
                      "explicitly to accept the risk."),
         "report":   _serialize(fresh),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTO-DEPLOY toggle (Task 3) — GET state (read-only) + POST set (password-gated)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/config/auto-deploy")
+def get_auto_deploy_config(db: Session = Depends(get_db)):
+    """
+    Current state of the master AUTO-DEPLOY toggle.
+
+    When ON, a re-assessment HOLD that no admin has acted on by T-0H is resolved
+    automatically by the decision engine — it deploys the LEAST-BAD safe option
+    (release the prepared draw, or apply the re-assessor's pyramid-safe L4-defer),
+    and NEVER auto-releases an insolvent or impossible-data draw.  Default: OFF.
+    """
+    from app.services.global_config import get_auto_deploy_on_unavailable
+    return {
+        "enabled": bool(get_auto_deploy_on_unavailable(db)),
+        "default": False,
+        "description": (
+            "Auto-deploy fires only at T-0H, only when an admin did not act on a HOLD, "
+            "and only releases a SOLVENT, reconciled option (money-safety floor). When "
+            "OFF, a HOLD freezes the draw until a human approves."
+        ),
+    }
+
+
+@router.post("/config/auto-deploy")
+def set_auto_deploy_config(
+    body: AutoDeployToggleRequest,
+    db: Session = Depends(get_db),
+    admin_username: str = Depends(require_admin_jwt),
+):
+    """
+    Arm or disable the auto-deploy engine (password-gated — this governs whether
+    money can move at T-0H without a human in the loop).
+    """
+    _verify_admin_password(db, admin_username, body.admin_password)
+    from app.services.global_config import set_auto_deploy_on_unavailable
+    set_auto_deploy_on_unavailable(db, body.enabled)
+    return {
+        "status":  "updated",
+        "enabled": bool(body.enabled),
+        "message": (
+            "Auto-deploy ARMED — a HOLD nobody acts on by T-0H will auto-deploy the "
+            "least-bad SAFE option."
+            if body.enabled else
+            "Auto-deploy DISABLED — a HOLD will freeze the draw until a human approves."
+        ),
     }

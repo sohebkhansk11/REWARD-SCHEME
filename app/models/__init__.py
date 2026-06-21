@@ -21,6 +21,10 @@ from app.models.debug_log import DebugLog
 # ── Forensic Debugger event-level audit trail ────────────────────────────────
 from app.models.forensic_event import ForensicEvent
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ── Master Pool Re-assessment Manager — virtual pre-deployment integrity gate ─
+from app.models.reassessment_report import ReassessmentReport, ReassessmentVerdict
+
 __all__ = [
     "Pool", "User", "Token", "Admin", "SystemSettings", "DrawHistory",
     # SDE architecture
@@ -31,4 +35,6 @@ __all__ = [
     "DebugLog",
     # Forensic Debugger
     "ForensicEvent",
+    # Re-assessment integrity gate
+    "ReassessmentReport", "ReassessmentVerdict",
 ]

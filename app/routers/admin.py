@@ -287,6 +287,192 @@ def get_stats(db: Session = Depends(get_db)):
     }
 
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ── SSOT RECONCILIATION (A2 — Jun-21) ──────────────────────────────────────────
+@router.get("/admin/stats/reconciliation")
+def get_reconciliation_stats(db: Session = Depends(get_db)):
+    """
+    SINGLE SOURCE OF TRUTH (SSOT) for every dashboard headline.
+
+    The user's complaint — "pool shows 84 active, where did 577 go?" and "each
+    statistic frontend shows different data" — is caused by every view computing
+    its own denominator: server counts vs a client-side .filter() over a
+    truncated /users/?limit=500 page vs pools.length (which still includes
+    dissolved pools).  This endpoint is the ONE authoritative, server-computed
+    payload that every view MUST consume so they can never disagree again.
+
+    MONEY-GRADE GUARANTEES:
+      • Every count is computed authoritatively from the User table (membership
+        truth) and the Pool table (pool-status truth) — NEVER from the
+        denormalized pool.total_members counter.
+      • pool.total_members is instead AUDITED here (stored vs live Active) and the
+        drift is reported as a health signal, not used as a source.
+      • The reconciliation identities the dashboard must satisfy are computed and
+        flagged explicitly:
+            total_rows == Active + Waitlist + Eliminated + Eliminated_Won
+            Active     == in_live_pool + orphans
+    """
+    from app.core.config import POOL_CAPACITY
+
+    # ── 1. Users by status (authoritative head-counts) ─────────────────────────
+    by_status = dict(
+        db.query(User.status, func.count(User.id)).group_by(User.status).all()
+    )
+    active_total     = by_status.get(UserStatus.Active, 0)
+    waitlist_total   = by_status.get(UserStatus.Waitlist, 0)
+    eliminated_total = by_status.get(UserStatus.Eliminated, 0)
+    won_total        = by_status.get(UserStatus.Eliminated_Won, 0)
+    total_users      = db.query(func.count(User.id)).scalar() or 0
+    status_sum       = active_total + waitlist_total + eliminated_total + won_total
+
+    # ── 2. Active-member PLACEMENT (where each Active member physically sits) ───
+    pool_status = {pid: st for pid, st in db.query(Pool.id, Pool.status).all()}
+    in_active_pool = in_paused_pool = orphan_dissolved = orphan_null = orphan_other = 0
+    for (pid,) in (
+        db.query(User.current_pool_id)
+        .filter(User.status == UserStatus.Active)
+        .all()
+    ):
+        if pid is None:
+            orphan_null += 1
+        elif pid not in pool_status:
+            orphan_dissolved += 1                        # points at a row that's gone
+        elif pool_status[pid] == PoolStatus.Merged_Dissolved:
+            orphan_dissolved += 1
+        elif pool_status[pid] == PoolStatus.Paused_Awaiting_Members:
+            in_paused_pool += 1
+        elif pool_status[pid] in (
+            PoolStatus.Active, PoolStatus.Full, PoolStatus.Waiting,
+        ):
+            in_active_pool += 1
+        else:
+            orphan_other += 1
+    orphans_total = orphan_dissolved + orphan_null + orphan_other
+    in_live_pool  = in_active_pool + in_paused_pool
+
+    # ── 3. Pools by status ─────────────────────────────────────────────────────
+    pools_by_status = dict(
+        db.query(Pool.status, func.count(Pool.id)).group_by(Pool.status).all()
+    )
+    pools_active    = pools_by_status.get(PoolStatus.Active, 0)
+    pools_paused    = pools_by_status.get(PoolStatus.Paused_Awaiting_Members, 0)
+    pools_full      = pools_by_status.get(PoolStatus.Full, 0)
+    pools_waiting   = pools_by_status.get(PoolStatus.Waiting, 0)
+    pools_dissolved = pools_by_status.get(PoolStatus.Merged_Dissolved, 0)
+    pools_total     = db.query(func.count(Pool.id)).scalar() or 0
+    pools_live      = pools_total - pools_dissolved      # the number the dashboard shows
+
+    # ── 4. Active members per level (L1..L6) ───────────────────────────────────
+    level_rows = dict(
+        db.query(User.current_level, func.count(User.id))
+        .filter(User.status == UserStatus.Active)
+        .group_by(User.current_level)
+        .all()
+    )
+    per_level = {f"L{lvl}": int(level_rows.get(lvl, 0)) for lvl in range(1, 7)}
+    per_level_other = sum(
+        int(c) for lvl, c in level_rows.items()
+        if lvl is None or lvl < 1 or lvl > 6
+    )
+
+    # ── 5. Winners + money (deposits in / payouts out) ─────────────────────────
+    total_payout = db.query(func.sum(Token.value_inr)).filter(
+        Token.type == TokenType.Withdraw, Token.status == TokenStatus.Burned
+    ).scalar() or 0
+    total_capital = db.query(func.sum(Token.value_inr)).filter(
+        Token.type == TokenType.Deposit, Token.status == TokenStatus.Burned
+    ).scalar() or 0
+
+    # ── 6. pool.total_members staleness audit (HEALTH SIGNAL, not a source) ────
+    live_counts = dict(
+        db.query(User.current_pool_id, func.count(User.id))
+        .filter(User.status == UserStatus.Active, User.current_pool_id.isnot(None))
+        .group_by(User.current_pool_id)
+        .all()
+    )
+    stale_pool_counters = 0
+    dissolved_with_members = 0
+    sum_stored_live = 0
+    for p in db.query(Pool).all():
+        stored = p.total_members or 0
+        actual = int(live_counts.get(p.id, 0))
+        if p.status == PoolStatus.Merged_Dissolved:
+            if actual > 0:
+                dissolved_with_members += 1
+            if stored != 0:
+                stale_pool_counters += 1
+        else:
+            sum_stored_live += stored
+            if stored != actual:
+                stale_pool_counters += 1
+
+    # ── 7. reconciliation identities + overall integrity verdict ───────────────
+    status_sum_ok    = (status_sum == total_users)
+    placement_sum    = in_live_pool + orphans_total
+    placement_ok     = (placement_sum == active_total)
+    integrity_ok = (
+        status_sum_ok and placement_ok
+        and orphans_total == 0
+        and dissolved_with_members == 0
+        and stale_pool_counters == 0
+    )
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "pool_capacity": POOL_CAPACITY,
+        "users": {
+            "total":          total_users,
+            "active":         active_total,
+            "waitlist":       waitlist_total,
+            "eliminated":     eliminated_total,
+            "eliminated_won": won_total,
+            "status_sum":     status_sum,
+            "status_sum_ok":  status_sum_ok,
+        },
+        "active_placement": {
+            "in_active_pool":   in_active_pool,
+            "in_paused_pool":   in_paused_pool,
+            "in_live_pool":     in_live_pool,
+            "orphan_dissolved": orphan_dissolved,
+            "orphan_null":      orphan_null,
+            "orphan_other":     orphan_other,
+            "orphans_total":    orphans_total,
+            "placement_sum":    placement_sum,
+            "placement_ok":     placement_ok,
+        },
+        "pools": {
+            "total":     pools_total,
+            "live":      pools_live,
+            "active":    pools_active,
+            "paused":    pools_paused,
+            "full":      pools_full,
+            "waiting":   pools_waiting,
+            "dissolved": pools_dissolved,
+        },
+        "active_by_level": {**per_level, "other": per_level_other},
+        "winners": {
+            "total":            won_total,
+            "total_payout_inr": float(total_payout),
+        },
+        "capital": {
+            "total_deposits_inr": float(total_capital),
+        },
+        "integrity": {
+            "ok":                          integrity_ok,
+            "orphans_total":               orphans_total,
+            "stale_pool_counters":         stale_pool_counters,
+            "dissolved_with_members":      dissolved_with_members,
+            "sum_stored_total_members_live": sum_stored_live,
+            "sum_actual_active_in_pools":  in_live_pool,
+        },
+        # ── Flat back-compat headline fields (simple consumers / fallbacks) ────
+        "active_users":   active_total,
+        "waitlist_count": waitlist_total,
+        "active_pools":   pools_active,
+        "live_pools":     pools_live,
+    }
+
+
 # ── Token Burn ────────────────────────────────────────────────────────────────
 
 @router.post("/admin/tokens/{code}/burn", response_model=TokenResponse)

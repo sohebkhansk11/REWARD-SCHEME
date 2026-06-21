@@ -1350,6 +1350,29 @@ def execute_weekly_draw(
     # user_prefix threaded through (None in production → unchanged; run-scoped in sim).
     refill = assign_waitlist_to_pools(db, user_prefix=user_prefix)
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # ROUTE-VIA-REASSESSMENT (Task 2): post-draw the merger has compacted the
+    # vacancies and the waitlist refill has repacked pools to 12 — i.e. the live
+    # layout has STRUCTURALLY changed.  Re-assess + record it (validate + report,
+    # locked decision #3) so the post-draw structure is verified and the held-L4
+    # backlog carried into NEXT week is surfaced on the decision trail (the user's
+    # concern: "if you leave L4 undrawn it will damage future projections").  This
+    # is a FORWARD-HEALTH snapshot — this week's winners already exited and pools are
+    # draw_completed, so it projects no new payout; it cross-verifies the merged
+    # structure and the L4 carry-forward.  Failure-isolated + fail-closed inside the
+    # helper; never rolls back the draw/merge.
+    try:
+        from app.services.pool_reassessor import route_pool_change_via_reassessment
+        route_pool_change_via_reassessment(
+            db, week_id_str, trigger="post_draw_merge", commit=True,
+        )
+    except Exception as _pdra_exc:
+        _logger.error(
+            "execute_weekly_draw: post-draw route-via-reassessment failed "
+            "(non-fatal — draw + merge already committed): %s",
+            _pdra_exc, exc_info=True,
+        )
+
     # SESSION EDIT [Claude Session Jun-14 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # Winner reveal ordering fix (E1+E2) — unified broadcast AFTER all draws and
     # refill complete.  Previously SDE Execute committed WIT tokens + Eliminated_Won

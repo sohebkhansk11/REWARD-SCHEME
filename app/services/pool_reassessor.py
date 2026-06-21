@@ -480,7 +480,53 @@ def run_reassessment(db: Session, week_id: str) -> ReassessResult:
     if not float_pass:
         shortfall = projected_payout - (available_float - reserve)
         avg_high  = _payout_net(db, 4)
-        defer_n   = max(1, -(-shortfall // max(avg_high, 1)))  # ceil division
+        defer_n   = max(1, -(-shortfall // max(avg_high, 1)))  # ceil division to cover shortfall
+
+        # ── SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # CONFLICT-AWARE REMEDIATION (Jun-21).  The re-assessor is NOT a naive draw-cost
+        # minimiser: deferring L4 draws frees float THIS week but GROWS the held-L4
+        # backlog, which damages FUTURE projections (the user's explicit concern: "if
+        # you leave L4 undrawn it will damage future projections") and can itself breach
+        # the pyramid-sustainability band.  So the float remediation and the pyramid
+        # remediation point in OPPOSITE directions — defer-L4 (float) vs add-L4-subdraws
+        # (pyramid).  We resolve the conflict in favour of FUTURE health: only propose
+        # the L4 defer when it provably stays inside the pyramid band; otherwise protect
+        # every due L4 clearance and propose a float TOP-UP for the exact shortfall.
+        backlog_if_deferred   = l4_backlog_after + defer_n
+        capacity_if_deferred  = max(0, clear_capacity - defer_n)
+        defer_is_pyramid_safe = (
+            flagged_l4_now == 0
+            or backlog_if_deferred <= capacity_if_deferred * PYRAMID_SUSTAIN_MULT
+        )
+        if defer_is_pyramid_safe:
+            float_action = (
+                f"Throttle this week's high-tier payouts: defer {defer_n} SDE L4 "
+                f"draw(s) to next week so projected payout ≤ available float. Pyramid "
+                f"stays within band (held-L4 would be {backlog_if_deferred} ≤ "
+                f"{int(capacity_if_deferred * PYRAMID_SUSTAIN_MULT)}), so deferring does "
+                f"not endanger future projections."
+            )
+            float_params = {
+                "remediation":       "defer_l4_pyramid_safe",
+                "defer_sde_draws":   int(defer_n),
+                "shortfall_inr":     int(shortfall),
+                "backlog_if_deferred": int(backlog_if_deferred),
+            }
+        else:
+            float_action = (
+                f"DO NOT defer L4 to save float — it would grow the held-L4 backlog to "
+                f"{backlog_if_deferred} (sustainable band ≤ "
+                f"{int(capacity_if_deferred * PYRAMID_SUSTAIN_MULT)}) and damage future "
+                f"projections. Instead TOP UP the float by ≈₹{shortfall:,} (inject "
+                f"deposits / defer non-L4 withdrawals) so EVERY due L4 still clears this "
+                f"week and the backlog does not compound."
+            )
+            float_params = {
+                "remediation":                "topup_float_protect_l4",
+                "topup_float_inr":            int(shortfall),
+                "shortfall_inr":              int(shortfall),
+                "would_be_backlog_if_deferred": int(backlog_if_deferred),
+            }
         corrected_plan.append({
             "gate": "float",
             "severity": "critical",
@@ -488,11 +534,8 @@ def run_reassessment(db: Session, week_id: str) -> ReassessResult:
                 f"Projected payout ₹{projected_payout:,} exceeds available float "
                 f"₹{available_float:,} by ₹{shortfall:,}."
             ),
-            "action": (
-                f"Throttle this week's high-tier payouts: defer {defer_n} SDE L4 "
-                f"draw(s) to next week so projected payout ≤ available float."
-            ),
-            "params": {"defer_sde_draws": int(defer_n), "shortfall_inr": int(shortfall)},
+            "action": float_action,
+            "params": float_params,
         })
     if not pyramid_pass:
         # how many extra SDE sub-draws would bring the backlog within capacity
@@ -689,3 +732,116 @@ def get_active_hold(db: Session, week_id: str):
     if rep is not None and rep.verdict == "HOLD" and not bool(rep.approved):
         return rep
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ROUTE-VIA-REASSESSMENT (Jun-21, Task 2) — every donor↔receiver MERGE / DISSOLVE
+# is routed through the virtual integrity gate so a structurally-changed pool layout
+# is always re-verified and recorded BEFORE the system trusts it.  Locked decision
+# #3: VALIDATE + REPORT, never roll back the structural change.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def route_pool_change_via_reassessment(
+    db: Session,
+    week_id: str,
+    *,
+    trigger: str,
+    commit: bool = True,
+):
+    """
+    Re-run the virtual integrity gate on the NEWLY merged/dissolved pool layout and
+    PERSIST a tagged ReassessmentReport (locked decision #3 — "validate + report,
+    not rollback").
+
+    The user's rule: "dissolver+merger jab bhi run ho to wo route via re-assessment
+    ho, taki proper pool ban ske."  After any structural change — a manual dissolve,
+    the post-draw merger convergence, or (implicitly) the T-2H merge that STEP 8b
+    already re-assesses — the resulting layout is verified and recorded so:
+      • the decision trail shows WHICH structural event produced the assessment
+        (audit.routed_trigger), and
+      • on HOLD the existing T-0H gate (get_active_hold / ReassessmentHoldError)
+        blocks deployment until an admin clears it.
+
+    MONEY-SAFETY (decision #3):
+      • This NEVER rolls back the merge/dissolve.  Those operations are already
+        correct, level-preserving moves (ONLY current_pool_id changes); undoing them
+        would itself be the unsafe act.  We validate the *outcome* and report it.
+      • Failure-isolated + FAIL-CLOSED: if the engine errors, we write a HOLD report
+        carrying the error (never a silent PASS), so a broken gate can't wave a bad
+        structure through.  The structural change itself stays intact.
+
+    ``commit`` — True (default): commit the report immediately (manual dissolve /
+    post-draw, which run outside the preparation transaction).  False: only flush
+    (caller owns the surrounding transaction, e.g. inside draw preparation).
+
+    Returns the persisted ReassessmentReport row, or None if even the fail-closed
+    write was impossible.
+    """
+    import json
+    from app.models.reassessment_report import ReassessmentReport
+
+    try:
+        result = run_reassessment(db, week_id)
+        # Tag the audit with the structural trigger that produced this assessment so
+        # the decision trail is self-explaining (no new column — migration-safe).
+        try:
+            result.audit["routed_trigger"] = trigger
+        except Exception:
+            pass
+        row = persist_report(db, result)
+        if commit:
+            db.commit()
+            db.refresh(row)
+        _logger.info(
+            "[ROUTE-REASSESS] trigger=%s week=%s → report #%s verdict=%s "
+            "(failed hard gate(s): %s) payout=₹%d float=₹%d",
+            trigger, week_id, row.id, result.verdict,
+            ", ".join(result.failed_hard_gates) or "none",
+            result.projected_payout_inr, result.available_float_inr,
+        )
+        return row
+    except Exception as exc:
+        # FAIL CLOSED — never let a gate error silently approve a changed layout.
+        _logger.critical(
+            "[ROUTE-REASSESS] trigger=%s week=%s — engine error, failing CLOSED "
+            "(writing HOLD report; structural change stays intact): %s",
+            trigger, week_id, exc, exc_info=True,
+        )
+        try:
+            # Discard ONLY the failed re-assessment's pending writes.  The merge/
+            # dissolve was already committed by its own caller, so this rollback
+            # cannot undo the structural change.
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            row = ReassessmentReport(
+                week_id=week_id, verdict="HOLD",
+                purity_pass=True, level_advance_pass=True,
+                float_pass=False, pyramid_pass=False, reconcile_pass=False,
+                projected_payout_inr=0, available_float_inr=0, net_float_inr=0,
+                audit_json=json.dumps({"engine_error": str(exc), "routed_trigger": trigger}),
+                corrected_plan_json=json.dumps([{
+                    "gate": "engine", "severity": "critical",
+                    "finding": f"Post-{trigger} re-assessment engine raised: {exc}",
+                    "action": ("Investigate the gate error. The structural change itself "
+                               "is intact and level-preserving; re-run preparation or "
+                               "approve explicitly to override the fail-closed hold."),
+                    "params": {},
+                }]),
+                approved=False,
+            )
+            db.add(row)
+            if commit:
+                db.commit()
+                db.refresh(row)
+            else:
+                db.flush()
+            return row
+        except Exception:
+            _logger.critical(
+                "[ROUTE-REASSESS] could not persist the fail-closed HOLD report.",
+                exc_info=True,
+            )
+            return None

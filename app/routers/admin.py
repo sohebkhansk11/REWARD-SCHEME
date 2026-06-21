@@ -1036,6 +1036,33 @@ def dissolve_pool_manual(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    # ── SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # ROUTE-VIA-REASSESSMENT (Task 2): the dissolve has structurally changed the pool
+    # layout (members relocated into receivers / fresh pools).  Route it through the
+    # virtual integrity gate so the resulting structure is re-verified + recorded
+    # (locked decision #3 — VALIDATE + REPORT, never roll back the dissolve, which is
+    # already a level-preserving move).  Failure-isolated + fail-closed inside the
+    # helper; the dissolve is already committed, so a gate error cannot undo it.
+    try:
+        from app.services.pool_reassessor import route_pool_change_via_reassessment
+        from app.services.draw_preparation import _make_week_id
+        from datetime import datetime, timezone
+        _wk = _make_week_id(datetime.now(timezone.utc))
+        _rep = route_pool_change_via_reassessment(
+            db, _wk, trigger="manual_dissolve", commit=True,
+        )
+        if _rep is not None:
+            result["reassessment"] = {
+                "week_id":        _wk,
+                "report_id":      _rep.id,
+                "verdict":        _rep.verdict,
+                "is_active_hold": (_rep.verdict == "HOLD" and not bool(_rep.approved)),
+            }
+    except Exception as _ra_exc:
+        # Reporting only — a re-assessment failure must never fail the dissolve, which
+        # is already durable.  Surface it softly so the admin knows to check the panel.
+        result["reassessment"] = {"error": str(_ra_exc)}
+
     result["note"] = (
         f"Pool '{result['pool_name']}' dissolved — {result['members_relocated']} "
         f"member(s) relocated into {len(result['receivers'])} pool(s) "

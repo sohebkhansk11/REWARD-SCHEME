@@ -466,6 +466,16 @@ def _run_preparation(
     try:
         from app.services.pool_reassessor import run_reassessment, persist_report
         _ra = run_reassessment(db, week_id)
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # ROUTE-VIA-REASSESSMENT (Task 2): the T-2H merge already ran at STEP 3b, so
+        # THIS gate is the re-assessment OF the newly merged/dissolved layout (the
+        # user's "pre-draw T-2H: merge first → draw sequence → THEN re-assess the
+        # merged pools" flow).  Tag the trigger so the decision trail shows this
+        # report assessed the post-merge structure (no extra report / no migration).
+        try:
+            _ra.audit["routed_trigger"] = "pre_draw_t2h_post_merge"
+        except Exception:
+            pass
         _report = persist_report(db, _ra)
         # NOTE: hold state is read back from this report row (reassessment_reports
         # is the single source of truth) — deliberately NO mirror column on

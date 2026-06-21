@@ -1084,12 +1084,90 @@ def run_merger_refill_converge(
             _verify_exc,
         )
 
+    # ── SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # LEFTOVER REMAINDER RULE (Jun-21, Task 2).  After full compaction + waitlist
+    # drain, the user's rule for the genuine remainder member(s):
+    #   • if the paid waitlist is EMPTY (nothing left to top it up to 12), the
+    #     leftover non-flagged Active partial pool's status must show "pool pause"
+    #     (Paused_Awaiting_Members).  Members stay PUT — nobody moves, nobody is
+    #     demoted, every current_level/journey is preserved — the pool simply waits
+    #     for new members; STEP 3b / _condense_pools_once will restore it to Active
+    #     the moment it refills to 12.
+    #   • if the paid waitlist STILL has member(s), we LEAVE the pool Active: the
+    #     general FIFO refill (assign_waitlist_to_pools, already looped above) is the
+    #     correct path and pausing would wrongly hide a fillable pool.
+    # SDE-flagged pools are NEVER paused (they draw via SDE staging regardless of
+    # fullness).  Empty shells (0 members) are not "leftover members" → left for the
+    # next compaction to dissolve.  Money-safe: ONLY pool.status / total_members move.
+    paused_remainders: list[str] = []
+    try:
+        _wl_filters = [
+            User.status == UserStatus.Waitlist,
+            User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+        ]
+        if user_prefix:
+            _wl_filters.append(User.username.like(f"{user_prefix}%"))
+        paid_waitlist_remaining = (
+            db.query(func.count(User.id)).filter(*_wl_filters).scalar() or 0
+        )
+
+        if paid_waitlist_remaining == 0:
+            remainder_pools = (
+                db.query(Pool)
+                .filter(
+                    Pool.status == PoolStatus.Active,
+                    Pool.contains_flagged_l4 == False,   # noqa: E712 (SDE pools draw regardless)
+                )
+                .all()
+            )
+            for p in remainder_pools:
+                cnt = (
+                    db.query(func.count(User.id))
+                    .filter(
+                        User.current_pool_id == p.id,
+                        User.status == UserStatus.Active,
+                    )
+                    .scalar() or 0
+                )
+                p.total_members = cnt          # keep the count truthful
+                if 0 < cnt < POOL_CAPACITY:     # genuine leftover member(s) → pause
+                    p.status = PoolStatus.Paused_Awaiting_Members
+                    paused_remainders.append(f"{p.name}({cnt}/12)")
+            if paused_remainders:
+                db.commit()
+                _logger.info(
+                    "[CONVERGE] leftover remainder rule — paid waitlist empty; paused "
+                    "%d non-flagged partial pool(s) → Paused_Awaiting_Members: %s",
+                    len(paused_remainders), ", ".join(paused_remainders),
+                )
+            else:
+                _logger.info(
+                    "[CONVERGE] leftover remainder rule — paid waitlist empty; no "
+                    "non-flagged partial pool to pause (all full or empty).",
+                )
+        else:
+            _logger.info(
+                "[CONVERGE] leftover remainder rule — %d paid waitlist member(s) "
+                "remain; leaving partial pool(s) Active for FIFO refill (no pause).",
+                paid_waitlist_remaining,
+            )
+    except Exception as _pause_exc:   # the pause rule must never break the converge
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _logger.error(
+            "[CONVERGE] leftover remainder (pause) rule failed (non-fatal): %s",
+            _pause_exc, exc_info=True,
+        )
+
     return {
         "transfers":     tot_xfer,
         "dissolved":     dissolved,
         "rounds":        rounds,
         "refill":        refill,
         "partial_pools": partial_pools,
+        "paused_remainders": paused_remainders,
     }
 
 

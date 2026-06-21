@@ -220,6 +220,11 @@ def job_weekly_draw() -> None:
     """
     _logger.info("Scheduler ▶ job_weekly_draw")
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Imported BEFORE the try so the `except ReassessmentHoldError` branch below can
+    # reference the type even though execute_weekly_draw is imported inside the `with`.
+    from app.services.pool_reassessor import ReassessmentHoldError
+
     try:
         with _get_db() as db:
             from app.services.draw             import execute_weekly_draw
@@ -279,6 +284,21 @@ def job_weekly_draw() -> None:
                     week_id,
                 )
 
+    except ReassessmentHoldError as exc:
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # The Master Pool Re-assessor placed this week on HOLD (STEP 8b at T-2H found a
+        # failed financial-grade gate) and no admin has approved the corrected plan.
+        # This is the DESIGNED, money-safe outcome — NOT a failure.  We deliberately do
+        # NOT mark draw_executed / draw_executed_at and we leave countdown_active as-is,
+        # so the dashboard keeps showing the week as pending while the admin reviews the
+        # report and approves the plan (which then re-runs the draw).  No state mutated.
+        _logger.error(
+            "Scheduler 🛑 job_weekly_draw HELD by re-assessor — week=%s report#%s "
+            "failed_gates=%s.  Draw NOT deployed; awaiting admin approval of the "
+            "corrected plan.  (draw_executed left False.)",
+            getattr(exc, "week_id", "?"), getattr(exc, "report_id", "?"),
+            ", ".join(getattr(exc, "failed_gates", []) or []) or "none",
+        )
     except ValueError as exc:
         # No eligible full pools found — not fatal; can happen early in the week
         # before pools are filled, or in dev environments with no data.

@@ -66,6 +66,28 @@ from app.models.token import Token, TokenType, TokenStatus
 _logger = logging.getLogger("reassessor")
 
 
+class ReassessmentHoldError(RuntimeError):
+    """
+    Raised at T-0H by execute_weekly_draw when the latest re-assessment for the
+    week is an UNAPPROVED HOLD.  Deployment is blocked — NO winners are committed,
+    NO tokens issued, NO staged SDE executed — until an admin reviews the proposed
+    corrected plan and approves it with their password (locked decision #1).
+
+    The staged result (SDECheckpoint rows, executed=False) is untouched and simply
+    waits; on approval the draw can be re-triggered and will deploy.
+    """
+
+    def __init__(self, week_id: str, report_id: int, failed_gates: list[str]):
+        self.week_id = week_id
+        self.report_id = report_id
+        self.failed_gates = failed_gates
+        super().__init__(
+            f"Re-assessment HOLD for week {week_id} (report #{report_id}); "
+            f"failed hard gate(s): {', '.join(failed_gates) or 'unknown'}. "
+            f"Deployment blocked pending admin approval of the corrected plan."
+        )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Tunable bands (conservative defaults).  A normal mature week must PASS; only a
 #  genuinely dangerous week (insolvent / runaway L4 / impossible data) must HOLD.
@@ -116,6 +138,17 @@ class ReassessResult:
     @property
     def is_hold(self) -> bool:
         return self.verdict == "HOLD"
+
+    @property
+    def failed_hard_gates(self) -> list[str]:
+        """The hard gates (float/pyramid/reconcile) that failed — these drive the HOLD."""
+        return [
+            name for name, ok in (
+                ("float", self.float_pass),
+                ("pyramid", self.pyramid_pass),
+                ("reconcile", self.reconcile_pass),
+            ) if not ok
+        ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -595,3 +628,64 @@ def run_reassessment(db: Session, week_id: str) -> ReassessResult:
         (winner_pyramid["L4"] / projected_winners * 100) if projected_winners else 0.0,
     )
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Persistence + hold-state helpers (used by the T-2H wiring and T-0H gate)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def persist_report(db: Session, result: "ReassessResult"):
+    """
+    Build and ADD a ReassessmentReport row from a ReassessResult.  The caller is
+    responsible for committing (in _run_preparation this happens at STEP 9).  The
+    row is flushed so its id is available immediately.  Returns the ORM row.
+    """
+    import json
+    from app.models.reassessment_report import ReassessmentReport
+
+    row = ReassessmentReport(
+        week_id=result.week_id,
+        verdict=result.verdict,
+        purity_pass=result.purity_pass,
+        level_advance_pass=result.level_advance_pass,
+        float_pass=result.float_pass,
+        pyramid_pass=result.pyramid_pass,
+        reconcile_pass=result.reconcile_pass,
+        projected_payout_inr=int(result.projected_payout_inr),
+        available_float_inr=int(result.available_float_inr),
+        net_float_inr=int(result.net_float_inr),
+        member_pyramid_json=json.dumps(result.member_pyramid),
+        winner_pyramid_json=json.dumps(result.winner_pyramid),
+        audit_json=json.dumps(result.audit, default=str),
+        corrected_plan_json=json.dumps(result.corrected_plan, default=str),
+        approved=False,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def latest_report(db: Session, week_id: str):
+    """Return the most recent ReassessmentReport for week_id (or None)."""
+    from app.models.reassessment_report import ReassessmentReport
+    return (
+        db.query(ReassessmentReport)
+        .filter(ReassessmentReport.week_id == week_id)
+        .order_by(ReassessmentReport.id.desc())
+        .first()
+    )
+
+
+def get_active_hold(db: Session, week_id: str):
+    """
+    Return the latest ReassessmentReport for ``week_id`` IF it is an unapproved
+    HOLD (i.e. deployment must be blocked), else None.
+
+    Failure-isolated by the caller: a lookup error (e.g. table missing on a stale
+    deploy) must NOT block the draw — STEP 8b is the authoritative gate that writes
+    the verdict; this is only a read of that verdict at T-0H.
+    """
+    rep = latest_report(db, week_id)
+    if rep is not None and rep.verdict == "HOLD" and not bool(rep.approved):
+        return rep
+    return None

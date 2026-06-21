@@ -653,6 +653,50 @@ def execute_weekly_draw(
     _staged_executed:  int = 0
     _ext_draws_count:  int = 0
 
+    # ── T-0H RE-ASSESSMENT GATE — refuse to deploy a HELD week ─────────────────
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # The Master Pool Re-assessor (STEP 8b, at T-2H preparation) has already virtually
+    # dissolved every pool, projected the FULL winner set (staged SDE + projected
+    # regular draws), run the five financial-grade checks, and persisted a verdict to
+    # the reassessment_reports table.  Here — at T-0H, the instant before any money
+    # moves — we READ that verdict back.  If the latest report for this week is a HOLD
+    # that NO admin has approved, we REFUSE to deploy the real draw and raise
+    # ReassessmentHoldError.  The scheduler and the manual-draw callers translate that
+    # into a clean "blocked — awaiting admin approval" outcome instead of mutating any
+    # token / status / pool state.  (Re-assessor locked decision #1: hold the result
+    # until the corrected plan is approved with the admin password.)
+    #
+    # FAILURE-ISOLATED LOOKUP:  a genuine active HOLD MUST hard-stop the draw, but a
+    # transient *lookup* error must NOT — STEP 8b is the authoritative writer of the
+    # verdict, and a read failure here (e.g. table absent on a brand-new deploy where
+    # no report was ever written → there is no hold) should not freeze an otherwise
+    # clear week.  So only a real active hold raises; any lookup exception is logged
+    # and the draw proceeds.
+    from app.services.pool_reassessor import get_active_hold, ReassessmentHoldError
+    _hold = None
+    try:
+        _hold = get_active_hold(db, week_id_str)
+    except Exception as _hold_exc:
+        _logger.warning(
+            "execute_weekly_draw: re-assessment hold lookup failed for week %s — "
+            "proceeding (STEP 8b is the authoritative gate; non-fatal): %s",
+            week_id_str, _hold_exc,
+        )
+        _hold = None
+    if _hold is not None:
+        _failed_gates = [name for name, ok in (
+            ("float",     _hold.float_pass),
+            ("pyramid",   _hold.pyramid_pass),
+            ("reconcile", _hold.reconcile_pass),
+        ) if not ok]
+        _logger.error(
+            "execute_weekly_draw: 🛑 RE-ASSESSMENT HOLD active for week %s (report #%d) — "
+            "DEPLOYMENT BLOCKED.  Failed hard gate(s): %s.  An admin must review and "
+            "approve the corrected plan before the draw can run.",
+            week_id_str, _hold.id, ", ".join(_failed_gates) or "none",
+        )
+        raise ReassessmentHoldError(week_id_str, _hold.id, _failed_gates)
+
     # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # PHASE B — QUANT-ADAPTIVE DRAW-PRIORITY PLAN.  Compute the situational lean ONCE,
     # up front, so EVERY downstream decision this cycle reads the SAME posture:

@@ -450,6 +450,72 @@ def _run_preparation(
     else:
         _logger.info("Preparation STEP 8: no L4 members — SDE not needed.")
 
+    # ── STEP 8b: Master Pool Re-assessment — virtual pre-deployment gate ──────
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Runs AFTER STEP 8 (SDE winners staged, executed=False) and BEFORE STEP 9
+    # (countdown activation), so it sees the FULL prepared result. It virtually
+    # dissolves every pool, projects the entire week's winner set (staged SDE +
+    # projected regular draws), and cross-verifies "purity of the draw" against the
+    # five financial-grade checks. A ReassessmentReport row is persisted (committed
+    # together with STEP 9). On HOLD, the row sits unapproved and the T-0H gate in
+    # execute_weekly_draw blocks deployment until an admin approves the corrected
+    # plan with their password (locked decision #1). Failure-isolated: if the gate
+    # itself errors, we FAIL CLOSED — persist a HOLD report carrying the error so
+    # the T-0H gate still blocks (money-safe), while preparation continues so the
+    # countdown/UI state stays consistent.
+    try:
+        from app.services.pool_reassessor import run_reassessment, persist_report
+        _ra = run_reassessment(db, week_id)
+        _report = persist_report(db, _ra)
+        # NOTE: hold state is read back from this report row (reassessment_reports
+        # is the single source of truth) — deliberately NO mirror column on
+        # WeeklyDrawState, so no schema migration is required.
+        if _ra.is_hold:
+            _logger.error(
+                "Preparation STEP 8b: RE-ASSESSMENT HOLD for week %s (report #%d) — "
+                "DEPLOYMENT BLOCKED pending admin approval. Failed hard gate(s): %s. "
+                "Corrected plan: %d action(s). payout=₹%d available_float=₹%d.",
+                week_id, _report.id, ", ".join(_ra.failed_hard_gates) or "none",
+                len(_ra.corrected_plan), _ra.projected_payout_inr, _ra.available_float_inr,
+            )
+        else:
+            _logger.info(
+                "Preparation STEP 8b: RE-ASSESSMENT PASS for week %s (report #%d) — "
+                "clear to deploy. payout=₹%d available_float=₹%d.",
+                week_id, _report.id, _ra.projected_payout_inr, _ra.available_float_inr,
+            )
+    except Exception as _ra_exc:
+        # FAIL CLOSED — the gate erred; record an explicit HOLD report so the T-0H
+        # gate blocks deployment until an admin reviews it. Never crash preparation.
+        _logger.critical(
+            "Preparation STEP 8b: RE-ASSESSMENT ENGINE ERROR for week %s — "
+            "failing CLOSED (writing HOLD report; deployment will block): %s",
+            week_id, _ra_exc, exc_info=True,
+        )
+        try:
+            import json as _json
+            from app.models.reassessment_report import ReassessmentReport
+            db.add(ReassessmentReport(
+                week_id=week_id, verdict="HOLD",
+                purity_pass=True, level_advance_pass=True,
+                float_pass=False, pyramid_pass=False, reconcile_pass=False,
+                projected_payout_inr=int(state.float_projection_inr or 0),
+                available_float_inr=0, net_float_inr=0,
+                audit_json=_json.dumps({"engine_error": str(_ra_exc)}),
+                corrected_plan_json=_json.dumps([{
+                    "gate": "engine", "severity": "critical",
+                    "finding": f"Re-assessment engine raised: {_ra_exc}",
+                    "action": "Investigate the gate error, then re-run preparation or "
+                              "approve explicitly to override the fail-closed hold.",
+                    "params": {},
+                }]),
+                approved=False,
+            ))
+            db.flush()
+        except Exception:
+            _logger.critical("Preparation STEP 8b: could not even persist the "
+                             "fail-closed HOLD report.", exc_info=True)
+
     # ── STEP 9: Mark preparation complete — two-flag activation ──────────────
     state.preparation_completed_at = datetime.now(timezone.utc)
     state.preparation_valid        = True    # FLAG 1

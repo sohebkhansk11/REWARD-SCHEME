@@ -42,6 +42,16 @@ api.interceptors.response.use(
 // ── Stats ────────────────────────────────────────────────────────────────────
 export const getStats   = ()       => api.get('/admin/stats')
 
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+/** GET /admin/stats/reconciliation — SSOT (single source of truth) payload.
+ *  ONE authoritative server-computed snapshot every headline/pool view should
+ *  consume so counts can never disagree ("84 active vs 577").  Computed from the
+ *  User + Pool tables (never the denormalized counter).  Returns
+ *  { users{}, active_placement{}, pools{}, active_by_level{}, winners{},
+ *    capital{}, integrity{}, + flat active_users/active_pools/live_pools }. */
+export const getReconciliation = () =>
+  api.get('/admin/stats/reconciliation')
+
 // ── Pools ────────────────────────────────────────────────────────────────────
 export const getPools   = (params) => api.get('/pools/',   { params: { limit: 100, ...params } })
 

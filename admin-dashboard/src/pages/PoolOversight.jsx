@@ -7,6 +7,8 @@ import {
   getPoolSettings, setAutoPoolCreation, manualCreatePool,
   fillPoolVacancies, syncPoolMemberCounts,
   getThreshold, updateThreshold,
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  getReconciliation,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -329,6 +331,9 @@ export default function PoolOversight() {
   const toast = useToast()
   const [pools, setPools] = useState([])
   const [users, setUsers] = useState([])
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // SSOT reconciliation payload (single source of truth for every headline).
+  const [recon, setRecon] = useState(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState(null)
@@ -358,9 +363,22 @@ export default function PoolOversight() {
     else setRefreshing(true)
     setError(null)
     try {
-      const [poolsRes, usersRes] = await Promise.all([getPools(), getUsers()])
+      // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+      // SSOT WIRING (A3).  Headline counts now come from the authoritative
+      // server-computed /admin/stats/reconciliation payload — never derived
+      // client-side from a truncated /users/ page.  The member fetch is widened
+      // to 5000 so per-pool expansions show EVERY Active member (the old 500-row
+      // unordered page dropped Active members past row 500 → "where gone 577?").
+      // getReconciliation is DEFENSIVE: if the endpoint is missing/old (404) the
+      // UI silently falls back to the legacy client-derived counts.
+      const [poolsRes, usersRes, reconRes] = await Promise.all([
+        getPools(),
+        getUsers({ limit: 5000 }),
+        getReconciliation().catch(() => null),
+      ])
       setPools(poolsRes.data)
       setUsers(usersRes.data)
+      setRecon(reconRes?.data ?? null)
     } catch (err) {
       const msg = err.code === 'ERR_NETWORK'
         ? `Cannot reach API at ${BASE_URL}`
@@ -518,7 +536,19 @@ export default function PoolOversight() {
   const membersOf = poolId => users.filter(u => u.current_pool_id === poolId)
 
   const activePools = pools.filter(p => p.status === 'Active')
-  const totalMembers = users.filter(u => u.status === 'Active').length
+
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // SSOT-PREFERRED headline values with defensive client fallback.  When the
+  // reconciliation endpoint is live every card reads ONE authoritative number;
+  // if it is missing the legacy client-derived value is used so the page never
+  // breaks.  "Live Pools" excludes Merged_Dissolved (dead pools are not pools).
+  const clientActiveMembers = users.filter(u => u.status === 'Active').length
+  const clientLivePools     = pools.filter(p => p.status !== 'Merged_Dissolved').length
+  const totalMembers   = recon?.users?.active   ?? clientActiveMembers
+  const livePoolsVal   = recon?.pools?.live     ?? clientLivePools
+  const activePoolsVal = recon?.pools?.active   ?? activePools.length
+  const dissolvedVal   = recon?.pools?.dissolved
+  const integrity      = recon?.integrity ?? null
 
   if (loading) {
     return <div className="flex items-center justify-center h-full"><Spinner className="w-8 h-8" /></div>
@@ -542,19 +572,55 @@ export default function PoolOversight() {
         </button>
       </div>
 
-      {/* Stats strip */}
+      {/* Stats strip — SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 /
+          Sohebkhan.sk11]: values now sourced from the SSOT reconciliation
+          endpoint (server-authoritative, no client truncation). */}
       <div className="grid grid-cols-3 gap-4">
         {[
-          { label: 'Total Pools', value: pools.length },
-          { label: 'Active Pools', value: activePools.length },
-          { label: 'Active Members', value: totalMembers },
+          { label: 'Live Pools', value: livePoolsVal,
+            sub: dissolvedVal != null ? `${dissolvedVal} dissolved (excluded)` : null },
+          { label: 'Active Pools', value: activePoolsVal },
+          { label: 'Active Members', value: totalMembers,
+            sub: recon ? 'server-verified' : 'client estimate' },
         ].map(s => (
           <div key={s.label} className="bg-white rounded-xl px-5 py-4 shadow-sm border border-slate-100 flex items-center justify-between">
-            <span className="text-sm text-slate-500">{s.label}</span>
+            <div className="flex flex-col">
+              <span className="text-sm text-slate-500">{s.label}</span>
+              {s.sub && <span className="text-[10px] text-slate-400 mt-0.5">{s.sub}</span>}
+            </div>
             <span className="text-xl font-bold text-slate-800 tabular-nums">{s.value}</span>
           </div>
         ))}
       </div>
+
+      {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+          SSOT integrity health strip — makes data-trustworthiness visible.  Green
+          when every reconciliation identity holds; amber with a breakdown when a
+          leak/staleness is detected (the 6-hourly integrity job auto-heals it). */}
+      {integrity && (
+        integrity.ok ? (
+          <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-2.5 text-sm text-emerald-700">
+            <Shield className="w-4 h-4 flex-shrink-0" />
+            <span className="font-medium">Data reconciled</span>
+            <span className="text-emerald-600/80 text-xs">
+              every Active member sits in a live pool · pool counters match live counts · no orphans
+            </span>
+          </div>
+        ) : (
+          <div className="flex items-start gap-3 bg-amber-50 border-2 border-amber-300 rounded-xl p-4 text-sm">
+            <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+            <div>
+              <p className="font-bold text-amber-800">⚠ Reconciliation drift detected</p>
+              <p className="text-xs text-amber-700 mt-0.5 leading-relaxed">
+                {integrity.orphans_total > 0 && <span className="mr-3">Orphaned Active members: <b>{integrity.orphans_total}</b></span>}
+                {integrity.stale_pool_counters > 0 && <span className="mr-3">Stale pool counters: <b>{integrity.stale_pool_counters}</b></span>}
+                {integrity.dissolved_with_members > 0 && <span className="mr-3">Dissolved pools holding members: <b>{integrity.dissolved_with_members}</b></span>}
+                <br />The 6-hourly integrity job re-homes orphans and resyncs counters automatically; run “Sync Member Counts” below to repair now.
+              </p>
+            </div>
+          </div>
+        )
+      )}
 
       {/* ── Type B Danger Banner ─────────────────────────────────────────────── */}
       {pools.filter(p => p.pool_draw_type === 'type_b' && (p.status ?? p.pool_status) === 'Active').length >= 1 && (

@@ -362,6 +362,35 @@ export const submitOverrideDecision = (choice, weekId) =>
 export const getDrawCountdown = () =>
   api.get('/draw/countdown')
 
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// ── Master Pool Re-assessment Manager (virtual pre-deployment integrity gate) ──
+// The re-assessor runs at T-2H (STEP 8b), virtually dissolves every pool, projects
+// the full winner set, and HOLDs deployment if a financial-grade gate fails.  These
+// back the Pool Re-assessment review panel + password-gated HOLD approval.
+
+/** GET /admin/reassessment/{week_id} — latest report for the week (full, deserialized).
+ *  Returns { exists, week_id, report }.  exists=false → week not assessed yet. */
+export const getReassessment = (weekId) =>
+  api.get(`/admin/reassessment/${encodeURIComponent(weekId)}`)
+
+/** GET /admin/reassessment/{week_id}/history — full audit trail, newest first */
+export const getReassessmentHistory = (weekId) =>
+  api.get(`/admin/reassessment/${encodeURIComponent(weekId)}/history`)
+
+/** POST /admin/reassessment/{week_id}/approve — clear a HOLD (admin password required).
+ *  @param weekId        ISO week key (e.g. "2026-W25")
+ *  @param adminPassword admin password (verified server-side)
+ *  @param opts.override  false (default) = re-assess on current data, clears ONLY if
+ *                        the fresh verdict is PASS;  true = accept the risk and clear
+ *                        as-prepared (requires opts.adminNote).
+ *  @param opts.adminNote reviewer note — REQUIRED when override=true. */
+export const approveReassessment = (weekId, adminPassword, { override = false, adminNote = undefined } = {}) =>
+  api.post(`/admin/reassessment/${encodeURIComponent(weekId)}/approve`, {
+    admin_password: adminPassword,
+    override,
+    ...(adminNote ? { admin_note: adminNote } : {}),
+  })
+
 /** GET /admin/stats/brain5-lpi — Brain 5 LPI live snapshot */
 export const getBrain5Lpi = () =>
   api.get('/admin/stats/brain5-lpi')

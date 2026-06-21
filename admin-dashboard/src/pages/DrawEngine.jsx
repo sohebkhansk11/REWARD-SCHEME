@@ -19,12 +19,16 @@ import {
   ChevronRight, Play, RotateCcw, XCircle,
   TrendingUp, Layers, Database, AlertCircle,
   IndianRupee, Timer, Settings,
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  ShieldCheck, ShieldAlert, Lock, Scale, ListChecks,
 } from 'lucide-react'
 import Spinner from '../components/Spinner'
 import {
   getBrain5Lpi, getDrawState, getDrawCountdown,
   prepareWeeklyDraw, manualExecuteDraw, triggerPostDrawCleanup,
   getOverrideDashboard, submitOverrideDecision, getSchedulerStatus,
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  getReassessment, approveReassessment,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -714,6 +718,429 @@ function OverrideDeadlineRing({ timeRemainingSeconds = 7200 }) {
   )
 }
 
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// ─── Module 4: Master Pool Re-assessment — virtual pre-deployment integrity gate ─
+// Renders the verdict produced at T-2H (STEP 8b) by app/services/pool_reassessor.py:
+// it virtually dissolves EVERY pool, projects the whole week's winner set, and
+// cross-verifies the "purity of the draw" against five financial-grade checks.
+// THREE checks are HARD gates (float-solvency, pyramid-sustainability,
+// reconciliation) — any one failing → HOLD → the real draw is refused at T-0H
+// until an admin clears it here.  TWO are diagnostics (purity, level-advancement)
+// that drive the corrected plan but never freeze a mature week alone.
+//
+// Backend is already deployed (additive endpoints) so this panel is fully
+// defensive: empty-state when no report exists, never throws on missing fields.
+
+const _RA_LEVELS = ['L1', 'L2', 'L3', 'L4', 'L5', 'L6']
+
+// One gate tile: hard gates carry money/integrity weight, diagnostics are advisory.
+function RaGateTile({ label, ok, hard, Icon }) {
+  const isHardFail = hard && !ok
+  const tone = ok
+    ? 'border-emerald-200 bg-emerald-50'
+    : hard
+      ? 'border-red-300 bg-red-50'
+      : 'border-amber-200 bg-amber-50'
+  const txt = ok ? 'text-emerald-700' : hard ? 'text-red-700' : 'text-amber-700'
+  return (
+    <div className={`border rounded-xl px-3 py-2.5 ${tone} ${isHardFail ? 'ring-2 ring-red-400/40' : ''}`}>
+      <div className="flex items-center justify-between gap-2">
+        <div className={`flex items-center gap-1.5 ${txt}`}>
+          <Icon className="w-3.5 h-3.5 flex-shrink-0" />
+          <span className="text-[11px] font-bold leading-tight">{label}</span>
+        </div>
+        {ok
+          ? <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+          : <XCircle className={`w-4 h-4 flex-shrink-0 ${hard ? 'text-red-600' : 'text-amber-600'}`} />}
+      </div>
+      <p className="text-[9px] font-semibold uppercase tracking-wider mt-1 opacity-60">
+        {hard ? 'Hard gate' : 'Diagnostic'} · {ok ? 'PASS' : 'FAIL'}
+      </p>
+    </div>
+  )
+}
+
+// Member-vs-winner pyramid: side-by-side bars per level. The "315 L4 winners but
+// only 80 members" signature shows up here as a winner bar overshooting members.
+function RaPyramid({ member = {}, winner = {} }) {
+  const peak = Math.max(
+    1,
+    ..._RA_LEVELS.map(l => Math.max(Number(member[l] ?? 0), Number(winner[l] ?? 0))),
+  )
+  return (
+    <div className="space-y-2">
+      {_RA_LEVELS.map(l => {
+        const mv = Number(member[l] ?? 0)
+        const wv = Number(winner[l] ?? 0)
+        const high = l === 'L4' || l === 'L5' || l === 'L6'
+        const impossible = wv > mv   // projecting more winners than members exist
+        return (
+          <div key={l} className="flex items-center gap-2">
+            <span className={`text-[11px] font-bold w-6 ${high ? 'text-red-600' : 'text-slate-500'}`}>{l}</span>
+            <div className="flex-1 space-y-1">
+              {/* members */}
+              <div className="flex items-center gap-1.5">
+                <div className="flex-1 h-2.5 bg-slate-100 rounded-full overflow-hidden">
+                  <div className="h-full bg-slate-400 rounded-full transition-all"
+                       style={{ width: `${(mv / peak) * 100}%` }} />
+                </div>
+                <span className="text-[10px] font-mono text-slate-500 w-9 text-right tabular-nums">{mv}</span>
+              </div>
+              {/* winners */}
+              <div className="flex items-center gap-1.5">
+                <div className="flex-1 h-2.5 bg-slate-100 rounded-full overflow-hidden">
+                  <div className={`h-full rounded-full transition-all ${impossible ? 'bg-red-500' : high ? 'bg-violet-500' : 'bg-violet-400'}`}
+                       style={{ width: `${Math.min(100, (wv / peak) * 100)}%` }} />
+                </div>
+                <span className={`text-[10px] font-mono w-9 text-right tabular-nums ${impossible ? 'text-red-600 font-bold' : 'text-violet-600'}`}>{wv}</span>
+              </div>
+            </div>
+            {impossible && (
+              <span title="More projected winners than members exist at this level — impossible-data signature"
+                    className="text-[9px] font-black text-red-600">⚠</span>
+            )}
+          </div>
+        )
+      })}
+      <div className="flex items-center gap-4 pt-1">
+        <span className="flex items-center gap-1 text-[9px] text-slate-400">
+          <span className="w-3 h-2 rounded-full bg-slate-400 inline-block" /> Members
+        </span>
+        <span className="flex items-center gap-1 text-[9px] text-slate-400">
+          <span className="w-3 h-2 rounded-full bg-violet-500 inline-block" /> Projected winners
+        </span>
+      </div>
+    </div>
+  )
+}
+
+function ReassessmentPanel({ weekId, onChanged }) {
+  const toast = useToast()
+  const [report,     setReport]     = useState(null)
+  const [exists,     setExists]     = useState(false)
+  const [loading,    setLoading]    = useState(true)
+  const [error,      setError]      = useState(null)
+
+  // approve modal
+  const [modalMode,  setModalMode]  = useState(null)   // 'reassess' | 'override' | null
+  const [password,   setPassword]   = useState('')
+  const [note,       setNote]       = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  const load = useCallback(async () => {
+    if (!weekId) { setLoading(false); return }
+    setLoading(true)
+    try {
+      const res = await getReassessment(weekId)
+      setExists(Boolean(res.data?.exists))
+      setReport(res.data?.report ?? null)
+      setError(null)
+    } catch (err) {
+      setError(err.response?.data?.detail ?? 'Failed to load re-assessment')
+      setReport(null)
+      setExists(false)
+    } finally {
+      setLoading(false)
+    }
+  }, [weekId])
+
+  useEffect(() => { load() }, [load])
+
+  const closeModal = () => { setModalMode(null); setPassword(''); setNote('') }
+
+  const submitApprove = async () => {
+    if (!password) { toast('Admin password required', 'error'); return }
+    if (modalMode === 'override' && !note.trim()) {
+      toast('Override requires a justification note', 'error'); return
+    }
+    setSubmitting(true)
+    try {
+      const res = await approveReassessment(weekId, password, {
+        override:  modalMode === 'override',
+        adminNote: note.trim() || undefined,
+      })
+      const d = res.data ?? {}
+      if (d.cleared) toast(d.message || 'HOLD cleared — draw may deploy.', 'success')
+      else           toast(d.message || 'Re-assessment still holds.', 'error')
+      closeModal()
+      await load()
+      onChanged?.()
+    } catch (err) {
+      toast(err.response?.data?.detail ?? 'Approval failed', 'error')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  // ── Empty / loading / error states (fully defensive) ──────────────────────
+  if (loading) {
+    return (
+      <SectionCard title="Master Pool Re-assessment" icon={ShieldCheck} iconColor="text-violet-500" badge="VIRTUAL GATE">
+        <div className="flex items-center justify-center h-24">
+          <Spinner className="w-6 h-6 text-violet-400" />
+        </div>
+      </SectionCard>
+    )
+  }
+  if (error) {
+    return (
+      <SectionCard title="Master Pool Re-assessment" icon={ShieldAlert} iconColor="text-red-500" badge="VIRTUAL GATE">
+        <div className="p-6 text-sm text-red-600 flex items-center gap-2">
+          <AlertCircle className="w-4 h-4" /> {error}
+        </div>
+      </SectionCard>
+    )
+  }
+  if (!exists || !report) {
+    return (
+      <SectionCard title="Master Pool Re-assessment" icon={ShieldCheck} iconColor="text-violet-500" badge="VIRTUAL GATE">
+        <div className="p-6 text-center">
+          <Shield className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+          <p className="text-sm font-semibold text-slate-500">
+            No re-assessment yet for {weekId || 'this week'}.
+          </p>
+          <p className="text-xs text-slate-400 mt-1">
+            The virtual integrity gate runs automatically at T-2H draw preparation
+            (STEP 8b). It dissolves every pool, projects the full week, and cross-verifies
+            draw purity before any real draw is allowed to deploy.
+          </p>
+        </div>
+      </SectionCard>
+    )
+  }
+
+  // ── Loaded ────────────────────────────────────────────────────────────────
+  const isHold     = report.verdict === 'HOLD'
+  const activeHold = report.is_active_hold
+  const g          = report.gates ?? {}
+  const fin        = report.financials ?? {}
+  const headroom   = Number(fin.headroom_inr ?? 0)
+  const audit      = report.audit ?? {}
+  const plan       = Array.isArray(report.corrected_plan) ? report.corrected_plan : []
+  const approval   = report.approval ?? {}
+  const fAudit     = audit.float    ?? {}
+  const pAudit     = audit.pyramid  ?? {}
+  const purAudit   = audit.purity   ?? {}
+
+  return (
+    <>
+      <SectionCard
+        title="Master Pool Re-assessment"
+        icon={activeHold ? ShieldAlert : ShieldCheck}
+        iconColor={activeHold ? 'text-red-500' : 'text-emerald-500'}
+        badge="VIRTUAL GATE"
+        action={
+          <button onClick={load}
+                  className="text-[11px] font-medium text-slate-400 hover:text-slate-600 flex items-center gap-1">
+            <RefreshCw className="w-3 h-3" /> {weekId}
+          </button>
+        }
+      >
+        <div className="p-5 space-y-5">
+
+          {/* ── Verdict banner ── */}
+          <div className={`rounded-xl px-5 py-4 flex items-center justify-between gap-4 flex-wrap border-2 ${
+            activeHold ? 'border-red-300 bg-red-50'
+            : isHold    ? 'border-amber-300 bg-amber-50'
+            : 'border-emerald-300 bg-emerald-50'
+          }`}>
+            <div className="flex items-center gap-3">
+              {activeHold
+                ? <ShieldAlert className="w-8 h-8 text-red-600 flex-shrink-0" />
+                : <ShieldCheck className="w-8 h-8 text-emerald-600 flex-shrink-0" />}
+              <div>
+                <p className={`text-lg font-black leading-none ${
+                  activeHold ? 'text-red-700' : isHold ? 'text-amber-700' : 'text-emerald-700'
+                }`}>
+                  {activeHold ? '🛑 DRAW HELD' : isHold ? 'HOLD (cleared)' : '✓ DRAW CLEARED TO DEPLOY'}
+                </p>
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Verdict <b>{report.verdict}</b> · report #{report.id} · assessed {fmt(report.run_at)}
+                  {report.failed_hard_gates?.length > 0 && (
+                    <> · failed: <b className="text-red-600">{report.failed_hard_gates.join(', ')}</b></>
+                  )}
+                </p>
+              </div>
+            </div>
+            {activeHold && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setModalMode('reassess')}
+                  className="flex items-center gap-1.5 px-3.5 py-2 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-lg transition">
+                  <RefreshCw className="w-3.5 h-3.5" /> Re-assess on current data
+                </button>
+                <button
+                  onClick={() => setModalMode('override')}
+                  className="flex items-center gap-1.5 px-3.5 py-2 bg-white border border-red-300 hover:bg-red-50 text-red-700 text-xs font-bold rounded-lg transition">
+                  <Lock className="w-3.5 h-3.5" /> Override &amp; deploy
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* ── Five gates ── */}
+          <div>
+            <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2">Integrity checks</p>
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
+              <RaGateTile label="Float Solvency"        ok={g.float_pass}         hard Icon={IndianRupee} />
+              <RaGateTile label="Pyramid Sustainability" ok={g.pyramid_pass}      hard Icon={Layers} />
+              <RaGateTile label="Reconciliation"         ok={g.reconcile_pass}    hard Icon={Database} />
+              <RaGateTile label="Draw Purity"            ok={g.purity_pass}             Icon={Scale} />
+              <RaGateTile label="Level Advancement"      ok={g.level_advance_pass}      Icon={TrendingUp} />
+            </div>
+          </div>
+
+          {/* ── Financials + Pyramid ── */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+
+            {/* Financials */}
+            <div className="space-y-3">
+              <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Float gate (solvency)</p>
+              <div className="grid grid-cols-2 gap-2">
+                <Chip label="Projected payout" value={INR(fin.projected_payout_inr)} accent="amber" />
+                <Chip label="Available float"  value={INR(fin.available_float_inr)} accent="blue" />
+                <Chip label="Net float"        value={INR(fin.net_float_inr)} accent="slate" />
+                <Chip label="Headroom"         value={INR(headroom)} accent={headroom >= 0 ? 'green' : 'red'} />
+              </div>
+              <div className="text-[10px] text-slate-400 space-y-0.5 pt-1 font-mono">
+                {fAudit.reserve_inr != null && <p>reserve held: {INR(fAudit.reserve_inr)}</p>}
+                {fAudit.worstcase_payout_inr != null && fAudit.composition_payout_inr != null && (
+                  <p>payout = max(composition {INR(fAudit.composition_payout_inr)}, worst-case {INR(fAudit.worstcase_payout_inr)})</p>
+                )}
+              </div>
+
+              {/* pyramid audit numbers */}
+              <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400 pt-2">Pyramid gate (held-L4 backlog)</p>
+              <div className="grid grid-cols-2 gap-2">
+                <Chip label="Flagged L4 now" value={pAudit.flagged_l4_now ?? '—'} accent={(pAudit.flagged_l4_now ?? 0) > 0 ? 'red' : 'slate'} />
+                <Chip label="L4 cleared"     value={pAudit.l4_cleared ?? '—'} accent="violet" />
+                <Chip label="Backlog after"  value={pAudit.l4_backlog_after ?? '—'} accent={(pAudit.l4_backlog_after ?? 0) > 0 ? 'amber' : 'green'} />
+                <Chip label="Clear capacity" value={pAudit.clear_capacity ?? '—'} accent="slate" />
+              </div>
+            </div>
+
+            {/* Pyramid bars */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Member vs projected-winner pyramid</p>
+                {purAudit.over_representation != null && (
+                  <span className={`text-[10px] font-bold ${g.purity_pass ? 'text-slate-400' : 'text-amber-600'}`}>
+                    high-tier over-rep {purAudit.over_representation}×
+                  </span>
+                )}
+              </div>
+              <RaPyramid member={report.member_pyramid} winner={report.winner_pyramid} />
+            </div>
+          </div>
+
+          {/* ── Corrected plan ── */}
+          {plan.length > 0 && (
+            <div>
+              <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2 flex items-center gap-1.5">
+                <ListChecks className="w-3.5 h-3.5" /> Proposed corrected plan
+              </p>
+              <div className="space-y-2">
+                {plan.map((step, i) => {
+                  const crit = step.severity === 'critical'
+                  return (
+                    <div key={i} className={`rounded-lg border px-3.5 py-2.5 ${
+                      crit ? 'border-red-200 bg-red-50/60' : 'border-amber-200 bg-amber-50/60'
+                    }`}>
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded ${
+                          crit ? 'bg-red-200 text-red-800' : 'bg-amber-200 text-amber-800'
+                        }`}>{step.gate}</span>
+                        <span className={`text-[9px] font-bold uppercase ${crit ? 'text-red-500' : 'text-amber-600'}`}>
+                          {step.severity}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-700 font-medium">{step.finding}</p>
+                      <p className="text-[11px] text-slate-600 mt-1">→ {step.action}</p>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ── Approval audit footer ── */}
+          {approval.approved && (
+            <div className="text-[10px] text-slate-400 border-t border-slate-100 pt-3 flex items-center gap-1.5">
+              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+              Cleared by <b className="text-slate-600">{approval.approved_by || '—'}</b> at {fmt(approval.approved_at)}
+              {approval.admin_note && <> · note: “{approval.admin_note}”</>}
+            </div>
+          )}
+        </div>
+      </SectionCard>
+
+      {/* ── Password-confirm modal (re-assess vs override) ── */}
+      {modalMode && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+             onClick={() => !submitting && closeModal()}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6"
+               onClick={e => e.stopPropagation()}>
+            <div className="flex items-center gap-2 mb-1">
+              {modalMode === 'override'
+                ? <Lock className="w-5 h-5 text-red-600" />
+                : <RefreshCw className="w-5 h-5 text-violet-600" />}
+              <h3 className="text-lg font-bold text-slate-900">
+                {modalMode === 'override' ? 'Override & Deploy' : 'Re-assess on Current Data'}
+              </h3>
+            </div>
+            <p className="text-xs text-slate-500 mb-4">
+              {modalMode === 'override'
+                ? 'You are explicitly ACCEPTING the risk and clearing the HOLD as-prepared. The prepared draw will deploy at the next execution. A justification note is required for the audit trail.'
+                : 'Re-runs the full virtual gate against the CURRENT data. The HOLD clears only if the fresh verdict is PASS — approval is re-verification, not a rubber stamp.'}
+            </p>
+
+            <label className="block text-[11px] font-semibold text-slate-600 mb-1">Admin password</label>
+            <input
+              type="password"
+              autoFocus
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') submitApprove() }}
+              disabled={submitting}
+              placeholder="••••••••"
+              className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-violet-400 focus:border-violet-400 outline-none disabled:opacity-50"
+            />
+
+            <label className="block text-[11px] font-semibold text-slate-600 mt-3 mb-1">
+              Reviewer note {modalMode === 'override'
+                ? <span className="text-red-500">(required)</span>
+                : <span className="text-slate-400">(optional)</span>}
+            </label>
+            <textarea
+              value={note}
+              onChange={e => setNote(e.target.value)}
+              disabled={submitting}
+              rows={2}
+              maxLength={2000}
+              placeholder={modalMode === 'override' ? 'Why is it safe to override this HOLD?' : 'Optional context for the audit trail'}
+              className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-violet-400 focus:border-violet-400 outline-none resize-none disabled:opacity-50"
+            />
+
+            <div className="flex items-center gap-2 mt-5">
+              <button onClick={closeModal} disabled={submitting}
+                      className="flex-1 px-4 py-2 border border-slate-200 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50 transition">
+                Cancel
+              </button>
+              <button onClick={submitApprove} disabled={submitting}
+                      className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-bold text-white transition disabled:opacity-50 ${
+                        modalMode === 'override' ? 'bg-red-600 hover:bg-red-700' : 'bg-violet-600 hover:bg-violet-700'
+                      }`}>
+                {submitting ? <Spinner className="w-4 h-4" /> : modalMode === 'override' ? <Lock className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
+                {submitting ? 'Working…' : modalMode === 'override' ? 'Override & Deploy' : 'Re-assess'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 export default function DrawEngine() {
   const toast = useToast()
@@ -783,6 +1210,15 @@ export default function DrawEngine() {
     return Math.ceil((((date - yearStart) / 86400000) + 1) / 7)
   }
 
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // Week id for the re-assessment panel: prefer the backend's own week_id (the
+  // exact key STEP 8b wrote the report under); fall back to the current ISO week.
+  const currentWeekId = (() => {
+    if (drawState?.week_id) return drawState.week_id
+    const now = new Date()
+    return `${now.getFullYear()}-W${String(getISOWeek(now)).padStart(2, '0')}`
+  })()
+
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="p-8 space-y-6">
@@ -813,6 +1249,10 @@ export default function DrawEngine() {
       {countdown && (
         <WarRoomBanner countdown={countdown} drawState={drawState} />
       )}
+
+      {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
+      {/* ── Master Pool Re-assessment — virtual pre-deployment integrity gate ── */}
+      <ReassessmentPanel weekId={currentWeekId} onChanged={() => fetchAll(true)} />
 
       {loading ? (
         <div className="flex items-center justify-center h-64">

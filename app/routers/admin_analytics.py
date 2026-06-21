@@ -1808,8 +1808,22 @@ def manual_execute_draw(db: Session = Depends(get_db)):
     # Belt-and-suspenders: resolve any pending override before drawing
     late_choice = auto_select_on_timeout(db, week_id)
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # The Master Pool Re-assessor may have placed this week on HOLD (failed financial-
+    # grade gate, unapproved).  Surface that as a clean 409 pointing at the report so
+    # the dashboard can route the admin to the Pool Re-assessment panel — NOT a 500.
+    from app.services.pool_reassessor import ReassessmentHoldError
     try:
         result = execute_weekly_draw(db)
+    except ReassessmentHoldError as exc:
+        raise HTTPException(status_code=409, detail={
+            "error":         "reassessment_hold",
+            "message":       "Draw blocked by the Pool Re-assessor — review and approve "
+                             "the corrected plan before re-running the draw.",
+            "week_id":       getattr(exc, "week_id", week_id),
+            "report_id":     getattr(exc, "report_id", None),
+            "failed_gates":  getattr(exc, "failed_gates", []) or [],
+        })
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 

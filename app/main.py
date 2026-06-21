@@ -39,6 +39,10 @@ from app.routers import admin_elimination as admin_elimination_router
 # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
 # Draw & Financial Strategy config router — backs the new admin sub-tab.
 from app.routers import admin_financial_config as admin_financial_config_router
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Master Pool Re-assessment Manager router — backs the Pool Re-assessment review
+# panel (verdict view + password-gated HOLD approval).
+from app.routers import admin_reassessment as admin_reassessment_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -274,6 +278,8 @@ app.include_router(dev_router.router)         # /dev/*                        �
 app.include_router(admin_elimination_router.router)  # /admin/elimination/*  — Payment Compliance engine (JWT required)
 # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
 app.include_router(admin_financial_config_router.router)  # /admin/financial-config/* — Draw & Financial Strategy (JWT required)
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+app.include_router(admin_reassessment_router.router)  # /admin/reassessment/* — Pool Re-assessment gate (JWT required)
 
 
 @app.get("/", tags=["Health"])

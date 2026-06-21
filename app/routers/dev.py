@@ -295,11 +295,24 @@ def force_draw(body: ForceDrawRequest, db: Session = Depends(get_db)):
 
     # ── GLOBAL MASS DRAW (no pool_id) ─────────────────────────────────────────
     if not body.pool_id:
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Surface a Pool Re-assessor HOLD as a clean 409 (not a 500) so the dev
+        # force-draw button reports the block and points to the report.
+        from app.services.pool_reassessor import ReassessmentHoldError
         try:
             mass = execute_weekly_draw(
                 db,
                 auto_pay_unpaid=True,   # always safe-pay before drawing in dev mode
             )
+        except ReassessmentHoldError as exc:
+            raise HTTPException(status_code=409, detail={
+                "error":        "reassessment_hold",
+                "message":      "Draw blocked by the Pool Re-assessor — approve the "
+                                "corrected plan (Pool Re-assessment panel) before re-running.",
+                "week_id":      getattr(exc, "week_id", None),
+                "report_id":    getattr(exc, "report_id", None),
+                "failed_gates": getattr(exc, "failed_gates", []) or [],
+            })
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
 

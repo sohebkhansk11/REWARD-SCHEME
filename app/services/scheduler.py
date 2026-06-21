@@ -459,13 +459,175 @@ def job_data_integrity_check() -> None:
                 db.commit()
             corrections["l4_flag_fixes"] = l4_fixes
 
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # ── 5. Dissolved-pool total_members hygiene (A1 — Jun-21) ─────────
+            # Step 1 above only resyncs Active/Paused pools, so a Merged_Dissolved
+            # pool can keep a stale non-zero total_members forever.  A dissolved
+            # pool owns NO members by definition; force its counter to 0 so no
+            # report ever sums phantom members from a dead pool.
+            dissolved_counter_fixes = 0
+            dissolved_pools = (
+                db.query(Pool)
+                .filter(Pool.status == PoolStatus.Merged_Dissolved)
+                .all()
+            )
+            for pool in dissolved_pools:
+                if (pool.total_members or 0) != 0:
+                    _logger.warning(
+                        "DataIntegrity: dissolved pool %d (%s) total_members=%d → 0",
+                        pool.id, pool.name, pool.total_members,
+                    )
+                    pool.total_members = 0
+                    dissolved_counter_fixes += 1
+            if dissolved_counter_fixes:
+                db.commit()
+            corrections["dissolved_counter_fixed"] = dissolved_counter_fixes
+
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # ── 6. ORPHANED Active members — detect + MONEY-SAFE re-home (A1) ──
+            # An "orphan" is an Active member whose current_pool_id is NULL, points
+            # at a row that no longer exists, or points at a Merged_Dissolved pool.
+            # Such a member is invisible to every pool-based view yet still counted
+            # Active — exactly the "84 active, where did 577 go?" leak.  The root
+            # cause (autoflush=False stale-read re-selection in _condense_pools_once)
+            # is already fixed with db.flush() (waitlist.py), so this is the
+            # belt-and-suspenders backstop that also heals any historical orphans
+            # already in the DB.
+            #
+            # RE-HOME CONTRACT (money-grade, non-negotiable):
+            #   • ONLY current_pool_id + dynamic_merges_experienced change — the
+            #     member's current_level / weekly_payment_status / join_date /
+            #     sde_* are PRESERVED (NEVER reset to L1 — that would destroy paid
+            #     journey progress, money-unsafe).
+            #   • Receiver = oldest under-capacity NON-flagged Active/Paused pool
+            #     (SDE immunity: contains_flagged_l4 pools are never receivers).
+            #   • If no live pool has a vacancy, a fresh Active pool is created for
+            #     the remainder (canonical _next_pool_name + crud_pool.create_pool).
+            orphans_rehomed = 0
+            orphan_rehome_new_pools = 0
+            try:
+                from app.core.config import POOL_CAPACITY
+                from app.crud import pool as _crud_pool
+                from app.schemas.pool import PoolCreate
+                from app.services.waitlist import _next_pool_name
+
+                live_pool_ids = {
+                    pid for (pid,) in db.query(Pool.id)
+                    .filter(Pool.status != PoolStatus.Merged_Dissolved).all()
+                }
+                active_members = (
+                    db.query(User).filter(User.status == UserStatus.Active).all()
+                )
+                orphans = [
+                    u for u in active_members
+                    if u.current_pool_id is None or u.current_pool_id not in live_pool_ids
+                ]
+
+                if orphans:
+                    def _live(pid: int) -> int:
+                        return (
+                            db.query(_func.count(User.id))
+                            .filter(
+                                User.current_pool_id == pid,
+                                User.status == UserStatus.Active,
+                            )
+                            .scalar() or 0
+                        )
+
+                    # Oldest-first non-flagged live receivers + their remaining cap.
+                    candidates = (
+                        db.query(Pool)
+                        .filter(
+                            Pool.status.in_([
+                                PoolStatus.Active,
+                                PoolStatus.Paused_Awaiting_Members,
+                            ]),
+                            Pool.contains_flagged_l4 == False,   # noqa: E712
+                        )
+                        .order_by(Pool.created_at.asc(), Pool.id.asc())
+                        .all()
+                    )
+                    cap_left = {p.id: max(0, POOL_CAPACITY - _live(p.id)) for p in candidates}
+                    touched: set[int] = set()
+
+                    for orphan in orphans:
+                        target = next(
+                            (p for p in candidates if cap_left.get(p.id, 0) > 0), None
+                        )
+                        if target is None:
+                            target = _crud_pool.create_pool(
+                                db,
+                                PoolCreate(
+                                    name=_next_pool_name(db),
+                                    status=PoolStatus.Active,
+                                    total_members=0,
+                                ),
+                            )
+                            orphan_rehome_new_pools += 1
+                            candidates.append(target)
+                            cap_left[target.id] = POOL_CAPACITY
+                        _logger.warning(
+                            "DataIntegrity: ORPHAN Active user %d (%s L%s) pointed at "
+                            "pool_id=%s (dissolved/null/missing) — re-homing to pool "
+                            "%d (%s), level preserved",
+                            orphan.id, orphan.username, orphan.current_level,
+                            orphan.current_pool_id, target.id, target.name,
+                        )
+                        orphan.current_pool_id = target.id
+                        orphan.dynamic_merges_experienced = (
+                            orphan.dynamic_merges_experienced or 0
+                        ) + 1
+                        cap_left[target.id] -= 1
+                        touched.add(target.id)
+                        orphans_rehomed += 1
+
+                    db.commit()
+
+                    # Resync counters + restore Paused→Active for filled receivers.
+                    for p in db.query(Pool).filter(Pool.id.in_(touched)).all():
+                        rc = _live(p.id)
+                        if (p.total_members or 0) != rc:
+                            p.total_members = rc
+                        if rc >= POOL_CAPACITY and p.status == PoolStatus.Paused_Awaiting_Members:
+                            p.status = PoolStatus.Active
+                    db.commit()
+
+                    try:
+                        from app.services import forensic as _forensic
+                        if _forensic.is_on():
+                            _forensic.system_event(
+                                "orphan_rehome",
+                                severity="warning",
+                                payload={
+                                    "orphans_rehomed": orphans_rehomed,
+                                    "new_pools_created": orphan_rehome_new_pools,
+                                },
+                                message=(f"Integrity job re-homed {orphans_rehomed} "
+                                         f"orphaned Active member(s) "
+                                         f"({orphan_rehome_new_pools} new pool(s))"),
+                            )
+                    except Exception:
+                        pass
+            except Exception as _orphan_exc:
+                db.rollback()
+                _logger.error(
+                    "DataIntegrity: orphan re-home step FAILED (non-fatal): %s",
+                    _orphan_exc, exc_info=True,
+                )
+            corrections["orphans_rehomed"] = orphans_rehomed
+            corrections["orphan_rehome_new_pools"] = orphan_rehome_new_pools
+
         _logger.info(
             "Scheduler ✓ job_data_integrity_check COMPLETE  "
-            "pool_fixes=%d  orphan_sde=%d  grace_expired=%d  l4_fixes=%d",
+            "pool_fixes=%d  orphan_sde=%d  grace_expired=%d  l4_fixes=%d  "
+            "dissolved_counter=%d  orphans_rehomed=%d  new_pools=%d",
             corrections.get("pool_member_count_fixed",   0),
             corrections.get("orphan_sde_flags_cleared",  0),
             corrections.get("expired_grace_cleared",     0),
             corrections.get("l4_flag_fixes",             0),
+            corrections.get("dissolved_counter_fixed",   0),
+            corrections.get("orphans_rehomed",           0),
+            corrections.get("orphan_rehome_new_pools",   0),
         )
 
     except Exception as exc:

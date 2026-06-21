@@ -1521,6 +1521,73 @@ def post_draw_cleanup(db: Session) -> dict:
                 _remerge_exc, exc_info=True,
             )
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # TOTAL_MEMBERS FULL RESYNC (A1 data-consistency — Jun-21).  pool.total_members
+    # is a DENORMALIZED counter maintained only by the merger/refill paths and the
+    # per-pool draw sync (draw.py:526).  But SDE evictions, Ext-II/III L5/L6
+    # clearances, accelerated dissolution and meta-pool draws all eject Active
+    # members from FLAGGED / SDE / meta pools WITHOUT decrementing total_members, so
+    # those pools drift stale (stored > actual) until the 6-hourly
+    # job_data_integrity_check repairs them — and that job SKIPS dissolved pools
+    # entirely.  Stale total_members is precisely what makes the Live-Map "total
+    # members" (which sums pool.total_members) disagree with the real Active
+    # head-count the user flagged ("pool shows 84 active, where did 577 go?").
+    #
+    # Once per week at T+5M — AFTER the post-SDE re-merge has settled final
+    # membership and while the draw_engine lock is STILL HELD (released only in
+    # step 5 below) so no concurrent draw / injection converge can race us — we
+    # recompute the authoritative live Active count for EVERY pool in ONE grouped
+    # query and write it back:
+    #     • non-dissolved pool   ->  exact live Active count (0 if none)
+    #     • Merged_Dissolved pool -> hard 0 (a dissolved pool owns no member)
+    # MONEY-SAFE: only pool.total_members (a reporting counter) is ever written —
+    # never a member's pool_id / level / payment / SDE / draw / payout field.
+    total_members_resynced = 0
+    try:
+        from sqlalchemy import func as _sa_func
+        _live_counts = dict(
+            db.query(User.current_pool_id, _sa_func.count(User.id))
+            .filter(
+                User.status == UserStatus.Active,
+                User.current_pool_id.isnot(None),
+            )
+            .group_by(User.current_pool_id)
+            .all()
+        )
+        for _pool in db.query(Pool).all():
+            if _pool.status == PoolStatus.Merged_Dissolved:
+                _want = 0
+            else:
+                _want = int(_live_counts.get(_pool.id, 0))
+            if (_pool.total_members or 0) != _want:
+                _pool.total_members = _want
+                total_members_resynced += 1
+        if total_members_resynced:
+            db.commit()
+            _logger.info(
+                "post_draw_cleanup: total_members resync corrected %d stale pool "
+                "counter(s) to live Active counts.", total_members_resynced,
+            )
+            try:
+                from app.services import forensic as _forensic
+                if _forensic.is_on():
+                    _forensic.system_event(
+                        "total_members_resync",
+                        severity="notice",
+                        payload={"pools_corrected": total_members_resynced},
+                        message=(f"Post-draw total_members resync corrected "
+                                 f"{total_members_resynced} stale pool counter(s)"),
+                    )
+            except Exception:
+                pass
+    except Exception as _resync_exc:
+        db.rollback()
+        _logger.error(
+            "post_draw_cleanup: total_members resync failed (non-fatal) — the "
+            "6-hourly integrity job will repair live pools: %s",
+            _resync_exc, exc_info=True,
+        )
+
     # 5: release draw engine lock (Commit B — lock released LAST, after re-merge)
     from app.models.system_lock import SystemLock
     db.query(SystemLock).filter(SystemLock.lock_name == "draw_engine").delete()
@@ -1531,6 +1598,7 @@ def post_draw_cleanup(db: Session) -> dict:
         "pools_l4_flag_cleared": pools_cleared,
         "orphan_sde_flags_cleared": orphan_flags_cleared,
         "post_sde_remerge_transfers": post_sde_remerge_transfers,
+        "total_members_resynced": total_members_resynced,
         "draw_lock_released": True,
     }
     _logger.info("post_draw_cleanup complete: %s", summary)

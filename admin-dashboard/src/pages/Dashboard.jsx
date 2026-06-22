@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
-import { IndianRupee, Users, LayoutGrid, Clock, RefreshCw, Zap, AlertCircle } from 'lucide-react'
-import { motion } from 'framer-motion'
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// Added CalendarDays icon + AnimatePresence for the new day-aware LiveClock.
+import { IndianRupee, Users, LayoutGrid, Clock, RefreshCw, Zap, AlertCircle, CalendarDays } from 'lucide-react'
+import { motion, AnimatePresence } from 'framer-motion'
 import MetricCard from '../components/MetricCard'
 import StatusBadge from '../components/StatusBadge'
 import Spinner from '../components/Spinner'
@@ -24,6 +26,89 @@ function LpiChip({ lpi }) {
       <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
       {cfg.label}
     </span>
+  )
+}
+
+// ── Live Day + Time watch (Framer Motion) ─────────────────────────────────────
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// Point 2 of the consistency/integrity request: surface the DAY alongside the time
+// and represent the watch more beautifully with Framer Motion.
+//
+// IMPORTANT (integrity note): this watch is the ADMIN's LOCAL browser clock and is
+// DISPLAY-ONLY — it drives no system event.  Every draw-lifecycle event runs off the
+// server's UTC wall-clock via APScheduler.  We therefore label it "Local" so the
+// admin never mistakes this widget for the clock that governs the draw.
+function LiveClock({ now }) {
+  const weekday  = now.toLocaleDateString('en-IN', { weekday: 'long' })
+  const datePart = now.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+  const hh = String(now.getHours()).padStart(2, '0')
+  const mm = String(now.getMinutes()).padStart(2, '0')
+  const ss = String(now.getSeconds()).padStart(2, '0')
+
+  // One animated digit cell — flips upward whenever its value changes.
+  const Digit = ({ value }) => (
+    <span className="relative inline-block w-[0.62em] h-[1.25em] overflow-hidden text-center align-baseline">
+      <AnimatePresence initial={false} mode="popLayout">
+        <motion.span
+          key={value}
+          initial={{ y: '110%', opacity: 0 }}
+          animate={{ y: '0%',   opacity: 1 }}
+          exit={{    y: '-110%', opacity: 0 }}
+          transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+          className="absolute inset-0 inline-block"
+        >
+          {value}
+        </motion.span>
+      </AnimatePresence>
+    </span>
+  )
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6, scale: 0.98 }}
+      animate={{ opacity: 1, y: 0,  scale: 1 }}
+      transition={{ type: 'spring', stiffness: 280, damping: 22 }}
+      className="hidden sm:flex items-stretch rounded-xl overflow-hidden border border-slate-200 shadow-sm bg-white"
+    >
+      {/* Day + date panel */}
+      <div className="flex items-center gap-2 px-3 py-1.5 bg-gradient-to-br from-violet-50 to-indigo-50 border-r border-slate-200">
+        <CalendarDays className="w-3.5 h-3.5 text-violet-500 flex-shrink-0" />
+        <div className="leading-tight">
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={weekday}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{    opacity: 0, y: -6 }}
+              transition={{ duration: 0.3 }}
+              className="text-[11px] font-bold text-violet-700 leading-none"
+            >
+              {weekday}
+            </motion.div>
+          </AnimatePresence>
+          <div className="text-[10px] text-slate-400 tabular-nums mt-0.5">{datePart}</div>
+        </div>
+      </div>
+
+      {/* Time panel */}
+      <div className="flex items-center gap-1.5 px-3 py-1.5">
+        <motion.span
+          animate={{ opacity: [1, 0.3, 1] }}
+          transition={{ duration: 1, repeat: Infinity, ease: 'easeInOut' }}
+          className="flex-shrink-0"
+        >
+          <Clock className="w-3.5 h-3.5 text-slate-400" />
+        </motion.span>
+        <span className="font-mono text-sm font-semibold text-slate-700 tabular-nums flex items-center leading-none">
+          <Digit value={hh[0]} /><Digit value={hh[1]} />
+          <span className="px-px text-slate-400">:</span>
+          <Digit value={mm[0]} /><Digit value={mm[1]} />
+          <span className="px-px text-slate-400">:</span>
+          <Digit value={ss[0]} /><Digit value={ss[1]} />
+        </span>
+        <span className="text-[9px] font-semibold text-slate-300 uppercase tracking-wider ml-0.5">Local</span>
+      </div>
+    </motion.div>
   )
 }
 
@@ -130,17 +215,8 @@ export default function Dashboard() {
           </div>
         </div>
         <div className="flex items-center gap-2.5 flex-shrink-0">
-          {/* Live clock */}
-          <motion.div
-            initial={{ opacity: 0, y: -4 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="hidden sm:flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2"
-          >
-            <Clock className="w-3.5 h-3.5 text-slate-400" />
-            <span className="font-mono text-sm font-semibold text-slate-700 tabular-nums">
-              {clock.toLocaleTimeString('en-IN', { hour12: false })}
-            </span>
-          </motion.div>
+          {/* Live day + time watch (Framer Motion) — see LiveClock note above */}
+          <LiveClock now={clock} />
           <button
             onClick={() => fetchAll(true)}
             disabled={refreshing}

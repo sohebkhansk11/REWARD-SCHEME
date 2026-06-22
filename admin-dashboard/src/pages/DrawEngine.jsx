@@ -725,10 +725,14 @@ function OverrideDeadlineRing({ timeRemainingSeconds = 7200 }) {
 // Renders the verdict produced at T-2H (STEP 8b) by app/services/pool_reassessor.py:
 // it virtually dissolves EVERY pool, projects the whole week's winner set, and
 // cross-verifies the "purity of the draw" against five financial-grade checks.
-// THREE checks are HARD gates (float-solvency, pyramid-sustainability,
-// reconciliation) — any one failing → HOLD → the real draw is refused at T-0H
-// until an admin clears it here.  TWO are diagnostics (purity, level-advancement)
-// that drive the corrected plan but never freeze a mature week alone.
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// Jun-22 — pyramid DE-ESCALATED to a pure diagnostic.  Only TWO checks are now HARD
+// gates (float-solvency, reconciliation) — either failing → HOLD → the real draw is
+// refused at T-0H until an admin clears it here.  THREE are diagnostics (pyramid,
+// purity, level-advancement): they surface the picture (incl. the corrected L4-drain
+// projection + the L4→L12 forward cascade) but NEVER freeze the draw.  Holding L4 =
+// stopping the session draw = breaking user-facing transparency, so a pyramid/L4
+// concern must never block — the draw always proceeds.
 //
 // Backend is already deployed (additive endpoints) so this panel is fully
 // defensive: empty-state when no report exists, never throws on missing fields.
@@ -817,6 +821,52 @@ function RaPyramid({ member = {}, winner = {} }) {
 }
 
 // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// Jun-22 — FORWARD L4→L12 CASCADE (diagnostic only).  Renders where the genuinely
+// dead-ended high-tier cohort runs if it is never made a winner and the SDE/maturity
+// hold is avoided.  Rungs above L6 are VIRTUAL (the real engine force-exits at L5/L6
+// via SDE Ext-II/III) and are flagged with `*`.  Fully defensive: renders nothing on
+// missing/empty ladder, so older backends without forward_cascade never break it.
+function RaCascade({ cascade = {} }) {
+  const ladder  = cascade?.ladder ?? {}
+  const rungs   = Object.keys(ladder)
+  if (rungs.length === 0) return null
+  const peak    = Math.max(1, ...rungs.map(l => Number(ladder[l] ?? 0)))
+  const virtual = new Set(cascade?.virtual_levels ?? [])
+  return (
+    <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50/60 px-3 py-2.5 space-y-1.5">
+      <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
+        <TrendingUp className="w-3 h-3" /> Forward cascade — if L3/L4 never won
+        <span className="text-[8px] font-black px-1 py-0.5 rounded bg-violet-100 text-violet-600">
+          → {cascade?.terminal_level ?? 'L12'}
+        </span>
+      </p>
+      <div className="space-y-1">
+        {rungs.map(l => {
+          const v   = Number(ladder[l] ?? 0)
+          const isV = virtual.has(l)
+          return (
+            <div key={l} className="flex items-center gap-2">
+              <span className={`text-[10px] font-bold w-8 ${isV ? 'text-violet-500' : 'text-slate-500'}`}>
+                {l}{isV ? '*' : ''}
+              </span>
+              <div className="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden">
+                <div className={`h-full rounded-full transition-all ${isV ? 'bg-violet-400' : 'bg-amber-400'}`}
+                     style={{ width: `${(v / peak) * 100}%` }} />
+              </div>
+              <span className="text-[10px] font-mono text-slate-500 w-9 text-right tabular-nums">{v}</span>
+            </div>
+          )
+        })}
+      </div>
+      <p className="text-[9px] text-slate-400 leading-snug pt-0.5">
+        * L7+ are VIRTUAL projection rungs — the engine itself force-exits at L5/L6 (SDE
+        Ext-II/III).  Shown to expose where the math runs; the draw is NEVER held for this.
+      </p>
+    </div>
+  )
+}
+
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
 // AUTO-DEPLOY master toggle (Task 3, Jun-21).  Self-contained + fully defensive:
 // if the backend endpoint is not deployed yet (older build) the GET fails and the
 // strip renders NOTHING, so the panel never breaks (Rule 5 — additive endpoint,
@@ -886,8 +936,12 @@ function AutoDeployToggle() {
               }`}>{enabled ? 'ARMED' : 'OFF'}</span>
             </p>
             <p className="text-[10px] text-slate-500 mt-0.5 leading-snug">
+              {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                  Jun-22 — a HOLD is now only ever a float-solvency / reconcile (money-data)
+                  hold (pyramid no longer holds), so the auto-deploy remedy is always a
+                  solvent, reconciled release. */}
               {enabled
-                ? 'A HOLD nobody acts on by T-0H will auto-deploy the least-bad SAFE option (release prepared draw, or pyramid-safe L4-defer). Never releases an insolvent/impossible-data draw.'
+                ? 'A HOLD nobody acts on by T-0H will auto-deploy the least-bad SAFE option — only ever a solvent, reconciled draw. Never releases an insolvent or impossible-data draw.'
                 : 'A HOLD freezes the draw until a human approves. Turn on to let the engine deploy the least-bad SAFE option if the admin is unavailable at T-0H.'}
             </p>
           </div>
@@ -1208,8 +1262,11 @@ function ReassessmentPanel({ weekId, onChanged }) {
             <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2">Integrity checks</p>
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
               <RaGateTile label="Float Solvency"        ok={g.float_pass}         hard Icon={IndianRupee} />
-              <RaGateTile label="Pyramid Sustainability" ok={g.pyramid_pass}      hard Icon={Layers} />
               <RaGateTile label="Reconciliation"         ok={g.reconcile_pass}    hard Icon={Database} />
+              {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                  Jun-22 — pyramid is now a DIAGNOSTIC (no `hard` prop): a fail shows amber,
+                  labelled "Diagnostic", and NEVER blocks the draw. */}
+              <RaGateTile label="Pyramid Sustainability" ok={g.pyramid_pass}            Icon={Layers} />
               <RaGateTile label="Draw Purity"            ok={g.purity_pass}             Icon={Scale} />
               <RaGateTile label="Level Advancement"      ok={g.level_advance_pass}      Icon={TrendingUp} />
             </div>
@@ -1234,14 +1291,27 @@ function ReassessmentPanel({ weekId, onChanged }) {
                 )}
               </div>
 
-              {/* pyramid audit numbers */}
-              <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400 pt-2">Pyramid gate (held-L4 backlog)</p>
+              {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                  Jun-22 — pyramid is DIAGNOSTIC.  Show the CORRECTED drain projection:
+                  flagged L4 that refill/merge & DRAW vs the genuinely dead-ended cohort
+                  (no paid-waitlist refill AND cannot merge).  Falls back to legacy keys
+                  so an older backend without the projected_* keys still renders. */}
+              <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400 pt-2 flex items-center gap-1.5">
+                Pyramid (L4 drain)
+                <span className="text-[8px] font-black px-1 py-0.5 rounded bg-slate-200 text-slate-500">DIAGNOSTIC · NEVER BLOCKS</span>
+              </p>
               <div className="grid grid-cols-2 gap-2">
-                <Chip label="Flagged L4 now" value={pAudit.flagged_l4_now ?? '—'} accent={(pAudit.flagged_l4_now ?? 0) > 0 ? 'red' : 'slate'} />
-                <Chip label="L4 cleared"     value={pAudit.l4_cleared ?? '—'} accent="violet" />
-                <Chip label="Backlog after"  value={pAudit.l4_backlog_after ?? '—'} accent={(pAudit.l4_backlog_after ?? 0) > 0 ? 'amber' : 'green'} />
-                <Chip label="Clear capacity" value={pAudit.clear_capacity ?? '—'} accent="slate" />
+                <Chip label="Flagged L4 now" value={pAudit.flagged_l4_now ?? '—'}
+                      accent={(pAudit.flagged_l4_now ?? 0) > 0 ? 'amber' : 'slate'} />
+                <Chip label="Will drain (refill/merge)" value={pAudit.projected_clearable_l4 ?? pAudit.l4_cleared ?? '—'} accent="green" />
+                <Chip label="Dead-ended (stuck)" value={pAudit.projected_stuck_l4 ?? pAudit.l4_backlog_after ?? '—'}
+                      accent={(pAudit.projected_stuck_l4 ?? pAudit.l4_backlog_after ?? 0) > 0 ? 'red' : 'green'} />
+                <Chip label="Paid waitlist" value={pAudit.stuck_breakdown?.paid_waitlist ?? '—'} accent="blue" />
               </div>
+              {/* Forward L4→L12 cascade — only when there is a genuinely dead-ended cohort */}
+              {(pAudit.projected_stuck_l4 ?? 0) > 0 && pAudit.forward_cascade?.ladder && (
+                <RaCascade cascade={pAudit.forward_cascade} />
+              )}
             </div>
 
             {/* Pyramid bars */}

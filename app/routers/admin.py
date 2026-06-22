@@ -779,12 +779,13 @@ def get_draw_schedule_setting(db: Session = Depends(get_db)):
     from app.services.settings import get_draw_schedule
     sched = get_draw_schedule(db)
     return DrawScheduleResponse(
-        draw_hour_utc   = sched["draw_hour_utc"],
-        draw_minute_utc = sched["draw_minute_utc"],
-        draw_prep_hours = sched["draw_prep_hours"],
-        draw_time_ist   = sched["draw_time_ist"],
-        draw_day        = sched["draw_day"],
-        message         = (
+        draw_hour_utc    = sched["draw_hour_utc"],
+        draw_minute_utc  = sched["draw_minute_utc"],
+        draw_prep_hours  = sched["draw_prep_hours"],
+        draw_day_of_week = sched["draw_day_of_week"],
+        draw_time_ist    = sched["draw_time_ist"],
+        draw_day         = sched["draw_day"],
+        message          = (
             f"Draw scheduled every {sched['draw_day']} at "
             f"{sched['draw_hour_utc']:02d}:{sched['draw_minute_utc']:02d} UTC "
             f"({sched['draw_time_ist']}). "
@@ -803,10 +804,13 @@ def update_draw_schedule_setting(
     Update the weekly draw schedule.
 
     Security gate: admin account password required.  Changes the UTC draw hour,
-    minute, and T-2H prep window.  The APScheduler jobs on Render pick up the
-    new values on the next fire — no redeploy needed.
+    minute, prep window AND the draw DAY (0=Mon … 6=Sun).
 
-    Draw day is always Sunday.  To change the draw day, a code change is required.
+    SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    After persisting, this calls scheduler.reschedule_draw_jobs(db) so the LIVE
+    APScheduler prep/draw/cleanup cron triggers re-point immediately — no redeploy,
+    no waiting for the next cycle.  Draw day is fully configurable now (the old
+    "always Sunday / code change required" limitation is removed).
     """
     from app.models.admin import Admin as AdminModel
     from app.services.settings import set_draw_schedule
@@ -827,27 +831,48 @@ def update_draw_schedule_setting(
         )
 
     try:
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # draw_day_of_week is forwarded (None → day left unchanged).
         sched = set_draw_schedule(
             db,
-            draw_hour_utc   = body.draw_hour_utc,
-            draw_minute_utc = body.draw_minute_utc,
-            draw_prep_hours = body.draw_prep_hours,
+            draw_hour_utc    = body.draw_hour_utc,
+            draw_minute_utc  = body.draw_minute_utc,
+            draw_prep_hours  = body.draw_prep_hours,
+            draw_day_of_week = body.draw_day_of_week,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Re-point the LIVE APScheduler prep/draw/cleanup cron triggers immediately so
+    # the new day/time governs the very next cycle — no redeploy, no restart.
+    # Wrapped defensively: a plain web worker without a running scheduler must NOT
+    # error the config save (the change is already persisted to the DB above).
+    reschedule_result: dict = {"applied": False, "reason": "not_attempted"}
+    try:
+        from app.services.scheduler import reschedule_draw_jobs
+        reschedule_result = reschedule_draw_jobs(db)
+    except Exception as exc:  # noqa: BLE001 — never let live-reschedule break the save
+        reschedule_result = {"applied": False, "reason": f"reschedule_error: {exc}"}
+
+    if reschedule_result.get("applied"):
+        live_note = " Live scheduler re-pointed — effective immediately."
+    else:
+        live_note = " Takes effect on the next APScheduler fire — no server restart needed."
+
     return DrawScheduleResponse(
-        draw_hour_utc   = sched["draw_hour_utc"],
-        draw_minute_utc = sched["draw_minute_utc"],
-        draw_prep_hours = sched["draw_prep_hours"],
-        draw_time_ist   = sched["draw_time_ist"],
-        draw_day        = sched["draw_day"],
-        message         = (
+        draw_hour_utc    = sched["draw_hour_utc"],
+        draw_minute_utc  = sched["draw_minute_utc"],
+        draw_prep_hours  = sched["draw_prep_hours"],
+        draw_day_of_week = sched["draw_day_of_week"],
+        draw_time_ist    = sched["draw_time_ist"],
+        draw_day         = sched["draw_day"],
+        message          = (
             f"Draw schedule updated: every {sched['draw_day']} at "
             f"{sched['draw_hour_utc']:02d}:{sched['draw_minute_utc']:02d} UTC "
             f"({sched['draw_time_ist']}). "
-            f"Prep window: {sched['draw_prep_hours']}h before draw. "
-            "Takes effect on the next APScheduler fire — no server restart needed."
+            f"Prep window: {sched['draw_prep_hours']}h before draw."
+            f"{live_note}"
         ),
     )
 

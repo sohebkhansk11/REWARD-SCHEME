@@ -52,28 +52,117 @@ from apscheduler.triggers.cron import CronTrigger
 
 _logger = logging.getLogger(__name__)
 
-# ── Draw time configuration ───────────────────────────────────────────────────
-# Sunday 7:00 PM IST  =  Sunday 13:30 UTC.
-# Override with DRAW_HOUR_UTC / DRAW_MINUTE_UTC env vars.
-_DRAW_HOUR_UTC   = int(os.getenv("DRAW_HOUR_UTC",   "13"))
-_DRAW_MINUTE_UTC = int(os.getenv("DRAW_MINUTE_UTC", "30"))
+# ── Draw schedule configuration ───────────────────────────────────────────────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# SINGLE SOURCE OF TRUTH = the system_settings DB rows.  The scheduler now resolves
+# the FULL draw calendar (day + hour + minute + prep window + cleanup offset) from the
+# DB via _resolve_schedule() — at start_scheduler() time AND on every
+# reschedule_draw_jobs() call — so an admin change in System Settings takes effect
+# IMMEDIATELY, with no redeploy and no waiting for "next Sunday".
+#
+# Previously the scheduler read DRAW_HOUR_UTC / DRAW_MINUTE_UTC env vars ONCE at import
+# and HARD-CODED day_of_week="sun", so every in-app Draw-Calendar change was silently
+# ignored.  The env vars below are now ONLY fallback DEFAULTS — used when the DB row is
+# absent or the DB is unreachable at cold start.  They preserve the historical
+# 13:30 UTC Sunday behaviour with zero configuration.
+_DEFAULT_DRAW_HOUR   = int(os.getenv("DRAW_HOUR_UTC",    "13"))
+_DEFAULT_DRAW_MINUTE = int(os.getenv("DRAW_MINUTE_UTC",  "30"))
+_DEFAULT_PREP_HOURS  = int(os.getenv("DRAW_PREP_HOURS",  "2"))
+_DEFAULT_CLEANUP_MIN = int(os.getenv("DRAW_CLEANUP_MIN", "5"))
+_DEFAULT_DRAW_DOW    = int(os.getenv("DRAW_DAY_OF_WEEK", "6"))   # 0=Mon … 6=Sun (Sunday)
 
-# Derived times (all in minutes-from-midnight UTC)
-_DRAW_TOTAL_MIN    = _DRAW_HOUR_UTC * 60 + _DRAW_MINUTE_UTC         # 810
-_PREP_TOTAL_MIN    = _DRAW_TOTAL_MIN - 120                           # 690  (T-2H)
-_CLEANUP_TOTAL_MIN = _DRAW_TOTAL_MIN + 5                             # 815  (T+5 min)
+# APScheduler's CronTrigger day_of_week integer numbering is 0=mon … 6=sun, identical
+# to our draw_day_of_week convention; we emit the explicit name string for clarity.
+_WEEKDAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+_DAY_FULL      = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday",
+                  4: "Friday", 5: "Saturday", 6: "Sunday"}
 
-_PREP_HOUR_UTC      = _PREP_TOTAL_MIN // 60                          # 11
-_PREP_MINUTE_UTC    = _PREP_TOTAL_MIN % 60                           # 30
-_CLEANUP_HOUR_UTC   = _CLEANUP_TOTAL_MIN // 60                       # 13
-_CLEANUP_MINUTE_UTC = _CLEANUP_TOTAL_MIN % 60                        # 35
+# Last-applied resolved schedule — set by _apply_timeline_jobs() so both job_preparation
+# (which needs the live prep window) and get_scheduler_status() can read the REAL applied
+# calendar without a DB round-trip.  None until the first apply.
+_active_schedule: dict | None = None
 
-# Day-of-week for prep job — handles edge case where draw < 02:00 UTC
-# (prep would fall on the previous Saturday).
-# For all IST-based draw times (earliest realistically 06:30 UTC = 12 PM IST)
-# this is always Sunday.  The guard is here for correctness only.
-_PREP_DOW    = "sun" if _PREP_TOTAL_MIN >= 0 else "sat"
-_CLEANUP_DOW = "sun" if _CLEANUP_TOTAL_MIN < 24 * 60 else "mon"
+
+def _resolve_schedule(db) -> dict:
+    """
+    Resolve the FULL draw calendar from the system_settings DB (single source of
+    truth), falling back to the env-var defaults when a value is missing or the DB
+    is unreachable.  Computes the derived T-prep and T+cleanup day/time with correct
+    cross-midnight DAY rollover for ANY configured draw day — not just Sunday.
+
+    Parameters
+    ----------
+    db : SQLAlchemy Session or None.  None → pure env/default resolution (used by
+         get_scheduler_status() when the scheduler has never been started).
+
+    Returns a dict with everything the cron triggers need:
+      draw_dow / draw_hour / draw_minute
+      prep_dow / prep_hour / prep_minute / prep_hours
+      cleanup_dow / cleanup_hour / cleanup_minute / cleanup_minutes
+      draw_day_name
+    """
+    draw_hour   = _DEFAULT_DRAW_HOUR
+    draw_minute = _DEFAULT_DRAW_MINUTE
+    prep_hours  = _DEFAULT_PREP_HOURS
+    cleanup_min = _DEFAULT_CLEANUP_MIN
+    draw_dow    = _DEFAULT_DRAW_DOW
+
+    if db is not None:
+        try:
+            from app.services.settings import get_draw_schedule
+            from app.services.global_config import (
+                get_draw_day_of_week, get_cleanup_offset_minutes,
+            )
+            sch         = get_draw_schedule(db)          # draw_hour/minute/prep (SSOT)
+            draw_hour   = int(sch["draw_hour_utc"])
+            draw_minute = int(sch["draw_minute_utc"])
+            prep_hours  = int(sch["draw_prep_hours"])
+            draw_dow    = int(get_draw_day_of_week(db))  # 0=Mon … 6=Sun (SSOT)
+            cleanup_min = int(get_cleanup_offset_minutes(db))
+        except Exception as exc:
+            _logger.warning(
+                "Scheduler ⚠ _resolve_schedule: DB read failed (%s: %s) — using "
+                "env/default calendar.", type(exc).__name__, exc,
+            )
+
+    # Belt-and-suspenders clamp — mirrors the validators in settings.py /
+    # global_config.py so a corrupt DB row can never produce an invalid cron.
+    draw_hour   = max(0, min(23, draw_hour))
+    draw_minute = max(0, min(59, draw_minute))
+    prep_hours  = max(1, min(6,  prep_hours))
+    cleanup_min = max(1, min(60, cleanup_min))
+    draw_dow    = draw_dow % 7
+
+    draw_total    = draw_hour * 60 + draw_minute
+    prep_total    = draw_total - prep_hours * 60
+    cleanup_total = draw_total + cleanup_min
+
+    # Cross-midnight DAY rollover.  prep_hours ≤ 6 → prep at most one day earlier;
+    # cleanup_min ≤ 60 → cleanup at most one day later.  So a single ±1 day shift
+    # is always sufficient and exact.
+    prep_dow = draw_dow
+    if prep_total < 0:
+        prep_total += 24 * 60
+        prep_dow    = (draw_dow - 1) % 7
+    cleanup_dow = draw_dow
+    if cleanup_total >= 24 * 60:
+        cleanup_total -= 24 * 60
+        cleanup_dow    = (draw_dow + 1) % 7
+
+    return {
+        "draw_dow":        draw_dow,
+        "draw_hour":       draw_hour,
+        "draw_minute":     draw_minute,
+        "prep_dow":        prep_dow,
+        "prep_hour":       prep_total // 60,
+        "prep_minute":     prep_total % 60,
+        "prep_hours":      prep_hours,
+        "cleanup_dow":     cleanup_dow,
+        "cleanup_hour":    cleanup_total // 60,
+        "cleanup_minute":  cleanup_total % 60,
+        "cleanup_minutes": cleanup_min,
+        "draw_day_name":   _DAY_FULL.get(draw_dow, "Sunday"),
+    }
 
 # Singleton scheduler instance — started/stopped via start_scheduler() /
 # stop_scheduler() from the FastAPI lifespan.
@@ -102,15 +191,24 @@ def _get_db() -> Generator:
 
 def job_preparation() -> None:
     """
-    T-2H preparation job.  Fires at _PREP_HOUR_UTC:_PREP_MINUTE_UTC every Sunday.
+    T-prep preparation job.  Fires at the configured prep time on the configured
+    draw day (default Sunday 11:30 UTC), resolved from the DB via _resolve_schedule().
 
-    Computes draw_time_utc as (now + 2 hours) rounded to the nearest minute.
+    Computes draw_time_utc as (now + prep_hours) rounded to the nearest minute.
     This is deliberately NOT derived from the cron config so that the clock
     drift between the scheduler trigger time and wall-clock is automatically
     absorbed — the draw_time_utc will always be within ±1 minute of reality.
+
+    SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    prep_hours is read from the live applied schedule (SSOT) instead of a hardcoded
+    "2 hours".  Since the prep cron fires at exactly draw − prep_hours, (now +
+    prep_hours) lands precisely on the configured draw time for ANY prep window.
     """
+    prep_hours = (_active_schedule or _resolve_schedule(None)).get(
+        "prep_hours", _DEFAULT_PREP_HOURS
+    )
     draw_time_utc = (
-        datetime.now(timezone.utc) + timedelta(hours=2)
+        datetime.now(timezone.utc) + timedelta(hours=prep_hours)
     ).replace(second=0, microsecond=0)
 
     _logger.info(
@@ -209,7 +307,8 @@ def job_override_watchdog() -> None:
 
 def job_weekly_draw() -> None:
     """
-    Sunday draw execution.  Fires at _DRAW_HOUR_UTC:_DRAW_MINUTE_UTC every Sunday.
+    Weekly draw execution.  Fires at the configured draw time on the configured
+    draw day (default Sunday 13:30 UTC), resolved from the DB via _resolve_schedule().
 
     Sequence:
       (a) Belt-and-suspenders auto_select_on_timeout() — catches the case
@@ -668,13 +767,89 @@ def job_data_integrity_check() -> None:
 # Scheduler lifecycle
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+def _apply_timeline_jobs(sched: AsyncIOScheduler, cfg: dict) -> None:
+    """
+    (Re)register the THREE draw-cycle jobs — preparation, weekly draw, post-draw
+    cleanup — on `sched` from a resolved schedule dict (see _resolve_schedule()).
+
+    replace_existing=True on every job means this is safe to call BOTH at startup
+    AND on a live reschedule: APScheduler atomically swaps the trigger for the same
+    job id, so the cron simply re-points to the new day/time without dropping the job.
+
+    The two heartbeat jobs (override watchdog, data-integrity) are day/time-agnostic
+    and are NOT touched here — they are added once in start_scheduler().
+
+    Updates the module-level _active_schedule so job_preparation and
+    get_scheduler_status() can read the live applied calendar.
+    """
+    global _active_schedule
+
+    # ── Job 1: T-prep Preparation ─────────────────────────────────────────────
+    sched.add_job(
+        job_preparation,
+        trigger=CronTrigger(
+            day_of_week=_WEEKDAY_NAMES[cfg["prep_dow"]],
+            hour=cfg["prep_hour"],
+            minute=cfg["prep_minute"],
+            timezone="UTC",
+        ),
+        id="draw_preparation",
+        name=f"T-{cfg['prep_hours']}H Draw Preparation",
+        replace_existing=True,
+        misfire_grace_time=600,   # 10-min tolerance — handles cold start delays
+        max_instances=1,
+        coalesce=True,            # if multiple misfires stacked, run only once
+    )
+
+    # ── Job 3: Weekly Draw ────────────────────────────────────────────────────
+    sched.add_job(
+        job_weekly_draw,
+        trigger=CronTrigger(
+            day_of_week=_WEEKDAY_NAMES[cfg["draw_dow"]],
+            hour=cfg["draw_hour"],
+            minute=cfg["draw_minute"],
+            timezone="UTC",
+        ),
+        id="weekly_draw",
+        name=f"{cfg['draw_day_name']} Weekly Draw",
+        replace_existing=True,
+        misfire_grace_time=300,   # 5-min tolerance — draw accuracy matters
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # ── Job 4: Post-Draw Cleanup ──────────────────────────────────────────────
+    sched.add_job(
+        job_post_cleanup,
+        trigger=CronTrigger(
+            day_of_week=_WEEKDAY_NAMES[cfg["cleanup_dow"]],
+            hour=cfg["cleanup_hour"],
+            minute=cfg["cleanup_minute"],
+            timezone="UTC",
+        ),
+        id="post_draw_cleanup",
+        name=f"Post-Draw Cleanup (T+{cfg['cleanup_minutes']} min)",
+        replace_existing=True,
+        misfire_grace_time=300,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    _active_schedule = cfg
+
+
 def start_scheduler() -> AsyncIOScheduler:
     """
     Build, configure, and START the AsyncIOScheduler.
 
     Called from the FastAPI lifespan startup handler.
     Stores the instance in the module-level _scheduler variable so that
-    get_scheduler_status() and stop_scheduler() can access it.
+    get_scheduler_status(), reschedule_draw_jobs() and stop_scheduler() can access it.
+
+    SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    The three draw-cycle jobs are now registered from the live DB schedule (SSOT) via
+    _resolve_schedule() + _apply_timeline_jobs(), with env-var defaults as fallback.
 
     Returns the running scheduler instance.
 
@@ -688,22 +863,21 @@ def start_scheduler() -> AsyncIOScheduler:
 
     sched = AsyncIOScheduler(timezone="UTC")
 
-    # ── Job 1: T-2H Preparation ───────────────────────────────────────────────
-    sched.add_job(
-        job_preparation,
-        trigger=CronTrigger(
-            day_of_week=_PREP_DOW,
-            hour=_PREP_HOUR_UTC,
-            minute=_PREP_MINUTE_UTC,
-            timezone="UTC",
-        ),
-        id="draw_preparation",
-        name="T-2H Draw Preparation",
-        replace_existing=True,
-        misfire_grace_time=600,   # 10-min tolerance — handles cold start delays
-        max_instances=1,
-        coalesce=True,            # if multiple misfires stacked, run only once
-    )
+    # ── Resolve the draw calendar from the DB (SSOT) ──────────────────────────
+    # Own short-lived session; any failure falls back to env/default inside
+    # _resolve_schedule(), so the scheduler always starts with a valid calendar.
+    try:
+        with _get_db() as _db:
+            cfg = _resolve_schedule(_db)
+    except Exception as exc:
+        _logger.warning(
+            "Scheduler ⚠ start_scheduler: could not open DB for schedule resolve "
+            "(%s) — using env/default calendar.", exc,
+        )
+        cfg = _resolve_schedule(None)
+
+    # ── Jobs 1/3/4: the draw-cycle (day+time from SSOT) ───────────────────────
+    _apply_timeline_jobs(sched, cfg)
 
     # ── Job 2: Override Watchdog (every 5 minutes) ────────────────────────────
     sched.add_job(
@@ -713,40 +887,6 @@ def start_scheduler() -> AsyncIOScheduler:
         name="Admin Override Auto-Select Watchdog",
         replace_existing=True,
         misfire_grace_time=120,
-        max_instances=1,
-        coalesce=True,
-    )
-
-    # ── Job 3: Weekly Draw ────────────────────────────────────────────────────
-    sched.add_job(
-        job_weekly_draw,
-        trigger=CronTrigger(
-            day_of_week="sun",
-            hour=_DRAW_HOUR_UTC,
-            minute=_DRAW_MINUTE_UTC,
-            timezone="UTC",
-        ),
-        id="weekly_draw",
-        name="Sunday Weekly Draw",
-        replace_existing=True,
-        misfire_grace_time=300,   # 5-min tolerance — draw accuracy matters
-        max_instances=1,
-        coalesce=True,
-    )
-
-    # ── Job 4: Post-Draw Cleanup ──────────────────────────────────────────────
-    sched.add_job(
-        job_post_cleanup,
-        trigger=CronTrigger(
-            day_of_week=_CLEANUP_DOW,
-            hour=_CLEANUP_HOUR_UTC,
-            minute=_CLEANUP_MINUTE_UTC,
-            timezone="UTC",
-        ),
-        id="post_draw_cleanup",
-        name="Post-Draw Cleanup (T+5 min)",
-        replace_existing=True,
-        misfire_grace_time=300,
         max_instances=1,
         coalesce=True,
     )
@@ -769,16 +909,49 @@ def start_scheduler() -> AsyncIOScheduler:
     _logger.info(
         "APScheduler STARTED  ·  "
         "prep=%s %02d:%02dUTC  "
-        "draw=sun %02d:%02dUTC  "
+        "draw=%s %02d:%02dUTC  "
         "cleanup=%s %02d:%02dUTC  "
         "watchdog=every-5min  "
         "integrity=every-6h",
-        _PREP_DOW, _PREP_HOUR_UTC, _PREP_MINUTE_UTC,
-        _DRAW_HOUR_UTC, _DRAW_MINUTE_UTC,
-        _CLEANUP_DOW, _CLEANUP_HOUR_UTC, _CLEANUP_MINUTE_UTC,
+        _WEEKDAY_NAMES[cfg["prep_dow"]],    cfg["prep_hour"],    cfg["prep_minute"],
+        _WEEKDAY_NAMES[cfg["draw_dow"]],    cfg["draw_hour"],    cfg["draw_minute"],
+        _WEEKDAY_NAMES[cfg["cleanup_dow"]], cfg["cleanup_hour"], cfg["cleanup_minute"],
     )
 
     return sched
+
+
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+def reschedule_draw_jobs(db) -> dict:
+    """
+    Re-resolve the draw calendar from the DB and re-point the live prep/draw/cleanup
+    cron triggers so a System-Settings change takes effect IMMEDIATELY — no redeploy,
+    no waiting for the next cycle.  This is the wiring that makes the Draw-Calendar
+    config a true single source of truth at runtime.
+
+    Called by the admin endpoints that persist draw-schedule changes (draw hour/minute/
+    prep window AND draw day/cleanup offset) right after their commit.
+
+    Returns {"applied": bool, "schedule": <resolved cfg>}.  When the scheduler is not
+    running (e.g. SCHEDULER_ENABLED=false, or a non-scheduler web worker), this is a
+    safe no-op (applied=False) — the new DB values are read fresh on the next
+    start_scheduler() regardless.
+    """
+    global _scheduler
+    cfg = _resolve_schedule(db)
+
+    if _scheduler is None or not _scheduler.running:
+        return {"applied": False, "reason": "scheduler_not_running", "schedule": cfg}
+
+    _apply_timeline_jobs(_scheduler, cfg)
+    _logger.info(
+        "Scheduler ↻ reschedule_draw_jobs APPLIED  ·  "
+        "prep=%s %02d:%02dUTC  draw=%s %02d:%02dUTC  cleanup=%s %02d:%02dUTC",
+        _WEEKDAY_NAMES[cfg["prep_dow"]],    cfg["prep_hour"],    cfg["prep_minute"],
+        _WEEKDAY_NAMES[cfg["draw_dow"]],    cfg["draw_hour"],    cfg["draw_minute"],
+        _WEEKDAY_NAMES[cfg["cleanup_dow"]], cfg["cleanup_hour"], cfg["cleanup_minute"],
+    )
+    return {"applied": True, "schedule": cfg}
 
 
 def stop_scheduler() -> None:
@@ -793,6 +966,29 @@ def stop_scheduler() -> None:
     _scheduler = None
 
 
+def _schedule_block() -> dict:
+    """
+    SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    Build the schedule summary block for get_scheduler_status().
+
+    Reports the REAL applied calendar (_active_schedule, set the moment jobs were
+    registered) when the scheduler is live; otherwise resolves env/defaults so the
+    panel still shows the calendar that WOULD be used on next start.  `source`
+    tells the UI whether the figures are live ("db"/"default") so the frontend can
+    stop mislabelling env-derived values.
+    """
+    cfg = _active_schedule if _active_schedule is not None else _resolve_schedule(None)
+    return {
+        "draw_utc":      f"{_WEEKDAY_NAMES[cfg['draw_dow']]} {cfg['draw_hour']:02d}:{cfg['draw_minute']:02d}",
+        "prep_utc":      f"{_WEEKDAY_NAMES[cfg['prep_dow']]} {cfg['prep_hour']:02d}:{cfg['prep_minute']:02d}",
+        "cleanup_utc":   f"{_WEEKDAY_NAMES[cfg['cleanup_dow']]} {cfg['cleanup_hour']:02d}:{cfg['cleanup_minute']:02d}",
+        "draw_day_name": cfg["draw_day_name"],
+        "prep_hours":    cfg["prep_hours"],
+        "cleanup_minutes": cfg["cleanup_minutes"],
+        "source":        "db" if _active_schedule is not None else "default",
+    }
+
+
 def get_scheduler_status() -> dict:
     """
     Return scheduler running state and next-run times for all registered jobs.
@@ -800,14 +996,10 @@ def get_scheduler_status() -> dict:
     """
     if _scheduler is None or not _scheduler.running:
         return {
-            "running": False,
-            "enabled": os.getenv("SCHEDULER_ENABLED", "false").lower() == "true",
-            "jobs":    [],
-            "schedule": {
-                "draw_utc":    f"sun {_DRAW_HOUR_UTC:02d}:{_DRAW_MINUTE_UTC:02d}",
-                "prep_utc":    f"{_PREP_DOW} {_PREP_HOUR_UTC:02d}:{_PREP_MINUTE_UTC:02d}",
-                "cleanup_utc": f"{_CLEANUP_DOW} {_CLEANUP_HOUR_UTC:02d}:{_CLEANUP_MINUTE_UTC:02d}",
-            },
+            "running":  False,
+            "enabled":  os.getenv("SCHEDULER_ENABLED", "false").lower() == "true",
+            "jobs":     [],
+            "schedule": _schedule_block(),
         }
 
     jobs = []
@@ -819,12 +1011,8 @@ def get_scheduler_status() -> dict:
         })
 
     return {
-        "running": True,
-        "enabled": True,
-        "jobs":    jobs,
-        "schedule": {
-            "draw_utc":    f"sun {_DRAW_HOUR_UTC:02d}:{_DRAW_MINUTE_UTC:02d}",
-            "prep_utc":    f"{_PREP_DOW} {_PREP_HOUR_UTC:02d}:{_PREP_MINUTE_UTC:02d}",
-            "cleanup_utc": f"{_CLEANUP_DOW} {_CLEANUP_HOUR_UTC:02d}:{_CLEANUP_MINUTE_UTC:02d}",
-        },
+        "running":  True,
+        "enabled":  True,
+        "jobs":     jobs,
+        "schedule": _schedule_block(),
     }

@@ -300,23 +300,40 @@ _DRAW_DEFAULTS = {
     _KEY_DRAW_PREP:   2,    # T-2H preparation window
 }
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# 0=Mon … 6=Sun — identical convention to global_config.draw_day_of_week (the SSOT
+# for the draw DAY) and to APScheduler's CronTrigger integer day_of_week numbering.
+_DAY_NAMES = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday",
+              4: "Friday", 5: "Saturday", 6: "Sunday"}
 
-def _utc_to_ist_label(hour_utc: int, minute_utc: int) -> str:
-    """Convert UTC draw time to IST label string (IST = UTC+5:30)."""
-    total_min  = hour_utc * 60 + minute_utc + 330   # +5h30m
-    ist_hour   = (total_min // 60) % 24
-    ist_min    = total_min % 60
-    period     = "PM" if ist_hour >= 12 else "AM"
-    h12        = ist_hour % 12 or 12
-    return f"{h12}:{ist_min:02d} {period} IST (Sunday)"
+
+def _utc_to_ist_label(hour_utc: int, minute_utc: int, day_idx: int = 6) -> str:
+    """
+    Convert a UTC draw time + UTC draw day to an IST label string (IST = UTC+5:30).
+
+    SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    The day is no longer hardcoded "Sunday".  When the +5:30 offset pushes the time
+    past midnight UTC, the IST weekday rolls forward by one, so the label always names
+    the weekday on which the draw actually lands in IST.
+    """
+    total_min = hour_utc * 60 + minute_utc + 330   # +5h30m
+    day_roll  = total_min // (24 * 60)             # 0 or 1 (offset is < 24h)
+    ist_hour  = (total_min // 60) % 24
+    ist_min   = total_min % 60
+    period    = "PM" if ist_hour >= 12 else "AM"
+    h12       = ist_hour % 12 or 12
+    ist_day   = _DAY_NAMES.get((day_idx + day_roll) % 7, "Sunday")
+    return f"{h12}:{ist_min:02d} {period} IST ({ist_day})"
 
 
 def get_draw_schedule(db: Session) -> dict:
     """
-    Return the current draw schedule settings.
+    Return the current draw schedule settings — the consolidated Draw-Calendar view.
 
-    Reads from system_settings table; falls back to compiled-in defaults
-    (13:30 UTC = 7:00 PM IST, T-2H prep) when rows do not exist.
+    Reads draw_hour_utc / draw_minute_utc / draw_prep_hours from system_settings, and
+    the draw DAY from global_config.draw_day_of_week (the single source of truth for
+    the day).  Falls back to compiled-in defaults (Sunday 13:30 UTC = 7:00 PM IST,
+    T-2H prep) when rows do not exist.
     """
     keys = [_KEY_DRAW_HOUR, _KEY_DRAW_MINUTE, _KEY_DRAW_PREP]
     rows = {
@@ -327,26 +344,40 @@ def get_draw_schedule(db: Session) -> dict:
     hour   = rows.get(_KEY_DRAW_HOUR,   _DRAW_DEFAULTS[_KEY_DRAW_HOUR])
     minute = rows.get(_KEY_DRAW_MINUTE, _DRAW_DEFAULTS[_KEY_DRAW_MINUTE])
     prep   = rows.get(_KEY_DRAW_PREP,   _DRAW_DEFAULTS[_KEY_DRAW_PREP])
+
+    # Draw DAY is owned by global_config (shared with the financial-config calendar
+    # and the stress simulator).  Lazy import avoids any module-load cycle.
+    from app.services.global_config import get_draw_day_of_week
+    day_idx = get_draw_day_of_week(db)   # 0=Mon … 6=Sun
+
     return {
-        "draw_hour_utc":   hour,
-        "draw_minute_utc": minute,
-        "draw_prep_hours": prep,
-        "draw_time_ist":   _utc_to_ist_label(hour, minute),
-        "draw_day":        "Sunday",
+        "draw_hour_utc":     hour,
+        "draw_minute_utc":   minute,
+        "draw_prep_hours":   prep,
+        "draw_day_of_week":  day_idx,
+        "draw_day":          _DAY_NAMES.get(day_idx, "Sunday"),
+        "draw_time_ist":     _utc_to_ist_label(hour, minute, day_idx),
     }
 
 
 def set_draw_schedule(
-    db:             Session,
-    draw_hour_utc:  int,
+    db:              Session,
+    draw_hour_utc:   int,
     draw_minute_utc: int,
     draw_prep_hours: int,
+    draw_day_of_week: int | None = None,
 ) -> dict:
     """
     Persist new draw schedule settings.
 
-    Validates all three values and writes them atomically.
-    The scheduler picks up the new times on its next APScheduler cron fire.
+    Validates all values and writes them atomically.  When draw_day_of_week is
+    provided (0=Mon … 6=Sun) it is persisted via global_config (the SSOT for the
+    day); when None the existing day is left unchanged — preserving backward
+    compatibility for callers that only edit the time.
+
+    SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    Callers MUST trigger scheduler.reschedule_draw_jobs(db) after this returns so the
+    live APScheduler cron re-points immediately (done in the admin router layer).
     """
     if not (0 <= draw_hour_utc <= 23):
         raise ValueError("draw_hour_utc must be 0–23.")
@@ -368,4 +399,10 @@ def set_draw_schedule(
             db.add(SystemSettings(key=key, value_int=val))
 
     db.commit()
+
+    # Persist the DAY through the SSOT accessor (validates 0–6, invalidates its cache).
+    if draw_day_of_week is not None:
+        from app.services.global_config import set_draw_day_of_week
+        set_draw_day_of_week(db, draw_day_of_week)
+
     return get_draw_schedule(db)

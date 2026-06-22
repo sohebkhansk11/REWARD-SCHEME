@@ -399,6 +399,25 @@ def update_draw_calendar(
     _day_names = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday",
                   4: "Friday", 5: "Saturday", 6: "Sunday"}
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # draw_day_of_week and cleanup_offset_minutes both feed the APScheduler cron
+    # triggers, so re-point the LIVE scheduler immediately — the prep/draw/cleanup
+    # jobs adopt the new day/cleanup-offset on the very next cycle (no redeploy).
+    # Defensive: a web worker without a running scheduler must NOT break this save
+    # (the values are already committed via the setters above).
+    reschedule_result: dict = {"applied": False, "reason": "not_attempted"}
+    try:
+        from app.services.scheduler import reschedule_draw_jobs
+        reschedule_result = reschedule_draw_jobs(db)
+    except Exception as exc:  # noqa: BLE001 — never let live-reschedule break the save
+        reschedule_result = {"applied": False, "reason": f"reschedule_error: {exc}"}
+
+    live_note = (
+        "Live scheduler re-pointed — effective immediately."
+        if reschedule_result.get("applied")
+        else "Active within 60 seconds (scheduler adopts new timing on next fire)."
+    )
+
     return {
         "draw_frequency":           get_draw_frequency(db),
         "draw_day_of_week":         get_draw_day_of_week(db),
@@ -409,10 +428,12 @@ def update_draw_calendar(
         "payment_due_offset_days":    get_payment_due_offset_days(db),
         # SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:
         "grace_close_offset_minutes": get_grace_close_offset_minutes(db),
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        "scheduler_reschedule":       reschedule_result,
         "message": (
             f"Draw calendar: {body.draw_frequency} on {_day_names.get(body.draw_day_of_week, 'Sunday')}, "
             f"grace={body.grace_period_hours}h, close T-2H−{body.grace_close_offset_minutes}min, "
             f"cleanup T+{body.cleanup_offset_minutes}min, due_offset={body.payment_due_offset_days}d. "
-            "Active within 60 seconds."
+            f"{live_note}"
         ),
     }

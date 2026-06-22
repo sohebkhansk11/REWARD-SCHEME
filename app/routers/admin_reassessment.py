@@ -125,9 +125,13 @@ def _serialize_result(result) -> dict:
 
 def _serialize(rep) -> dict:
     """Full deserialized view of one ReassessmentReport row for the dashboard."""
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Jun-22 — pyramid de-escalated to a pure diagnostic; it is NO LONGER a hard gate
+    # and must not appear in failed_hard_gates (which the UI renders as draw-blocking).
+    # Only float-solvency + reconcile remain hard.  pyramid_pass is still surfaced in
+    # the gates block below for visibility, just not as a blocker.
     failed_hard = [name for name, ok in (
         ("float",     rep.float_pass),
-        ("pyramid",   rep.pyramid_pass),
         ("reconcile", rep.reconcile_pass),
     ) if not ok]
     is_active_hold = (rep.verdict == "HOLD") and (not bool(rep.approved))

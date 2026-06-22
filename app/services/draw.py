@@ -723,9 +723,13 @@ def execute_weekly_draw(
 
     if _hold is not None:
         # Recompute from the CURRENT hold — auto-deploy may have appended a newer report.
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Jun-22 — pyramid is a pure diagnostic now and must NEVER appear as a draw-
+        # blocking gate.  Only float-solvency + reconcile (real money/data safety) can
+        # hold the session.  (A pyramid-only concern no longer produces a HOLD at all,
+        # so get_active_hold returns None for it and this branch isn't even reached.)
         _failed_gates = [name for name, ok in (
             ("float",     _hold.float_pass),
-            ("pyramid",   _hold.pyramid_pass),
             ("reconcile", _hold.reconcile_pass),
         ) if not ok]
         _logger.error(

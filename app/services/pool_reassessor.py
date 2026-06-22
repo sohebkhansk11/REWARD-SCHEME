@@ -36,12 +36,32 @@ WHY THIS EXISTS (root-cause, proven from the production CSV/forensic data):
   (float-solvent NOW + pyramid-sustainable FORWARD) and the level-advancement
   accumulation is resolved, exactly as required.
 
-VERDICT (locked decision #2):
-  HOLD if NOT (float_pass AND pyramid_pass AND reconcile_pass).
-  purity_pass / level_advance_pass are surfaced as diagnostics and drive the
-  proposed corrected plan; they do not, on their own, freeze a normal mature
-  week (which would halt the whole scheme) — they escalate to HOLD only when a
-  hard money/data gate also fails.
+VERDICT (locked decision #2 — REVISED Jun-22, Soheb Khan User 2):
+  HOLD if NOT (float_pass AND reconcile_pass).
+  ── pyramid is now a PURE DIAGNOSTIC (de-escalated from a hard gate). ──
+  The user's standing rule: "L4 ko hold nahi kar sakte — L4 ko hold karna matlab
+  session draw rokna, jo system ki transparency ko users ke saamne compromise
+  karti hai."  Freezing the whole weekly draw because an L4 backlog looks
+  unsustainable is the WRONG remedy — it stops draws users can see, which
+  destroys transparency, and it does NOT actually drain L4 (a held L4 only ever
+  leaves by WINNING).  So the pyramid sustainability check NO LONGER blocks the
+  draw.  It is computed with a CORRECTED forward projection (see below) and
+  surfaced as a diagnostic + the L4→L12 forward-cascade trajectory, so the
+  re-assessment SHOWS where the math leads if L3/L4 are never made winners — but
+  the draw ALWAYS proceeds.
+  purity_pass / level_advance_pass remain diagnostics as before.
+  float_pass (never pay more than the float holds) and reconcile_pass (never
+  deploy impossible/inconsistent data) stay HARD — they are genuine money/data
+  safety, not throughput throttles, and in healthy operation they PASS.
+
+PROJECTION CORRECTION (Jun-22):
+  The old projection under-counted L4-clearing because it only credited pools that
+  were ALREADY exactly 12/12 right now, treating every partial pool as if it would
+  never draw.  That manufactured a phantom "L4 can never drain" backlog and tripped
+  a false HOLD.  The corrected projection treats a pool as PAUSED/STUCK under EXACTLY
+  ONE condition (the user's rule): paid-waitlist == 0 AND the pool can be neither a
+  merge donor NOR a merge receiver.  Otherwise the pool is projected to refill (from
+  the waitlist) or merge into a drawable 12/12 pool, so its L4 is projected-clearable.
 
 All thresholds are module constants (safe, conservative defaults) so they can be
 promoted to admin-configurable settings later without touching the logic.
@@ -59,7 +79,10 @@ from sqlalchemy.orm import Session
 from app.core.config import (
     LEVEL_LOW, LEVEL_HIGH, POOL_CAPACITY,
 )
-from app.models.user import User, UserStatus
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# WeeklyPaymentStatus needed for the corrected pause-pool projection (Jun-22): a
+# partial pool counts as "will refill & draw" only while PAID waitlist supply exists.
+from app.models.user import User, UserStatus, WeeklyPaymentStatus
 from app.models.pool import Pool, PoolStatus
 from app.models.token import Token, TokenType, TokenStatus
 
@@ -158,11 +181,15 @@ class ReassessResult:
 
     @property
     def failed_hard_gates(self) -> list[str]:
-        """The hard gates (float/pyramid/reconcile) that failed — these drive the HOLD."""
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Jun-22 — pyramid DE-ESCALATED to a pure diagnostic and REMOVED from the
+        # hard-gate set.  A pyramid concern must NEVER drive a HOLD (= stop the
+        # session draw = break user-facing transparency).  Only float-solvency and
+        # reconcile — genuine money/data-safety gates — remain hard.
+        """The hard gates (float/reconcile) that failed — these drive the HOLD."""
         return [
             name for name, ok in (
                 ("float", self.float_pass),
-                ("pyramid", self.pyramid_pass),
                 ("reconcile", self.reconcile_pass),
             ) if not ok
         ]
@@ -353,6 +380,179 @@ def _project_regular_draws(db: Session) -> tuple[dict, int, int, int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+#  CORRECTED L4-CLEARING PROJECTION (Jun-22) — the pause-pool rule + forward cascade
+#
+#  The user's diagnosis, made law: the old projection mis-counted how many flagged
+#  L4 can actually drain, because it only credited pools that were ALREADY 12/12 at
+#  T-2H and silently wrote off every partial pool.  In a healthy system those partial
+#  pools refill from the paid waitlist (or consolidate via the donor↔receiver merger)
+#  and DO draw.  Writing them off manufactured a phantom backlog → a false pyramid
+#  HOLD → the session draw was frozen (transparency broken).
+#
+#  THE RULE (verbatim intent): "projection me pause pool ka option SIRF EK hi condition
+#  me rakho — jab waitlist me member ZERO ho AND pool merge ke time na donor ban sake
+#  na receiver."  Everywhere else a pool is projected as drawable.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _paid_waitlist_count(db: Session) -> int:
+    """Live PAID waitlist supply — members who can refill a partial pool to 12/12."""
+    return int(
+        db.query(func.count(User.id)).filter(
+            User.status                == UserStatus.Waitlist,
+            User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+        ).scalar() or 0
+    )
+
+
+def _project_stuck_l4(db: Session) -> tuple[int, int, dict]:
+    """
+    Project how many flagged L4 are GENUINELY un-clearable vs how many WILL drain.
+
+    Mechanics this honours:
+      • A flagged-L4 pool is MERGE-IMMUNE (the condensation core never uses a
+        contains_flagged_l4 pool as donor or receiver — waitlist.py).  So such a pool
+        can become drawable in only one way: REFILL to 12/12 from the paid waitlist,
+        after which its L4 clears via an SDE sub-draw.
+      • Therefore a flagged-L4 pool is projected STUCK under EXACTLY the user's single
+        condition: it is not already full AND the paid waitlist is empty (no refill)
+        AND it cannot merge (it is flagged ⇒ cannot donate or receive).  A 12/12
+        flagged pool is never stuck (it draws this cycle); a partial flagged pool is
+        stuck ONLY when paid-waitlist == 0.
+
+    Returns (projected_stuck_l4, projected_clearable_l4, breakdown).  Pure read pass.
+    """
+    paid_wl = _paid_waitlist_count(db)
+
+    # Live member headcount per pool (Active only) — to know which flagged pools are
+    # already full (draw now) vs partial (need refill).
+    live_counts = dict(
+        db.query(User.current_pool_id, func.count(User.id))
+        .filter(User.status == UserStatus.Active, User.current_pool_id.isnot(None))
+        .group_by(User.current_pool_id)
+        .all()
+    )
+    # Flagged-L4 count per pool (the L4 members each flagged pool is carrying).
+    flagged_per_pool = dict(
+        db.query(User.current_pool_id, func.count(User.id))
+        .filter(
+            User.status         == UserStatus.Active,
+            User.current_level  == 4,
+            User.sde_required    == True,          # noqa: E712
+            User.current_pool_id.isnot(None),
+        )
+        .group_by(User.current_pool_id)
+        .all()
+    )
+
+    flagged_pool_ids = [pid for pid, n in flagged_per_pool.items() if n > 0]
+    flagged_pools = (
+        db.query(Pool).filter(Pool.id.in_(flagged_pool_ids)).all()
+        if flagged_pool_ids else []
+    )
+
+    stuck = 0
+    clearable = 0
+    full_pools = partial_drawable_pools = stuck_pools = 0
+    for p in flagged_pools:
+        n_l4   = int(flagged_per_pool.get(p.id, 0))
+        live   = int(live_counts.get(p.id, 0))
+        is_full = (live >= POOL_CAPACITY)
+        # The single pause condition: partial AND no waitlist refill AND can't merge.
+        # A flagged pool is merge-immune ⇒ donor==receiver==False ⇒ the merge clause
+        # is always True for it, so the gate collapses to (partial AND paid_wl == 0).
+        will_refill_or_full = is_full or (paid_wl > 0)
+        if will_refill_or_full:
+            clearable += n_l4
+            if is_full:
+                full_pools += 1
+            else:
+                partial_drawable_pools += 1
+        else:
+            stuck += n_l4
+            stuck_pools += 1
+
+    breakdown = {
+        "paid_waitlist": paid_wl,
+        "flagged_pools_total": len(flagged_pools),
+        "flagged_pools_full_draw_now": full_pools,
+        "flagged_pools_partial_will_refill": partial_drawable_pools,
+        "flagged_pools_stuck_deadend": stuck_pools,
+        "projected_clearable_l4": clearable,
+        "projected_stuck_l4": stuck,
+        "pause_condition": "paid_waitlist==0 AND not(donor) AND not(receiver)",
+    }
+    return stuck, clearable, breakdown
+
+
+def _project_level_cascade(stuck_high_tier: int, l3_inflow: int, *, max_level: int = 12) -> dict:
+    """
+    FORWARD LEVEL-CASCADE PROJECTION (virtual — diagnostic only).
+
+    The user's rule: "uske baad projection me ye daalo — L4 agar clear nahi hua, IF
+    SDE and other maturity protection hold and avoided, THEN L4→L5→L6→L7→…→L12, taaki
+    projection me dikhe re-assessment ko ki calculations kahan tak le jaa sakti hain
+    agar yahi par L3/L4 ko winner nahi banaya gaya toh."
+
+    Model: the GENUINELY-stuck high-tier cohort (pools dead-ended per _project_stuck_l4)
+    does not vanish if it is never made a winner.  If the SDE/maturity protection that
+    HOLDS it at its level is itself avoided/exhausted, the cohort advances one rung each
+    maturity cycle, while fresh L3 keep advancing into L4 behind it.  We roll that
+    forward rung by rung from L4 up to L{max_level} and report the per-rung projected
+    population, so the re-assessment SEES the runaway.
+
+    IMPORTANT: the REAL engine caps at L6 (SDE Ext-II/III forced-exit valves clear L5
+    and L6).  Rungs L7..L{max_level} are VIRTUAL projection levels shown ONLY to expose
+    where the math runs if high-tier is never won — the engine never creates them.
+    """
+    max_level = max(6, int(max_level))
+    rungs = list(range(4, max_level + 1))          # L4 .. L12
+    ladder = {f"L{lvl}": 0 for lvl in rungs}
+    if stuck_high_tier <= 0 and l3_inflow <= 0:
+        return {
+            "ladder": ladder, "terminal_level": "L4", "cycles_modelled": 0,
+            "l3_inflow_per_cycle": int(max(0, l3_inflow)),
+            "note": "No stuck high-tier and no L3 inflow — cascade is dormant.",
+            "virtual_levels": [f"L{l}" for l in rungs if l > 6],
+        }
+
+    # Seed: the stuck cohort sits at L4 today.
+    ladder["L4"] = int(max(0, stuck_high_tier))
+    inflow = int(max(0, l3_inflow))
+    cycles = len(rungs) - 1                          # L4→L5→…→L12  ⇒ (max_level-4) shifts
+    terminal = 4
+    for _ in range(cycles):
+        # Everyone climbs one rung (top rung L{max_level} is the terminal pile-up).
+        new_ladder = {f"L{lvl}": 0 for lvl in rungs}
+        for lvl in rungs:
+            cur = ladder[f"L{lvl}"]
+            if cur <= 0:
+                continue
+            tgt = min(lvl + 1, max_level)
+            new_ladder[f"L{tgt}"] += cur
+            if tgt > terminal:
+                terminal = tgt
+        # Fresh L3 advance into L4 behind the climbing cohort.
+        new_ladder["L4"] += inflow
+        ladder = new_ladder
+
+    return {
+        "ladder": ladder,
+        "terminal_level": f"L{terminal}",
+        "cycles_modelled": cycles,
+        "l3_inflow_per_cycle": inflow,
+        "virtual_levels": [f"L{l}" for l in rungs if l > 6],
+        "note": (
+            f"If the {stuck_high_tier} dead-ended high-tier member(s) are never made "
+            f"winners and the SDE/maturity hold is avoided, the cohort climbs "
+            f"L4→…→L{max_level} over {cycles} maturity cycle(s); fresh L3 (+{inflow}/cycle) "
+            f"keep feeding L4. Rungs above L6 are VIRTUAL — they show the runaway, the "
+            f"engine itself force-exits at L5/L6 via SDE Ext-II/III."
+        ),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Available float (canonical ledger identity — matches dev.py SSOT)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -446,18 +646,21 @@ def run_reassessment(db: Session, week_id: str) -> ReassessResult:
     reserve = int(available_float * FLOAT_RESERVE_FRACTION)
     float_pass = (available_float - reserve - projected_payout) >= 0
 
-    # ── R3/R4b pyramid-sustainability (HARD): flagged-L4 backlog vs clear rate ─
+    # ── R3/R4b pyramid-sustainability (DIAGNOSTIC, Jun-22 — NO LONGER A HARD GATE) ─
     # Engine mechanics (draw.py / _advance_survivor_level): draw winners EXIT
     # (Eliminated_Won); the 10 survivors each advance +1 level — EXCEPT a flagged
     # L4 (current_level==4 AND sde_required) is HELD at L4 (Case-E true defer) and
     # L5/L6 are held.  So an L4 can only LEAVE the system by WINNING (an SDE upper
-    # draw, or a regular high-tier draw).  The sustainability risk is therefore a
-    # growing HELD-L4 backlog: if flagged L4 accumulate faster than the draw clears
-    # them, future weeks inherit an ever-larger liability the SDE valve can never
-    # catch up to (and the held band edges toward an L5/L6 leak).
+    # draw, or a regular high-tier draw).
+    #
+    # WHY THIS NO LONGER BLOCKS (user's standing rule): freezing the whole weekly draw
+    # because the L4 backlog looks unsustainable is the WRONG remedy — it stops draws
+    # users can see (breaks transparency) and does not drain L4 anyway.  So we COMPUTE
+    # the sustainability picture with a CORRECTED projection and surface it as a
+    # diagnostic + forward cascade; pyramid_pass NEVER drives the verdict (see hard_ok).
     #
     # flagged_l4_now is set by STEP 3 flag_l4_members earlier in this same prep
-    # cycle, so at re-assessment time it is the exact backlog this week must clear.
+    # cycle, so at re-assessment time it is the exact flagged-L4 population.
     flagged_l4_now = int(
         db.query(func.count(User.id)).filter(
             User.status == UserStatus.Active,
@@ -467,15 +670,32 @@ def run_reassessment(db: Session, week_id: str) -> ReassessResult:
     )
     l4_now         = member_pyramid["L4"]
     l3_now         = member_pyramid["L3"]
-    l4_cleared     = winner_pyramid["L4"]                 # SDE upper + regular L4 high winners
-    l4_backlog_after = max(0, flagged_l4_now - l4_cleared)
+    l4_cleared     = winner_pyramid["L4"]                 # SDE upper + regular L4 high winners THIS cycle
     # forward inflow (diagnostic): L3 survivors advancing into L4 next week
     l3_advancing   = max(0, l3_now - winner_pyramid["L3"])
-    clear_capacity = max(l4_cleared, sde_draws, 1)        # this week's L4-clearing power
+
+    # CORRECTED PROJECTION (the pause-pool rule): a flagged-L4 pool is "stuck" ONLY
+    # when it is partial AND there is no paid-waitlist refill AND it cannot merge
+    # (flagged ⇒ merge-immune).  Everything else refills/merges and DOES draw.  So the
+    # genuinely-unsustainable backlog is the dead-ended count, NOT (flagged − this
+    # week's six).  This is what kills the phantom backlog that used to false-HOLD.
+    projected_stuck_l4, projected_clearable_l4, _stuck_breakdown = _project_stuck_l4(db)
+    # The realistic forward backlog = only the dead-ended members (with healthy
+    # waitlist this is ~0).  Floor at 0; never below what this cycle already clears.
+    l4_backlog_after = int(projected_stuck_l4)
+    # Clearing power now reflects the projected drainable L4 (refill+merge aware), not
+    # just the handful of pools that happened to be 12/12 at this instant.
+    clear_capacity = max(l4_cleared, sde_draws, projected_clearable_l4, 1)
+    # Diagnostic-only verdict (does NOT block): sustainable when nothing is dead-ended,
+    # or the dead-ended backlog stays within the (now realistic) clear band.
     pyramid_pass   = (
-        flagged_l4_now == 0                                            # nothing to clear, OR
-        or l4_backlog_after <= clear_capacity * PYRAMID_SUSTAIN_MULT   # catchable in ≤ MULT weeks
+        projected_stuck_l4 == 0
+        or l4_backlog_after <= clear_capacity * PYRAMID_SUSTAIN_MULT
     )
+
+    # FORWARD LEVEL-CASCADE (virtual, diagnostic): where the math runs if the stuck
+    # high-tier are never made winners — L4→L5→…→L12 (user's explicit ask).
+    level_cascade = _project_level_cascade(projected_stuck_l4, l3_advancing, max_level=12)
 
     # ── R5 reconciliation (HARD): internal consistency + impossible-data guard ─
     # (a) winner totals reconcile with draw counts
@@ -488,8 +708,13 @@ def run_reassessment(db: Session, week_id: str) -> ReassessResult:
     ]
     reconcile_pass = count_ok and not impossible_levels
 
-    # ── VERDICT (locked decision #2) ─────────────────────────────────────────
-    hard_ok = float_pass and pyramid_pass and reconcile_pass
+    # ── VERDICT (locked decision #2 — REVISED Jun-22) ────────────────────────
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # pyramid REMOVED from the verdict — it is now a pure diagnostic and must NEVER
+    # hold the draw (= stop a session = break transparency).  Only float-solvency
+    # (never pay more than the float holds) and reconcile (never deploy impossible
+    # data) — genuine money/data safety — can drive a HOLD.
+    hard_ok = float_pass and reconcile_pass
     verdict = "PASS" if hard_ok else "HOLD"
 
     # ── Corrected plan (locked decision #1) — proposed on HOLD ───────────────
@@ -555,29 +780,43 @@ def run_reassessment(db: Session, week_id: str) -> ReassessResult:
             "params": float_params,
         })
     if not pyramid_pass:
-        # how many extra SDE sub-draws would bring the backlog within capacity
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Jun-22 — DIAGNOSTIC (severity "warning"): this NEVER holds the draw.  It
+        # reports ONLY the genuinely dead-ended L4 (the corrected projected_stuck_l4 —
+        # pools with no waitlist refill that also cannot merge) and the L4→L12 forward
+        # cascade, so the admin SEES where the math runs if those stuck members are
+        # never won — while the session draw still goes ahead.
+        # how many extra SDE sub-draws would bring the dead-ended backlog within band
         target_clear = -(-l4_backlog_after // max(int(PYRAMID_SUSTAIN_MULT), 1))  # ceil
         extra_sde    = max(1, int(target_clear) - clear_capacity)
         corrected_plan.append({
             "gate": "pyramid",
-            "severity": "critical",
+            "severity": "warning",
             "finding": (
-                f"Flagged-L4 backlog {flagged_l4_now} vs this week's clear capacity "
-                f"{clear_capacity}: {l4_backlog_after} flagged L4 would remain HELD "
-                f"after the draw (sustainable band ≤ {int(clear_capacity*PYRAMID_SUSTAIN_MULT)}). "
-                f"L4 is accumulating faster than the SDE valve can shed it."
+                f"{projected_stuck_l4} flagged L4 are in DEAD-ENDED pools (no paid-"
+                f"waitlist refill AND cannot merge) so they cannot drain — vs "
+                f"{projected_clearable_l4} that refill/merge and DO draw (clear band ≤ "
+                f"{int(clear_capacity*PYRAMID_SUSTAIN_MULT)}). If never won, this cohort "
+                f"cascades {level_cascade.get('ladder', {}).get('L4', 0)}→… up to "
+                f"{level_cascade.get('terminal_level', 'L12')} (see forward cascade). "
+                f"The draw is NOT held — this is a diagnostic only."
             ),
             "action": (
-                f"Add ≈{extra_sde} SDE sub-draw(s) this week to clear the held-L4 "
-                f"backlog before it climbs toward the L5/L6 leak band; if supply is "
-                f"exhausted, slow L3→L4 advancement (defer maturing pools)."
+                f"Unblock the dead-end, do NOT stop the draw: inject paid-waitlist "
+                f"supply (so the stuck pools refill to 12/12 and their L4 clears via "
+                f"SDE), or admit more L1, or add ≈{extra_sde} SDE sub-draw(s); slowing "
+                f"L3→L4 advancement also relieves the inflow feeding the cascade."
             ),
             "params": {
                 "flagged_l4_now": flagged_l4_now,
                 "l4_cleared": l4_cleared,
+                "projected_stuck_l4": int(projected_stuck_l4),
+                "projected_clearable_l4": int(projected_clearable_l4),
                 "backlog_after": l4_backlog_after,
                 "clear_capacity": clear_capacity,
                 "extra_sde_subdraws": int(extra_sde),
+                "stuck_breakdown": _stuck_breakdown,
+                "forward_cascade": level_cascade,
             },
         })
     if not reconcile_pass:
@@ -649,11 +888,21 @@ def run_reassessment(db: Session, week_id: str) -> ReassessResult:
             "breakdown": float_breakdown,
         },
         "pyramid": {
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Jun-22 — diagnostic-only block.  l4_backlog_after now = projected_stuck_l4
+            # (dead-ended only); clear_capacity is refill/merge-aware.  These keys are
+            # kept stable because auto_deploy_resolve_hold reads them.
+            "is_diagnostic_only": True,
+            "blocks_draw": False,
             "flagged_l4_now": flagged_l4_now,
             "l4_now": l4_now, "l3_now": l3_now,
             "l4_cleared": l4_cleared, "l3_advancing": l3_advancing,
+            "projected_stuck_l4": int(projected_stuck_l4),
+            "projected_clearable_l4": int(projected_clearable_l4),
             "l4_backlog_after": l4_backlog_after, "clear_capacity": clear_capacity,
             "sustain_mult": PYRAMID_SUSTAIN_MULT,
+            "stuck_breakdown": _stuck_breakdown,
+            "forward_cascade": level_cascade,
         },
         "reconcile": {
             "count_ok": count_ok, "impossible_levels": impossible_levels,

@@ -16,20 +16,26 @@ five financial-grade checks:
                           (catches the 66%-L4 over-representation)
   2. level_advance_pass — the L4 backlog is not growing unsustainably
                           (the user's "level-advancement issue")
-  3. float_pass         — projected payout ≤ available float (solvent NOW)
+  3. float_pass         — projected payout ≤ available float (solvent NOW)  [HARD]
   4. pyramid_pass       — forward projection stays sustainable (solvent FUTURE)
+                          [DIAGNOSTIC ONLY as of Jun-22 — see VERDICT]
   5. reconcile_pass     — per-type draw counts and per-level winner counts are
                           internally consistent (catches the "non-trustable
-                          data" the report exhibited: 315 L4 > 299 theoretical)
+                          data" the report exhibited: 315 L4 > 299 theoretical)  [HARD]
 
-VERDICT (locked decision #2 — positive future projection = BOTH float-solvent
-AND pyramid-sustainable):
+VERDICT (locked decision #2 — REVISED Jun-22, Soheb Khan User 2):
 
-    HOLD  if NOT (float_pass AND pyramid_pass AND reconcile_pass)
-    PASS  otherwise   (purity / level_advance failures are surfaced as
-                       diagnostics and drive the proposed corrected plan, but
-                       only escalate to HOLD when they co-occur with a money
-                       signal, so a normal mature week is never frozen).
+    HOLD  if NOT (float_pass AND reconcile_pass)
+    PASS  otherwise
+
+  pyramid_pass is now a PURE DIAGNOSTIC and is NO LONGER part of the verdict.
+  User's standing rule: holding L4 = stopping the session draw = breaking
+  user-facing transparency, so a pyramid/L4-backlog concern must NEVER freeze the
+  draw.  It is computed with a corrected, refill/merge-aware projection and
+  surfaced (with an L4→L12 forward cascade) so the admin SEES where the math runs
+  if L3/L4 are never won — but the draw always proceeds.  purity / level_advance
+  remain diagnostics.  Only float-solvency (never pay more than the float holds)
+  and reconcile (never deploy impossible data) can hold a deployment.
 
 On HOLD the real result is NOT deployed at T-0H until an admin reviews the
 proposed corrected_plan_json and approves it with their password (locked

@@ -217,6 +217,11 @@ export default function SystemSettings() {
   const [drawHour,     setDrawHour]     = useState('')
   const [drawMinute,   setDrawMinute]   = useState('')
   const [drawPrep,     setDrawPrep]     = useState('')
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // Draw DAY is now editable from this tab (0=Mon … 6=Sun) — single source of truth
+  // shared with the Financial-Strategy chronology tab.  Seeded from the schedule
+  // response; defaults to 6 (Sunday) until the schedule loads.
+  const [drawDay,      setDrawDay]      = useState(6)
 
   // ── Draw Schedule modal ───────────────────────────────────────────────────
   const [drawModalOpen,   setDrawModalOpen]   = useState(false)
@@ -339,6 +344,12 @@ export default function SystemSettings() {
         setDrawHour(String(s.draw_hour_utc))
         setDrawMinute(String(s.draw_minute_utc))
         setDrawPrep(String(s.draw_prep_hours))
+        // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        // Seed the editable draw-day selector (defensive: older backends may omit
+        // draw_day_of_week → fall back to 6/Sunday).
+        if (s.draw_day_of_week !== undefined && s.draw_day_of_week !== null) {
+          setDrawDay(s.draw_day_of_week)
+        }
       } else {
         toast(schedRes.reason?.response?.data?.detail ?? 'Failed to load draw schedule', 'error')
       }
@@ -387,22 +398,34 @@ export default function SystemSettings() {
   const drawHourInt    = parseInt(drawHour,   10)
   const drawMinuteInt  = parseInt(drawMinute, 10)
   const drawPrepInt    = parseInt(drawPrep,   10)
+  // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // Draw DAY (0=Mon … 6=Sun) folded into validity / dirty / preview alongside time.
+  const drawDayInt     = parseInt(drawDay, 10)
+  const _DAY_SHORT     = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
+  const _DAY_FULL      = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
   const drawInputValid = (
     !isNaN(drawHourInt)   && drawHourInt   >= 0 && drawHourInt   <= 23 &&
     !isNaN(drawMinuteInt) && drawMinuteInt >= 0 && drawMinuteInt <= 59 &&
-    !isNaN(drawPrepInt)   && drawPrepInt   >= 1 && drawPrepInt   <= 6
+    !isNaN(drawPrepInt)   && drawPrepInt   >= 1 && drawPrepInt   <= 6  &&
+    !isNaN(drawDayInt)    && drawDayInt    >= 0 && drawDayInt    <= 6
   )
   const drawIsDirty = drawInputValid && schedule && (
-    drawHourInt !== schedule.draw_hour_utc || drawMinuteInt !== schedule.draw_minute_utc || drawPrepInt !== schedule.draw_prep_hours
+    drawHourInt !== schedule.draw_hour_utc ||
+    drawMinuteInt !== schedule.draw_minute_utc ||
+    drawPrepInt !== schedule.draw_prep_hours ||
+    drawDayInt !== schedule.draw_day_of_week
   )
+  // IST preview is now day-aware: the +5:30 offset can roll the weekday forward by one.
   const previewIst = (() => {
     if (!drawInputValid) return '—'
     const totalMin = drawHourInt * 60 + drawMinuteInt + 330
+    const dayRoll  = (totalMin / (24 * 60)) | 0
     const h24 = (totalMin / 60 | 0) % 24
     const m   = totalMin % 60
     const p   = h24 >= 12 ? 'PM' : 'AM'
     const h12 = h24 % 12 || 12
-    return `${h12}:${String(m).padStart(2, '0')} ${p} IST`
+    const istDay = _DAY_FULL[((drawDayInt + dayRoll) % 7 + 7) % 7]
+    return `${h12}:${String(m).padStart(2, '0')} ${p} IST (${istDay})`
   })()
   const handleDrawSaveClick = () => {
     if (!drawInputValid) { toast('Please enter valid values for all draw schedule fields', 'error'); return }
@@ -414,12 +437,19 @@ export default function SystemSettings() {
     if (!drawAdminPw.trim()) { toast('Admin password is required', 'error'); return }
     setDrawSaveLoading(true)
     try {
-      const res = await updateDrawSchedule(drawHourInt, drawMinuteInt, drawPrepInt, drawAdminPw)
+      // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+      // Carry the editable draw DAY through to the backend (single source of truth).
+      const res = await updateDrawSchedule(drawHourInt, drawMinuteInt, drawPrepInt, drawAdminPw, drawDayInt)
       const s   = res.data
       setSchedule(s)
       setDrawHour(String(s.draw_hour_utc))
       setDrawMinute(String(s.draw_minute_utc))
       setDrawPrep(String(s.draw_prep_hours))
+      if (s.draw_day_of_week !== undefined && s.draw_day_of_week !== null) {
+        setDrawDay(s.draw_day_of_week)
+        // Keep the Financial-Strategy chronology day picker in lock-step (same SSOT).
+        setDrawDayOfWeek(s.draw_day_of_week)
+      }
       toast(s.message, 'success')
       handleCloseDrawModal()
     } catch (err) {
@@ -444,6 +474,32 @@ export default function SystemSettings() {
     try {
       const r = await updateDrawCalendar(_chronoPayload(), pw)
       setFinConfig(prev => ({ ...prev, ...r.data }))
+      // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+      // This save also re-points the live scheduler and changes the SSOT draw day —
+      // mirror it into the Draw-Calendar tab state + schedule badge so both tabs stay
+      // consistent without a full refetch.
+      if (r.data.draw_day_of_week !== undefined && r.data.draw_day_of_week !== null) {
+        const newDay = r.data.draw_day_of_week
+        setDrawDay(newDay)
+        setSchedule(prev => {
+          if (!prev) return prev
+          // Recompute the day-aware IST label so the badge is correct immediately
+          // (+5:30 offset can roll the weekday forward by one).
+          const totalMin = prev.draw_hour_utc * 60 + prev.draw_minute_utc + 330
+          const dayRoll  = (totalMin / (24 * 60)) | 0
+          const h24 = (totalMin / 60 | 0) % 24
+          const m   = totalMin % 60
+          const p   = h24 >= 12 ? 'PM' : 'AM'
+          const h12 = h24 % 12 || 12
+          const istDay = _DAY_FULL[((newDay + dayRoll) % 7 + 7) % 7]
+          return {
+            ...prev,
+            draw_day_of_week: newDay,
+            draw_day:         r.data.draw_day_name ?? _DAY_FULL[newDay] ?? prev.draw_day,
+            draw_time_ist:    `${h12}:${String(m).padStart(2, '0')} ${p} IST (${istDay})`,
+          }
+        })
+      }
       toast(r.data.message, 'success')
       setChronoModalOpen(false); setChronoAdminPw('')
     } catch (err) { toast(err.response?.data?.detail ?? 'Failed to update draw chronology', 'error') }
@@ -611,7 +667,7 @@ export default function SystemSettings() {
           iconBg="bg-violet-50"
           iconColor="text-violet-600"
           title="Draw Calendar"
-          subtitle="Weekly draw time (UTC) and T-2H preparation window. APScheduler picks up changes on the next draw fire — no server restart needed."
+          subtitle="Draw DAY, time (UTC) and T-prep preparation window — the single source of truth for the whole draw timeline. APScheduler re-points live on save — no server restart needed."
           badge={
             schedule && (
               <span className="text-xs font-semibold bg-violet-100 text-violet-700 border border-violet-200 rounded-full px-2.5 py-0.5">
@@ -620,39 +676,58 @@ export default function SystemSettings() {
             )
           }
         >
+          {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+              Draw day is now DYNAMIC (no longer "Every Sunday (fixed)") — read from the
+              live schedule, which derives it from the SSOT draw_day_of_week. */}
           <div className="bg-slate-50 rounded-xl border border-slate-100 divide-y divide-slate-100 mb-6">
-            <StatRow label="Draw day"         value="Every Sunday (fixed)"          accent="text-slate-600" />
+            <StatRow label="Draw day"         value={schedule ? `Every ${schedule.draw_day}` : '—'} accent="text-violet-600" />
             <StatRow label="Draw time (UTC)"  value={schedule ? `${String(schedule.draw_hour_utc).padStart(2,'0')}:${String(schedule.draw_minute_utc).padStart(2,'0')} UTC` : '—'} accent="text-violet-600" />
             <StatRow label="Draw time (IST)"  value={schedule?.draw_time_ist ?? '—'} accent="text-violet-600" />
             <StatRow label="Prep window"      value={schedule ? `T-${schedule.draw_prep_hours}H (${schedule.draw_prep_hours} hours before draw)` : '—'} />
-            <StatRow label="Default schedule" value="13:30 UTC · 7:00 PM IST · T-2H prep" accent="text-slate-500" />
+            <StatRow label="Default schedule" value="Sunday · 13:30 UTC · 7:00 PM IST · T-2H prep" accent="text-slate-500" />
           </div>
 
           <div className="flex items-start gap-3 p-4 rounded-xl bg-violet-50 border border-violet-100 mb-6">
             <AlertTriangle className="w-4 h-4 text-violet-600 flex-shrink-0 mt-0.5" />
             <div className="text-xs text-violet-800 leading-relaxed space-y-1">
               <p className="font-semibold">How draw timing works</p>
+              {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                  Removed the obsolete "always Sunday / code change required" bullets —
+                  the draw day is fully configurable below and re-points the live scheduler. */}
               <ul className="list-disc list-inside space-y-0.5 text-violet-700">
-                <li>T-2H: start_draw_preparation() — LPI snapshot, SDE staging</li>
+                <li>T-prep: start_draw_preparation() — LPI snapshot, SDE staging</li>
                 <li>T-0H: execute_weekly_draw() — full mass draw + SDE execution reveal</li>
-                <li>T+5m: post_draw_cleanup() — reset flags, release locks</li>
-                <li>Draw day is always Sunday — change requires a code update</li>
-                <li>Changes take effect on the NEXT Sunday APScheduler fire</li>
+                <li>T+cleanup: post_draw_cleanup() — reset flags, release locks</li>
+                <li>Draw <strong>day</strong> is editable below — every caller/receiver/worker on the timeline follows it</li>
+                <li>Saving re-points the live APScheduler immediately (no redeploy); otherwise the change is adopted on the next fire</li>
               </ul>
             </div>
           </div>
 
-          <div className="grid grid-cols-3 gap-4 mb-6">
-            <NumInput label="Draw Hour (UTC)"  value={drawHour}   onChange={setDrawHour}   min={0} max={23} unit="h"   note="0–23 UTC" />
-            <NumInput label="Draw Minute (UTC)"value={drawMinute} onChange={setDrawMinute} min={0} max={59} unit="m"   note="0–59" />
+          {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+              Editable Draw Day selector added alongside hour/minute/prep. */}
+          <div className="grid grid-cols-2 gap-4 mb-4">
+            <div className="space-y-1.5">
+              <label className="block text-sm font-semibold text-slate-700">Draw Day</label>
+              <select value={drawDay} onChange={e => setDrawDay(parseInt(e.target.value, 10))} className={inputCls}>
+                {_DAY_FULL.map((d, i) => (
+                  <option key={i} value={i}>{d}</option>
+                ))}
+              </select>
+              <p className="text-xs text-slate-400">0=Mon … 6=Sun · governs the entire draw timeline</p>
+            </div>
             <NumInput label="Prep Window"       value={drawPrep}   onChange={setDrawPrep}   min={1} max={6}  unit="hrs" note="1–6 hours before draw" />
+          </div>
+          <div className="grid grid-cols-2 gap-4 mb-6">
+            <NumInput label="Draw Hour (UTC)"   value={drawHour}   onChange={setDrawHour}   min={0} max={23} unit="h"   note="0–23 UTC" />
+            <NumInput label="Draw Minute (UTC)" value={drawMinute} onChange={setDrawMinute} min={0} max={59} unit="m"   note="0–59" />
           </div>
 
           {drawInputValid && (
             <div className="mb-4 flex items-center gap-2 px-4 py-2.5 bg-violet-50 border border-violet-100 rounded-xl">
               <Calendar className="w-4 h-4 text-violet-500 flex-shrink-0" />
               <p className="text-sm text-violet-700">
-                Preview: Sunday <strong>{String(drawHourInt).padStart(2,'0')}:{String(drawMinuteInt).padStart(2,'0')} UTC</strong>
+                Preview: {_DAY_FULL[drawDayInt]} <strong>{String(drawHourInt).padStart(2,'0')}:{String(drawMinuteInt).padStart(2,'0')} UTC</strong>
                 {' = '}<strong>{previewIst}</strong>{' · Prep at '}<strong>T-{drawPrepInt}H</strong>
               </p>
             </div>
@@ -660,8 +735,8 @@ export default function SystemSettings() {
           {drawIsDirty && (
             <p className="text-xs text-violet-600 flex items-center gap-1 mb-3">
               <ChevronRight className="w-3.5 h-3.5" />
-              Changing from <strong>{String(schedule.draw_hour_utc).padStart(2,'0')}:{String(schedule.draw_minute_utc).padStart(2,'0')} UTC / T-{schedule.draw_prep_hours}H</strong>
-              {' → '}<strong>{String(drawHourInt).padStart(2,'0')}:{String(drawMinuteInt).padStart(2,'0')} UTC / T-{drawPrepInt}H</strong>
+              Changing from <strong>{schedule.draw_day} {String(schedule.draw_hour_utc).padStart(2,'0')}:{String(schedule.draw_minute_utc).padStart(2,'0')} UTC / T-{schedule.draw_prep_hours}H</strong>
+              {' → '}<strong>{_DAY_FULL[drawDayInt]} {String(drawHourInt).padStart(2,'0')}:{String(drawMinuteInt).padStart(2,'0')} UTC / T-{drawPrepInt}H</strong>
             </p>
           )}
           <SaveBtn onClick={handleDrawSaveClick} disabled={!drawIsDirty || refreshing} color="violet">
@@ -1068,9 +1143,10 @@ export default function SystemSettings() {
           </div>
           <div className="bg-slate-50 rounded-xl border border-slate-100 divide-y divide-slate-100">
             <div className="flex items-center justify-between px-4 py-3"><span className="text-sm text-slate-500">Setting</span><span className="text-sm font-semibold text-slate-800">Draw Calendar</span></div>
-            {schedule && <div className="flex items-center justify-between px-4 py-3"><span className="text-sm text-slate-500">Current</span><span className="text-sm font-semibold text-slate-600">{String(schedule.draw_hour_utc).padStart(2,'0')}:{String(schedule.draw_minute_utc).padStart(2,'0')} UTC · T-{schedule.draw_prep_hours}H</span></div>}
-            <div className="flex items-center justify-between px-4 py-3"><span className="text-sm text-slate-500">New value</span><span className="text-sm font-bold text-violet-600">{String(drawHourInt).padStart(2,'0')}:{String(drawMinuteInt).padStart(2,'0')} UTC · T-{drawPrepInt}H</span></div>
-            <div className="flex items-center justify-between px-4 py-3"><span className="text-sm text-slate-500">IST preview</span><span className="text-sm font-bold text-violet-600">{previewIst} (Sunday)</span></div>
+            {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]: day folded into the confirm preview */}
+            {schedule && <div className="flex items-center justify-between px-4 py-3"><span className="text-sm text-slate-500">Current</span><span className="text-sm font-semibold text-slate-600">{schedule.draw_day} · {String(schedule.draw_hour_utc).padStart(2,'0')}:{String(schedule.draw_minute_utc).padStart(2,'0')} UTC · T-{schedule.draw_prep_hours}H</span></div>}
+            <div className="flex items-center justify-between px-4 py-3"><span className="text-sm text-slate-500">New value</span><span className="text-sm font-bold text-violet-600">{_DAY_FULL[drawDayInt]} · {String(drawHourInt).padStart(2,'0')}:{String(drawMinuteInt).padStart(2,'0')} UTC · T-{drawPrepInt}H</span></div>
+            <div className="flex items-center justify-between px-4 py-3"><span className="text-sm text-slate-500">IST preview</span><span className="text-sm font-bold text-violet-600">{previewIst}</span></div>
           </div>
           <div className="space-y-2">
             <label className="block text-sm font-semibold text-slate-700"><Lock className="w-3.5 h-3.5 inline mr-1.5 text-slate-400" />Admin Password</label>

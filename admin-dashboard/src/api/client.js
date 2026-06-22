@@ -553,12 +553,19 @@ export const getDrawSchedule    = () =>
   api.get('/admin/settings/draw-schedule')
 
 /** PUT  /admin/settings/draw-schedule — update draw timing (admin password required) */
-export const updateDrawSchedule = (drawHourUtc, drawMinuteUtc, drawPrepHours, adminPassword) =>
+// SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// drawDayOfWeek (0=Mon … 6=Sun) is now carried so the draw DAY is editable from the
+// Draw-Calendar tab.  Optional & omitted from the body when undefined → backward
+// compatible with any time-only caller (the backend leaves the day unchanged).
+export const updateDrawSchedule = (drawHourUtc, drawMinuteUtc, drawPrepHours, adminPassword, drawDayOfWeek) =>
   api.put('/admin/settings/draw-schedule', {
-    draw_hour_utc:   drawHourUtc,
-    draw_minute_utc: drawMinuteUtc,
-    draw_prep_hours: drawPrepHours,
-    admin_password:  adminPassword,
+    draw_hour_utc:    drawHourUtc,
+    draw_minute_utc:  drawMinuteUtc,
+    draw_prep_hours:  drawPrepHours,
+    ...(drawDayOfWeek !== undefined && drawDayOfWeek !== null
+        ? { draw_day_of_week: drawDayOfWeek }
+        : {}),
+    admin_password:   adminPassword,
   })
 
 // SESSION EDIT [Claude Session Jun-15 — Soheb Khan User 2 / Sohebkhan.sk11]:

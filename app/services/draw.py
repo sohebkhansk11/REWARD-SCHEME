@@ -1984,6 +1984,50 @@ def run_accelerated_dissolution_draw(
     ))
     db.commit()
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Task #10 — accelerated-dissolution forensic emission (gap fix).
+    # Mirrors run_dual_draw:566-587 canonical pattern.  Toggle-gated, append-only,
+    # failure-isolated — financial-grade: never raises into the draw path.
+    # Closes the W22-W27 forensic blind spot where accel-dissolution winners +
+    # the draw itself were invisible in forensic output.
+    try:
+        from app.services import forensic as _forensic
+        if _forensic.is_on():
+            for _res, _ref in (
+                (result_1, getattr(upper_winner, "username", None)),
+                (result_2, getattr(lower_winner, "username", None)),
+            ):
+                _forensic.member_won(
+                    _res.winner_id, _ref or f"user:{_res.winner_id}",
+                    pool_id=pool.id, level=_res.winner_level,
+                    draw_type=POOL_DRAW_ACCELERATED,
+                    amount_inr=int(_res.net_payout_inr or 0),
+                    payload={
+                        "pool_name": pool.name,
+                        "edge_case": "accelerated_dissolution",
+                    },
+                )
+            _forensic.draw_event(
+                "draw_executed",
+                pool_id=pool.id, ref=pool.name,
+                draw_type=POOL_DRAW_ACCELERATED,
+                payload={
+                    "winners":            [result_1.winner_id, result_2.winner_id],
+                    "upper_level":        result_1.winner_level,
+                    "lower_level":        result_2.winner_level,
+                    "upper_payout":       int(result_1.net_payout_inr or 0),
+                    "lower_payout":       int(result_2.net_payout_inr or 0),
+                    "create_relief_pool": bool(create_relief_pool),
+                },
+                message=(
+                    f"DRAW {POOL_DRAW_ACCELERATED} pool {pool.name}: "
+                    f"@L{result_1.winner_level}+@L{result_2.winner_level} won "
+                    f"(₹{int(result_1.net_payout_inr or 0)}+₹{int(result_2.net_payout_inr or 0)})"
+                ),
+            )
+    except Exception:
+        pass
+
     # ── Create relief pool from waitlist ──────────────────────────────────────
     relief_pool_id: int | None = None
     if create_relief_pool:

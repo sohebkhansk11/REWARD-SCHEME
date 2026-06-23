@@ -1046,6 +1046,75 @@ def _execute_case_d_single_pair(
 
         db.commit()
 
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Task #10 — Case D cross-pool dual-L4 forensic emission (gap fix).
+        # Mirrors run_dual_draw:566-587 canonical pattern.  Case D is the cross-pool
+        # supply-rescue path (Pool A's L4 + Pool B's L4 paired); both pools are
+        # marked draw_completed_this_week — without forensic emission the cross-pool
+        # ₹11,000 payout was invisible in operator output.  The draw is anchored to
+        # Pool A in DrawHistory but BOTH pools are referenced in the forensic
+        # payload so post-hoc reconciliation can pair them.  Toggle-gated,
+        # append-only, failure-isolated.
+        try:
+            from app.services import forensic as _forensic
+            if _forensic.is_on():
+                _forensic.member_won(
+                    upper_l4.id, upper_l4.username or f"user:{upper_l4.id}",
+                    pool_id=pool_a.id, level=upper_l4.current_level,
+                    draw_type=POOL_DRAW_SDE,
+                    amount_inr=int(upper_net_d),
+                    payload={
+                        "pool_name":   pool_a.name,
+                        "tier":        "upper",
+                        "edge_case":   "case_d_cross_pool",
+                        "session_num": session_num,
+                        "paired_with_pool_id":   pool_b.id,
+                        "paired_with_pool_name": pool_b.name,
+                    },
+                )
+                _forensic.member_won(
+                    lower_l4.id, lower_l4.username or f"user:{lower_l4.id}",
+                    pool_id=pool_b.id, level=lower_l4.current_level,
+                    draw_type=POOL_DRAW_SDE,
+                    amount_inr=int(lower_net_d),
+                    payload={
+                        "pool_name":   pool_b.name,
+                        "tier":        "lower",
+                        "edge_case":   "case_d_cross_pool",
+                        "session_num": session_num,
+                        "paired_with_pool_id":   pool_a.id,
+                        "paired_with_pool_name": pool_a.name,
+                    },
+                )
+                _forensic.draw_event(
+                    "draw_executed",
+                    pool_id=pool_a.id, ref=pool_a.name,
+                    draw_type=POOL_DRAW_SDE,
+                    severity="warning",   # cross-pool dual-L4 always notable
+                    payload={
+                        "winners":       [upper_l4.id, lower_l4.id],
+                        "upper_level":   upper_l4.current_level,
+                        "lower_level":   lower_l4.current_level,
+                        "upper_payout":  int(upper_net_d),
+                        "lower_payout":  int(lower_net_d),
+                        "total_payout":  int(upper_net_d + lower_net_d),
+                        "is_case_d":     True,
+                        "pool_a_id":     pool_a.id,
+                        "pool_a_name":   pool_a.name,
+                        "pool_b_id":     pool_b.id,
+                        "pool_b_name":   pool_b.name,
+                        "session_num":   session_num,
+                    },
+                    message=(
+                        f"DRAW {POOL_DRAW_SDE} CASE_D cross-pool "
+                        f"{pool_a.name}↔{pool_b.name}: "
+                        f"@L{upper_l4.current_level}+@L{lower_l4.current_level} won "
+                        f"(₹{int(upper_net_d)}+₹{int(lower_net_d)})"
+                    ),
+                )
+        except Exception:
+            pass
+
         _logger.info(
             "SDE CASE D ✓  upper=@%s(Pool '%s' L%d ₹%s)  "
             "lower=@%s(Pool '%s' L%d ₹%s)  total_payout=₹%s",
@@ -2752,6 +2821,71 @@ def execute_staged_sde_draws(db: Session) -> int:
             db.commit()
             executed_count += 1
 
+            # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+            # Task #10 — staged SDE T-0H forensic emission (gap fix).
+            # Mirrors run_dual_draw:566-587 canonical pattern.  One member_won per
+            # winner + one draw_executed per checkpoint.  Case-C cross-pool +
+            # Lever-4 same-pool dual-L4 both flagged in payload so post-hoc
+            # forensic replay can reconstruct the exact T-0H sub-draw type.
+            # Toggle-gated, append-only, failure-isolated.
+            try:
+                from app.services import forensic as _forensic
+                if _forensic.is_on():
+                    _staged_draw_type = POOL_DRAW_SDE_CASE_C if _is_case_c else POOL_DRAW_SDE
+                    _forensic.member_won(
+                        upper.id, upper.username or f"user:{upper.id}",
+                        pool_id=pool.id, level=cp.upper_winner_level,
+                        draw_type=_staged_draw_type,
+                        amount_inr=int(upper_net_d),
+                        payload={
+                            "pool_name":      pool.name,
+                            "tier":           "upper",
+                            "edge_case":      ("case_c" if _is_case_c
+                                               else ("dual_l4_lever4" if _is_dual_l4
+                                                     else "case_a_or_b")),
+                            "sde_session_id": cp.session_id,
+                            "checkpoint_id":  cp.id,
+                        },
+                    )
+                    _forensic.member_won(
+                        lower.id, lower.username or f"user:{lower.id}",
+                        pool_id=pool.id, level=cp.lower_winner_level,
+                        draw_type=_staged_draw_type,
+                        amount_inr=int(lower_net_d),
+                        payload={
+                            "pool_name":      pool.name,
+                            "tier":           "lower",
+                            "edge_case":      ("case_c" if _is_case_c
+                                               else ("dual_l4_lever4" if _is_dual_l4
+                                                     else "case_a_or_b")),
+                            "sde_session_id": cp.session_id,
+                            "checkpoint_id":  cp.id,
+                        },
+                    )
+                    _forensic.draw_event(
+                        "draw_executed",
+                        pool_id=pool.id, ref=pool.name,
+                        draw_type=_staged_draw_type,
+                        payload={
+                            "winners":        [upper.id, lower.id],
+                            "upper_level":    cp.upper_winner_level,
+                            "lower_level":    cp.lower_winner_level,
+                            "upper_payout":   int(upper_net_d),
+                            "lower_payout":   int(lower_net_d),
+                            "is_case_c":      bool(_is_case_c),
+                            "is_dual_l4":     bool(_is_dual_l4),
+                            "sde_session_id": cp.session_id,
+                            "checkpoint_id":  cp.id,
+                        },
+                        message=(
+                            f"DRAW {_staged_draw_type} pool {pool.name}: "
+                            f"@L{cp.upper_winner_level}+@L{cp.lower_winner_level} won "
+                            f"(₹{int(upper_net_d)}+₹{int(lower_net_d)})"
+                        ),
+                    )
+            except Exception:
+                pass
+
             _logger.info(
                 "execute_staged_sde_draws: ✓ checkpoint %d  pool='%s'  "
                 "upper=@%s(L%d ₹%s)  lower=@%s(L%d ₹%s)",
@@ -3164,6 +3298,65 @@ def execute_sde_ext2_draw(
     db.commit()
     # ── END ATOMIC TRANSACTION ────────────────────────────────────────────────
 
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Task #10 — SDE Ext-II/III forensic emission (gap fix).
+    # Mirrors run_dual_draw:566-587 canonical pattern.  Critical: L5/L6 forced
+    # exits MUST be visible in forensic — they indicate prior SDE failure and are
+    # the band the entire Q1 pure-protection regime exists to prevent.
+    # Toggle-gated, append-only, failure-isolated.
+    try:
+        from app.services import forensic as _forensic
+        if _forensic.is_on():
+            _forensic.member_won(
+                upper_member.id, upper_member.username or f"user:{upper_member.id}",
+                pool_id=pool.id, level=upper_member.current_level,
+                draw_type=draw_type,
+                amount_inr=int(upper_net_d),
+                payload={
+                    "pool_name":            pool.name,
+                    "tier":                 "upper",
+                    "edge_case":            "ext2_l5_forced_exit"
+                                            if draw_type == POOL_DRAW_SDE_EXT2
+                                            else "ext3_l6_forced_exit",
+                    "drawdown_projection":  projection,
+                },
+            )
+            _forensic.member_won(
+                lower_winner.id, lower_winner.username or f"user:{lower_winner.id}",
+                pool_id=pool.id, level=lower_winner.current_level,
+                draw_type=draw_type,
+                amount_inr=int(lower_net_d),
+                payload={
+                    "pool_name": pool.name,
+                    "tier":      "lower",
+                    "edge_case": "ext2_l5_forced_exit"
+                                 if draw_type == POOL_DRAW_SDE_EXT2
+                                 else "ext3_l6_forced_exit",
+                },
+            )
+            _forensic.draw_event(
+                "draw_executed",
+                pool_id=pool.id, ref=pool.name,
+                draw_type=draw_type,
+                severity="warning",   # L5/L6 forced exit is ALWAYS a warning event
+                payload={
+                    "winners":           [upper_member.id, lower_winner.id],
+                    "upper_level":       upper_member.current_level,
+                    "lower_level":       lower_winner.current_level,
+                    "upper_payout":      int(upper_net_d),
+                    "lower_payout":      int(lower_net_d),
+                    "week_id":           week_id,
+                    "savings_vs_1week":  projection.get("savings_acting_now_vs_1week"),
+                },
+                message=(
+                    f"DRAW {draw_type} pool {pool.name}: "
+                    f"FORCED EXIT @L{upper_member.current_level}+@L{lower_winner.current_level} won "
+                    f"(₹{int(upper_net_d)}+₹{int(lower_net_d)})"
+                ),
+            )
+    except Exception:
+        pass
+
     _logger.info(
         "SDE Ext-II COMPLETE pool='%s': upper=@%s(L%d ₹%s)  lower=@%s(L%d ₹%s)  "
         "savings=₹%s vs waiting 1 week",
@@ -3495,6 +3688,66 @@ def run_preventive_l3_draw(
         winner_2_journey_type       = "merged" if _w2_merges > 0 else "direct",
     ))
     db.commit()
+
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Task #10 — Preventive-L3 forensic emission (gap fix).
+    # Mirrors run_dual_draw:566-587 canonical pattern.  Preventive-L3 is the only
+    # draw type that can deliberately exit two L3 members at once to bleed off
+    # cascade pressure; without forensic emission, weekly cascade telemetry shows
+    # the L3 ratio drop but never the WHY.  Toggle-gated, append-only, failure-isolated.
+    try:
+        from app.services import forensic as _forensic
+        if _forensic.is_on():
+            _forensic.member_won(
+                winner_1.id, winner_1.username or f"user:{winner_1.id}",
+                pool_id=pool.id, level=winner_1.current_level,
+                draw_type=POOL_DRAW_SDE_PREVENTIVE_L3,
+                amount_inr=int(w1_net_d),
+                payload={
+                    "pool_name":            pool.name,
+                    "tier":                 "upper",
+                    "edge_case":            "preventive_l3_cascade_protection",
+                    "cascade_risk_at_draw": float(cascade_risk),
+                    "l3_count_before":      int(l3_count_before),
+                },
+            )
+            _forensic.member_won(
+                winner_2.id, winner_2.username or f"user:{winner_2.id}",
+                pool_id=pool.id, level=winner_2.current_level,
+                draw_type=POOL_DRAW_SDE_PREVENTIVE_L3,
+                amount_inr=int(w2_net_d),
+                payload={
+                    "pool_name":            pool.name,
+                    "tier":                 "lower",
+                    "edge_case":            "preventive_l3_cascade_protection",
+                    "cascade_risk_at_draw": float(cascade_risk),
+                    "l3_count_before":      int(l3_count_before),
+                },
+            )
+            _forensic.draw_event(
+                "draw_executed",
+                pool_id=pool.id, ref=pool.name,
+                draw_type=POOL_DRAW_SDE_PREVENTIVE_L3,
+                severity="warning",   # cascade-protection trigger is always notable
+                payload={
+                    "winners":              [winner_1.id, winner_2.id],
+                    "upper_level":          winner_1.current_level,
+                    "lower_level":          winner_2.current_level,
+                    "upper_payout":         int(w1_net_d),
+                    "lower_payout":         int(w2_net_d),
+                    "cascade_risk_at_draw": float(cascade_risk),
+                    "l3_count_before":      int(l3_count_before),
+                    "week_id":              week_id,
+                },
+                message=(
+                    f"DRAW {POOL_DRAW_SDE_PREVENTIVE_L3} pool {pool.name}: "
+                    f"CASCADE-PROTECT @L{winner_1.current_level}+@L{winner_2.current_level} won "
+                    f"(₹{int(w1_net_d)}+₹{int(w2_net_d)}) "
+                    f"cascade_risk={float(cascade_risk):.3f} l3_before={int(l3_count_before)}"
+                ),
+            )
+    except Exception:
+        pass
 
     _logger.warning(
         "Preventive L3 draw COMPLETE: pool='%s'  cascade_risk=%.3f  "

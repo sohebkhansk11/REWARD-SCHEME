@@ -781,9 +781,12 @@ def execute_weekly_draw(
         _draw_posture = "BALANCED"
 
     # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
-    # FORENSIC — record the situational draw posture decided for this cycle, with the
-    # clamped valve thresholds it produced. Lets the timeline explain WHY a given week
-    # leaned THROUGHPUT vs LIABILITY_CONTROL. Failure-isolated + no-op when OFF.
+    # FORENSIC — record the draw posture + the quant brain's scenario classification.
+    # Q2 (Jun-23): posture is now always BALANCED (single steady rule — see
+    # draw_priority.py).  The forensic event still emits the *scenario* the brain
+    # detected (VELOCITY_CLIFF / DRY_PHASE / etc.) so post-hoc reconciliation can
+    # see what the system was looking at — but posture no longer SWITCHES on it.
+    # Failure-isolated + no-op when forensic is OFF.
     try:
         from app.services import forensic as _forensic
         if _forensic.is_on():

@@ -1,47 +1,45 @@
 """
-Draw Priority — Quant-Adaptive Situational Lean  (Phase B)
-==========================================================
-A PURE module (no DB reads, no DB writes, no side effects).  It derives a
-``DrawPriorityPlan`` from the atomic ``SystemSnapshot`` the engine already
-reads once per cycle, and the rest of the draw pipeline consumes that plan
-read-only.
+Draw Priority — Steady-Rule Deterministic Lean  (Q2 rewrite, Jun-23)
+====================================================================
+A PURE module (no DB reads, no DB writes, no side effects).  It returns a
+single, deterministic ``DrawPriorityPlan`` that the rest of the draw pipeline
+consumes read-only — one steady rule, every week, regardless of regime.
 
-Why this exists
----------------
-The user's stress tests showed the engine running a single static draw lean in
-every market regime.  The request: make draw-type intensity *situational* —
-defensive scenarios should shed L4+ liability harder and route to SDE sooner;
-growth scenarios should keep regular throughput high — WITHOUT touching the
-hard money-safety ordering.
+Q2 — Posture-switching removed (Jun-23 user directive — verbatim:
+    "Nahi — posture switching hatao, ek hi steady rule har week chalegi")
+
+The previous design switched between THROUGHPUT / BALANCED / LIABILITY_CONTROL
+based on the quant brain's reserve multiplier.  Forensic run a4243fd2 proved
+that switching caused feast-or-famine:
+
+  • W1–W4   BALANCED/VELOCITY_CLIFF        → 4–5 draws/week
+  • W5–W8   LIABILITY_CONTROL/DRY_PHASE    → freeze + 16/17 draw blowouts
+  • W9–W19  LIABILITY_CONTROL/DRY_PHASE    → 11 consecutive zero-draw freezes
+  • W20–W21 LIABILITY_CONTROL/DRY_PHASE    → 60-draw + 80-winner blowout
+  • W22+    LIABILITY_CONTROL/DRY_PHASE    → 12-week collapse + L5 leak begins
+
+The blowout was driven by ``l4_density_desc`` pool ordering (defensive
+LIABILITY_CONTROL preset) draining the densest L4 pools all at once, then
+having no waitlist to refill, then having no draws for weeks until inventory
+quietly rebuilt — repeat.
+
+Q2 fix: ``compute_draw_priority()`` now ignores the multiplier entirely and
+always returns the BALANCED preset (today's production-static config).  The
+multiplier is still computed by the quant brain because reserve-pool calcs
+elsewhere depend on it, but it no longer steers draw posture.
 
 Design constraints (financial-grade — INVIOLABLE)
 -------------------------------------------------
-1. **No DB mutation.**  This module only reads scalar fields off the snapshot
-   and returns a frozen dataclass.  It can never corrupt pool/payout state.
-2. **Hard-safety ordering is untouched.**  Ext-II/III L5/L6 clearance always
-   runs first; SDE staging→execution order is fixed; only-12/12 eligibility is
-   fixed.  This plan changes only valve *intensity* (cascade / accel triggers),
-   per-pool *routing* cutoffs, and eligible-pool *draw order* — never WHICH
-   safety draw runs or in what order the safety phases execute.
-3. **Every number is clamped to a safe band.**  No posture — however extreme
-   the quant multiplier — can push a trigger outside the bands below.  This is
-   the guarantee that a misread scenario can never break payout math or starve
-   a safety draw.
-4. **BALANCED == today's static config EXACTLY.**  In the neutral regime
-   (multiplier == 1.00) the returned plan reproduces the current production
-   constants (regular<14, type_a 14–24, sde≥25, cascade 2.0, accel 0.60, FIFO).
-   So this whole module is a *no-op* unless the quant brain leaves NEUTRAL.
-
-Posture derivation
-------------------
-Posture comes from the quant reserve multiplier, which the quant brain already
-computes by blending velocity / burn-rate / RDR / cascade-risk.  Reusing it
-means the draw lean tracks the SAME scenario the reserve logic reacts to (one
-brain, one signal — no second, divergent classifier to keep in sync):
-
-    multiplier <= 0.75  → THROUGHPUT          (SUSTAINABLE_WAVE / BOOM_GOLDEN_CROSS)
-    multiplier == 1.00  → BALANCED            (NEUTRAL / VELOCITY_CLIFF)
-    multiplier >= 1.50  → LIABILITY_CONTROL   (FLASH_FLOOD / DRY_PHASE / REFERRAL_LIFELINE)
+1. **No DB mutation.**  This module only returns a frozen dataclass.
+2. **Hard-safety ordering is untouched.**  Ext-II/III L5/L6 clearance still
+   runs first; SDE staging→execution order is fixed; only-12/12 eligibility
+   is fixed.  This plan now only fixes valve *intensity* + per-pool routing
+   cutoffs + pool ordering to ONE deterministic value.
+3. **Every number is clamped to a safe band.**  The clamps below are now
+   redundant (constants live well inside) but are kept as belt-and-suspenders
+   against accidental future edits.
+4. **Steady rule == today's production-static BALANCED preset EXACTLY.**
+   regular<14, type_a 14–24, sde≥25, cascade 2.0, accel 0.60, pool_order=fifo.
 """
 
 from __future__ import annotations
@@ -99,59 +97,53 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Q2 STEADY-RULE (Jun-23): the constants below are the one-and-only draw lean
+# the engine will ever use.  They reproduce the production-static BALANCED
+# preset that pre-dated the posture-switching experiment.  Any future tuning
+# must be a one-time edit here, NOT a runtime-conditional switch on a
+# multiplier / scenario / brain output — that path is what caused W18-W19
+# freeze + W20-W21 blowout + W22+ collapse.
+_STEADY_REGULAR_MAX:       float = 14.0
+_STEADY_SDE_MIN:           float = 25.0
+_STEADY_CASCADE_THRESHOLD: float = 2.0
+_STEADY_ACCEL_RATIO:       float = 0.60
+_STEADY_POOL_ORDER_KEY:    str   = "fifo"
+
+
 def compute_draw_priority(snap: "SystemSnapshot") -> DrawPriorityPlan:
     """
-    Derive the situational draw lean from the atomic snapshot's quant multiplier.
+    Q2 STEADY-RULE: return the one deterministic draw lean for every week.
 
-    PURE: reads only ``snap.multiplier`` (with a safe 1.0 fallback) and returns a
-    frozen plan.  Never raises on a missing/odd multiplier — defaults to BALANCED.
-    Every returned number is clamped into its safe band before being handed back.
+    PURE: ignores ``snap`` entirely.  The argument is retained for signature
+    stability (the single caller in draw.py:766 still passes a snapshot, and
+    we don't want to ripple a signature change through unrelated tests).
+    Every returned number is still passed through the safe-band clamp — those
+    clamps are now belt-and-suspenders against accidental future re-tuning.
+
+    Posture is always ``BALANCED``.  Pool order is always ``fifo``.
+    No multiplier-driven switching, no scenario-driven switching.
     """
-    mult = getattr(snap, "multiplier", 1.0)
-    try:
-        mult = float(mult)
-    except (TypeError, ValueError):
-        mult = 1.0
-
-    if mult <= 0.75:
-        # Growth regime — keep regular throughput high, relax the shed valves.
-        posture                       = DrawPosture.THROUGHPUT
-        regular_max, sde_min          = 18.0, 30.0
-        cascade_threshold, accel_ratio = 2.5, 0.70
-        pool_order_key                = "fifo"
-    elif mult >= 1.50:
-        # Defensive regime — route to SDE sooner, fire the shed valves earlier,
-        # and draw the highest-liability (most L4-dense) pools FIRST.
-        posture                       = DrawPosture.LIABILITY_CONTROL
-        regular_max, sde_min          = 10.0, 18.0
-        cascade_threshold, accel_ratio = 1.5, 0.50
-        pool_order_key                = "l4_density_desc"
-    else:
-        # Neutral regime — EXACT reproduction of today's static production config.
-        posture                       = DrawPosture.BALANCED
-        regular_max, sde_min          = 14.0, 25.0
-        cascade_threshold, accel_ratio = 2.0, 0.60
-        pool_order_key                = "fifo"
-
-    # Belt-and-suspenders clamp — no posture can ever escape the safe envelope.
-    regular_max       = _clamp(regular_max,       *_REGULAR_MAX_BAND)
-    sde_min           = _clamp(sde_min,           *_SDE_MIN_BAND)
-    cascade_threshold = _clamp(cascade_threshold, *_CASCADE_BAND)
-    accel_ratio       = _clamp(accel_ratio,       *_ACCEL_BAND)
+    # The clamps are no-ops at today's constants but kept as a safety net
+    # against accidental constant re-edits that could escape the safe envelope.
+    regular_max       = _clamp(_STEADY_REGULAR_MAX,       *_REGULAR_MAX_BAND)
+    sde_min           = _clamp(_STEADY_SDE_MIN,           *_SDE_MIN_BAND)
+    cascade_threshold = _clamp(_STEADY_CASCADE_THRESHOLD, *_CASCADE_BAND)
+    accel_ratio       = _clamp(_STEADY_ACCEL_RATIO,       *_ACCEL_BAND)
 
     plan = DrawPriorityPlan(
-        posture           = posture,
+        posture           = DrawPosture.BALANCED,
         regular_max       = regular_max,
         type_a_min        = regular_max,    # type_a band opens exactly where regular closes
         sde_min           = sde_min,
         cascade_threshold = cascade_threshold,
         accel_ratio       = accel_ratio,
-        pool_order_key    = pool_order_key,
+        pool_order_key    = _STEADY_POOL_ORDER_KEY,
     )
     _logger.debug(
-        "compute_draw_priority: multiplier=%.2f → posture=%s "
-        "(regular<%.0f type_a<%.0f sde≥%.0f cascade>%.2f accel≥%.2f order=%s)",
-        mult, posture.value, regular_max, sde_min, sde_min,
-        cascade_threshold, accel_ratio, pool_order_key,
+        "compute_draw_priority: STEADY rule (Q2) → "
+        "regular<%.0f type_a<%.0f sde≥%.0f cascade>%.2f accel≥%.2f order=%s",
+        regular_max, sde_min, sde_min,
+        cascade_threshold, accel_ratio, _STEADY_POOL_ORDER_KEY,
     )
     return plan

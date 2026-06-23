@@ -98,52 +98,65 @@ _RNG_SECRET = os.getenv("DRAW_RNG_SECRET", "dev-insecure-secret-replace-in-prod"
 
 # ── SDE INVARIANT BACKSTOP — "No L4 person should ever reach L5" ───────────────
 # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
-# LEVER 6 — Case-E TRUE-DEFER advancement guard (single source of truth).
+# Q1 PURE PROTECTION (Jun-23 autopsy directive — verbatim user mandate:
+#   "L5/L6 me koi pahunchna hi nahi chahiye — pure protection (mechanic broken
+#    hai, fix karna hai)").
 #
-# The documented SDE guarantee (Discussion.md L164 / Q3 Question-B) is absolute:
-# "No L4 person should ever reach L5."  Every survivor-advancement site in the
-# engine previously did an unconditional `min(current_level + 1, 6)`, so a
-# FLAGGED L4 (current_level == 4 AND sde_required) that was NOT one of the two
-# winners — i.e. the supply ladder (meta pool → Lever 4 → Case C → Case D →
-# Lever 5 meta-pool receiver) could not drain it this week — advanced straight
-# into the L5/L6 leak band.  That was the residual, measured leak.
+# The previous Lever-6 design only HELD L4 when sde_required==True, trusting
+# the upstream "advanced-to-L4" handler in draw.py to flag the member atomically
+# on the same write that moved them L3→L4.  Forensic run a4243fd2 disproved
+# that trust: by W22 the system had L5=14 active members, and by W26 L5=38.
+# The leak came from L4 survivors whose sde_required flag was MISSING for
+# legitimate reasons (admin override, pool dissolution re-homing, legacy data,
+# accelerated-dissolution survivor loop that doesn't flag L4 the same way as
+# run_dual_draw) — they fell through to the +1 advance branch and entered the
+# L5/L6 band.
 #
-# This pure helper is the LAST-RESORT safety net that closes it: a flagged L4
-# survivor is HELD at L4 (the documented Case-E "true defer") instead of
-# advancing.  It keeps sde_required=True, so get_flagged_l4_members() re-queues
-# it FIFO next week and it exits the moment drawable supply returns — typically
-# the very next week (its pool unlocks and draws it as the upper winner).  It is
-# NEVER a substitute for the supply mechanisms; it only fires AFTER all of them
-# are genuinely exhausted (waitlist dry + no pairable partner), and it makes the
-# L4→L5→L6 escalation path structurally unreachable.
+# This function is the ONE engine SSOT for all survivor-level changes (verified
+# by grep — admin_override and dev/user_auth set absolute levels for legacy/
+# fresh users, never `level + 1`).  By removing the `and sde_required` predicate
+# we make it MATHEMATICALLY impossible for this function to return a post-draw
+# level of 5 or 6 from any survivor advance.  Combined with the existing
+# `current_level >= 5` HOLD branch (which kept legacy L5/L6 members from
+# climbing further), the L4→L5→L6 leak band is now structurally sealed.
+#
+# Callers are updated in tandem (draw.py:481, draw.py:1922) so that newly-held
+# L4 members get a fresh sde_flagged_week stamp on first hold (Case-C) while
+# already-flagged held L4 members preserve their original flagged week (Case-B).
 #
 # Callers must apply the SAME payment gate they already use: an Unpaid survivor
 # does not advance at all (handled at the call site), so this guard is consulted
 # only on the advancing (Paid / SDE-winner-pool) path.
 def _advance_survivor_level(current_level: int, sde_required: bool) -> tuple[int, bool]:
     """
-    Compute a draw survivor's post-draw level, enforcing 'No L4 reaches L5'
-    (and, defensively, 'no L5/L6 climbs the leak band further').
+    Compute a draw survivor's post-draw level under the Q1 pure-protection rule.
+
+    The function is the single source of truth for level changes from a draw
+    survivor advance.  Post-draw level is GUARANTEED to be ≤ 4 from this path
+    (defensive HOLD for legacy L5/L6 members keeps them at their existing
+    level; they exit via the Ext-II/III legacy cleaner — not by climbing).
 
     Returns (new_level, held):
-      • flagged L4 (current_level == 4 AND sde_required) -> (4, True)
-            HELD at L4 — documented Case-E true defer; get_flagged_l4_members()
-            re-queues it FIFO next week and it exits when supply returns.
-      • any L5/L6 survivor (current_level >= 5)          -> (current_level, True)
-            HELD at its level — L5/L6 "should never exist" and must EXIT via the
-            Ext-II/III valve (which drains by LEVEL, not sde_required), never
-            climb on a survivor advancement.  This branch is intentionally
-            INDEPENDENT of sde_required: a LEGACY member that leaked before this
-            guard existed had its sde_required cleared by the old buggy loop, so
-            keying on level alone is what actually catches it.
-      • everyone else                                    -> (min(level+1, 6), False)
-            normal +1 advancement (L1->L2->L3->L4 ...), capped at L6.
+      • current_level == 4 (any sde_required state)      -> (4, True)
+            HELD at L4 — Q1 PURE PROTECTION.  The caller atomically sets
+            sde_required=True + stamps sde_flagged_week on the same DB write
+            (see draw.py:478 / draw.py:1919).  Held members are re-queued FIFO
+            by get_flagged_l4_members() and exit when SDE supply returns.
+      • current_level >= 5 (legacy L5/L6 only)           -> (current_level, True)
+            HELD at its level — these members exist only as pre-Q1 legacy data
+            (admin overrides, or migrated state from before this guard).  They
+            MUST exit via SDE Ext-II/III legacy cleaner; this branch refuses to
+            let them climb further.  Independent of sde_required because old
+            buggy code may have cleared the flag.
+      • everyone else (L1, L2, L3)                       -> (level + 1, False)
+            normal +1 advancement.  Hard upper bound of 4 from this path is
+            now an invariant of the function (was: min(level+1, 6)).
     """
-    if current_level == 4 and sde_required:
+    if current_level == 4:
         return 4, True
     if current_level >= 5:
         return current_level, True
-    return min(current_level + 1, 6), False
+    return current_level + 1, False
 
 
 # ── Data Transfer Objects ─────────────────────────────────────────────────────

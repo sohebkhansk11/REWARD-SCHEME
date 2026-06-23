@@ -501,9 +501,17 @@ def _project_level_cascade(stuck_high_tier: int, l3_inflow: int, *, max_level: i
     forward rung by rung from L4 up to L{max_level} and report the per-rung projected
     population, so the re-assessment SEES the runaway.
 
-    IMPORTANT: the REAL engine caps at L6 (SDE Ext-II/III forced-exit valves clear L5
-    and L6).  Rungs L7..L{max_level} are VIRTUAL projection levels shown ONLY to expose
-    where the math runs if high-tier is never won — the engine never creates them.
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Q1 PURE PROTECTION (Jun-23): the previous claim that "the engine caps at L6
+    # because SDE Ext-II/III forced-exit valves clear L5 and L6" was FALSIFIED by
+    # forensic run a4243fd2 (L5 trajectory W22→W27 = 14→28→31→34→38→35 — the
+    # valves did not clear).  As of Jun-23, _advance_survivor_level (sde_engine.py:
+    # 142) HOLDS every L4 survivor at L4 with sde_required=True, making L5/L6 entry
+    # from any survivor advance MATHEMATICALLY UNREACHABLE.  Legacy L5/L6 occupants
+    # (admin override, pre-Q1 migrated data) are still drained by Ext-II/III as a
+    # one-time cleaner; new entries cannot happen.  Rungs L7..L{max_level} remain
+    # VIRTUAL projection rungs — they expose runaway math that is now structurally
+    # impossible, kept as a regression alarm.
     """
     max_level = max(6, int(max_level))
     rungs = list(range(4, max_level + 1))          # L4 .. L12
@@ -542,12 +550,20 @@ def _project_level_cascade(stuck_high_tier: int, l3_inflow: int, *, max_level: i
         "cycles_modelled": cycles,
         "l3_inflow_per_cycle": inflow,
         "virtual_levels": [f"L{l}" for l in rungs if l > 6],
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Q1 PURE PROTECTION (Jun-23): corrected the trailing claim — the engine
+        # does NOT rely on Ext-II/III to clear L5/L6; as of Jun-23
+        # _advance_survivor_level HOLDS every L4 survivor at L4, making L5+ from
+        # any survivor advance structurally unreachable.  Ext-II/III remains as
+        # a legacy cleaner for pre-Q1 occupants only.
         "note": (
             f"If the {stuck_high_tier} dead-ended high-tier member(s) are never made "
             f"winners and the SDE/maturity hold is avoided, the cohort climbs "
             f"L4→…→L{max_level} over {cycles} maturity cycle(s); fresh L3 (+{inflow}/cycle) "
-            f"keep feeding L4. Rungs above L6 are VIRTUAL — they show the runaway, the "
-            f"engine itself force-exits at L5/L6 via SDE Ext-II/III."
+            f"keep feeding L4. Rungs above L6 are VIRTUAL — they expose runaway math that "
+            f"is structurally impossible after Q1 pure protection (sde_engine.py:142): the "
+            f"L4 survivor HOLD makes L5/L6 entry unreachable; Ext-II/III remains only as "
+            f"legacy cleaner for pre-Q1 L5/L6 occupants."
         ),
     }
 

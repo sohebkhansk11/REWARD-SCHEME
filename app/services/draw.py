@@ -477,8 +477,15 @@ def run_dual_draw(
             }
             if reaching_l4:
                 _upd["sde_required"]     = True
-                # Held (deferred) L4 keeps its ORIGINAL flagged week.
-                _upd["sde_flagged_week"] = member.sde_flagged_week if _case_e_def else week_id
+                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Q1 PURE PROTECTION (Jun-23): _advance_survivor_level now HOLDS
+                # any L4 survivor regardless of prior sde_required state, so
+                # _case_e_def can fire for both (a) a previously-flagged L4 held
+                # with no SDE supply this week — preserve original flagged week —
+                # AND (b) a legacy non-flagged L4 entering the held band for the
+                # first time — stamp current week.  `member.sde_flagged_week or
+                # week_id` resolves both cases without a branch.
+                _upd["sde_flagged_week"] = member.sde_flagged_week or week_id
             _old_level = member.current_level
             crud_user.update_user(db, member_id, UserUpdate(**_upd))
 
@@ -1918,8 +1925,13 @@ def run_accelerated_dissolution_draw(
             }
             if reaching_l4:
                 _upd["sde_required"]     = True
-                # Held (deferred) L4 keeps its ORIGINAL flagged week.
-                _upd["sde_flagged_week"] = member.sde_flagged_week if _case_e_def else week_id
+                # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+                # Q1 PURE PROTECTION (Jun-23) — see twin block in run_dual_draw
+                # (draw.py:478).  Same `or week_id` resolution: preserve
+                # original flagged week for already-flagged held L4 (Case-B),
+                # stamp current week for legacy non-flagged L4 newly entering
+                # the held band (Case-C).
+                _upd["sde_flagged_week"] = member.sde_flagged_week or week_id
             _old_level = member.current_level
             crud_user.update_user(db, member_id, UserUpdate(**_upd))
 

@@ -67,17 +67,34 @@ _M_STANDARD_75  = 0.75   # BOOM_GOLDEN_CROSS: mixed traffic, moderate optimism
 _M_PROTECTION   = 2.00   # DRY_PHASE / REFERRAL_LIFELINE: double reserve
 
 # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
-# ── LEVER 3b — Gated dynamic-reserve floor ──────────────────────────────────────
-# In a HEALTHY market (organic growth, draining waitlist) the protective
-# (operational_pools × 12 × multiplier) spawn reserve is far larger than needed and
-# starves the live pools of supply. The user's design caps the reserve at a lean
-# 4 members/pool ONLY while the AI scenario is one of the two healthy regimes; in
-# every other (FLASH_FLOOD / VELOCITY_CLIFF / DRY_PHASE / REFERRAL_LIFELINE /
-# NEUTRAL) scenario the original × 12 × multiplier solvency-defense reserve stands
-# UNCHANGED. The scenario strings here MUST match determine_reserve_multiplier()'s
-# exact return labels (verified below in this same module).
-HEALTHY_RESERVE_SCENARIOS = frozenset({"SUSTAINABLE_WAVE", "BOOM_GOLDEN_CROSS"})
-HEALTHY_RESERVE_PER_POOL  = 4   # lean reserve floor (members/pool) in healthy regimes
+# ── Q3 STEADY-RULE SPAWN GATE (Jun-23) ────────────────────────────────────────
+# Q2 (Jun-23) removed posture switching from the draw side.  Forensic run
+# a4243fd2 ALSO proved that this *spawn* gate — which previously switched between
+# a 4/pool healthy floor and a (12 × multiplier)/pool protective ceiling based on
+# the brain's scenario — was the SECOND half of the feast-or-famine:
+#
+#   W5–W19  : DRY_PHASE detected → reserve = pools × 12 × 2.0 → enormous.
+#             Waitlist couldn't breach it → 11+ consecutive zero-spawn weeks,
+#             waitlist piled up, draws stalled (no fresh L1 supply for refill).
+#   W20–W21 : Waitlist FINALLY breached the wall → 60-draw + 80-winner blowout.
+#   W22–W27 : Whole pool fabric collapsed; L5 leak began.
+#
+# Q3 (Jun-23) per user directive: "broken waitlist and pool creation mechanism …
+# so many pool".  Collapse to ONE steady rule the way Q2 did for posture.
+#
+# RULE: reserve = operational_pools × HEALTHY_RESERVE_PER_POOL (4/pool), ALWAYS.
+#
+#   • 4/pool covers exactly 2 weeks of full-pool 2-winner burn (burn = 2/pool/wk),
+#     i.e. one full draw cycle of safety buffer + one in reserve.
+#   • Admin threshold (POOL_CAPACITY default) is STILL the floor below this:
+#     pools spawn only when (waitlist - reserve) >= admin_threshold.  So spawn
+#     never runs ahead of admin intent; the gate just stops over-clamping during
+#     a dry phase that mathematically locks the waitlist forever.
+#   • multiplier / scenario are still computed by the brain and still emitted in
+#     telemetry/forensic events (admin can SEE what the brain detected — Q4
+#     reconciliation requires this).  They just no longer GATE the spawn.
+HEALTHY_RESERVE_SCENARIOS = frozenset({"SUSTAINABLE_WAVE", "BOOM_GOLDEN_CROSS"})  # retained for legacy callers
+HEALTHY_RESERVE_PER_POOL  = 4   # lean reserve floor (members/pool) — now applied universally
 
 
 def compute_dynamic_reserve(
@@ -85,19 +102,23 @@ def compute_dynamic_reserve(
     multiplier: float,
     scenario: str,
 ) -> int:
-    """LEVER 3b — single source of truth for the spawn-reserve floor.
+    """Q3 STEADY-RULE: return the lean spawn-reserve floor for EVERY scenario.
 
-    Healthy scenario  → operational_pools × HEALTHY_RESERVE_PER_POOL (lean 4/pool).
-    Any other scenario → int(operational_pools × POOL_CAPACITY × multiplier)
-                          (the original protective solvency-defense reserve).
+    reserve = operational_pools × HEALTHY_RESERVE_PER_POOL (4/pool), unconditionally.
 
-    Both the Phase-2 spawn gate (waitlist.py) and the admin telemetry snapshot
-    (get_system_snapshot below) call THIS function so the live gate and the
-    displayed reserve target can never drift apart.
+    PURE: ignores ``multiplier`` and ``scenario`` for the math.  The arguments
+    are retained for signature stability (the Phase-2 spawn gate in
+    waitlist.py and the admin telemetry snapshot below both still pass them,
+    and we want the brain's *scenario classification* preserved in telemetry
+    even though it no longer SWITCHES the gate — see Q2 / Q3 module banner).
+
+    Single source of truth for both the live Phase-2 spawn gate (waitlist.py)
+    and the admin telemetry snapshot (get_system_snapshot below) — they can
+    never drift apart because both call THIS function.
     """
-    if scenario in HEALTHY_RESERVE_SCENARIOS:
-        return int(operational_pool_count) * HEALTHY_RESERVE_PER_POOL
-    return int(operational_pool_count * POOL_CAPACITY * multiplier)
+    # multiplier + scenario intentionally observed but unused — see Q3 banner.
+    _ = (multiplier, scenario)
+    return int(operational_pool_count) * HEALTHY_RESERVE_PER_POOL
 
 
 # ── Query helpers ─────────────────────────────────────────────────────────────

@@ -404,6 +404,42 @@ def assign_waitlist_to_pools(db: Session, *, user_prefix: str | None = None) -> 
             _dynamic_reserve, remaining, _available_to_spawn, threshold,
         )
 
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Q3 (Jun-23): forensic Phase-2 SPAWN DECISION event — emitted on EVERY
+        # weekly tick (even when the gate holds the waitlist) so reconciliation can
+        # see, week-by-week, exactly why pools were or were not created.  This is
+        # what was missing in run a4243fd2: the W9–W19 freeze emitted zero
+        # phase2_spawn events because the existing forensic only fired on the
+        # success path.  Toggle-gated + failure-isolated; no payload mutates state.
+        try:
+            from app.services import forensic as _forensic
+            if _forensic.is_on():
+                _gate_passed = _available_to_spawn >= threshold
+                _forensic.system_event(
+                    "phase2_spawn_decision",
+                    severity="notice" if _gate_passed else "warning",
+                    payload={
+                        "scenario":            _ai_scenario,
+                        "multiplier":          _ai_multiplier,
+                        "waitlist_paid":       remaining,
+                        "active_pools":        _active_pool_count,
+                        "operational_pools":   _operational_pool_count,
+                        "dynamic_reserve":     _dynamic_reserve,
+                        "available_to_spawn":  _available_to_spawn,
+                        "admin_threshold":     threshold,
+                        "base_threshold":      base_threshold,
+                        "gate_passed":         _gate_passed,
+                    },
+                    message=(
+                        f"PHASE2 SPAWN {'PASSED' if _gate_passed else 'HELD'} — "
+                        f"scenario={_ai_scenario} mult={_ai_multiplier:.2f} "
+                        f"wl={remaining} reserve={_dynamic_reserve} "
+                        f"avail={_available_to_spawn} threshold={threshold}"
+                    ),
+                )
+        except Exception:
+            pass
+
         if _available_to_spawn >= threshold:
             # Create as many FULL pools as the AI-available portion allows.
             # pools_to_make * POOL_CAPACITY <= _available_to_spawn (every pool is full).
@@ -952,6 +988,163 @@ def _condense_pools_once(db: Session) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Q3 ORPHAN RE-HOME CORE (Jun-23) — extracted from scheduler.job_data_integrity_check
+# so the dual-tick draw cycle ALSO heals orphans, not just the 6-hourly integrity job.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rehome_orphans_once(db: Session) -> dict:
+    """
+    Single-pass orphan re-home — extracted from scheduler.job_data_integrity_check
+    (Q3 fix, Jun-23) so it can ALSO run inside the dual-tick draw cycle.
+
+    Q3 user mandate (verbatim): "so many orphan member not handling by merger,
+    doner and dissolver".  Forensic run a4243fd2 confirmed orphans (Active
+    members whose current_pool_id points at a Merged_Dissolved row, or NULL, or
+    a row that has been deleted) PERSISTED for weeks because the existing rehome
+    job only fired every 6 hours — between draws orphans were invisible to the
+    merger/donor/dissolver and were never paid even though they kept counting as
+    Active.  This core lets the merger driver heal them on EVERY tick (T-2H + T+5M).
+
+    RE-HOME CONTRACT (money-grade, non-negotiable — IDENTICAL to scheduler's):
+      • ONLY current_pool_id + dynamic_merges_experienced change.  current_level
+        / weekly_payment_status / join_date / sde_required / sde_flagged_week
+        are PRESERVED — orphans keep their paid journey progress.
+      • Receiver = oldest under-capacity NON-flagged Active/Paused pool
+        (SDE immunity: contains_flagged_l4 pools are NEVER orphan receivers).
+      • If no live pool has a vacancy, a fresh Active pool is created via
+        _next_pool_name + crud_pool.create_pool (canonical sequential naming).
+      • Idempotent: a re-run on a clean DB does nothing (orphans == []).
+      • Failure-isolated: any exception rolls back THIS step's writes only and
+        is logged + forensic'd, but does NOT break the surrounding converge.
+
+    Returns {rehomed, new_pools, orphan_ids:[…first 50 for audit]}.
+    """
+    from sqlalchemy import func as _func
+    from app.crud import pool as _crud_pool
+    from app.schemas.pool import PoolCreate
+
+    rehomed_count    = 0
+    new_pools_count  = 0
+    orphan_ids:      list[int] = []
+
+    try:
+        live_pool_ids: set[int] = {
+            pid for (pid,) in db.query(Pool.id)
+            .filter(Pool.status != PoolStatus.Merged_Dissolved).all()
+        }
+        active_members: list[User] = (
+            db.query(User).filter(User.status == UserStatus.Active).all()
+        )
+        orphans: list[User] = [
+            u for u in active_members
+            if u.current_pool_id is None or u.current_pool_id not in live_pool_ids
+        ]
+
+        if not orphans:
+            return {"rehomed": 0, "new_pools": 0, "orphan_ids": []}
+
+        def _live(pid: int) -> int:
+            return (
+                db.query(_func.count(User.id))
+                .filter(
+                    User.current_pool_id == pid,
+                    User.status == UserStatus.Active,
+                )
+                .scalar() or 0
+            )
+
+        candidates: list[Pool] = (
+            db.query(Pool)
+            .filter(
+                Pool.status.in_([
+                    PoolStatus.Active,
+                    PoolStatus.Paused_Awaiting_Members,
+                ]),
+                Pool.contains_flagged_l4 == False,    # noqa: E712 (SDE immunity)
+            )
+            .order_by(Pool.created_at.asc(), Pool.id.asc())
+            .all()
+        )
+        cap_left: dict[int, int] = {p.id: max(0, POOL_CAPACITY - _live(p.id)) for p in candidates}
+        touched: set[int] = set()
+
+        for orphan in orphans:
+            target = next(
+                (p for p in candidates if cap_left.get(p.id, 0) > 0), None
+            )
+            if target is None:
+                target = _crud_pool.create_pool(
+                    db,
+                    PoolCreate(
+                        name=_next_pool_name(db),
+                        status=PoolStatus.Active,
+                        total_members=0,
+                    ),
+                )
+                new_pools_count += 1
+                candidates.append(target)
+                cap_left[target.id] = POOL_CAPACITY
+            _logger.warning(
+                "[CONVERGE-ORPHAN] @%-20s (id=%5d L%s) pool_id=%s "
+                "(dissolved/null/missing) → re-home to pool %d (%s) — journey preserved.",
+                orphan.username, orphan.id, orphan.current_level,
+                orphan.current_pool_id, target.id, target.name,
+            )
+            orphan.current_pool_id = target.id
+            orphan.dynamic_merges_experienced = (orphan.dynamic_merges_experienced or 0) + 1
+            cap_left[target.id] -= 1
+            touched.add(target.id)
+            orphan_ids.append(orphan.id)
+            rehomed_count += 1
+
+        db.commit()
+
+        # Resync counters + restore Paused→Active for receivers we filled.
+        for p in db.query(Pool).filter(Pool.id.in_(touched)).all():
+            rc = _live(p.id)
+            if (p.total_members or 0) != rc:
+                p.total_members = rc
+            if rc >= POOL_CAPACITY and p.status == PoolStatus.Paused_Awaiting_Members:
+                p.status = PoolStatus.Active
+        db.commit()
+
+        try:
+            from app.services import forensic as _forensic
+            if _forensic.is_on():
+                _forensic.system_event(
+                    "orphan_rehome",
+                    severity="warning",
+                    payload={
+                        "rehomed":          rehomed_count,
+                        "new_pools":        new_pools_count,
+                        "orphan_ids":       orphan_ids[:50],
+                        "trigger":          "converge_driver",
+                    },
+                    message=(f"CONVERGE-ORPHAN: re-homed {rehomed_count} "
+                             f"orphaned Active member(s) ({new_pools_count} new pool(s))"),
+                )
+        except Exception:
+            pass
+
+    except Exception as _exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _logger.error(
+            "[CONVERGE-ORPHAN] rehome step FAILED (non-fatal): %s",
+            _exc, exc_info=True,
+        )
+
+    return {
+        "rehomed":    rehomed_count,
+        "new_pools":  new_pools_count,
+        "orphan_ids": orphan_ids[:50],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
 # DUAL-TICK CONVERGENCE DRIVER (Jun-19 requirement).
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -991,25 +1184,44 @@ def run_merger_refill_converge(
     tot_xfer:  int       = 0
     dissolved: list[str] = []
     refill:    dict      = {}
+    # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Q3 (Jun-23): track orphans re-homed during the converge so the dual-tick
+    # cycle's summary (and the forensic event below) shows both the merger and
+    # the orphan-heal volume in one place.
+    tot_rehomed:        int = 0
+    tot_orphan_pools:   int = 0
 
     while rounds < max_rounds:
         rounds += 1
         m      = _condense_pools_once(db)
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Q3 (Jun-23): heal orphans INSIDE the converge loop — AFTER compaction
+        # (so we don't fight the merger over the same vacancies) and BEFORE the
+        # refill (so newly-orphan-filled receivers count toward the refill view of
+        # available vacancies).  Failure isolation lives inside _rehome_orphans_once;
+        # this site treats the call as side-effect-tolerant and the loop continues
+        # even if rehome fails (the legacy 6-hourly integrity job is still a backstop).
+        orphan_summary = _rehome_orphans_once(db)
         refill = assign_waitlist_to_pools(db, user_prefix=user_prefix)
 
-        tot_xfer  += m["transfers"]
-        dissolved += m["dissolved"]
+        tot_xfer        += m["transfers"]
+        dissolved       += m["dissolved"]
+        tot_rehomed     += orphan_summary["rehomed"]
+        tot_orphan_pools += orphan_summary["new_pools"]
 
         progressed = bool(
             m["transfers"]
+            or orphan_summary["rehomed"]
             or refill["phase1_assigned"]
             or refill["phase2_pools_count"]
             or refill["phase3_transfers"]
         )
         _logger.info(
-            "[CONVERGE] round %d — compaction xfers=%d | refill P1=%d P2=%d P3=%d → %s",
+            "[CONVERGE] round %d — compaction xfers=%d | orphan rehomed=%d (+%d pools) "
+            "| refill P1=%d P2=%d P3=%d → %s",
             rounds,
             m["transfers"],
+            orphan_summary["rehomed"], orphan_summary["new_pools"],
             refill["phase1_assigned"],
             refill["phase2_pools_count"],
             refill["phase3_transfers"],
@@ -1168,6 +1380,10 @@ def run_merger_refill_converge(
         "refill":        refill,
         "partial_pools": partial_pools,
         "paused_remainders": paused_remainders,
+        # SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Q3 (Jun-23): expose orphan-rehome totals from the converge loop.
+        "orphans_rehomed":      tot_rehomed,
+        "orphan_rehome_pools":  tot_orphan_pools,
     }
 
 

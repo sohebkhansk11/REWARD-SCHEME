@@ -3075,6 +3075,31 @@ def manual_sim_stop(db: Session = Depends(get_db)):
     return manual_sim.stop_session(db)
 
 
+class ManualSimLinkRequest(BaseModel):
+    link_global: bool = Field(
+        ...,
+        description="When true, the frontend mirrors the global watch to the "
+                    "simulated instant while a session is live. The simulated "
+                    "clock itself stays request-scoped regardless.",
+    )
+
+
+@router.post("/manual-sim/link")
+def manual_sim_link(body: ManualSimLinkRequest, db: Session = Depends(get_db)):
+    """
+    Toggle the global-watch link on the active Time Machine session.
+
+    Display/intent switch only — the simulated write-clock is always installed
+    just for the duration of an action request and never held open, so concurrent
+    real traffic is never exposed to simulated time.  409 if no session is active.
+    """
+    from app.services import manual_sim
+    try:
+        return manual_sim.set_link(db, body.link_global)
+    except manual_sim.ManualSimError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
 # ── Per-event actions (Phase 3) ──────────────────────────────────────────────
 # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
 # Each action runs the SAME production service the live app / RealSimEngine call,
@@ -3133,6 +3158,7 @@ def _manual_sim_run(db: Session, action_key: str, runner):
         raise HTTPException(status_code=409, detail=str(exc))
 
     sim_now = manual_sim.sim_now(db)
+    cur_event = manual_sim.current_event(db)
     try:
         with manual_sim.manual_clock(sim_now):
             result = runner(manual_sim, sim_now)
@@ -3146,6 +3172,20 @@ def _manual_sim_run(db: Session, action_key: str, runner):
             pass
         _logger_sim.error("manual-sim action '%s' FAILED: %s", action_key, exc)
         raise HTTPException(status_code=400, detail=f"{action_key} failed: {exc}")
+
+    # Always-on audit + sliding TTL (post-commit so a failed action leaves no trail
+    # and never extends the session).
+    try:
+        st = manual_sim.load_state(db) or {}
+        manual_sim._audit(
+            db, f"action:{action_key}", event=cur_event,
+            cycle_num=st.get("cycle_num"), sim_now=sim_now,
+            payload=(result if isinstance(result, dict) else None),
+            message=f"{action_key} @ {cur_event}",
+        )
+        manual_sim.touch_session(db)
+    except Exception:
+        pass
 
     return {
         "action": action_key,

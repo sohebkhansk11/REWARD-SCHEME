@@ -254,6 +254,54 @@ def clear_state(db: Session) -> None:
         db.commit()
 
 
+# ── Always-on audit trail (independent of the Forensic Debugger toggle) ───────
+def _audit(
+    db: Session,
+    event_type: str,
+    *,
+    event: Optional[str] = None,
+    cycle_num: Optional[int] = None,
+    sim_now: Optional[datetime] = None,
+    payload: Optional[dict] = None,
+    severity: str = "info",
+    message: Optional[str] = None,
+) -> None:
+    """Append one immutable ForensicEvent row for a Time-Machine operation.
+
+    Manual time-travel mutates REAL (dev-DB) money state, so every start / stop /
+    jump / link-toggle / action must leave an append-only audit trail REGARDLESS
+    of whether the Forensic Debugger capture toggle is on (forensic.record() is a
+    no-op when off).  We therefore write the row directly, tagged run_id
+    "manual_sim" and tick "MANUAL/<event>" so it is trivially filterable and never
+    confused with a stress-test capture.
+
+    Failure-isolated: an audit hiccup must never break the operation it records.
+    """
+    try:
+        from app.models.forensic_event import ForensicEvent
+        row = ForensicEvent(
+            run_id="manual_sim",
+            week_id=(int(cycle_num) if cycle_num is not None else None),
+            tick=(f"MANUAL/{event}" if event else "MANUAL"),
+            category="SYSTEM",
+            event_type=str(event_type)[:48],
+            severity=str(severity)[:12],
+            actor="dev:manual_sim",
+            entity_type="session",
+            entity_ref=(sim_now.strftime("%a %d %b %H:%M") if sim_now else None),
+            payload_json=(json.dumps(payload, default=str)[:4096] if payload else None),
+            message=(str(message or event_type)[:512]),
+        )
+        db.add(row)
+        db.commit()
+    except Exception as exc:        # audit must never break the operation
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _logger.debug("manual_sim audit swallowed: %s", exc)
+
+
 # ── Request-scoped time-travel context ───────────────────────────────────────
 def manual_clock(sim_now: datetime) -> ChronosEngine:
     """Return a request-scoped ``ChronosEngine`` pinned to ``sim_now``.
@@ -345,6 +393,12 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
     cur     = st["current_event"]
     ms      = _compute_milestones(db, t00h)
 
+    # TTL countdown for the red "Time Machine is LIVE" banner — seconds until the
+    # session auto-expires (never negative; 0 means it is about to revert).
+    ttl_remaining = None
+    if exp:
+        ttl_remaining = max(0, int((_parse(exp) - datetime.now(timezone.utc)).total_seconds()))
+
     events: list[dict] = []
     for name, dt in _ordered_milestones(ms):
         meta = EVENT_META[name]
@@ -377,6 +431,8 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
         "cycle_t00h":          _iso(t00h),
         "created_at":          st.get("created_at"),
         "expires_at":          st.get("expires_at"),
+        "ttl_hours":           st.get("ttl_hours", _DEFAULT_TTL_HOURS),
+        "ttl_remaining_seconds": ttl_remaining,
     }
     if include_snapshot:
         out["snapshot"] = _snapshot(db)
@@ -414,6 +470,7 @@ def start_session(
     # never collide when "inject users" is triggered repeatedly.
     inject_prefix = ("msim" + uuid.uuid4().hex[:4])[:8].ljust(8, "0")
 
+    ttl = max(1, int(ttl_hours))
     state = {
         "active":         True,
         "sim_now":        _iso(ms.CYCLE_START),
@@ -424,19 +481,25 @@ def start_session(
         "inject_prefix":  inject_prefix,
         "inject_counter": 0,
         "settlement":     dict(_DEFAULT_SETTLEMENT),
+        "ttl_hours":      ttl,
         "created_at":     _iso(now),
-        "expires_at":     _iso(now + timedelta(hours=max(1, int(ttl_hours)))),
+        "expires_at":     _iso(now + timedelta(hours=ttl)),
     }
     save_state(db, state)
     _logger.info(
         "manual_sim: session started — anchor=%s cycle_start=%s link_global=%s ttl=%dh",
-        _iso(t00h), _iso(ms.CYCLE_START), bool(link_global), ttl_hours,
+        _iso(t00h), _iso(ms.CYCLE_START), bool(link_global), ttl,
     )
+    _audit(db, "session_started", event="CYCLE_START", cycle_num=1,
+           sim_now=ms.CYCLE_START,
+           payload={"anchor": _iso(t00h), "link_global": bool(link_global), "ttl_hours": ttl},
+           message=f"Time Machine started — anchor {_iso(t00h)}, link={bool(link_global)}")
     return compute_state(db)
 
 
 def stop_session(db: Session) -> dict:
     """Tear down the manual-sim session and guarantee no clock is left installed."""
+    prev = load_state(db)
     clear_state(db)
     # Defensive: should never be installed between requests, but never leave a
     # simulated write-clock live after an explicit stop.
@@ -446,7 +509,45 @@ def stop_session(db: Session) -> dict:
     except Exception:
         pass
     _logger.info("manual_sim: session stopped — clock uninstalled")
+    if prev and prev.get("active"):
+        _audit(db, "session_stopped", event=prev.get("current_event"),
+               cycle_num=prev.get("cycle_num"),
+               message="Time Machine stopped — clock uninstalled")
     return {"active": False, "stopped": True, "dev_mode": _dev_mode_enabled()}
+
+
+def touch_session(db: Session) -> None:
+    """Slide the session's TTL forward by its original window on activity.
+
+    A session that is being actively driven (jumps / actions) must not expire
+    mid-work, yet a forgotten session must still revert.  Each operation pushes
+    ``expires_at`` to ``now + ttl_hours`` — so the safety timer measures IDLE time,
+    not total session age.  No-op if there is no active session.
+    """
+    st = load_state(db)
+    if not st or not st.get("active"):
+        return
+    ttl = max(1, int(st.get("ttl_hours", _DEFAULT_TTL_HOURS)))
+    st["expires_at"] = _iso(datetime.now(timezone.utc) + timedelta(hours=ttl))
+    save_state(db, st)
+
+
+def set_link(db: Session, link_global: bool) -> dict:
+    """Toggle whether the global watch is linked to the simulation watch.
+
+    The simulated clock is always request-scoped (installed only inside an action
+    request and never held open), so this flag is a DISPLAY/intent switch: when on,
+    the frontend mirrors the global watch to the simulated instant while a session
+    is live.  Requires an active session.
+    """
+    st = _require_active(db)
+    st["link_global"] = bool(link_global)
+    save_state(db, st)
+    _audit(db, "link_toggled", event=st.get("current_event"),
+           cycle_num=st.get("cycle_num"),
+           payload={"link_global": bool(link_global)},
+           message=f"Global-watch link {'ON' if link_global else 'OFF'}")
+    return compute_state(db)
 
 
 # ── Jump engine (event-state machine) ────────────────────────────────────────
@@ -487,6 +588,7 @@ def jump_next(db: Session) -> dict:
         nxt = EVENT_SPINE[idx + 1]
         st["current_event"] = nxt
         st["sim_now"] = _iso(getattr(ms, nxt))
+        rolled = False
     else:
         next_t00h = ms.T_00H + ms.cycle_length
         nms = _compute_milestones(db, next_t00h)
@@ -494,8 +596,16 @@ def jump_next(db: Session) -> dict:
         st["cycle_num"]     = int(st.get("cycle_num", 1)) + 1
         st["current_event"] = "DUE_DATE"
         st["sim_now"]       = _iso(nms.DUE_DATE)
+        rolled = True
 
+    ttl = max(1, int(st.get("ttl_hours", _DEFAULT_TTL_HOURS)))
+    st["expires_at"] = _iso(datetime.now(timezone.utc) + timedelta(hours=ttl))
     save_state(db, st)
+    _audit(db, "rollover" if rolled else "jump_next",
+           event=st["current_event"], cycle_num=st["cycle_num"],
+           sim_now=_parse(st["sim_now"]),
+           message=("rolled into cycle %d → %s" % (st["cycle_num"], st["current_event"]))
+                   if rolled else ("jumped to %s" % st["current_event"]))
     return compute_state(db)
 
 
@@ -525,7 +635,11 @@ def jump_to(db: Session, event: str) -> dict:
     ms   = _compute_milestones(db, t00h)
     st["current_event"] = event
     st["sim_now"] = _iso(getattr(ms, event))
+    ttl = max(1, int(st.get("ttl_hours", _DEFAULT_TTL_HOURS)))
+    st["expires_at"] = _iso(datetime.now(timezone.utc) + timedelta(hours=ttl))
     save_state(db, st)
+    _audit(db, "jump_to", event=event, cycle_num=st.get("cycle_num"),
+           sim_now=_parse(st["sim_now"]), message=f"jumped to {event}")
     return compute_state(db)
 
 

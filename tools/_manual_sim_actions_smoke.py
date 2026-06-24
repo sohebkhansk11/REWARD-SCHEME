@@ -105,12 +105,38 @@ try:
     check("cleanup ran", "cleanup" in out["result"])
     print("   cleanup result:", out["result"])
 
+    print("\n== Phase 4: link toggle / TTL / forensic audit ==")
+    state_now = manual_sim.compute_state(db)
+    check("ttl_remaining surfaced", isinstance(state_now.get("ttl_remaining_seconds"), int)
+          and state_now["ttl_remaining_seconds"] > 0)
+    check("ttl_hours surfaced", state_now.get("ttl_hours") == 6)
+
+    out = dev.manual_sim_link(dev.ManualSimLinkRequest(link_global=True), db)
+    check("link toggled ON", out["link_global"] is True)
+    out = dev.manual_sim_link(dev.ManualSimLinkRequest(link_global=False), db)
+    check("link toggled OFF", out["link_global"] is False)
+
+    from app.models.forensic_event import ForensicEvent
+    audit_n = db.query(ForensicEvent).filter(ForensicEvent.run_id == "manual_sim").count()
+    action_n = db.query(ForensicEvent).filter(
+        ForensicEvent.run_id == "manual_sim",
+        ForensicEvent.event_type.like("action:%"),
+    ).count()
+    check("forensic audit rows written", audit_n > 0)
+    check("per-action audit rows written", action_n >= 5)
+    print(f"   audit rows: total={audit_n}  action={action_n}")
+
     print("\n== rollover then stop ==")
     st = manual_sim.jump_next(db)            # T_05M -> next cycle DUE_DATE
     check("rolled into cycle 2", st["cycle_num"] == 2 and st["current_event"] == "DUE_DATE")
     manual_sim.stop_session(db)
     from app.core import sim_clock
     check("no clock installed after stop", sim_clock.is_simulated() is False)
+    stop_audit = db.query(ForensicEvent).filter(
+        ForensicEvent.run_id == "manual_sim",
+        ForensicEvent.event_type == "session_stopped",
+    ).count()
+    check("stop audited", stop_audit == 1)
 
 finally:
     db.close()

@@ -39,6 +39,9 @@ import {
   // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
   getForensicStatus, toggleForensic, getForensicEvents, getForensicSummary,
   exportForensicEvents, clearForensicEvents,
+  // SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  manualSimStart, manualSimState, manualSimJumpNext, manualSimJumpTo,
+  manualSimStop, manualSimLink, manualSimAction,
 } from '../api/client'
 import { useToast } from '../context/ToastContext'
 
@@ -2614,6 +2617,336 @@ function ForensicTab({ toast }) {
 }
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TAB 5 — TIME MACHINE (Manual Event-Timeline Simulator)
+// SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// Event-to-event time travel.  The watch shows the simulated day + date + time;
+// jumping to an event activates exactly that event's real actions; every action
+// runs a production service at the simulated instant (backend manual_clock).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Frontend presentation for each event's actions.  `ep` is the backend route key
+// (/dev/manual-sim/action/<ep>); `fields` drive the inline inputs.  The action
+// LIST itself always comes from the backend (state.available_actions) so the panel
+// can never offer something the server would reject.
+const MS_EVENT_ICONS = {
+  CYCLE_START: Play, DUE_DATE: IndianRupee, GRACE_PERIOD_START: Shuffle,
+  G_CLOSE: Skull, T_02H: Settings, T_00H: Trophy, T_05M: RefreshCw,
+}
+const MS_ACTIONS = {
+  inject_users:          { ep:'inject',  label:'Inject users', icon:UserPlus, accent:'cyan',
+    fields:[{k:'count',label:'Count',def:24,step:1},{k:'organic_ratio',label:'Organic ratio',def:0.6,step:0.1}] },
+  pay_all_installments:  { ep:'pay-all', label:'Pay all installments', icon:IndianRupee, accent:'emerald' },
+  set_late_pct:          { ep:'set-late', label:'Set late %', icon:AlertTriangle, accent:'amber',
+    fields:[{k:'late_pct',label:'Late %',def:15,step:1}] },
+  pay_remaining:         { ep:'pay-remaining', label:'Pay remaining', icon:CheckCircle2, accent:'emerald' },
+  grace_settlement:      { ep:'grace-settle', label:'Run grace settlement', icon:Shuffle, accent:'purple',
+    fields:[{k:'late_pct',label:'Late % (blank=use set)',step:1},{k:'elim_pct_a',label:'Eliminate % (A)',def:80,step:1},{k:'grace_pct_c',label:'Grace-pay % (C)',def:15,step:1}] },
+  finalize_eliminations: { ep:'finalize-eliminations', label:'Confirm guillotine (read-only)', icon:Skull, accent:'red' },
+  prepare_draw:          { ep:'prepare-draw', label:'Prepare draw (−2h)', icon:Settings, accent:'blue' },
+  execute_draw:          { ep:'execute-draw', label:'Execute draw', icon:Trophy, accent:'purple' },
+  run_cleanup:           { ep:'cleanup', label:'Run cleanup (+5m)', icon:RefreshCw, accent:'slate' },
+}
+
+const _btnAccent = {
+  cyan:'bg-cyan-700 hover:bg-cyan-600', emerald:'bg-emerald-700 hover:bg-emerald-600',
+  amber:'bg-amber-700 hover:bg-amber-600', purple:'bg-purple-700 hover:bg-purple-600',
+  red:'bg-red-800 hover:bg-red-700', blue:'bg-blue-700 hover:bg-blue-600',
+  slate:'bg-slate-700 hover:bg-slate-600',
+}
+
+function MsCountdown({ seconds }) {
+  if (seconds == null) return null
+  const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = seconds % 60
+  const txt = h > 0 ? `${h}h ${String(m).padStart(2,'0')}m` : `${m}m ${String(s).padStart(2,'0')}s`
+  return <span className="tabular-nums">{txt}</span>
+}
+
+function TimeMachineTab({ toast }) {
+  const [state, setState]       = useState({ active: false })
+  const [busy, setBusy]         = useState(null)        // action key currently running
+  const [last, setLast]         = useState(null)        // { action, result }
+  const [inputs, setInputs]     = useState({})          // action field values
+  const [ttlLocal, setTtlLocal] = useState(null)        // smooth per-second TTL display
+  // start-form
+  const [anchor, setAnchor]     = useState('')
+  const [linkOnStart, setLink]  = useState(true)
+  const [ttlHours, setTtlHours] = useState(6)
+
+  const active = state?.active === true
+
+  const handleErr = useCallback((e, what) => {
+    const sc = e?.response?.status
+    const detail = e?.response?.data?.detail || e?.message || 'unknown error'
+    if (sc === 403)      toast('ENABLE_DEV_MODE is false on the server', 'error')
+    else if (sc === 409) toast(detail, 'info')
+    else                 toast(`${what} failed: ${detail}`, 'error')
+  }, [toast])
+
+  const refresh = useCallback(async () => {
+    try { const { data } = await manualSimState(); setState(data); if (data?.ttl_remaining_seconds != null) setTtlLocal(data.ttl_remaining_seconds) }
+    catch (e) { if (e?.response?.status === 403) setState({ active:false, dev_mode:false }) }
+  }, [])
+
+  useEffect(() => { refresh() }, [refresh])
+
+  // Poll state every 6s while active (keeps snapshot + TTL fresh across jumps).
+  useEffect(() => {
+    if (!active) return
+    const id = setInterval(refresh, 6_000)
+    return () => clearInterval(id)
+  }, [active, refresh])
+
+  // Smooth 1s TTL countdown between polls.
+  useEffect(() => {
+    if (!active || ttlLocal == null) return
+    const id = setInterval(() => setTtlLocal(v => (v == null ? v : Math.max(0, v - 1))), 1_000)
+    return () => clearInterval(id)
+  }, [active, ttlLocal])
+
+  const setField = (k, v) => setInputs(p => ({ ...p, [k]: v }))
+
+  const buildBody = (actionKey) => {
+    const reg = MS_ACTIONS[actionKey]
+    if (!reg?.fields) return undefined
+    const body = {}
+    for (const f of reg.fields) {
+      const raw = inputs[f.k] ?? f.def
+      if (raw !== '' && raw != null) body[f.k] = Number(raw)
+    }
+    return body
+  }
+
+  const start = async () => {
+    setBusy('__start')
+    try {
+      const params = { link_global: linkOnStart, ttl_hours: Number(ttlHours) || 6 }
+      if (anchor.trim()) params.draw_anchor = anchor.trim()
+      const { data } = await manualSimStart(params)
+      setState(data); setTtlLocal(data?.ttl_remaining_seconds ?? null); setLast(null)
+      toast('Time Machine started', 'success')
+    } catch (e) { handleErr(e, 'Start') } finally { setBusy(null) }
+  }
+
+  const stop = async () => {
+    setBusy('__stop')
+    try { await manualSimStop(); setState({ active:false }); setLast(null); toast('Time Machine stopped', 'info') }
+    catch (e) { handleErr(e, 'Stop') } finally { setBusy(null) }
+  }
+
+  const jumpNext = async () => {
+    setBusy('__next')
+    try { const { data } = await manualSimJumpNext(); setState(data); setTtlLocal(data?.ttl_remaining_seconds ?? null) }
+    catch (e) { handleErr(e, 'Jump next') } finally { setBusy(null) }
+  }
+
+  const jumpTo = async (event) => {
+    setBusy('__to:' + event)
+    try { const { data } = await manualSimJumpTo(event); setState(data); setTtlLocal(data?.ttl_remaining_seconds ?? null) }
+    catch (e) { handleErr(e, 'Jump to ' + event) } finally { setBusy(null) }
+  }
+
+  const toggleLink = async (v) => {
+    try { const { data } = await manualSimLink(v); setState(data) }
+    catch (e) { handleErr(e, 'Link toggle') }
+  }
+
+  const runAction = async (actionKey) => {
+    const reg = MS_ACTIONS[actionKey]
+    if (!reg) return
+    setBusy(actionKey)
+    try {
+      const { data } = await manualSimAction(reg.ep, buildBody(actionKey))
+      setState(data.state); setTtlLocal(data.state?.ttl_remaining_seconds ?? null)
+      setLast({ action: data.action, result: data.result })
+      toast(`${reg.label} ✓`, 'success')
+    } catch (e) { handleErr(e, reg.label) } finally { setBusy(null) }
+  }
+
+  const snap = state?.snapshot
+  const curMeta = active ? (state.current_event_meta || {}) : {}
+  const avail = active ? (state.available_actions || []) : []
+
+  return (
+    <div className="space-y-4">
+
+      {/* ── Red LIVE banner ─────────────────────────────────────────────────── */}
+      {active && (
+        <div className="bg-gradient-to-r from-red-900 via-red-950 to-slate-950 border-2 border-red-700/70 rounded-2xl px-5 py-3 flex items-center gap-3 shadow-lg shadow-red-950/40">
+          <span className="w-2.5 h-2.5 rounded-full bg-red-400 animate-pulse block flex-shrink-0" />
+          <span className="text-sm font-extrabold text-red-100 tracking-wide">TIME MACHINE IS LIVE</span>
+          <span className="text-xs text-red-300/80">simulated clock · dev DB only · production untouched</span>
+          <div className="ml-auto flex items-center gap-3 text-xs">
+            <span className="text-red-300/80">auto-revert in <span className="font-bold text-red-200"><MsCountdown seconds={ttlLocal} /></span></span>
+          </div>
+        </div>
+      )}
+
+      {/* ── The Watch ───────────────────────────────────────────────────────── */}
+      <DevCard icon={Clock} iconBg="bg-violet-950" iconColor="text-violet-400"
+               title="Simulation Watch" subtitle="event-to-event time travel on the dev database">
+        {active ? (
+          <div className="space-y-5">
+            <div className="flex flex-col sm:flex-row sm:items-end gap-4 sm:gap-8">
+              <div>
+                <p className="text-[11px] font-bold uppercase tracking-[0.2em] text-violet-400/80">{state.day_of_week}</p>
+                <p className="text-4xl font-black tabular-nums text-slate-100 leading-tight mt-1">{state.time_str}</p>
+                <p className="text-sm text-slate-400 mt-0.5">{state.date_str} · UTC</p>
+              </div>
+              <div className="flex items-center gap-4 sm:ml-auto">
+                <div className="text-center px-3">
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wider">Cycle</p>
+                  <p className="text-xl font-black text-cyan-300 tabular-nums">{state.cycle_num}</p>
+                </div>
+                <div className="text-center px-3 border-l border-slate-700">
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wider">Event</p>
+                  <p className="text-sm font-bold text-violet-300">{curMeta.label || state.current_event}</p>
+                </div>
+                <div className="flex items-center gap-2 pl-3 border-l border-slate-700">
+                  <Radio className={`w-4 h-4 ${state.link_global ? 'text-emerald-400' : 'text-slate-600'}`} />
+                  <span className="text-xs text-slate-400">Link watch</span>
+                  <Toggle checked={!!state.link_global} onChange={toggleLink} label="Link global watch" />
+                </div>
+              </div>
+            </div>
+            {curMeta.note && <p className="text-xs text-slate-500 italic">— {curMeta.note}</p>}
+
+            {/* controls */}
+            <div className="flex flex-wrap items-center gap-2.5">
+              <button onClick={jumpNext} disabled={!!busy}
+                className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-violet-700 hover:bg-violet-600 text-white text-sm font-semibold disabled:opacity-40 transition-colors">
+                {busy === '__next' ? <Spinner className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />} Jump to next event
+              </button>
+              <button onClick={stop} disabled={!!busy}
+                className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-red-900/60 text-slate-300 hover:text-red-200 text-sm font-semibold border border-slate-700 hover:border-red-800 disabled:opacity-40 transition-colors">
+                {busy === '__stop' ? <Spinner className="w-4 h-4" /> : <XCircle className="w-4 h-4" />} Stop & revert
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <InfoBanner accent="blue" text="Start a session to anchor cycle 1's draw. The clock opens at that cycle's CYCLE_START; jump event→event to activate each instant's real actions. All synthetic users are dev-prefixed (msim…); production DB is never touched." />
+            <div className="grid sm:grid-cols-3 gap-3">
+              <DevInput label="Draw anchor (T_00H)" hint="ISO · optional" placeholder="next Sunday 00:00 UTC"
+                value={anchor} onChange={e => setAnchor(e.target.value)} />
+              <DevInput label="TTL (hours)" type="number" min="1" max="72"
+                value={ttlHours} onChange={e => setTtlHours(e.target.value)} />
+              <div className="flex items-end gap-3 pb-1">
+                <div className="flex items-center gap-2">
+                  <Toggle checked={linkOnStart} onChange={setLink} label="Link global watch on start" />
+                  <span className="text-xs text-slate-400">Link global watch</span>
+                </div>
+              </div>
+            </div>
+            <button onClick={start} disabled={!!busy}
+              className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-violet-700 hover:bg-violet-600 text-white text-sm font-bold disabled:opacity-40 transition-colors">
+              {busy === '__start' ? <Spinner className="w-4 h-4" /> : <Play className="w-4 h-4" />} Start Time Machine
+            </button>
+          </div>
+        )}
+      </DevCard>
+
+      {/* ── Event timeline ──────────────────────────────────────────────────── */}
+      {active && (
+        <DevCard icon={CalendarDays} iconBg="bg-cyan-950" iconColor="text-cyan-400"
+                 title="Event timeline" subtitle="click a future event to jump forward · time only moves forward">
+          <div className="flex items-stretch gap-1 overflow-x-auto pb-1">
+            {(state.events || []).map((ev, i) => {
+              const Icon = MS_EVENT_ICONS[ev.name] || Clock
+              const t = ev.iso ? new Date(ev.iso).toISOString().slice(11, 16) : ''
+              const clickable = !ev.is_current && !ev.is_past
+              return (
+                <Fragment key={ev.name}>
+                  {i > 0 && <div className={`flex-shrink-0 self-center w-4 h-px ${ev.is_past || ev.is_current ? 'bg-violet-700' : 'bg-slate-700'}`} />}
+                  <button
+                    disabled={!clickable || !!busy}
+                    onClick={() => clickable && jumpTo(ev.name)}
+                    title={ev.note}
+                    className={`flex-1 min-w-[92px] flex flex-col items-center gap-1.5 px-2 py-3 rounded-xl border transition-all ${
+                      ev.is_current
+                        ? 'bg-violet-700/30 border-violet-500 ring-2 ring-violet-500/40'
+                        : ev.is_past
+                          ? 'bg-slate-800/40 border-slate-700/60 opacity-60'
+                          : 'bg-slate-800/70 border-slate-700 hover:border-cyan-600 hover:bg-cyan-950/30 cursor-pointer'
+                    } ${(!clickable || busy) ? 'cursor-default' : ''}`}
+                  >
+                    <div className={`p-1.5 rounded-lg ${ev.is_current ? 'bg-violet-600' : ev.is_past ? 'bg-slate-700' : 'bg-slate-700'}`}>
+                      {busy === '__to:' + ev.name ? <Spinner className="w-3.5 h-3.5" /> : <Icon className={`w-3.5 h-3.5 ${ev.is_current ? 'text-white' : ev.is_past ? 'text-emerald-400' : 'text-slate-300'}`} />}
+                    </div>
+                    <span className={`text-[10px] font-bold text-center leading-tight ${ev.is_current ? 'text-violet-200' : 'text-slate-400'}`}>{ev.short}</span>
+                    <span className="text-[9px] tabular-nums text-slate-500">{t}</span>
+                  </button>
+                </Fragment>
+              )
+            })}
+          </div>
+        </DevCard>
+      )}
+
+      {/* ── Action panel for the current event ──────────────────────────────── */}
+      {active && (
+        <DevCard icon={Zap} iconBg="bg-amber-950" iconColor="text-amber-400"
+                 title={`Actions — ${curMeta.label || state.current_event}`}
+                 subtitle="each runs a real production service at the simulated instant">
+          <div className="space-y-3">
+            {avail.map(key => {
+              const reg = MS_ACTIONS[key]
+              if (!reg) return null
+              const Icon = reg.icon
+              return (
+                <div key={key} className="flex flex-wrap items-end gap-3 bg-slate-800/40 border border-slate-700/50 rounded-xl p-3">
+                  {(reg.fields || []).map(f => (
+                    <div key={f.k} className="w-32">
+                      <label className="block text-[11px] text-slate-400 font-medium mb-1">{f.label}</label>
+                      <input
+                        type="number" step={f.step ?? 1}
+                        value={inputs[f.k] ?? (f.def ?? '')}
+                        onChange={e => setField(f.k, e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-violet-600"
+                      />
+                    </div>
+                  ))}
+                  <button onClick={() => runAction(key)} disabled={!!busy}
+                    className={`flex items-center gap-2 px-4 py-2 rounded-lg ${_btnAccent[reg.accent] || _btnAccent.slate} text-white text-sm font-semibold disabled:opacity-40 transition-colors ml-auto`}>
+                    {busy === key ? <Spinner className="w-4 h-4" /> : <Icon className="w-4 h-4" />} {reg.label}
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        </DevCard>
+      )}
+
+      {/* ── Snapshot + last result ──────────────────────────────────────────── */}
+      {active && snap && (
+        <DevCard icon={Database} iconBg="bg-emerald-950" iconColor="text-emerald-400"
+                 title="Live snapshot" subtitle="real dev-DB counts at the simulated instant">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
+            <StatPill label="Live members" value={NUM(snap.live_members)} accent="emerald" />
+            <StatPill label="Waitlist"     value={NUM(snap.waitlist)}     accent="cyan" />
+            <StatPill label="Paid on time" value={NUM(snap.paid_on_time)} accent="blue" />
+            <StatPill label="Unpaid"       value={NUM(snap.unpaid)}       accent="amber" />
+            <StatPill label="Pools active" value={NUM(snap.pools_active)} accent="purple" />
+            <StatPill label="Pools paused" value={NUM(snap.pools_paused)} accent="rose" />
+          </div>
+
+          {last && (
+            <ResultBox>
+              <p className="text-xs text-slate-400 mb-2">
+                Last action: <code className="text-violet-300 font-bold">{last.action}</code>
+              </p>
+              <pre className="text-[11px] font-mono text-slate-300 bg-slate-950/70 border border-slate-800 rounded-xl p-3 overflow-x-auto max-h-60">
+{JSON.stringify(last.result, null, 2)}
+              </pre>
+            </ResultBox>
+          )}
+        </DevCard>
+      )}
+    </div>
+  )
+}
+
+
 const TABS = [
   { id:0, icon:FlaskConical, label:'Stress Test',  short:'Stress'  },
   { id:1, icon:Zap,          label:'Draw Control', short:'Draw'    },
@@ -2621,6 +2954,8 @@ const TABS = [
   { id:3, icon:Skull,        label:'Danger Zone',  short:'Danger', danger:true },
   // SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]:
   { id:4, icon:ScrollText,   label:'Forensic',     short:'Forensic' },
+  // SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  { id:5, icon:Clock,        label:'Time Machine', short:'Time'   },
 ]
 
 function TabNav({ active, setActive }) {
@@ -2820,6 +3155,8 @@ export default function DevTools() {
           {tab===3&&<DangerTab      toast={toast}/>}
           {/* SESSION EDIT [Claude Session Jun-16 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
           {tab===4&&<ForensicTab    toast={toast}/>}
+          {/* SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
+          {tab===5&&<TimeMachineTab toast={toast}/>}
         </div>
 
         <div className="h-8"/>

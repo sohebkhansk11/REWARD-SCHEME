@@ -671,6 +671,43 @@ export const exportForensicEvents = (format = 'csv', filters = {}) =>
 export const clearForensicEvents = (runId = undefined) =>
   api.delete('/dev/forensic/events', { params: runId ? { run_id: runId } : {} })
 
+// SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// ── Manual Event-Timeline Simulator — "Time Machine" (/dev/manual-sim/*) ──────
+// Event-to-event time travel on the dev DB.  The simulated clock is request-scoped
+// on the backend; every action wraps a real production service at the simulated
+// instant.  All routes are 403 in production (require_dev_mode).
+
+/** POST /dev/manual-sim/start — { draw_anchor?, link_global?, ttl_hours? } */
+export const manualSimStart = (params = {}) =>
+  api.post('/dev/manual-sim/start', params)
+
+/** GET /dev/manual-sim/state — full Time Machine view (watch / timeline / actions) */
+export const manualSimState = () =>
+  api.get('/dev/manual-sim/state')
+
+/** POST /dev/manual-sim/jump-next — advance the clock to the next event */
+export const manualSimJumpNext = () =>
+  api.post('/dev/manual-sim/jump-next')
+
+/** POST /dev/manual-sim/jump-to — { event } — forward-only jump within the cycle */
+export const manualSimJumpTo = (event) =>
+  api.post('/dev/manual-sim/jump-to', { event })
+
+/** POST /dev/manual-sim/stop — tear down the session, uninstall any sim clock */
+export const manualSimStop = () =>
+  api.post('/dev/manual-sim/stop')
+
+/** POST /dev/manual-sim/link — { link_global } — toggle the global-watch link */
+export const manualSimLink = (linkGlobal) =>
+  api.post('/dev/manual-sim/link', { link_global: linkGlobal })
+
+/** POST /dev/manual-sim/action/<key> — run an event's action at the sim instant.
+ *  key ∈ inject | pay-all | set-late | pay-remaining | grace-settle |
+ *        finalize-eliminations | prepare-draw | execute-draw | cleanup
+ *  body varies by action (e.g. inject → {count, organic_ratio}). */
+export const manualSimAction = (key, body = undefined) =>
+  api.post(`/dev/manual-sim/action/${key}`, body, { timeout: 120_000 })
+
 // ── Auth (no JWT needed for these calls) ──────────────────────────────────────
 export const adminLogin     = (username, password) =>
   api.post('/admin/auth/login',      { username, password })

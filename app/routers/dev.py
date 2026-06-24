@@ -3141,12 +3141,15 @@ def _manual_sim_run(db: Session, action_key: str, runner):
 
     1. Enforce the dev-mode gate and the event→action guard.
     2. Resolve the simulated instant from the persisted session.
-    3. Run ``runner(manual_sim, sim_now)`` INSIDE manual_clock(sim_now) so the
-       production service it calls reads + writes the simulated time.
-    4. Commit, then return ``{action, result, state}`` (fresh full Time Machine
-       state so the panel re-renders the watch, timeline and snapshot in one round
-       trip).  On any service failure the transaction is rolled back (no partial
-       money mutation) and surfaced as HTTP 400.
+    3. Run ``runner(manual_sim, sim_now, chronos)`` INSIDE manual_clock(sim_now) so
+       the production service it calls reads + writes the simulated time.  The live
+       ``ChronosEngine`` is handed to the runner so an injector can distribute users
+       across random simulated instants (chronos.jump_to per user).
+    4. Record the action for event-driven gating (post-commit), then return
+       ``{action, result, state}`` (fresh full Time Machine state so the panel
+       re-renders the watch, timeline, gating and snapshot in one round trip).  On
+       any service failure the transaction is rolled back (no partial money
+       mutation) and surfaced as HTTP 400.
     """
     from app.services import manual_sim
 
@@ -3160,8 +3163,8 @@ def _manual_sim_run(db: Session, action_key: str, runner):
     sim_now = manual_sim.sim_now(db)
     cur_event = manual_sim.current_event(db)
     try:
-        with manual_sim.manual_clock(sim_now):
-            result = runner(manual_sim, sim_now)
+        with manual_sim.manual_clock(sim_now) as chronos:
+            result = runner(manual_sim, sim_now, chronos)
         db.commit()
     except HTTPException:
         raise
@@ -3172,6 +3175,15 @@ def _manual_sim_run(db: Session, action_key: str, runner):
             pass
         _logger_sim.error("manual-sim action '%s' FAILED: %s", action_key, exc)
         raise HTTPException(status_code=400, detail=f"{action_key} failed: {exc}")
+
+    # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Record completion for the event-driven HARD-BLOCK gate + dim locks.  Done
+    # post-commit so a failed/rolled-back action records nothing — the gate only
+    # opens for work that actually landed.
+    try:
+        manual_sim.record_action(db, action_key)
+    except Exception:
+        pass
 
     # Always-on audit + sliding TTL (post-commit so a failed action leaves no trail
     # and never extends the session).
@@ -3197,38 +3209,60 @@ def _manual_sim_run(db: Session, action_key: str, runner):
 @router.post("/manual-sim/action/inject")
 def manual_sim_action_inject(body: ManualSimInjectRequest, db: Session = Depends(get_db)):
     """
-    Inject synthetic users at the simulated instant (available at EVERY event).
+    Inject synthetic users at RANDOM simulated instants within the current event's
+    own calendar day (available at EVERY event).
 
-    Re-uses the production MassLoadInjector + the exact pool-formation pipeline the
-    live injection path uses (fill vacancies → form full pools → lock-gated merger
-    convergence).  Pool formation runs synchronously here — Time-Machine batches are
-    developer-driven and small — but is the SAME code as the background path.
+    SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    Production-fidelity rewrite (requirements #4, #5, #6):
+      • TIME — uses the production ``inject_distributed`` so each user joins at a
+        distinct, randomly-generated time-of-day (strictly ascending; chronos jumps
+        to each instant before the row is written).  The DATE is NEVER overridden —
+        the window is [sim_now, end of the event's own day | next event, whichever
+        is sooner] (manual_sim.inject_window).
+      • POOLS — NO override.  Pool formation runs ONLY through the production
+        ``assign_waitlist_to_pools`` (via fill_pool_vacancies) + the lock-gated
+        injection-time merger convergence — the SAME gate the live signup path
+        uses.  The previous ``manual_create_pool`` force-drain loop (which created
+        full pools regardless of the AI-reserve threshold — the "waitlist instant
+        drained → new pool" the developer observed) has been REMOVED, so the
+        simulator now shows true production behaviour: the waitlist accumulates and
+        a full pool forms only when the threshold/reserve gate actually passes.
     """
     from app.services.real_simulation import MassLoadInjector
 
-    def runner(ms, sim_now):
+    def runner(ms, sim_now, chronos):
         prefix, base = ms.reserve_inject_counter(db, body.count)
+        win_start, win_end = ms.inject_window(db)           # date never overridden
+
+        # Existing session users seed referral linkage (organic_ratio governs how
+        # many of the new joiners come in via an existing member's referral).
+        existing_ids = [
+            r[0] for r in db.query(User.id)
+            .filter(User.username.like(f"{prefix}%")).all()
+        ]
+
         injector = MassLoadInjector(run_prefix=prefix)
         injector._counter = base                            # continue this session's id block
-        created = injector.inject_week(
-            db, body.count, now=sim_now, organic_ratio=body.organic_ratio,
+        created = injector.inject_distributed(
+            db, body.count, win_start, win_end,
+            organic_ratio=body.organic_ratio,
+            existing_ids=existing_ids,
+            chronos=chronos,
         )
         db.commit()                                         # persist users before forming pools
 
-        # Net pool delta captures BOTH paths: assign_waitlist_to_pools auto-creates
-        # full pools internally, and the manual_create_pool loop drains any remainder.
+        # Pool formation is PURELY production-gated now (no override).  Net delta
+        # reflects only what assign_waitlist_to_pools + the merger actually formed.
         pools_before = db.query(func.count(Pool.id)).scalar() or 0
-        fill_pool_vacancies(db)
-        while True:
-            new_pool = manual_create_pool(db)
-            if not new_pool:
-                break
+        fill_pool_vacancies(db)                             # = production assign_waitlist_to_pools
         _post_injection_consolidate(db)                     # lock-gated injection-time converge
         pools_after = db.query(func.count(Pool.id)).scalar() or 0
 
         return {
             "injected":     len(created),
             "pools_formed": max(0, pools_after - pools_before),
+            "window_start": win_start.isoformat(),
+            "window_end":   win_end.isoformat(),
             "prefix":       prefix,
         }
 
@@ -3244,7 +3278,7 @@ def manual_sim_action_pay_all(db: Session = Depends(get_db)):
     """
     from app.services.real_simulation import MassLoadInjector
 
-    def runner(ms, sim_now):
+    def runner(ms, sim_now, chronos):
         st = ms._require_active(db)
         injector = MassLoadInjector(run_prefix=st.get("inject_prefix", "msim0000"))
         paid = injector.auto_pay_installments(db, week_num=int(st.get("cycle_num", 1)))
@@ -3263,7 +3297,7 @@ def manual_sim_action_set_late(body: ManualSimSetLateRequest, db: Session = Depe
     apply_abc_model samples the late cohort itself at the grace event, so marking
     here would double-count.
     """
-    def runner(ms, sim_now):
+    def runner(ms, sim_now, chronos):
         knobs  = ms.set_settlement(db, late_ratio=body.late_pct / 100.0)
         active = db.query(func.count(User.id)).filter(
             User.status == UserStatus.Active
@@ -3286,7 +3320,7 @@ def manual_sim_action_pay_remaining(db: Session = Depends(get_db)):
     """
     from app.services.real_simulation import MassLoadInjector
 
-    def runner(ms, sim_now):
+    def runner(ms, sim_now, chronos):
         st = ms._require_active(db)
         injector = MassLoadInjector(run_prefix=st.get("inject_prefix", "msim0000"))
         paid = injector.auto_pay_installments(db, week_num=int(st.get("cycle_num", 1)))
@@ -3300,18 +3334,23 @@ def manual_sim_action_grace_settle(body: ManualSimGraceRequest, db: Session = De
     """
     GRACE_PERIOD_START — the authoritative A/B/C grace-window settlement.
 
-    Runs the production apply_abc_model at the simulated instant: it marks the
-    late cohort, accrues real Late_Fee tokens, splits them into
-      • B — paid the late fee and stay in (Unpaid by design this week),
-      • C — entered the grace window and paid the grace fee → survive,
-      • A / failed-C — eliminated (real EliminationEvent rows written),
-    then refills the vacancies.  The response is framed exactly as the panel asks:
-    of those who were late, how many paid late fees (B) versus how many entered the
-    grace window (C survivors + the eliminated who could not pay).
+    Runs the production apply_abc_model at the simulated instant.  EVERY late member
+    accrues a real Late_Fee token; the late cohort is then split into exactly three
+    production buckets (A + B + C == late payers):
+      • A — directly eliminated (real EliminationEvent rows written),
+      • B — paid the late fee and stay in the pool (Unpaid by design this week),
+      • C — grace survivors: paid the grace fee (+ settled late fee) → Paid,
+    then the vacancies are refilled via the production waitlist engine.
+
+    SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    The response is framed to the model's ACTUAL buckets (A/B/C).  The previous
+    ``entered_grace_no_fee`` field implied a "grace without late fee" state that does
+    not exist in the model (all late members owe a late fee) — it has been removed
+    in favour of the truthful, reconciling A/B/C split.
     """
     from app.services.real_simulation import MassLoadInjector
 
-    def runner(ms, sim_now):
+    def runner(ms, sim_now, chronos):
         st    = ms._require_active(db)
         knobs = ms.set_settlement(
             db,
@@ -3327,15 +3366,16 @@ def manual_sim_action_grace_settle(body: ManualSimGraceRequest, db: Session = De
             grace_pct_c=knobs["grace_pct_c"],
         )
         n_late = int(res.get("n_late", 0))
-        n_b    = int(res.get("n_type_b", 0))
-        n_c    = int(res.get("n_saved", 0))
-        n_elim = int(res.get("n_elim", 0))
+        n_b    = int(res.get("n_type_b", 0))   # B — late fee, stay Unpaid in pool
+        n_c    = int(res.get("n_saved", 0))    # C — grace survivors (paid grace fee)
+        n_elim = int(res.get("n_elim", 0))     # A — directly eliminated
         return {
             "late_payers":              n_late,
+            "eliminated_A":             n_elim,
             "paid_late_fee_B":          n_b,
             "grace_survivors_C":        n_c,
-            "entered_grace_no_fee":     max(0, n_late - n_b),  # B paid; the rest go to grace
-            "eliminated_A_or_failed":   n_elim,
+            # Truthful invariant — the three buckets must sum to the late cohort.
+            "buckets_reconcile":        (n_elim + n_b + n_c == n_late),
             "late_fee_revenue_inr":     res.get("late_fee_revenue_inr", 0),
             "grace_fee_revenue_inr":    res.get("grace_fee_revenue_inr", 0),
             "total_compliance_revenue_inr": res.get("total_compliance_revenue_inr", 0),
@@ -3358,7 +3398,7 @@ def manual_sim_action_finalize_eliminations(db: Session = Depends(get_db)):
     """
     from app.models.elimination_event import EliminationEvent, EliminationReason
 
-    def runner(ms, sim_now):
+    def runner(ms, sim_now, chronos):
         cycle_start, cycle_end = ms.cycle_window(db)
         rows = (
             db.query(EliminationEvent)
@@ -3393,7 +3433,7 @@ def manual_sim_action_prepare_draw(db: Session = Depends(get_db)):
     """
     from app.services.draw_preparation import start_draw_preparation
 
-    def runner(ms, sim_now):
+    def runner(ms, sim_now, chronos):
         st     = ms._require_active(db)
         prefix = st.get("inject_prefix", "msim0000")
         prep   = start_draw_preparation(db, draw_time_utc=sim_now, user_prefix=prefix)
@@ -3421,7 +3461,7 @@ def manual_sim_action_execute_draw(db: Session = Depends(get_db)):
     is the developer's explicit choice at the due-date / grace events, never an
     implicit side-effect of the draw.
     """
-    def runner(ms, sim_now):
+    def runner(ms, sim_now, chronos):
         st     = ms._require_active(db)
         prefix = st.get("inject_prefix", "msim0000")
         res    = execute_weekly_draw(db, auto_pay_unpaid=False, user_prefix=prefix)
@@ -3455,7 +3495,7 @@ def manual_sim_action_cleanup(db: Session = Depends(get_db)):
     from app.services.draw import post_draw_cleanup
     from app.services.real_simulation import MassLoadInjector
 
-    def runner(ms, sim_now):
+    def runner(ms, sim_now, chronos):
         st       = ms._require_active(db)
         summary  = post_draw_cleanup(db)
         injector = MassLoadInjector(run_prefix=st.get("inject_prefix", "msim0000"))

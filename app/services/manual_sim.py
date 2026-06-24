@@ -132,7 +132,9 @@ EVENT_META: dict[str, dict] = {
         "label": "Grace open",
         "short": "grace open",
         "icon":  "ti-hourglass-high",
-        "note":  "grace window opens — late-fee vs grace-without-fee",
+        # A/B/C settlement — EVERY late member accrues a late fee; the buckets are
+        # A (eliminated) / B (late fee, stay Unpaid in pool) / C (grace-pay survive).
+        "note":  "A/B/C settlement — eliminate (A) · late-fee stay (B) · grace-pay survive (C)",
         "actions": ["grace_settlement", "inject_users"],
     },
     "G_CLOSE": {
@@ -173,6 +175,55 @@ _DEFAULT_SETTLEMENT = {
     "late_ratio":  0.15,   # fraction of active members treated as late this cycle
     "elim_pct_a":  80.0,   # A — % of late directly eliminated (skip grace)
     "grace_pct_c": 15.0,   # C — % of grace-eligible late who pay and survive
+}
+
+# SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ── Event-driven HARD-BLOCK gating ("no override") ───────────────────────────
+# Each event has a REQUIRED action that must be completed before the clock may
+# advance off it.  A tuple means "any ONE of these satisfies" (the due-date can be
+# settled either by paying everyone on time OR by setting a late-ratio and paying
+# the remainder).  ``None`` = no required action (a pure marker event — only the
+# always-optional inject_users is offered there, which never gates advancement).
+# jump_next / jump_to refuse (ManualSimError → HTTP 409) until the requirement is
+# met; the frontend dims the advance control and explains WHY it is dim.
+REQUIRED_ACTION: dict[str, "Optional[tuple[str, ...]]"] = {
+    "CYCLE_START":        None,
+    "DUE_DATE":           ("pay_all_installments", "pay_remaining"),
+    "GRACE_PERIOD_START": ("grace_settlement",),
+    "G_CLOSE":            ("finalize_eliminations",),
+    "T_02H":              ("prepare_draw",),
+    "T_00H":              ("execute_draw",),
+    "T_05M":              ("run_cleanup",),
+}
+
+# ── Mutual-exclusion / single-shot locks ("no overwrite") ────────────────────
+# When the key action completes at its event, every action listed in the value is
+# DIMMED for the remainder of that cycle:event visit.  An action that names itself
+# is single-shot (it cannot be re-run).  pay-all and the set-late/pay-remaining
+# path lock each other, so a settled due-date can never be re-settled (the user's
+# "if I pay all then other buttons should be dim — no override no overwritten").
+# inject_users is intentionally absent: member injection stays available 24×7.
+ACTION_LOCKS: dict[str, tuple[str, ...]] = {
+    "pay_all_installments":  ("pay_all_installments", "set_late_pct", "pay_remaining"),
+    "pay_remaining":         ("pay_remaining", "pay_all_installments"),
+    "grace_settlement":      ("grace_settlement",),
+    "finalize_eliminations": ("finalize_eliminations",),
+    "prepare_draw":          ("prepare_draw",),
+    "execute_draw":          ("execute_draw",),
+    "run_cleanup":           ("run_cleanup",),
+}
+
+# Human-readable labels for the gating notes / dim reasons surfaced to the panel.
+ACTION_LABELS: dict[str, str] = {
+    "inject_users":          "Inject members",
+    "pay_all_installments":  "Pay all installments",
+    "set_late_pct":          "Set late %",
+    "pay_remaining":         "Pay remaining",
+    "grace_settlement":      "A/B/C grace settlement",
+    "finalize_eliminations": "Finalize eliminations",
+    "prepare_draw":          "Prepare draw",
+    "execute_draw":          "Execute draw",
+    "run_cleanup":           "Run cleanup",
 }
 
 
@@ -363,6 +414,131 @@ def _snapshot(db: Session) -> dict:
     }
 
 
+# SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+def _compliance(db: Session, *, window: "Optional[tuple[datetime, datetime]]" = None) -> dict:
+    """Real-DB payment-compliance breakdown for the Time Machine panel.
+
+    Every count is read straight from the production tables (no override, no
+    synthetic figure) so the developer sees exactly what the strategy will act on
+    before advancing.  ``window`` (CYCLE_START, T_05M) scopes the elimination count
+    to the CURRENT cycle so it does not leak across rollovers.
+    """
+    from sqlalchemy import func
+    from app.models.user import User, UserStatus, WeeklyPaymentStatus
+    from app.models.pool import Pool, PoolStatus
+    from app.models.elimination_event import EliminationEvent
+
+    active = db.query(func.count(User.id)).filter(
+        User.status == UserStatus.Active
+    ).scalar() or 0
+    paid = db.query(func.count(User.id)).filter(
+        User.status == UserStatus.Active,
+        User.weekly_payment_status == WeeklyPaymentStatus.Paid,
+    ).scalar() or 0
+    unpaid = active - paid
+    # Late = Unpaid AND carrying an accrued late fee (the production "late payer"
+    # state apply_abc_model produces; distinct from merely not-yet-paid).
+    late_payers = db.query(func.count(User.id)).filter(
+        User.status == UserStatus.Active,
+        User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
+        User.late_fees_inr > 0,
+    ).scalar() or 0
+    grace_active = db.query(func.count(User.id)).filter(
+        User.status == UserStatus.Active,
+        User.grace_active.is_(True),
+    ).scalar() or 0
+    grace_fee_paid = db.query(func.count(User.id)).filter(
+        User.status == UserStatus.Active,
+        User.grace_fee_paid.is_(True),
+    ).scalar() or 0
+    at_risk = db.query(func.count(User.id)).filter(
+        User.status == UserStatus.Active,
+        User.elimination_risk.is_(True),
+    ).scalar() or 0
+    waitlist = db.query(func.count(User.id)).filter(
+        User.status == UserStatus.Waitlist
+    ).scalar() or 0
+
+    eliminated_this_cycle = 0
+    if window is not None:
+        start, end = window
+        eliminated_this_cycle = db.query(func.count(EliminationEvent.id)).filter(
+            EliminationEvent.created_at >= start,
+            EliminationEvent.created_at <= end,
+        ).scalar() or 0
+
+    pools_active = db.query(func.count(Pool.id)).filter(
+        Pool.status == PoolStatus.Active
+    ).scalar() or 0
+    pools_paused = db.query(func.count(Pool.id)).filter(
+        Pool.status == PoolStatus.Paused_Awaiting_Members
+    ).scalar() or 0
+
+    return {
+        "active":                active,
+        "paid_on_time":          paid,
+        "unpaid":                unpaid,
+        "late_payers":           late_payers,
+        "grace_active":          grace_active,
+        "grace_fee_paid":        grace_fee_paid,
+        "at_risk":               at_risk,
+        "eliminated_this_cycle": eliminated_this_cycle,
+        "waitlist":              waitlist,
+        "pools_active":          pools_active,
+        "pools_paused":          pools_paused,
+    }
+
+
+def task_list(event: str, c: dict, settlement: dict) -> list[str]:
+    """Event-aware "what must happen here" checklist, derived from live counts.
+
+    Pure presentation — every number comes from ``_compliance`` (the production
+    tables).  Answers the user's "har event par task list aani chahie" so the
+    developer knows, at each event, how many members must pay / are late / are
+    grace-eligible / are eliminated before advancing.
+    """
+    late_ratio = float(settlement.get("late_ratio", 0.0) or 0.0)
+    tasks: list[str] = []
+    if event == "CYCLE_START":
+        tasks.append(f"Payment window open — {c['active']} active, {c['waitlist']} on waitlist.")
+        tasks.append("Optional: inject members (random join-time within today's date).")
+    elif event == "DUE_DATE":
+        tasks.append(f"{c['unpaid']} of {c['active']} active members must pay this week's installment.")
+        tasks.append(f"Projected late this cycle (knob): {int(c['active'] * late_ratio)} @ late-ratio {late_ratio:.0%}.")
+        tasks.append("Settle: Pay-all (everyone on time) OR Set-late % then Pay-remaining.")
+    elif event == "GRACE_PERIOD_START":
+        tasks.append(f"{c['late_payers']} late payer(s) to settle via A/B/C.")
+        tasks.append("A% eliminate · C% grace-pay & survive · B remainder pay late-fee & stay Unpaid.")
+        tasks.append(f"Grace-active now: {c['grace_active']} · grace-fee paid: {c['grace_fee_paid']}.")
+    elif event == "G_CLOSE":
+        tasks.append(f"Confirm {c['eliminated_this_cycle']} elimination(s) finalized this cycle.")
+        tasks.append(f"{c['at_risk']} member(s) flagged at-risk (Type B — Unpaid, still in pool).")
+    elif event == "T_02H":
+        tasks.append(f"Prepare draw — {c['active']} active across {c['pools_active']} pool(s).")
+        tasks.append("Acquires draw lock, flags L4, plans SDE meta-pool, freezes LPI snapshot.")
+    elif event == "T_00H":
+        tasks.append(f"Execute draw across {c['pools_active']} active pool(s).")
+        tasks.append(f"{c['pools_paused']} pool(s) paused awaiting members; {c['waitlist']} on waitlist.")
+    elif event == "T_05M":
+        tasks.append("Cleanup — reset weekly flags, release draw lock, settle referral-RW.")
+        tasks.append("Then jump-next to roll into the next cycle (lands on its Due-date).")
+    return tasks
+
+
+def _disabled_actions(event: str, done_here: list[str]) -> list[str]:
+    """Actions to DIM at ``event`` given what's already been done this visit.
+
+    Applies the ACTION_LOCKS mutual-exclusion / single-shot rules and intersects
+    with the actions actually offered at this event.  inject_users is never dimmed.
+    """
+    disabled: set[str] = set()
+    for done in done_here:
+        for locked in ACTION_LOCKS.get(done, ()):
+            disabled.add(locked)
+    disabled.discard("inject_users")
+    return [a for a in EVENT_META[event]["actions"] if a in disabled]
+
+
 def _ordered_milestones(ms: _SimMilestones) -> list[tuple[str, datetime]]:
     """The seven (event_name, datetime) pairs in strict chronological order."""
     return [(name, getattr(ms, name)) for name in EVENT_SPINE]
@@ -399,9 +575,12 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
     if exp:
         ttl_remaining = max(0, int((_parse(exp) - datetime.now(timezone.utc)).total_seconds()))
 
+    cyc = int(st.get("cycle_num", 1))
     events: list[dict] = []
     for name, dt in _ordered_milestones(ms):
         meta = EVENT_META[name]
+        req  = REQUIRED_ACTION.get(name)
+        ev_done = _event_done(st, cyc, name)
         events.append({
             "name":       name,
             "label":      meta["label"],
@@ -412,7 +591,19 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
             "is_current": name == cur,
             "is_past":    (dt < sim_now) and name != cur,
             "actions":    meta["actions"],
+            # SESSION EDIT [Jun-24]: per-event gating telemetry for the timeline.
+            "required":      list(req) if req else [],
+            "required_done": (not req) or any(a in ev_done for a in req),
         })
+
+    # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Event-driven gating + dim-lock telemetry for the CURRENT event.
+    cur_required = REQUIRED_ACTION.get(cur)
+    can_adv, adv_reason = advance_gate(st)
+    done_here = _event_done(st, cyc, cur)
+    disabled  = _disabled_actions(cur, done_here)
+    settlement = dict(_DEFAULT_SETTLEMENT)
+    settlement.update(st.get("settlement") or {})
 
     out = {
         "active":              True,
@@ -422,7 +613,7 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
         "day_of_week":         sim_now.strftime("%A"),
         "date_str":            sim_now.strftime("%d %b %Y"),
         "time_str":            sim_now.strftime("%H:%M:%S"),
-        "cycle_num":           st.get("cycle_num", 1),
+        "cycle_num":           cyc,
         "current_event":       cur,
         "current_event_index": EVENT_SPINE.index(cur),
         "current_event_meta":  EVENT_META[cur],
@@ -433,9 +624,21 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
         "expires_at":          st.get("expires_at"),
         "ttl_hours":           st.get("ttl_hours", _DEFAULT_TTL_HOURS),
         "ttl_remaining_seconds": ttl_remaining,
+        # ── Event-driven gating (hard-block, no override) ────────────────────
+        "required_action":     list(cur_required) if cur_required else [],
+        "required_done":       (not cur_required) or any(a in done_here for a in cur_required),
+        "can_advance":         can_adv,
+        "advance_block_reason": adv_reason,
+        "actions_done":        done_here,
+        "disabled_actions":    disabled,
+        "settlement":          settlement,
     }
     if include_snapshot:
         out["snapshot"] = _snapshot(db)
+        # Real-DB compliance breakdown + per-event task list (payment compliance).
+        compliance = _compliance(db, window=(ms.CYCLE_START, ms.T_05M))
+        out["compliance"] = compliance
+        out["task_list"]  = task_list(cur, compliance, settlement)
     return out
 
 
@@ -566,6 +769,79 @@ def _require_active(db: Session) -> dict:
     return st
 
 
+# SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# ── Event-driven gating helpers ──────────────────────────────────────────────
+def _event_key(st: dict) -> str:
+    """Stable per-visit key ``"<cycle>:<event>"`` for action-completion tracking.
+
+    Including the cycle number means each rollover starts a fresh slate — the new
+    cycle's Due-date gate is independent of the previous cycle's settlement.
+    """
+    return f"{int(st.get('cycle_num', 1))}:{st.get('current_event')}"
+
+
+def _event_done(st: dict, cycle_num: int, event: str) -> list[str]:
+    """The list of action keys completed at a given cycle:event (never None)."""
+    return list((st.get("actions_done") or {}).get(f"{int(cycle_num)}:{event}", []))
+
+
+def record_action(db: Session, action_key: str) -> None:
+    """Mark ``action_key`` complete for the CURRENT cycle:event.
+
+    Drives both the advance-gate (required action satisfied) and the dim locks
+    (mutual-exclusion / single-shot).  Called by the action spine AFTER the
+    production service has committed, so a failed action records nothing.
+    """
+    st = _require_active(db)
+    done = st.setdefault("actions_done", {})
+    key  = _event_key(st)
+    bucket = done.setdefault(key, [])
+    if action_key not in bucket:
+        bucket.append(action_key)
+    save_state(db, st)
+
+
+def advance_gate(st: dict) -> tuple[bool, str]:
+    """Whether the clock may step OFF the current event, and why not.
+
+    Hard-block / no-override: if the current event has a REQUIRED action, at least
+    one of its options must already be recorded for this cycle:event.  Returns
+    ``(can_advance, reason)`` — reason is "" when advancement is allowed.
+    """
+    cur = st.get("current_event")
+    required = REQUIRED_ACTION.get(cur)
+    if not required:
+        return True, ""
+    done = _event_done(st, st.get("cycle_num", 1), cur)
+    if any(a in done for a in required):
+        return True, ""
+    labels = " or ".join(ACTION_LABELS.get(a, a) for a in required)
+    return False, f"Complete “{labels}” at {EVENT_META[cur]['label']} before advancing — no override."
+
+
+def _path_gate(st: dict, target_event: str) -> tuple[bool, str]:
+    """Multi-step forward jump guard: EVERY event from the current one up to (but
+    excluding) ``target_event`` must have its required action satisfied.
+
+    This enforces the user's "without event-driven, next event can't be jumped"
+    rule even for a timeline shortcut that skips intermediate nodes — you cannot
+    leap past an event whose work is still pending.
+    """
+    cur_idx = EVENT_SPINE.index(st["current_event"])
+    tgt_idx = EVENT_SPINE.index(target_event)
+    cyc = int(st.get("cycle_num", 1))
+    for i in range(cur_idx, tgt_idx):
+        ev = EVENT_SPINE[i]
+        required = REQUIRED_ACTION.get(ev)
+        if not required:
+            continue
+        if not any(a in _event_done(st, cyc, ev) for a in required):
+            labels = " or ".join(ACTION_LABELS.get(a, a) for a in required)
+            return False, (f"Complete “{labels}” at {EVENT_META[ev]['label']} "
+                           f"before jumping past it — no override.")
+    return True, ""
+
+
 def jump_next(db: Session) -> dict:
     """Advance the simulated clock to the NEXT event on the spine.
 
@@ -579,6 +855,10 @@ def jump_next(db: Session) -> dict:
     the current event.  Logic runs only when an event's action is triggered.
     """
     st = _require_active(db)
+    # HARD-BLOCK gate — the current event's required action must be done first.
+    ok, why = advance_gate(st)
+    if not ok:
+        raise ManualSimError(why)
     t00h = _parse(st["cycle_t00h"])
     cur  = st["current_event"]
     ms   = _compute_milestones(db, t00h)
@@ -630,6 +910,11 @@ def jump_to(db: Session, event: str) -> dict:
             f"Cannot jump backward from '{cur}' to '{event}'. "
             "Time only moves forward — use jump-next to roll into the next cycle."
         )
+
+    # HARD-BLOCK gate — cannot leap past any event whose required action is pending.
+    ok, why = _path_gate(st, event)
+    if not ok:
+        raise ManualSimError(why)
 
     t00h = _parse(st["cycle_t00h"])
     ms   = _compute_milestones(db, t00h)
@@ -742,3 +1027,29 @@ def cycle_window(db: Session) -> tuple[datetime, datetime]:
     t00h = _parse(st["cycle_t00h"])
     ms   = _compute_milestones(db, t00h)
     return ms.CYCLE_START, ms.T_05M
+
+
+# SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+def inject_window(db: Session) -> tuple[datetime, datetime]:
+    """Random-injection time window for the CURRENT event (requirement #4).
+
+    Returns ``(start, end)`` where ``start`` is the simulated instant and ``end`` is
+    the END OF THAT EVENT'S OWN CALENDAR DAY — but never crossing into the next
+    milestone (whichever is sooner).  Only the TIME-OF-DAY is randomised inside this
+    window; the DATE is never overridden (events stay event-driven).  A minimum
+    5-minute window is guaranteed so an inject at end-of-day still distributes.
+    """
+    st   = _require_active(db)
+    now  = _parse(st["sim_now"])
+    t00h = _parse(st["cycle_t00h"])
+    ms   = _compute_milestones(db, t00h)
+
+    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    future = [getattr(ms, n) for n in EVENT_SPINE if getattr(ms, n) > now]
+    next_evt = min(future) if future else None
+    end = end_of_day
+    if next_evt is not None and next_evt < end:
+        end = next_evt
+    if end <= now:                                  # already at the boundary
+        end = now + timedelta(minutes=5)
+    return now, end

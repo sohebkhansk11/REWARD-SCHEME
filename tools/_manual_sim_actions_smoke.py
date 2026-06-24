@@ -47,11 +47,30 @@ try:
     st = manual_sim.start_session(db, ttl_hours=6)
     check("starts at CYCLE_START", st["current_event"] == "CYCLE_START")
 
-    out = dev.manual_sim_action_inject(dev.ManualSimInjectRequest(count=24), db)
-    check("inject ran", out["action"] == "inject_users")
-    check("24 users injected", out["result"]["injected"] == 24)
-    check("pools formed from injection", out["result"]["pools_formed"] >= 1)
-    print("   inject result:", out["result"])
+    inj = dev.manual_sim_action_inject(dev.ManualSimInjectRequest(count=24), db)
+    check("inject ran", inj["action"] == "inject_users")
+    check("24 users injected", inj["result"]["injected"] == 24)
+    # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Pool formation is now PURELY production-gated (the manual_create_pool force-drain
+    # override was REMOVED).  pools_formed may legitimately be 0 (the AI-reserve gate
+    # held) — assert the production-gated shape, not the old >=1 override behaviour.
+    check("pools_formed is a non-negative int (production-gated, no override)",
+          isinstance(inj["result"]["pools_formed"], int) and inj["result"]["pools_formed"] >= 0)
+    check("inject window surfaced (date never overridden)",
+          bool(inj["result"].get("window_start")) and bool(inj["result"].get("window_end")))
+    print("   inject result:", inj["result"])
+
+    # ── Requirement #6: confirm NO instant-drain override ─────────────────────
+    # Fresh DB: every injected user is either Active (in a full 12-member pool the
+    # production gate decided to form) or still on the waitlist.  None are lost, and
+    # pools only ever appear in full-12 batches — exactly assign_waitlist_to_pools.
+    comp0 = manual_sim.compute_state(db)["compliance"]
+    check("#6: every injected user accounted for (active + waitlist == 24, no loss)",
+          comp0["active"] + comp0["waitlist"] == 24)
+    check("#6: pools form only as full 12-member batches (production gate, no instant-drain)",
+          comp0["active"] == 12 * inj["result"]["pools_formed"])
+    print(f"   #6 compliance: active={comp0['active']}  waitlist={comp0['waitlist']}  "
+          f"pools_formed={inj['result']['pools_formed']}")
 
     print("\n== event->action guard (pay-all before DUE_DATE) ==")
     guard_409 = False
@@ -61,12 +80,39 @@ try:
         guard_409 = (exc.status_code == 409)
     check("pay-all rejected at CYCLE_START (409)", guard_409)
 
-    print("\n== DUE_DATE: set-late / pay-all / pay-remaining ==")
+    print("\n== DUE_DATE: gating + compliance + set-late / pay-all / pay-remaining ==")
     manual_sim.jump_to(db, "DUE_DATE")
+
+    # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Event-driven gating (req #2): cannot advance until a pay action is done.
+    # Compliance panel + per-event task list must be present (req #3).
+    state_due = manual_sim.compute_state(db)
+    check("DUE_DATE requires a pay action", "pay_all_installments" in state_due["required_action"])
+    check("cannot advance before paying (can_advance False)", state_due["can_advance"] is False)
+    check("compliance panel present", isinstance(state_due.get("compliance"), dict)
+          and "late_payers" in state_due["compliance"])
+    check("task_list present + non-empty", isinstance(state_due.get("task_list"), list)
+          and len(state_due["task_list"]) > 0)
+    blocked = False
+    try:
+        manual_sim.jump_next(db)
+    except manual_sim.ManualSimError:
+        blocked = True
+    check("jump-next hard-blocked until required action done (no override)", blocked)
+
     out = dev.manual_sim_action_set_late(dev.ManualSimSetLateRequest(late_pct=20.0), db)
     check("set-late stored ratio 0.2", abs(out["result"]["late_ratio"] - 0.2) < 1e-9)
     out = dev.manual_sim_action_pay_all(db)
     check("pay-all ran", "installments_paid" in out["result"])
+
+    # SESSION EDIT [Jun-24]: after pay-all the gate opens and the mutually-exclusive
+    # pay actions are dimmed (req #2 + #3 — no override / overwrite).
+    state_paid = manual_sim.compute_state(db)
+    check("can advance after pay-all (gate open)", state_paid["can_advance"] is True)
+    check("pay-all dims set_late_pct + pay_remaining (locked, no overwrite)",
+          "set_late_pct" in state_paid["disabled_actions"]
+          and "pay_remaining" in state_paid["disabled_actions"])
+
     out = dev.manual_sim_action_pay_remaining(db)
     check("pay-remaining ran", "remaining_paid" in out["result"])
 
@@ -76,8 +122,13 @@ try:
         dev.ManualSimGraceRequest(late_pct=30.0, elim_pct_a=50.0, grace_pct_c=40.0), db)
     r = out["result"]
     check("grace settlement ran", "late_payers" in r)
-    check("B + grace-no-fee accounts for all late",
-          r["paid_late_fee_B"] + r["entered_grace_no_fee"] == r["late_payers"])
+    # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Truthful A/B/C buckets must reconcile to the late cohort (req #3).  The old
+    # misleading entered_grace_no_fee field has been removed.
+    check("ABC invariant A+B+C == late_payers",
+          r["eliminated_A"] + r["paid_late_fee_B"] + r["grace_survivors_C"] == r["late_payers"])
+    check("buckets_reconcile flag is True", r["buckets_reconcile"] is True)
+    check("misleading entered_grace_no_fee field removed", "entered_grace_no_fee" not in r)
     print("   grace result:", r)
 
     print("\n== G_CLOSE: guillotine confirm (read-only) ==")

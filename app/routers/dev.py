@@ -2937,3 +2937,139 @@ def clear_forensic_events(
         "message": f"Cleared {count} forensic event(s)"
                    + (f" for run '{run_id}'." if run_id else " (entire table)."),
     }
+
+
+# =============================================================================
+# Manual Event-Timeline Simulator — "Time Machine"   (/dev/manual-sim/*)
+# =============================================================================
+# SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# A MANUAL counterpart to the automated /dev/real-simulation engine.  Where that
+# engine races the clock through every weekly cycle in one synchronous run, the
+# Time Machine lets a developer jump event → event along the SAME milestone spine
+# (CYCLE_START → DUE_DATE → GRACE_PERIOD_START → G_CLOSE → T_02H → T_00H → T_05M)
+# across separate requests, surfacing only the actions valid at each instant.
+#
+# All clock + event-state logic lives in app/services/manual_sim.py.  These
+# endpoints are a thin transport layer; they inherit the router's
+# require_dev_mode gate, so every route here is 403 in production.  The action
+# endpoints that actually mutate money state (Phase 3) wrap the SAME production
+# services in a request-scoped ChronosEngine (manual_sim.manual_clock) so reads
+# and writes observe the simulated instant — zero business-logic duplication.
+# =============================================================================
+
+
+class ManualSimStartRequest(BaseModel):
+    draw_anchor: Optional[str] = Field(
+        None,
+        description=(
+            "ISO-8601 timestamp for cycle 1's draw (T_00H). Omit to default to "
+            "the next Sunday 00:00 UTC. The simulated clock starts one cycle "
+            "before this, at the computed CYCLE_START."
+        ),
+    )
+    link_global: bool = Field(
+        False,
+        description="Link the global watch to the simulation watch (display + "
+                    "request-scoped clock). Gated by ENABLE_DEV_MODE.",
+    )
+    ttl_hours: int = Field(
+        6, ge=1, le=72,
+        description="Session auto-expiry window. A forgotten session reverts "
+                    "after this many hours.",
+    )
+
+
+class ManualSimJumpToRequest(BaseModel):
+    event: str = Field(
+        ...,
+        description="Target event name from the spine. Must be strictly ahead "
+                    "of the current event (time only moves forward).",
+    )
+
+
+@router.post("/manual-sim/start")
+def manual_sim_start(body: ManualSimStartRequest, db: Session = Depends(get_db)):
+    """
+    Start (or replace) a Time Machine session.
+
+    Anchors cycle 1 at ``draw_anchor`` (defaults to next Sunday 00:00 UTC) and
+    positions the simulated clock at that cycle's CYCLE_START.  Returns the full
+    state (watch, timeline, current event, available actions, snapshot).
+    """
+    from app.services import manual_sim
+
+    anchor_dt = None
+    if body.draw_anchor:
+        try:
+            anchor_dt = datetime.fromisoformat(body.draw_anchor)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid draw_anchor '{body.draw_anchor}'. Use ISO-8601, "
+                       "e.g. 2026-03-22T00:00:00+00:00.",
+            )
+    try:
+        return manual_sim.start_session(
+            db,
+            draw_anchor=anchor_dt,
+            link_global=body.link_global,
+            ttl_hours=body.ttl_hours,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+
+@router.get("/manual-sim/state")
+def manual_sim_state(db: Session = Depends(get_db)):
+    """
+    Current Time Machine state — the panel's single source of truth.
+
+    Returns ``{"active": false}`` when no session is live (or after TTL expiry,
+    which auto-clears the stale session).  Otherwise returns the watch
+    (sim time / day / date), cycle number, current event, the seven-node
+    timeline with past/current flags, the actions available now, and a real-DB
+    snapshot.
+    """
+    from app.services import manual_sim
+    return manual_sim.compute_state(db)
+
+
+@router.post("/manual-sim/jump-next")
+def manual_sim_jump_next(db: Session = Depends(get_db)):
+    """
+    Advance the simulated clock to the next event on the spine.
+
+    Moves the clock only — runs no business logic.  At T_05M (cleanup) it rolls
+    into the next cycle and lands on DUE_DATE (the draw event doubles as the new
+    cycle's start, keeping simulated time strictly forward).
+    """
+    from app.services import manual_sim
+    try:
+        return manual_sim.jump_next(db)
+    except manual_sim.ManualSimError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/manual-sim/jump-to")
+def manual_sim_jump_to(body: ManualSimJumpToRequest, db: Session = Depends(get_db)):
+    """
+    Forward-only jump to a named event within the current cycle.
+
+    The target must be strictly ahead of the current event; backward jumps are
+    rejected (409) because the timeline only moves forward.
+    """
+    from app.services import manual_sim
+    try:
+        return manual_sim.jump_to(db, body.event)
+    except manual_sim.ManualSimError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/manual-sim/stop")
+def manual_sim_stop(db: Session = Depends(get_db)):
+    """
+    Tear down the Time Machine session and guarantee no simulated clock remains
+    installed.  Idempotent — safe to call when no session is active.
+    """
+    from app.services import manual_sim
+    return manual_sim.stop_session(db)

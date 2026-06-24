@@ -3073,3 +3073,353 @@ def manual_sim_stop(db: Session = Depends(get_db)):
     """
     from app.services import manual_sim
     return manual_sim.stop_session(db)
+
+
+# ── Per-event actions (Phase 3) ──────────────────────────────────────────────
+# SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# Each action runs the SAME production service the live app / RealSimEngine call,
+# wrapped in manual_sim.manual_clock(sim_now) so every READ (datetime in the
+# strategy modules) and every WRITE (token / elimination / draw timestamps via
+# sim_clock) observes the simulated instant.  There is NO second financial
+# implementation here — the Time Machine only chooses WHEN, not HOW.
+#
+# The event→action guard (manual_sim.assert_action) is the server-side authority:
+# an action is rejected (409) unless it is offered at the event the clock is
+# currently standing on, so the draw can never be executed before its −2h prep,
+# etc.  The dev-mode gate is enforced twice (router dependency + manual_clock).
+
+class ManualSimInjectRequest(BaseModel):
+    count: int = Field(..., ge=1, le=20000,
+                       description="Number of synthetic Paid-Waitlist users to inject.")
+    organic_ratio: float = Field(0.6, ge=0.0, le=1.0,
+                                 description="Fraction joining organically (rest via referral).")
+
+
+class ManualSimSetLateRequest(BaseModel):
+    late_pct: float = Field(..., ge=0.0, le=100.0,
+                            description="Percentage of active members to treat as late this "
+                                        "cycle. Stored as the grace-settlement late-ratio knob.")
+
+
+class ManualSimGraceRequest(BaseModel):
+    late_pct: Optional[float] = Field(None, ge=0.0, le=100.0,
+                                      description="Override the stored late-ratio (else uses the "
+                                                  "value set at the due-date event).")
+    elim_pct_a: Optional[float] = Field(None, ge=0.0, le=100.0,
+                                        description="A — % of late directly eliminated (skip grace).")
+    grace_pct_c: Optional[float] = Field(None, ge=0.0, le=100.0,
+                                         description="C — % of grace-eligible late who pay and survive.")
+
+
+def _manual_sim_run(db: Session, action_key: str, runner):
+    """Guard, time-travel, run, commit — the shared spine of every action route.
+
+    1. Enforce the dev-mode gate and the event→action guard.
+    2. Resolve the simulated instant from the persisted session.
+    3. Run ``runner(manual_sim, sim_now)`` INSIDE manual_clock(sim_now) so the
+       production service it calls reads + writes the simulated time.
+    4. Commit, then return ``{action, result, state}`` (fresh full Time Machine
+       state so the panel re-renders the watch, timeline and snapshot in one round
+       trip).  On any service failure the transaction is rolled back (no partial
+       money mutation) and surfaced as HTTP 400.
+    """
+    from app.services import manual_sim
+
+    if not manual_sim._dev_mode_enabled():
+        raise HTTPException(status_code=403, detail="ENABLE_DEV_MODE is not true.")
+    try:
+        manual_sim.assert_action(db, action_key)          # 409 if not allowed here
+    except manual_sim.ManualSimError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    sim_now = manual_sim.sim_now(db)
+    try:
+        with manual_sim.manual_clock(sim_now):
+            result = runner(manual_sim, sim_now)
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:                               # any production-service failure
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _logger_sim.error("manual-sim action '%s' FAILED: %s", action_key, exc)
+        raise HTTPException(status_code=400, detail=f"{action_key} failed: {exc}")
+
+    return {
+        "action": action_key,
+        "result": result,
+        "state":  manual_sim.compute_state(db),
+    }
+
+
+@router.post("/manual-sim/action/inject")
+def manual_sim_action_inject(body: ManualSimInjectRequest, db: Session = Depends(get_db)):
+    """
+    Inject synthetic users at the simulated instant (available at EVERY event).
+
+    Re-uses the production MassLoadInjector + the exact pool-formation pipeline the
+    live injection path uses (fill vacancies → form full pools → lock-gated merger
+    convergence).  Pool formation runs synchronously here — Time-Machine batches are
+    developer-driven and small — but is the SAME code as the background path.
+    """
+    from app.services.real_simulation import MassLoadInjector
+
+    def runner(ms, sim_now):
+        prefix, base = ms.reserve_inject_counter(db, body.count)
+        injector = MassLoadInjector(run_prefix=prefix)
+        injector._counter = base                            # continue this session's id block
+        created = injector.inject_week(
+            db, body.count, now=sim_now, organic_ratio=body.organic_ratio,
+        )
+        db.commit()                                         # persist users before forming pools
+
+        # Net pool delta captures BOTH paths: assign_waitlist_to_pools auto-creates
+        # full pools internally, and the manual_create_pool loop drains any remainder.
+        pools_before = db.query(func.count(Pool.id)).scalar() or 0
+        fill_pool_vacancies(db)
+        while True:
+            new_pool = manual_create_pool(db)
+            if not new_pool:
+                break
+        _post_injection_consolidate(db)                     # lock-gated injection-time converge
+        pools_after = db.query(func.count(Pool.id)).scalar() or 0
+
+        return {
+            "injected":     len(created),
+            "pools_formed": max(0, pools_after - pools_before),
+            "prefix":       prefix,
+        }
+
+    return _manual_sim_run(db, "inject_users", runner)
+
+
+@router.post("/manual-sim/action/pay-all")
+def manual_sim_action_pay_all(db: Session = Depends(get_db)):
+    """
+    DUE_DATE — everyone pays on time.  Marks every Unpaid Active member Paid and
+    writes one weekly DEP installment token per member, timestamped at the
+    simulated instant (production MassLoadInjector.auto_pay_installments).
+    """
+    from app.services.real_simulation import MassLoadInjector
+
+    def runner(ms, sim_now):
+        st = ms._require_active(db)
+        injector = MassLoadInjector(run_prefix=st.get("inject_prefix", "msim0000"))
+        paid = injector.auto_pay_installments(db, week_num=int(st.get("cycle_num", 1)))
+        return {"installments_paid": paid}
+
+    return _manual_sim_run(db, "pay_all_installments", runner)
+
+
+@router.post("/manual-sim/action/set-late")
+def manual_sim_action_set_late(body: ManualSimSetLateRequest, db: Session = Depends(get_db)):
+    """
+    DUE_DATE — choose how many members are late this cycle.
+
+    Stores the late-ratio knob (fed to the grace-window settlement) and returns a
+    projection.  Deliberately does NOT pre-mark members: the production
+    apply_abc_model samples the late cohort itself at the grace event, so marking
+    here would double-count.
+    """
+    def runner(ms, sim_now):
+        knobs  = ms.set_settlement(db, late_ratio=body.late_pct / 100.0)
+        active = db.query(func.count(User.id)).filter(
+            User.status == UserStatus.Active
+        ).scalar() or 0
+        return {
+            "late_ratio":     knobs["late_ratio"],
+            "active_members": active,
+            "projected_late": int(active * knobs["late_ratio"]),
+        }
+
+    return _manual_sim_run(db, "set_late_pct", runner)
+
+
+@router.post("/manual-sim/action/pay-remaining")
+def manual_sim_action_pay_remaining(db: Session = Depends(get_db)):
+    """
+    DUE_DATE — the stragglers settle.  Pays every still-Unpaid Active member at
+    the simulated instant (same production auto-pay as pay-all; idempotent and
+    collision-safe on re-run).
+    """
+    from app.services.real_simulation import MassLoadInjector
+
+    def runner(ms, sim_now):
+        st = ms._require_active(db)
+        injector = MassLoadInjector(run_prefix=st.get("inject_prefix", "msim0000"))
+        paid = injector.auto_pay_installments(db, week_num=int(st.get("cycle_num", 1)))
+        return {"remaining_paid": paid}
+
+    return _manual_sim_run(db, "pay_remaining", runner)
+
+
+@router.post("/manual-sim/action/grace-settle")
+def manual_sim_action_grace_settle(body: ManualSimGraceRequest, db: Session = Depends(get_db)):
+    """
+    GRACE_PERIOD_START — the authoritative A/B/C grace-window settlement.
+
+    Runs the production apply_abc_model at the simulated instant: it marks the
+    late cohort, accrues real Late_Fee tokens, splits them into
+      • B — paid the late fee and stay in (Unpaid by design this week),
+      • C — entered the grace window and paid the grace fee → survive,
+      • A / failed-C — eliminated (real EliminationEvent rows written),
+    then refills the vacancies.  The response is framed exactly as the panel asks:
+    of those who were late, how many paid late fees (B) versus how many entered the
+    grace window (C survivors + the eliminated who could not pay).
+    """
+    from app.services.real_simulation import MassLoadInjector
+
+    def runner(ms, sim_now):
+        st    = ms._require_active(db)
+        knobs = ms.set_settlement(
+            db,
+            late_ratio=(None if body.late_pct is None else body.late_pct / 100.0),
+            elim_pct_a=body.elim_pct_a,
+            grace_pct_c=body.grace_pct_c,
+        )
+        injector = MassLoadInjector(run_prefix=st.get("inject_prefix", "msim0000"))
+        res = injector.apply_abc_model(
+            db,
+            late_ratio=knobs["late_ratio"],
+            elim_pct_a=knobs["elim_pct_a"],
+            grace_pct_c=knobs["grace_pct_c"],
+        )
+        n_late = int(res.get("n_late", 0))
+        n_b    = int(res.get("n_type_b", 0))
+        n_c    = int(res.get("n_saved", 0))
+        n_elim = int(res.get("n_elim", 0))
+        return {
+            "late_payers":              n_late,
+            "paid_late_fee_B":          n_b,
+            "grace_survivors_C":        n_c,
+            "entered_grace_no_fee":     max(0, n_late - n_b),  # B paid; the rest go to grace
+            "eliminated_A_or_failed":   n_elim,
+            "late_fee_revenue_inr":     res.get("late_fee_revenue_inr", 0),
+            "grace_fee_revenue_inr":    res.get("grace_fee_revenue_inr", 0),
+            "total_compliance_revenue_inr": res.get("total_compliance_revenue_inr", 0),
+            "knobs":                    knobs,
+        }
+
+    return _manual_sim_run(db, "grace_settlement", runner)
+
+
+@router.post("/manual-sim/action/finalize-eliminations")
+def manual_sim_action_finalize_eliminations(db: Session = Depends(get_db)):
+    """
+    G_CLOSE — the guillotine confirmation.
+
+    Read-only: the eliminations were written atomically by the grace settlement
+    (production apply_abc_model eliminates A + failed-C in one settlement, exactly
+    as the live engine does).  This surfaces the EliminationEvent rows finalized in
+    THIS cycle — count, split by reason, and total forfeited — so the developer can
+    confirm the guillotine before the draw prepares.  It mutates nothing.
+    """
+    from app.models.elimination_event import EliminationEvent, EliminationReason
+
+    def runner(ms, sim_now):
+        cycle_start, cycle_end = ms.cycle_window(db)
+        rows = (
+            db.query(EliminationEvent)
+            .filter(
+                EliminationEvent.created_at >= cycle_start,
+                EliminationEvent.created_at <= cycle_end,
+            )
+            .all()
+        )
+        non_payment = sum(1 for r in rows if r.reason == EliminationReason.non_payment)
+        grace_exp   = sum(1 for r in rows if r.reason == EliminationReason.grace_expired)
+        total_forfeited = sum(float(r.total_forfeited or 0) for r in rows)
+        return {
+            "eliminations_this_cycle": len(rows),
+            "reason_non_payment":      non_payment,
+            "reason_grace_expired":    grace_exp,
+            "total_forfeited_inr":     round(total_forfeited, 2),
+            "read_only":               True,
+        }
+
+    return _manual_sim_run(db, "finalize_eliminations", runner)
+
+
+@router.post("/manual-sim/action/prepare-draw")
+def manual_sim_action_prepare_draw(db: Session = Depends(get_db)):
+    """
+    T_02H — run the production draw preparation at the simulated instant.
+
+    Acquires the draw-engine lock, flags L4 members, plans SDE meta-pools, freezes
+    the Brain-5 LPI snapshot and runs the re-assessor — scoped to this session's
+    injected users.  Surfaces whether an admin override is required before the draw.
+    """
+    from app.services.draw_preparation import start_draw_preparation
+
+    def runner(ms, sim_now):
+        st     = ms._require_active(db)
+        prefix = st.get("inject_prefix", "msim0000")
+        prep   = start_draw_preparation(db, draw_time_utc=sim_now, user_prefix=prefix)
+        return {
+            "week_id":                 prep.week_id,
+            "preparation_valid":       bool(prep.preparation_valid),
+            "countdown_active":        bool(prep.countdown_active),
+            "admin_override_required": bool(prep.admin_override_required),
+            "sde_sessions_planned":    int(prep.sde_sessions_planned or 0),
+            "total_l4_count":          int(prep.total_l4_count or 0),
+            "total_active_count":      int(prep.total_active_count or 0),
+            "float_projection_inr":    int(prep.float_projection_inr or 0),
+        }
+
+    return _manual_sim_run(db, "prepare_draw", runner)
+
+
+@router.post("/manual-sim/action/execute-draw")
+def manual_sim_action_execute_draw(db: Session = Depends(get_db)):
+    """
+    T_00H — execute the global weekly draw at the simulated instant.
+
+    Runs the production execute_weekly_draw (SDE pre-passes, all pool draws,
+    refill) scoped to this session's users.  ``auto_pay_unpaid`` is False — payment
+    is the developer's explicit choice at the due-date / grace events, never an
+    implicit side-effect of the draw.
+    """
+    def runner(ms, sim_now):
+        st     = ms._require_active(db)
+        prefix = st.get("inject_prefix", "msim0000")
+        res    = execute_weekly_draw(db, auto_pay_unpaid=False, user_prefix=prefix)
+        return {
+            "pools_drawn":        int(res.pools_drawn),
+            "winners":            len(res.draw_results),
+            "total_auto_paid":    int(res.total_auto_paid),
+            "sde_draws":          int(res.sde_draws_this_week),
+            "ext_draws":          int(res.ext_draws_this_week),
+            "preventive_l3_draws": int(res.preventive_l3_draws_this_week),
+            "accel_draws":        int(res.accel_draws_this_week),
+            "paused_pools":       len(res.paused_pools),
+            "skipped_pools":      len(res.skipped_pools),
+            "draw_posture":       res.draw_posture,
+        }
+
+    return _manual_sim_run(db, "execute_draw", runner)
+
+
+@router.post("/manual-sim/action/cleanup")
+def manual_sim_action_cleanup(db: Session = Depends(get_db)):
+    """
+    T_05M — post-draw cleanup at the simulated instant.
+
+    Resets weekly draw flags, releases the draw-engine lock and auto-settles
+    referral-withdraw tokens (production post_draw_cleanup + auto_settle_referral_rw).
+    Moves NO clock — after cleanup the developer uses jump-next to roll into the
+    next cycle (landing on its DUE_DATE), keeping clock-moves and money-mutations
+    strictly separate operations.
+    """
+    from app.services.draw import post_draw_cleanup
+    from app.services.real_simulation import MassLoadInjector
+
+    def runner(ms, sim_now):
+        st       = ms._require_active(db)
+        summary  = post_draw_cleanup(db)
+        injector = MassLoadInjector(run_prefix=st.get("inject_prefix", "msim0000"))
+        rw_settled = injector.auto_settle_referral_rw(db, week_num=int(st.get("cycle_num", 1)))
+        return {"cleanup": summary, "rw_settled": rw_settled}
+
+    return _manual_sim_run(db, "run_cleanup", runner)

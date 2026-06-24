@@ -72,6 +72,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -159,9 +160,19 @@ EVENT_META: dict[str, dict] = {
         "label": "Cleanup +5m",
         "short": "cleanup",
         "icon":  "ti-broom",
-        "note":  "weekly flags reset, lock released → roll to next cycle",
-        "actions": ["cleanup_advance", "inject_users"],
+        "note":  "weekly flags reset, lock released (then jump-next to roll over)",
+        "actions": ["run_cleanup", "inject_users"],
     },
+}
+
+# Default A/B/C settlement knobs, carried in session state so the grace-window
+# settlement can run with the late-ratio chosen at the due-date event.  These are
+# PARAMETERS fed to the production apply_abc_model — never a re-implementation of
+# its rules.
+_DEFAULT_SETTLEMENT = {
+    "late_ratio":  0.15,   # fraction of active members treated as late this cycle
+    "elim_pct_a":  80.0,   # A — % of late directly eliminated (skip grace)
+    "grace_pct_c": 15.0,   # C — % of grace-eligible late who pay and survive
 }
 
 
@@ -397,15 +408,24 @@ def start_session(
 
     ms = _compute_milestones(db, t00h)
 
+    # Every synthetic user the Time Machine injects carries this 8-char prefix so
+    # the dev DB stays cleanly attributable and resettable.  The injector username
+    # counter is persisted across inject actions within the session so usernames
+    # never collide when "inject users" is triggered repeatedly.
+    inject_prefix = ("msim" + uuid.uuid4().hex[:4])[:8].ljust(8, "0")
+
     state = {
-        "active":        True,
-        "sim_now":       _iso(ms.CYCLE_START),
-        "cycle_t00h":    _iso(t00h),
-        "cycle_num":     1,
-        "current_event": "CYCLE_START",
-        "link_global":   bool(link_global),
-        "created_at":    _iso(now),
-        "expires_at":    _iso(now + timedelta(hours=max(1, int(ttl_hours)))),
+        "active":         True,
+        "sim_now":        _iso(ms.CYCLE_START),
+        "cycle_t00h":     _iso(t00h),
+        "cycle_num":      1,
+        "current_event":  "CYCLE_START",
+        "link_global":    bool(link_global),
+        "inject_prefix":  inject_prefix,
+        "inject_counter": 0,
+        "settlement":     dict(_DEFAULT_SETTLEMENT),
+        "created_at":     _iso(now),
+        "expires_at":     _iso(now + timedelta(hours=max(1, int(ttl_hours)))),
     }
     save_state(db, state)
     _logger.info(
@@ -507,3 +527,104 @@ def jump_to(db: Session, event: str) -> dict:
     st["sim_now"] = _iso(getattr(ms, event))
     save_state(db, st)
     return compute_state(db)
+
+
+# ── Action support (Phase 3) ─────────────────────────────────────────────────
+# These helpers back the per-event action endpoints in app/routers/dev.py.  They
+# carry NO financial rule — they only resolve the simulated instant, enforce the
+# event→action guard, and manage session bookkeeping.  Each endpoint then runs a
+# real production service inside ``with manual_clock(sim_now()):``.
+def sim_now(db: Session) -> datetime:
+    """The current simulated instant of the active session (tz-aware UTC)."""
+    st = _require_active(db)
+    return _parse(st["sim_now"])
+
+
+def current_event(db: Session) -> str:
+    """The current event name of the active session."""
+    return _require_active(db)["current_event"]
+
+
+def assert_action(db: Session, action_key: str) -> dict:
+    """Return the active state, or raise ManualSimError if ``action_key`` is not
+    offered at the CURRENT event.
+
+    This is the server-side authority for what a developer may do at the instant
+    they are standing on — the panel renders the same ``EVENT_META`` action list,
+    but the guard is enforced here so a stale/forged client cannot run an action
+    out of its valid window (e.g. executing the draw before the −2h prep event).
+    """
+    st  = _require_active(db)
+    cur = st["current_event"]
+    allowed = EVENT_META[cur]["actions"]
+    if action_key not in allowed:
+        raise ManualSimError(
+            f"Action '{action_key}' is not available at event '{cur}'. "
+            f"Allowed here: {', '.join(allowed)}."
+        )
+    return st
+
+
+def reserve_inject_counter(db: Session, count: int) -> tuple[str, int]:
+    """Reserve a contiguous block of ``count`` injector ids for this session.
+
+    Returns ``(inject_prefix, base)``.  A freshly-built ``MassLoadInjector`` seeded
+    with ``_counter = base`` will mint usernames ``{prefix}_{base+1:06d} …`` that
+    never collide with a previous inject in the same session, because the stored
+    counter is advanced by ``count`` and persisted before the injector runs.
+    """
+    st = _require_active(db)
+    prefix = st.get("inject_prefix") or ("msim" + uuid.uuid4().hex[:4])[:8].ljust(8, "0")
+    base   = int(st.get("inject_counter", 0))
+    st["inject_prefix"]  = prefix
+    st["inject_counter"] = base + max(0, int(count))
+    save_state(db, st)
+    return prefix, base
+
+
+def get_settlement(db: Session) -> dict:
+    """The A/B/C settlement knobs for the active session, merged over defaults."""
+    st = _require_active(db)
+    merged = dict(_DEFAULT_SETTLEMENT)
+    merged.update(st.get("settlement") or {})
+    return merged
+
+
+def set_settlement(
+    db: Session,
+    *,
+    late_ratio: Optional[float] = None,
+    elim_pct_a: Optional[float] = None,
+    grace_pct_c: Optional[float] = None,
+) -> dict:
+    """Update the session's settlement knobs (only the provided values change).
+
+    These feed the production ``apply_abc_model`` at the grace-window event; they
+    are stored here so the late-ratio chosen at the due-date event flows into the
+    grace settlement without pre-marking members (which would conflict with the
+    model's own late sampling).  Returns the merged knobs.
+    """
+    st = _require_active(db)
+    cur = dict(_DEFAULT_SETTLEMENT)
+    cur.update(st.get("settlement") or {})
+    if late_ratio is not None:
+        cur["late_ratio"] = max(0.0, min(1.0, float(late_ratio)))
+    if elim_pct_a is not None:
+        cur["elim_pct_a"] = max(0.0, min(100.0, float(elim_pct_a)))
+    if grace_pct_c is not None:
+        cur["grace_pct_c"] = max(0.0, min(100.0, float(grace_pct_c)))
+    st["settlement"] = cur
+    save_state(db, st)
+    return cur
+
+
+def cycle_window(db: Session) -> tuple[datetime, datetime]:
+    """``(CYCLE_START, T_05M)`` of the session's CURRENT cycle, tz-aware UTC.
+
+    Used to scope read-only reporting (e.g. counting the eliminations finalized in
+    this cycle) without leaking into adjacent cycles.
+    """
+    st   = _require_active(db)
+    t00h = _parse(st["cycle_t00h"])
+    ms   = _compute_milestones(db, t00h)
+    return ms.CYCLE_START, ms.T_05M

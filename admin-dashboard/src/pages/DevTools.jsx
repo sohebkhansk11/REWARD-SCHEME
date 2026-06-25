@@ -1298,6 +1298,9 @@ function TimeMachineTab({ toast }) {
   const requiredAction  = active ? (state.required_action || []) : []
   const requiredDone    = active ? state.required_done !== false : true
   const disabledActions = active ? (state.disabled_actions || []) : []
+  // SESSION EDIT [Claude Session Jun-25 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // Per-action truthful dim reason (e.g. "All members already paid — nothing due").
+  const disabledReasons = active ? (state.disabled_reasons || {}) : {}
   const compliance      = active ? state.compliance : null
   const tasks           = active ? (state.task_list || []) : []
   const settlement      = active ? (state.settlement || {}) : {}
@@ -1578,14 +1581,14 @@ function TimeMachineTab({ toast }) {
                   <div className="ml-auto flex items-center gap-2">
                     {locked && (
                       <span className="flex items-center gap-1 text-[11px] font-semibold text-emerald-400/80">
-                        <CheckCircle2 className="w-3.5 h-3.5" /> done — locked
+                        <CheckCircle2 className="w-3.5 h-3.5" /> {disabledReasons[key] || 'done — locked'}
                       </span>
                     )}
                     {isRequired && !locked && (
                       <span className="text-[11px] font-semibold text-amber-300">required here</span>
                     )}
                     <button onClick={() => runAction(key)} disabled={!!busy || locked}
-                      title={locked ? 'Already completed at this event — no override / overwrite' : reg.label}
+                      title={locked ? (disabledReasons[key] || 'Already completed at this event — no override / overwrite') : reg.label}
                       className={`flex items-center gap-2 px-4 py-2 rounded-lg text-white text-sm font-semibold disabled:opacity-40 transition-colors ${
                         locked ? 'bg-slate-700 cursor-not-allowed' : (_btnAccent[reg.accent] || _btnAccent.slate)
                       }`}>

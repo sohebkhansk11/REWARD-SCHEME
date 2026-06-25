@@ -135,28 +135,48 @@ try:
         guard_409 = (exc.status_code == 409)
     check("pay-all rejected at CYCLE_START (409)", guard_409)
 
-    print("\n== CYCLE 1 DUE_DATE — pay-all (members just joined Paid) + lock ==")
+    print("\n== CYCLE 1 DUE_DATE — NO dues owed (all joined Paid) → auto-settled, dimmed ==")
+    # SESSION EDIT [Claude Session Jun-25 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Cycle 1 has nothing to collect — everyone injected joins Paid, so 0 Active
+    # members are Unpaid.  This is the *no-dues auto-settle* path (the user's
+    # reported bug): the gate must UNLOCK and every pay control must DIM with a
+    # truthful reason — NOT stay "required" and silently let a button overwrite
+    # already-paid members.  This is STATE-derived satisfaction, never an override:
+    # carry-forward guarantees cycle 2+ starts Unpaid (the real-dues gate, below).
     manual_sim.jump_to(db, "DUE_DATE")
     state_due = manual_sim.compute_state(db)
-    check("DUE_DATE requires a pay action", "pay_all_installments" in state_due["required_action"])
-    check("cannot advance before paying (can_advance False)", state_due["can_advance"] is False)
-    check("compliance panel present", isinstance(state_due.get("compliance"), dict)
-          and "late_payers" in state_due["compliance"])
-    check("task_list present + non-empty", isinstance(state_due.get("task_list"), list)
-          and len(state_due["task_list"]) > 0)
-    blocked = False
-    try:
-        manual_sim.jump_next(db)
-    except manual_sim.ManualSimError:
-        blocked = True
-    check("jump-next hard-blocked until required action done (no override)", blocked)
-
-    dev.manual_sim_action_pay_all(db)
+    check("DUE_DATE still names a pay action in its required-set (event spine intact)",
+          "pay_all_installments" in state_due["required_action"])
+    check("no-dues: nothing is owed so the required action reads DONE (state-satisfied)",
+          state_due["required_done"] is True)
+    check("no-dues: gate UNLOCKS — advance allowed without any payment (can_advance True)",
+          state_due["can_advance"] is True)
+    check("no-dues: compliance shows 0 Active+Unpaid (every active member already paid)",
+          state_due["compliance"]["unpaid"] == 0
+          and state_due["compliance"]["paid_on_time"] == state_due["compliance"]["active"])
+    _NO_DUES = "All members already paid — nothing due this cycle"
+    check("no-dues: pay-all is DIMMED (no overwrite of already-paid members)",
+          "pay_all_installments" in state_due["disabled_actions"]
+          and state_due["disabled_reasons"].get("pay_all_installments") == _NO_DUES)
+    check("no-dues: set-late is DIMMED with the same truthful reason",
+          "set_late_pct" in state_due["disabled_actions"]
+          and state_due["disabled_reasons"].get("set_late_pct") == _NO_DUES)
+    check("no-dues: pay-remaining is DIMMED with the same truthful reason",
+          "pay_remaining" in state_due["disabled_actions"]
+          and state_due["disabled_reasons"].get("pay_remaining") == _NO_DUES)
+    check("no-dues: inject is NEVER dimmed (joiners welcome at every event)",
+          "inject_users" not in state_due["disabled_actions"])
+    check("no-dues: task_list states nothing is due this cycle",
+          isinstance(state_due.get("task_list"), list)
+          and any("nothing" in t.lower() or "already paid" in t.lower()
+                  for t in state_due["task_list"]))
+    # Defense-in-depth: even if the (dimmed) pay-all button were force-pressed, the
+    # production runner only processes Active+Unpaid → 0 paid, ZERO overwrite.
+    idem = dev.manual_sim_action_pay_all(db)
+    check("no-dues: forced pay-all is server-idempotent — 0 installments paid (no re-charge)",
+          idem["result"]["installments_paid"] == 0)
     state_paid = manual_sim.compute_state(db)
-    check("can advance after pay-all (gate open)", state_paid["can_advance"] is True)
-    check("pay-all dims set_late_pct + pay_remaining (locked, no overwrite)",
-          "set_late_pct" in state_paid["disabled_actions"]
-          and "pay_remaining" in state_paid["disabled_actions"])
+    check("no-dues: still advance-able after the idempotent pay-all", state_paid["can_advance"] is True)
 
     print("\n== CYCLE 1 → CYCLE 2 rollover (carry-forward reset) ==")
     active_c1 = manual_sim.compute_state(db)["compliance"]["active"]
@@ -171,6 +191,27 @@ try:
     check("bug #2 carry-forward: no stale at-risk / grace flags survive the reset",
           comp_due2["at_risk"] == 0 and comp_due2["grace_active"] == 0)
     print(f"   cycle-2 due-date: carried Active(Unpaid)={carried}")
+
+    # SESSION EDIT [Claude Session Jun-25 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # REAL-dues locked-gate test (the counterpart to cycle-1's no-dues auto-settle).
+    # Now that carry-forward has reset every survivor to Unpaid, the due-date is
+    # genuinely OWED — so the gate must HARD-BLOCK and jump-next must be refused
+    # until the installment is actually settled.  This proves the cycle-1 unlock was
+    # state-derived (nothing owed) and can NEVER silently skip a real collection.
+    state_owed = manual_sim.compute_state(db)
+    check("real-dues: required action is NOT done while members are Unpaid",
+          state_owed["required_done"] is False)
+    check("real-dues: gate HARD-BLOCKS — cannot advance before settling (can_advance False)",
+          state_owed["can_advance"] is False)
+    check("real-dues: no pay control is dimmed while a genuine balance is owed",
+          "pay_all_installments" not in state_owed["disabled_actions"]
+          and "pay_remaining" not in state_owed["disabled_actions"])
+    blocked = False
+    try:
+        manual_sim.jump_next(db)
+    except manual_sim.ManualSimError:
+        blocked = True
+    check("real-dues: jump-next hard-blocked until the due-date is settled (no override)", blocked)
 
     print("\n== CYCLE 2 DUE_DATE — inject fresh joiners, then set-late (bug #1) ==")
     unpaid_before = active_unpaid_ids(db)            # the carried cohort

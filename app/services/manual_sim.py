@@ -497,6 +497,30 @@ def _compliance(db: Session, *, window: "Optional[tuple[datetime, datetime]]" = 
     }
 
 
+# SESSION EDIT [Claude Session Jun-25 — Soheb Khan User 2 / Sohebkhan.sk11]:
+def _due_date_settled(db: Session) -> bool:
+    """True when NO Active member is Unpaid — the due-date's installment
+    requirement is intrinsically met and there is nothing left to collect.
+
+    This is the legitimate "everyone has already paid" state (e.g. cycle-1 joiners,
+    who join with weekly_payment_status=Paid because their joining installment IS
+    this week's installment; or any cycle after a full pay-all).  In that state the
+    settle actions (pay-all / set-late / pay-remaining) are pure no-ops — re-running
+    them would only re-touch already-Paid rows — so the clock may advance without
+    them and the panel must DIM them.  This is state-DERIVED satisfaction, NOT an
+    override: when even one Active member is still Unpaid this returns False and the
+    hard-block gate stands (no due-date with money owed can ever be skipped).  The
+    carry-forward reset makes every cycle≥2 start Unpaid, so collection is never
+    silently bypassed.
+    """
+    from sqlalchemy import func
+    from app.models.user import User, UserStatus, WeeklyPaymentStatus
+    return (db.query(func.count(User.id)).filter(
+        User.status == UserStatus.Active,
+        User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
+    ).scalar() or 0) == 0
+
+
 def task_list(event: str, c: dict, settlement: dict) -> list[str]:
     """Event-aware "what must happen here" checklist, derived from live counts.
 
@@ -511,9 +535,17 @@ def task_list(event: str, c: dict, settlement: dict) -> list[str]:
         tasks.append(f"Payment window open — {c['active']} active, {c['waitlist']} on waitlist.")
         tasks.append("Optional: inject members (random join-time within today's date).")
     elif event == "DUE_DATE":
-        tasks.append(f"{c['unpaid']} of {c['active']} active members must pay this week's installment.")
-        tasks.append(f"Projected late this cycle (knob): {int(c['active'] * late_ratio)} @ late-ratio {late_ratio:.0%}.")
-        tasks.append("Settle: Pay-all (everyone on time) OR Set-late % then Pay-remaining.")
+        # SESSION EDIT [Jun-25]: when nothing is owed (every active member already
+        # Paid — e.g. joiners whose joining installment IS this week's installment),
+        # the settle actions are no-ops; surface "nothing due, advance" instead of
+        # asking the operator to re-pay (which would only overwrite Paid rows).
+        if c["unpaid"] == 0:
+            tasks.append(f"All {c['active']} active member(s) have already paid — nothing due this cycle.")
+            tasks.append("No settlement needed (pay actions are dimmed) — advance to Grace open.")
+        else:
+            tasks.append(f"{c['unpaid']} of {c['active']} active members must pay this week's installment.")
+            tasks.append(f"Projected late this cycle (knob): {int(c['active'] * late_ratio)} @ late-ratio {late_ratio:.0%}.")
+            tasks.append("Settle: Pay-all (everyone on time) OR Set-late % then Pay-remaining.")
     elif event == "GRACE_PERIOD_START":
         # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
         # Truthful A/B/C model — bucket B no longer "pays late-fee & stays Unpaid".
@@ -544,18 +576,32 @@ def task_list(event: str, c: dict, settlement: dict) -> list[str]:
     return tasks
 
 
-def _disabled_actions(event: str, done_here: list[str]) -> list[str]:
-    """Actions to DIM at ``event`` given what's already been done this visit.
+def _disabled_actions(
+    event: str, done_here: list[str], db: "Optional[Session]" = None,
+) -> dict[str, str]:
+    """Actions to DIM at ``event`` → ``{action_key: human reason}``.
 
-    Applies the ACTION_LOCKS mutual-exclusion / single-shot rules and intersects
-    with the actions actually offered at this event.  inject_users is never dimmed.
+    Two sources, each with a truthful reason the panel renders next to the dimmed
+    control (financial-grade: every disabled control explains itself):
+      1. ACTION_LOCKS mutual-exclusion / single-shot — once a settling action runs,
+         its conflicting siblings (and itself) dim ("… already done — no overwrite").
+      2. SESSION EDIT [Jun-25] state-derived: at the DUE_DATE, when nothing is owed
+         (``_due_date_settled``), the pay-all / set-late / pay-remaining actions are
+         no-ops and dim with "nothing due" — so the operator can never re-pay /
+         overwrite an already-Paid roster (the reported bug).
+    inject_users is never dimmed.  Result is intersected with the actions actually
+    offered at this event.
     """
-    disabled: set[str] = set()
+    disabled: dict[str, str] = {}
     for done in done_here:
         for locked in ACTION_LOCKS.get(done, ()):
-            disabled.add(locked)
-    disabled.discard("inject_users")
-    return [a for a in EVENT_META[event]["actions"] if a in disabled]
+            disabled.setdefault(
+                locked, f"{ACTION_LABELS.get(done, done)} already done — no overwrite")
+    if event == "DUE_DATE" and db is not None and _due_date_settled(db):
+        for k in ("pay_all_installments", "set_late_pct", "pay_remaining"):
+            disabled.setdefault(k, "All members already paid — nothing due this cycle")
+    disabled.pop("inject_users", None)
+    return {a: r for a, r in disabled.items() if a in EVENT_META[event]["actions"]}
 
 
 def _ordered_milestones(ms: _SimMilestones) -> list[tuple[str, datetime]]:
@@ -595,6 +641,9 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
         ttl_remaining = max(0, int((_parse(exp) - datetime.now(timezone.utc)).total_seconds()))
 
     cyc = int(st.get("cycle_num", 1))
+    # SESSION EDIT [Jun-25]: the due-date is also satisfied by STATE — when no active
+    # member is Unpaid there is nothing to collect (joiners join Paid).  Compute once.
+    due_settled = _due_date_settled(db)
     events: list[dict] = []
     for name, dt in _ordered_milestones(ms):
         meta = EVENT_META[name]
@@ -611,16 +660,18 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
             "is_past":    (dt < sim_now) and name != cur,
             "actions":    meta["actions"],
             # SESSION EDIT [Jun-24]: per-event gating telemetry for the timeline.
+            # [Jun-25] the CURRENT due-date node also reads "done" when nothing is owed.
             "required":      list(req) if req else [],
-            "required_done": (not req) or any(a in ev_done for a in req),
+            "required_done": (not req) or any(a in ev_done for a in req)
+                             or (name == cur and name == "DUE_DATE" and due_settled),
         })
 
     # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
     # Event-driven gating + dim-lock telemetry for the CURRENT event.
     cur_required = REQUIRED_ACTION.get(cur)
-    can_adv, adv_reason = advance_gate(st)
+    can_adv, adv_reason = advance_gate(st, db)
     done_here = _event_done(st, cyc, cur)
-    disabled  = _disabled_actions(cur, done_here)
+    disabled_map = _disabled_actions(cur, done_here, db)
     settlement = dict(_DEFAULT_SETTLEMENT)
     settlement.update(st.get("settlement") or {})
 
@@ -645,11 +696,15 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
         "ttl_remaining_seconds": ttl_remaining,
         # ── Event-driven gating (hard-block, no override) ────────────────────
         "required_action":     list(cur_required) if cur_required else [],
-        "required_done":       (not cur_required) or any(a in done_here for a in cur_required),
+        # [Jun-25] required is also "done" when the due-date has nothing owed.
+        "required_done":       (not cur_required) or any(a in done_here for a in cur_required)
+                               or (cur == "DUE_DATE" and due_settled),
         "can_advance":         can_adv,
         "advance_block_reason": adv_reason,
         "actions_done":        done_here,
-        "disabled_actions":    disabled,
+        "disabled_actions":    list(disabled_map.keys()),
+        # [Jun-25] per-action human reason for the dim (rendered beside each control).
+        "disabled_reasons":    disabled_map,
         "settlement":          settlement,
     }
     if include_snapshot:
@@ -823,12 +878,17 @@ def record_action(db: Session, action_key: str) -> None:
     save_state(db, st)
 
 
-def advance_gate(st: dict) -> tuple[bool, str]:
+def advance_gate(st: dict, db: "Optional[Session]" = None) -> tuple[bool, str]:
     """Whether the clock may step OFF the current event, and why not.
 
     Hard-block / no-override: if the current event has a REQUIRED action, at least
     one of its options must already be recorded for this cycle:event.  Returns
     ``(can_advance, reason)`` — reason is "" when advancement is allowed.
+
+    SESSION EDIT [Jun-25]: the due-date is ALSO satisfied by state — when ``db`` is
+    given and no active member is Unpaid, the installment is fully collected and the
+    clock may advance without re-running a settle action (which would be a no-op).
+    This is not an override: with any Unpaid member the gate still hard-blocks.
     """
     cur = st.get("current_event")
     required = REQUIRED_ACTION.get(cur)
@@ -837,17 +897,23 @@ def advance_gate(st: dict) -> tuple[bool, str]:
     done = _event_done(st, st.get("cycle_num", 1), cur)
     if any(a in done for a in required):
         return True, ""
+    if cur == "DUE_DATE" and db is not None and _due_date_settled(db):
+        return True, ""
     labels = " or ".join(ACTION_LABELS.get(a, a) for a in required)
     return False, f"Complete “{labels}” at {EVENT_META[cur]['label']} before advancing — no override."
 
 
-def _path_gate(st: dict, target_event: str) -> tuple[bool, str]:
+def _path_gate(st: dict, target_event: str, db: "Optional[Session]" = None) -> tuple[bool, str]:
     """Multi-step forward jump guard: EVERY event from the current one up to (but
     excluding) ``target_event`` must have its required action satisfied.
 
     This enforces the user's "without event-driven, next event can't be jumped"
     rule even for a timeline shortcut that skips intermediate nodes — you cannot
     leap past an event whose work is still pending.
+
+    SESSION EDIT [Jun-25]: a due-date with nothing owed (``_due_date_settled``) is
+    treated as satisfied so a no-dues cycle can be jumped past without a redundant
+    pay action — still a hard-block when any active member is Unpaid.
     """
     cur_idx = EVENT_SPINE.index(st["current_event"])
     tgt_idx = EVENT_SPINE.index(target_event)
@@ -857,10 +923,13 @@ def _path_gate(st: dict, target_event: str) -> tuple[bool, str]:
         required = REQUIRED_ACTION.get(ev)
         if not required:
             continue
-        if not any(a in _event_done(st, cyc, ev) for a in required):
-            labels = " or ".join(ACTION_LABELS.get(a, a) for a in required)
-            return False, (f"Complete “{labels}” at {EVENT_META[ev]['label']} "
-                           f"before jumping past it — no override.")
+        if any(a in _event_done(st, cyc, ev) for a in required):
+            continue
+        if ev == "DUE_DATE" and db is not None and _due_date_settled(db):
+            continue
+        labels = " or ".join(ACTION_LABELS.get(a, a) for a in required)
+        return False, (f"Complete “{labels}” at {EVENT_META[ev]['label']} "
+                       f"before jumping past it — no override.")
     return True, ""
 
 
@@ -877,8 +946,9 @@ def jump_next(db: Session) -> dict:
     the current event.  Logic runs only when an event's action is triggered.
     """
     st = _require_active(db)
-    # HARD-BLOCK gate — the current event's required action must be done first.
-    ok, why = advance_gate(st)
+    # HARD-BLOCK gate — the current event's required action must be done first
+    # (or, at the due-date, intrinsically satisfied because nothing is owed).
+    ok, why = advance_gate(st, db)
     if not ok:
         raise ManualSimError(why)
     t00h = _parse(st["cycle_t00h"])
@@ -942,8 +1012,9 @@ def jump_to(db: Session, event: str) -> dict:
             "Time only moves forward — use jump-next to roll into the next cycle."
         )
 
-    # HARD-BLOCK gate — cannot leap past any event whose required action is pending.
-    ok, why = _path_gate(st, event)
+    # HARD-BLOCK gate — cannot leap past any event whose required action is pending
+    # (a no-dues due-date is intrinsically satisfied; see _path_gate).
+    ok, why = _path_gate(st, event, db)
     if not ok:
         raise ManualSimError(why)
 

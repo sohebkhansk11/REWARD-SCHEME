@@ -1100,7 +1100,10 @@ const MS_ACTIONS = {
   pay_remaining:         { ep:'pay-remaining', label:'Pay remaining', icon:CheckCircle2, accent:'emerald' },
   grace_settlement:      { ep:'grace-settle', label:'Run grace settlement', icon:Shuffle, accent:'purple',
     fields:[{k:'late_pct',label:'Late % (blank=use set)',step:1},{k:'elim_pct_a',label:'Eliminate % (A)',def:80,step:1},{k:'grace_pct_c',label:'Grace-pay % (C)',def:15,step:1}] },
-  finalize_eliminations: { ep:'finalize-eliminations', label:'Confirm guillotine (read-only)', icon:Skull, accent:'red' },
+  // SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+  // Finalize is the REAL guillotine now (mutates) — it eliminates A (non-payment)
+  // + B (grace-expired) and refills vacancies from the waitlist.  No longer read-only.
+  finalize_eliminations: { ep:'finalize-eliminations', label:'Run guillotine (eliminate A+B)', icon:Skull, accent:'red' },
   prepare_draw:          { ep:'prepare-draw', label:'Prepare draw (−2h)', icon:Settings, accent:'blue' },
   execute_draw:          { ep:'execute-draw', label:'Execute draw', icon:Trophy, accent:'purple' },
   run_cleanup:           { ep:'cleanup', label:'Run cleanup (+5m)', icon:RefreshCw, accent:'slate' },
@@ -1118,6 +1121,67 @@ function MsCountdown({ seconds }) {
   const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = seconds % 60
   const txt = h > 0 ? `${h}h ${String(m).padStart(2,'0')}m` : `${m}m ${String(s).padStart(2,'0')}s`
   return <span className="tabular-nums">{txt}</span>
+}
+
+// SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+// Human-legible summary of the most consequential action results so the operator
+// reads the outcome without parsing raw JSON.  Truthful to the new production
+// lifecycle: grace settlement shows the A/B/C buckets (A+B eliminated, only C
+// survives); finalize shows the real guillotine count + per-reason split + seats
+// refilled; inject surfaces the draw-window "held on waitlist" hold (bug #3).
+function MsActionSummary({ action, result: r }) {
+  if (!r || typeof r !== 'object') return null
+  const INR = (v) => `₹${Number(v ?? 0).toLocaleString('en-IN')}`
+
+  if (action === 'grace_settlement') {
+    const reconcile = r.buckets_reconcile !== false
+    return (
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+        <StatPill label="At-risk cohort"      value={NUM(r.at_risk)}              accent="rose" />
+        <StatPill label="A · eliminate"       value={NUM(r.eliminate_pending_A)}  accent="red" />
+        <StatPill label="C · grace-pay (live)" value={NUM(r.grace_saved_C)}        accent="emerald" />
+        <StatPill label="B · grace-expires"   value={NUM(r.grace_pending_B)}       accent="amber" />
+        <StatPill label="Late-fee revenue"    value={INR(r.late_fee_revenue_inr)}  accent="blue" />
+        <StatPill label="Grace-fee revenue"   value={INR(r.grace_fee_revenue_inr)} accent="purple" />
+        <StatPill label="A+B+C reconciles"    value={reconcile ? 'YES' : 'NO'}     accent={reconcile ? 'emerald' : 'red'} />
+        <StatPill label="Survive (C only)"    value={NUM(r.grace_saved_C)}         accent="emerald" />
+      </div>
+    )
+  }
+
+  if (action === 'finalize_eliminations') {
+    return (
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+        <StatPill label="Eliminated"        value={NUM(r.eliminated_this_cycle)} accent="red" />
+        <StatPill label="A · non-payment"   value={NUM(r.reason_non_payment)}    accent="rose" />
+        <StatPill label="B · grace-expired" value={NUM(r.reason_grace_expired)}  accent="amber" />
+        <StatPill label="Forfeited"         value={INR(r.total_forfeited_inr)}   accent="purple" />
+        <StatPill label="Seats refilled"    value={NUM(r.seats_refilled)}        accent="emerald" />
+        <StatPill label="ISO week"          value={r.iso_week ?? '—'}            accent="slate" />
+      </div>
+    )
+  }
+
+  if (action === 'inject_users') {
+    const held = r.held_on_waitlist === true
+    return (
+      <div className="space-y-2.5">
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+          <StatPill label="Injected"     value={NUM(r.injected)}     accent="cyan" />
+          <StatPill label="Pools formed" value={NUM(r.pools_formed)} accent={r.pools_formed > 0 ? 'blue' : 'slate'} />
+          <StatPill label="Held on waitlist" value={held ? 'YES' : 'no'} accent={held ? 'amber' : 'slate'} />
+        </div>
+        {held && (
+          <div className="flex items-start gap-2 rounded-xl border border-amber-700/50 bg-amber-950/40 px-3 py-2">
+            <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+            <p className="text-xs text-amber-200">{r.note || 'Roster frozen at G_CLOSE — joiners held on the waitlist for the next cycle.'}</p>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return null
 }
 
 function TimeMachineTab({ toast }) {
@@ -1412,57 +1476,62 @@ function TimeMachineTab({ toast }) {
 
       {/* ── A / B / C settlement guide (grace event only) ───────────────────── */}
       {/* SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
-      {/* User req #3: "show guide how to fill the ABC model". Truthful to production */}
-      {/* apply_abc_model — every late member accrues a late fee, then late splits     */}
-      {/* into A (eliminate) · C (grace-pay & survive) · B (remainder, pay late fee &  */}
-      {/* stay Unpaid). Live preview uses the current late-payer count + the knobs.    */}
+      {/* TRUTHFUL production lifecycle (the synthetic apply_abc_model re-sampler was   */}
+      {/* REMOVED). The base cohort is the REAL at-risk set (Active · Unpaid · risk=    */}
+      {/* True, carried forward from Due-date) — NOT a fresh random re-sample. It splits */}
+      {/* into A (eliminate non-payment) · C (grace-fee paid → survive) · B (remainder, */}
+      {/* grace granted but EXPIRES at G_CLOSE → eliminated grace_expired). Preview      */}
+      {/* mirrors the backend's clamping split exactly so A + B + C == at_risk always.   */}
       {active && state.current_event === 'GRACE_PERIOD_START' && (() => {
-        const gLate = compliance?.late_payers ?? 0
+        const gRisk = compliance?.at_risk ?? 0
         const gA = Number(inputs.elim_pct_a ?? settlement.elim_pct_a ?? 80)
         const gC = Number(inputs.grace_pct_c ?? settlement.grace_pct_c ?? 15)
-        const overflow = (gA + gC) > 100
-        const pA = overflow ? 0 : Math.round(gLate * gA / 100)
-        const pC = overflow ? 0 : Math.round(gLate * gC / 100)
-        const pB = overflow ? 0 : Math.max(0, gLate - pA - pC)
+        // Exact mirror of dev.py grace_settle: floor + clamp so B is never negative.
+        const pA = Math.min(gRisk, Math.floor(gRisk * gA / 100))
+        const pC = Math.min(gRisk - pA, Math.floor(gRisk * gC / 100))
+        const pB = gRisk - pA - pC
+        const squeezed = (gA + gC) > 100
         return (
           <DevCard icon={Info} iconBg="bg-purple-950" iconColor="text-purple-300"
                    title="A / B / C settlement — how to fill the model"
-                   subtitle="production apply_abc_model · all late members accrue a late fee, then split into three buckets">
+                   subtitle="real at-risk cohort (carried forward from Due-date) splits into three buckets — no re-sampling">
             <div className="space-y-3">
               <p className="text-xs text-slate-300 leading-relaxed">
-                Of the <span className="font-bold text-rose-300">{gLate}</span> late payer(s) this cycle, the model splits
-                them three ways. <span className="text-slate-400">Late % (blank = use the % you set at Due-date)</span> only
-                relabels how many are late; <span className="font-semibold text-slate-200">A%</span> and{' '}
-                <span className="font-semibold text-slate-200">C%</span> are percentages <em>of the late set</em>.
+                The <span className="font-bold text-rose-300">{gRisk}</span> at-risk member(s) this cycle are the genuine
+                Unpaid old members flagged at Due-date (paid members &amp; fresh joiners are never touched). The model
+                splits this cohort three ways — <span className="font-semibold text-slate-200">A%</span> and{' '}
+                <span className="font-semibold text-slate-200">C%</span> are percentages <em>of the at-risk set</em>;
+                B is whatever remains.
               </p>
               <div className="grid sm:grid-cols-3 gap-2.5">
                 <div className="rounded-xl border border-red-800/50 bg-red-950/30 p-3">
                   <p className="text-[11px] font-bold uppercase tracking-wider text-red-300">A · Eliminate</p>
                   <p className="text-2xl font-black text-red-200 tabular-nums mt-1">{pA}</p>
-                  <p className="text-[11px] text-slate-400 mt-1">{gA}% of late → guillotine (removed from pool).</p>
+                  <p className="text-[11px] text-slate-400 mt-1">{gA}% → guillotine at G_CLOSE (reason <span className="font-mono">non_payment</span>).</p>
                 </div>
                 <div className="rounded-xl border border-emerald-800/50 bg-emerald-950/30 p-3">
                   <p className="text-[11px] font-bold uppercase tracking-wider text-emerald-300">C · Grace-pay</p>
                   <p className="text-2xl font-black text-emerald-200 tabular-nums mt-1">{pC}</p>
-                  <p className="text-[11px] text-slate-400 mt-1">{gC}% of late → pay grace + late fee, survive.</p>
+                  <p className="text-[11px] text-slate-400 mt-1">{gC}% → pay grace + late fee now → <span className="font-semibold text-emerald-300">survive</span>.</p>
                 </div>
                 <div className="rounded-xl border border-amber-800/50 bg-amber-950/30 p-3">
-                  <p className="text-[11px] font-bold uppercase tracking-wider text-amber-300">B · Remainder</p>
+                  <p className="text-[11px] font-bold uppercase tracking-wider text-amber-300">B · Grace-expires</p>
                   <p className="text-2xl font-black text-amber-200 tabular-nums mt-1">{pB}</p>
-                  <p className="text-[11px] text-slate-400 mt-1">rest → pay late fee, stay Unpaid in pool.</p>
+                  <p className="text-[11px] text-slate-400 mt-1">rest → grace granted but lapses at G_CLOSE → eliminated <span className="font-mono">grace_expired</span>.</p>
                 </div>
               </div>
-              {overflow ? (
-                <div className="flex items-start gap-2 rounded-xl border border-red-700/60 bg-red-950/50 px-3 py-2">
-                  <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
-                  <p className="text-xs text-red-200">A% + C% = {gA + gC}% exceeds 100%. The model rejects this — keep
-                    <span className="font-semibold"> A% + C% ≤ 100</span> so bucket B (the remainder) is never negative.</p>
+              {squeezed ? (
+                <div className="flex items-start gap-2 rounded-xl border border-amber-700/60 bg-amber-950/50 px-3 py-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-xs text-amber-200">A% + C% = {gA + gC}% exceeds 100%. The model does not reject this —
+                    A takes its share first, then <span className="font-semibold">C is clamped to the remainder</span> (here {pC}),
+                    leaving B = {pB}. A + B + C still equals the at-risk count.</p>
                 </div>
               ) : (
                 <p className="text-[11px] text-slate-500">
-                  Rule: <span className="font-semibold text-slate-300">A% + C% ≤ 100</span> · Invariant:{' '}
-                  <span className="font-mono text-slate-300">A + B + C = {pA} + {pB} + {pC} = {pA + pB + pC} = late ({gLate})</span>.
-                  Fill the fields in <span className="font-semibold">“Run grace settlement”</span> below, then it posts to production apply_abc_model.
+                  Invariant (always holds, B clamps):{' '}
+                  <span className="font-mono text-slate-300">A + B + C = {pA} + {pB} + {pC} = {pA + pB + pC} = at-risk ({gRisk})</span>.
+                  Fill the fields in <span className="font-semibold">“Run grace settlement”</span> below; only C survives — A and B are both eliminated at G_CLOSE.
                 </p>
               )}
             </div>
@@ -1548,7 +1617,11 @@ function TimeMachineTab({ toast }) {
               <p className="text-xs text-slate-400 mb-2">
                 Last action: <code className="text-violet-300 font-bold">{last.action}</code>
               </p>
-              <pre className="text-[11px] font-mono text-slate-300 bg-slate-950/70 border border-slate-800 rounded-xl p-3 overflow-x-auto max-h-60">
+              {/* SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]: */}
+              {/* Legible outcome summary (A/B/C buckets · guillotine reasons · waitlist hold) */}
+              {/* above the raw response so the operator reads the result at a glance.        */}
+              <MsActionSummary action={last.action} result={last.result} />
+              <pre className="text-[11px] font-mono text-slate-300 bg-slate-950/70 border border-slate-800 rounded-xl p-3 overflow-x-auto max-h-60 mt-3">
 {JSON.stringify(last.result, null, 2)}
               </pre>
             </ResultBox>

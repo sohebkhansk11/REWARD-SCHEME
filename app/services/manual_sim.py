@@ -85,6 +85,8 @@ from app.services.real_simulation import (
     ChronosEngine,
     _compute_milestones,
     _SimMilestones,
+    # SESSION EDIT [Jun-24]: cycle-rollover payment reset (carry-forward lifecycle).
+    _fm_reset_payment_cycle,
 )
 
 _logger = logging.getLogger(__name__)
@@ -205,6 +207,12 @@ REQUIRED_ACTION: dict[str, "Optional[tuple[str, ...]]"] = {
 # inject_users is intentionally absent: member injection stays available 24×7.
 ACTION_LOCKS: dict[str, tuple[str, ...]] = {
     "pay_all_installments":  ("pay_all_installments", "set_late_pct", "pay_remaining"),
+    # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # set_late_pct is now a real money mutation (accrues per-member late fees + marks
+    # the cohort at-risk), so it must be SINGLE-SHOT (re-running would double-accrue)
+    # AND mutually exclusive with pay-all (a cycle settled "everyone on time" can
+    # never also designate a late cohort — no override, no overwrite).
+    "set_late_pct":          ("set_late_pct", "pay_all_installments"),
     "pay_remaining":         ("pay_remaining", "pay_all_installments"),
     "grace_settlement":      ("grace_settlement",),
     "finalize_eliminations": ("finalize_eliminations",),
@@ -507,12 +515,23 @@ def task_list(event: str, c: dict, settlement: dict) -> list[str]:
         tasks.append(f"Projected late this cycle (knob): {int(c['active'] * late_ratio)} @ late-ratio {late_ratio:.0%}.")
         tasks.append("Settle: Pay-all (everyone on time) OR Set-late % then Pay-remaining.")
     elif event == "GRACE_PERIOD_START":
-        tasks.append(f"{c['late_payers']} late payer(s) to settle via A/B/C.")
-        tasks.append("A% eliminate · C% grace-pay & survive · B remainder pay late-fee & stay Unpaid.")
+        # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Truthful A/B/C model — bucket B no longer "pays late-fee & stays Unpaid".
+        # B is granted grace that EXPIRES at G_CLOSE → swept (grace_expired) by the
+        # guillotine.  Only C (grace-fee paid) survives; A & B are both eliminated.
+        tasks.append(f"{c['at_risk']} at-risk (Unpaid) member(s) to settle via A/B/C.")
+        tasks.append("A% eliminate (non-payment) · C% grace-pay & survive · "
+                     "B remainder grace-expires at G_CLOSE → eliminated.")
         tasks.append(f"Grace-active now: {c['grace_active']} · grace-fee paid: {c['grace_fee_paid']}.")
     elif event == "G_CLOSE":
-        tasks.append(f"Confirm {c['eliminated_this_cycle']} elimination(s) finalized this cycle.")
-        tasks.append(f"{c['at_risk']} member(s) flagged at-risk (Type B — Unpaid, still in pool).")
+        # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Finalize is the REAL guillotine now: eliminate every Active member still
+        # risk=True AND grace_active=False (A → non_payment) plus those whose grace
+        # expired at this instant (B → grace_expired).  After close, NO Unpaid member
+        # may remain Active — that is the production invariant we assert.
+        tasks.append(f"Finalize the guillotine — {c['at_risk']} at-risk member(s) pending: "
+                     "A → non-payment, B → grace-expired; C (grace-paid) survives.")
+        tasks.append("After G_CLOSE no Unpaid member may stay Active (vacancies refill from waitlist).")
     elif event == "T_02H":
         tasks.append(f"Prepare draw — {c['active']} active across {c['pools_active']} pool(s).")
         tasks.append("Acquires draw lock, flags L4, plans SDE meta-pool, freezes LPI snapshot.")
@@ -684,6 +703,9 @@ def start_session(
         "inject_prefix":  inject_prefix,
         "inject_counter": 0,
         "settlement":     dict(_DEFAULT_SETTLEMENT),
+        # SESSION EDIT [Jun-24]: the REAL late cohort designated at the due-date event
+        # (ids).  pay-remaining skips them; rollover + pay-all clear them.
+        "late_cohort_ids": [],
         "ttl_hours":      ttl,
         "created_at":     _iso(now),
         "expires_at":     _iso(now + timedelta(hours=ttl)),
@@ -870,6 +892,15 @@ def jump_next(db: Session) -> dict:
         st["sim_now"] = _iso(getattr(ms, nxt))
         rolled = False
     else:
+        # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Cycle rollover (T_05M → next cycle's DUE_DATE).  Carry-forward + reset:
+        # the new week's installment is owed, so every SURVIVING Active member is
+        # reset Paid→Unpaid via the REAL production helper (_fm_reset_payment_cycle).
+        # Members injected AFTER this point join Paid, so the next due-date
+        # enforcement never touches fresh joiners (bug #1).  The previous cycle's
+        # designated late cohort is cleared — a brand-new week starts clean.
+        _fm_reset_payment_cycle(db)            # commits the survivors→Unpaid reset
+        st["late_cohort_ids"] = []
         next_t00h = ms.T_00H + ms.cycle_length
         nms = _compute_milestones(db, next_t00h)
         st["cycle_t00h"]    = _iso(next_t00h)
@@ -1027,6 +1058,44 @@ def cycle_window(db: Session) -> tuple[datetime, datetime]:
     t00h = _parse(st["cycle_t00h"])
     ms   = _compute_milestones(db, t00h)
     return ms.CYCLE_START, ms.T_05M
+
+
+# SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+def milestones(db: Session) -> _SimMilestones:
+    """The frozen ``_SimMilestones`` for the session's CURRENT cycle.
+
+    Exposes every milestone instant (notably ``G_CLOSE``) so an action can pin a
+    production deadline to the exact simulated milestone — e.g. the grace-window
+    settlement grants bucket-B grace expiring AT ``G_CLOSE`` so the guillotine sweeps
+    them precisely when the window closes.
+    """
+    st   = _require_active(db)
+    return _compute_milestones(db, _parse(st["cycle_t00h"]))
+
+
+# ── Late-cohort carry-forward (the REAL due-date late set) ────────────────────
+# The ids of members designated late at the due-date event are persisted so the
+# straggler pay-remaining can skip them (they must stay Unpaid + at-risk into the
+# grace window).  Cleared at rollover (new week) and by pay-all (everyone on time).
+def set_late_cohort(db: Session, ids: "list[int]") -> None:
+    """Persist the designated late-cohort member ids for the current cycle."""
+    st = _require_active(db)
+    st["late_cohort_ids"] = [int(i) for i in (ids or [])]
+    save_state(db, st)
+
+
+def get_late_cohort(db: Session) -> "list[int]":
+    """The designated late-cohort member ids for the current cycle (never None)."""
+    st = _require_active(db)
+    return [int(i) for i in (st.get("late_cohort_ids") or [])]
+
+
+def clear_late_cohort(db: Session) -> None:
+    """Clear the designated late cohort (idempotent — safe when already empty)."""
+    st = _require_active(db)
+    if st.get("late_cohort_ids"):
+        st["late_cohort_ids"] = []
+        save_state(db, st)
 
 
 # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:

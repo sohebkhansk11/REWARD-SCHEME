@@ -3251,6 +3251,27 @@ def manual_sim_action_inject(body: ManualSimInjectRequest, db: Session = Depends
         )
         db.commit()                                         # persist users before forming pools
 
+        # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Bug #3 — a member who joins DURING the draw window (grace already closed,
+        # draw being prepared/executed) must NOT be folded into a pool for THIS draw.
+        # The roster is frozen at G_CLOSE.  So from G_CLOSE through cleanup we hold
+        # every joiner on the waitlist (skip the production pool-formation pass);
+        # they are picked up by the next cycle's normal refill.  Before G_CLOSE the
+        # behaviour is unchanged (purely production-gated, no override).
+        DRAW_WINDOW = {"G_CLOSE", "T_02H", "T_00H", "T_05M"}
+        cur_event = ms.current_event(db)
+        if cur_event in DRAW_WINDOW:
+            return {
+                "injected":          len(created),
+                "pools_formed":      0,
+                "held_on_waitlist":  True,
+                "window_start":      win_start.isoformat(),
+                "window_end":        win_end.isoformat(),
+                "prefix":            prefix,
+                "note":              f"Roster frozen at G_CLOSE — joiners held on waitlist "
+                                     f"during the draw window ({cur_event}).",
+            }
+
         # Pool formation is PURELY production-gated now (no override).  Net delta
         # reflects only what assign_waitlist_to_pools + the merger actually formed.
         pools_before = db.query(func.count(Pool.id)).scalar() or 0
@@ -3259,11 +3280,12 @@ def manual_sim_action_inject(body: ManualSimInjectRequest, db: Session = Depends
         pools_after = db.query(func.count(Pool.id)).scalar() or 0
 
         return {
-            "injected":     len(created),
-            "pools_formed": max(0, pools_after - pools_before),
-            "window_start": win_start.isoformat(),
-            "window_end":   win_end.isoformat(),
-            "prefix":       prefix,
+            "injected":         len(created),
+            "pools_formed":     max(0, pools_after - pools_before),
+            "held_on_waitlist": False,
+            "window_start":     win_start.isoformat(),
+            "window_end":       win_end.isoformat(),
+            "prefix":           prefix,
         }
 
     return _manual_sim_run(db, "inject_users", runner)
@@ -3282,6 +3304,10 @@ def manual_sim_action_pay_all(db: Session = Depends(get_db)):
         st = ms._require_active(db)
         injector = MassLoadInjector(run_prefix=st.get("inject_prefix", "msim0000"))
         paid = injector.auto_pay_installments(db, week_num=int(st.get("cycle_num", 1)))
+        # SESSION EDIT [Jun-24]: pay-all settles EVERYONE on time → there is no late
+        # cohort this cycle.  Clear any stored cohort so a later pay-remaining/grace
+        # never references a stale id set (no overwrite / no leakage across visits).
+        ms.clear_late_cohort(db)
         return {"installments_paid": paid}
 
     return _manual_sim_run(db, "pay_all_installments", runner)
@@ -3290,22 +3316,70 @@ def manual_sim_action_pay_all(db: Session = Depends(get_db)):
 @router.post("/manual-sim/action/set-late")
 def manual_sim_action_set_late(body: ManualSimSetLateRequest, db: Session = Depends(get_db)):
     """
-    DUE_DATE — choose how many members are late this cycle.
+    DUE_DATE — designate the REAL late cohort for this cycle.
 
-    Stores the late-ratio knob (fed to the grace-window settlement) and returns a
-    projection.  Deliberately does NOT pre-mark members: the production
-    apply_abc_model samples the late cohort itself at the grace event, so marking
-    here would double-count.
+    SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    Bug #1 root-cause fix.  This action no longer stores a passive knob that the
+    grace event would later use to RE-SAMPLE a fresh random cohort from ALL Active
+    members (which wrongly enforced members who paid on time / brand-new joiners).
+    Instead it selects the late cohort NOW, from the production tables, and only
+    ever from members who are genuinely ``Active AND Unpaid`` — so a member who
+    paid this week (including everyone injected this cycle, who join Paid) is NEVER
+    eligible to be marked late.  Each selected member accrues a REAL late fee
+    (1–4 simulated days × late_fee_per_day, capped at late_fee_max_cap) and STAYS
+    Unpaid; the shared production ``mark_at_risk_core`` then flags exactly that
+    cohort.  Their ids are persisted so pay-remaining skips them (carry-forward).
     """
     def runner(ms, sim_now, chronos):
-        knobs  = ms.set_settlement(db, late_ratio=body.late_pct / 100.0)
-        active = db.query(func.count(User.id)).filter(
-            User.status == UserStatus.Active
-        ).scalar() or 0
+        from app.services.elimination_engine import mark_at_risk_core, _get_all_settings
+
+        st       = ms._require_active(db)
+        settings = _get_all_settings(db)
+        knobs    = ms.set_settlement(db, late_ratio=body.late_pct / 100.0)
+
+        # REAL cohort — ONLY Active AND Unpaid (deterministic id order for the
+        # random sample seed of fairness).  Paid members (incl. this-cycle joiners)
+        # are structurally excluded — they can never be enforced as "late".
+        unpaid = (
+            db.query(User)
+            .filter(
+                User.status                == UserStatus.Active,
+                User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
+            )
+            .order_by(User.id.asc())
+            .all()
+        )
+        ratio  = float(knobs["late_ratio"])
+        n_late = max(0, min(len(unpaid), int(round(len(unpaid) * ratio))))
+        late_cohort = random.sample(unpaid, n_late) if n_late else []
+
+        fee_per_day = int(settings.get("late_fee_per_day_inr", 50))
+        fee_cap     = int(settings.get("late_fee_max_cap_inr", 500))
+        accrued_inr = 0
+        for u in late_cohort:
+            days = random.randint(1, 4)                       # simulated days overdue
+            fee  = min(days * fee_per_day, fee_cap)
+            u.late_fees_inr = Decimal(str(fee))               # accrue, STAY Unpaid
+            accrued_inr += fee
+        db.flush()                                            # make fees visible to mark-at-risk
+
+        # Flag exactly the accrued-late cohort via the SHARED production core
+        # (Active AND Unpaid AND late_fees>=one day's fee AND risk==False).
+        newly_at_risk = mark_at_risk_core(db, settings)
+
+        # Persist the cohort ids — pay-remaining skips them; rollover clears them.
+        late_ids = [int(u.id) for u in late_cohort]
+        ms.set_late_cohort(db, late_ids)
+
         return {
-            "late_ratio":     knobs["late_ratio"],
-            "active_members": active,
-            "projected_late": int(active * knobs["late_ratio"]),
+            "late_ratio":          ratio,
+            "unpaid_members":      len(unpaid),
+            "late_selected":       len(late_cohort),
+            "newly_at_risk":       newly_at_risk,
+            "late_fee_accrued_inr": accrued_inr,
+            "late_fee_per_day_inr": fee_per_day,
+            "late_fee_cap_inr":    fee_cap,
+            "late_cohort_ids":     late_ids,
         }
 
     return _manual_sim_run(db, "set_late_pct", runner)
@@ -3314,17 +3388,25 @@ def manual_sim_action_set_late(body: ManualSimSetLateRequest, db: Session = Depe
 @router.post("/manual-sim/action/pay-remaining")
 def manual_sim_action_pay_remaining(db: Session = Depends(get_db)):
     """
-    DUE_DATE — the stragglers settle.  Pays every still-Unpaid Active member at
-    the simulated instant (same production auto-pay as pay-all; idempotent and
-    collision-safe on re-run).
+    DUE_DATE — the non-late stragglers settle.
+
+    SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    Pays every still-Unpaid Active member EXCEPT the designated late cohort (the ids
+    stored by set-late).  The late cohort stays Unpaid + at-risk so it carries
+    forward into the grace-window settlement — they are the ONLY members the A/B/C
+    split may act on (bug #2 carry-forward).  Same production auto-pay as pay-all;
+    idempotent and collision-safe on re-run.
     """
     from app.services.real_simulation import MassLoadInjector
 
     def runner(ms, sim_now, chronos):
-        st = ms._require_active(db)
+        st       = ms._require_active(db)
+        skip_ids = set(ms.get_late_cohort(db))
         injector = MassLoadInjector(run_prefix=st.get("inject_prefix", "msim0000"))
-        paid = injector.auto_pay_installments(db, week_num=int(st.get("cycle_num", 1)))
-        return {"remaining_paid": paid}
+        paid = injector.auto_pay_installments(
+            db, week_num=int(st.get("cycle_num", 1)), skip_ids=skip_ids,
+        )
+        return {"remaining_paid": paid, "late_cohort_held": len(skip_ids)}
 
     return _manual_sim_run(db, "pay_remaining", runner)
 
@@ -3334,51 +3416,117 @@ def manual_sim_action_grace_settle(body: ManualSimGraceRequest, db: Session = De
     """
     GRACE_PERIOD_START — the authoritative A/B/C grace-window settlement.
 
-    Runs the production apply_abc_model at the simulated instant.  EVERY late member
-    accrues a real Late_Fee token; the late cohort is then split into exactly three
-    production buckets (A + B + C == late payers):
-      • A — directly eliminated (real EliminationEvent rows written),
-      • B — paid the late fee and stay in the pool (Unpaid by design this week),
-      • C — grace survivors: paid the grace fee (+ settled late fee) → Paid,
-    then the vacancies are refilled via the production waitlist engine.
-
     SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
-    The response is framed to the model's ACTUAL buckets (A/B/C).  The previous
-    ``entered_grace_no_fee`` field implied a "grace without late fee" state that does
-    not exist in the model (all late members owe a late fee) — it has been removed
-    in favour of the truthful, reconciling A/B/C split.
-    """
-    from app.services.real_simulation import MassLoadInjector
+    Bug #2 root-cause fix.  The synthetic ``apply_abc_model`` (which re-sampled a
+    FRESH random cohort from ALL Active members — eliminating members who had paid,
+    "reversing" their tokens, and leaving Type-B members Active+Unpaid AFTER the
+    grace window closed) has been REMOVED entirely.  Settlement now operates ONLY on
+    the REAL carried-forward at-risk cohort — ``Active AND elimination_risk=True AND
+    grace_fee_paid=False`` — i.e. exactly the members designated late at the due-date
+    event.  Paid members are NEVER touched.  When that cohort is empty (everyone
+    paid), this is a clean no-op (fixes "after all paid, ABC makes no sense").
 
+    The cohort is split deterministically (stable id order) into three buckets that
+    reconcile to the at-risk count (A + B + C == at_risk):
+      • A (first elim_pct_a%)  — left at-risk, NOT granted grace → the G_CLOSE
+        guillotine eliminates them with reason non_payment.
+      • C (next grace_pct_c%)  — granted grace then SEAT-SAVED via the shared
+        production cores → grace fee + late fee collected, flags cleared, Paid,
+        they SURVIVE.
+      • B (remainder)          — granted grace with the window expiring EXACTLY at
+        G_CLOSE, left Unpaid → the G_CLOSE guillotine's expire-grace sweep eliminates
+        them with reason grace_expired.  (No member is ever left Unpaid-and-Active
+        past grace close — fixes "unpaid member as active after grace window.")
+
+    Nothing is eliminated HERE — A and B are merely staged; the real
+    EliminationEvent rows are written by the finalize-eliminations guillotine at
+    G_CLOSE.  C's seat-save revenue is reported below.
+    """
     def runner(ms, sim_now, chronos):
-        st    = ms._require_active(db)
+        from app.services.elimination_engine import (
+            grant_grace_core, save_seat_core, _get_all_settings,
+        )
+
+        st       = ms._require_active(db)
+        settings = _get_all_settings(db)
+        # Record the operator's A/C knobs (late_ratio is informational only now —
+        # the cohort is the REAL at-risk set, not a re-sample of a ratio).
         knobs = ms.set_settlement(
             db,
             late_ratio=(None if body.late_pct is None else body.late_pct / 100.0),
             elim_pct_a=body.elim_pct_a,
             grace_pct_c=body.grace_pct_c,
         )
-        injector = MassLoadInjector(run_prefix=st.get("inject_prefix", "msim0000"))
-        res = injector.apply_abc_model(
-            db,
-            late_ratio=knobs["late_ratio"],
-            elim_pct_a=knobs["elim_pct_a"],
-            grace_pct_c=knobs["grace_pct_c"],
+        g_close = ms.milestones(db).G_CLOSE     # grace window for bucket B closes here
+
+        # REAL carried-forward at-risk cohort (stable id order → deterministic split).
+        cohort = (
+            db.query(User)
+            .filter(
+                User.status           == UserStatus.Active,
+                User.elimination_risk == True,    # noqa: E712
+                User.grace_fee_paid   == False,   # noqa: E712
+            )
+            .order_by(User.id.asc())
+            .all()
         )
-        n_late = int(res.get("n_late", 0))
-        n_b    = int(res.get("n_type_b", 0))   # B — late fee, stay Unpaid in pool
-        n_c    = int(res.get("n_saved", 0))    # C — grace survivors (paid grace fee)
-        n_elim = int(res.get("n_elim", 0))     # A — directly eliminated
+        at_risk = len(cohort)
+
+        if at_risk == 0:
+            # Everyone paid — nothing to settle.  Clean, truthful no-op.
+            return {
+                "at_risk":                  0,
+                "eliminate_pending_A":      0,
+                "grace_saved_C":            0,
+                "grace_pending_B":          0,
+                "buckets_reconcile":        True,
+                "late_fee_revenue_inr":     0.0,
+                "grace_fee_revenue_inr":    0.0,
+                "total_compliance_revenue_inr": 0.0,
+                "knobs":                    knobs,
+                "note":                     "No at-risk members — settlement is a no-op.",
+            }
+
+        pct_a = float(knobs["elim_pct_a"])
+        pct_c = float(knobs["grace_pct_c"])
+        n_a = min(at_risk, int(at_risk * pct_a / 100.0))
+        n_c = min(at_risk - n_a, int(at_risk * pct_c / 100.0))
+        n_b = at_risk - n_a - n_c                # remainder (always >= 0)
+
+        bucket_a = cohort[:n_a]                  # eliminate (non_payment) at G_CLOSE
+        bucket_c = cohort[n_a:n_a + n_c]         # grace-pay & survive
+        bucket_b = cohort[n_a + n_c:]            # grace expires at G_CLOSE → grace_expired
+
+        # A — leave exactly as-is (Active, risk=True, grace_active=False): the
+        # guillotine eliminates them with reason non_payment.  No mutation needed.
+
+        # C — grant grace then seat-save (collects grace fee + late fee → Paid).
+        late_fee_rev  = 0.0
+        grace_fee_rev = 0.0
+        for u in bucket_c:
+            grant_grace_core(db, u, expires_at=g_close, settings=settings)
+            saved = save_seat_core(db, u, settings)
+            grace_fee_rev += float(saved["grace_fee_paid_inr"])
+            late_fee_rev  += float(saved["late_fees_cleared"])
+
+        # B — grant grace with the window expiring AT G_CLOSE, leave Unpaid: the
+        # guillotine's expire-grace sweep flips grace_active off and eliminates them
+        # with reason grace_expired.  No member remains Unpaid-and-Active past close.
+        for u in bucket_b:
+            grant_grace_core(db, u, expires_at=g_close, settings=settings)
+
+        db.flush()
+
         return {
-            "late_payers":              n_late,
-            "eliminated_A":             n_elim,
-            "paid_late_fee_B":          n_b,
-            "grace_survivors_C":        n_c,
-            # Truthful invariant — the three buckets must sum to the late cohort.
-            "buckets_reconcile":        (n_elim + n_b + n_c == n_late),
-            "late_fee_revenue_inr":     res.get("late_fee_revenue_inr", 0),
-            "grace_fee_revenue_inr":    res.get("grace_fee_revenue_inr", 0),
-            "total_compliance_revenue_inr": res.get("total_compliance_revenue_inr", 0),
+            "at_risk":                  at_risk,
+            "eliminate_pending_A":      len(bucket_a),
+            "grace_saved_C":            len(bucket_c),
+            "grace_pending_B":          len(bucket_b),
+            # Truthful invariant — the three buckets must sum to the at-risk cohort.
+            "buckets_reconcile":        (len(bucket_a) + len(bucket_c) + len(bucket_b) == at_risk),
+            "late_fee_revenue_inr":     round(late_fee_rev, 2),
+            "grace_fee_revenue_inr":    round(grace_fee_rev, 2),
+            "total_compliance_revenue_inr": round(late_fee_rev + grace_fee_rev, 2),
             "knobs":                    knobs,
         }
 
@@ -3388,35 +3536,37 @@ def manual_sim_action_grace_settle(body: ManualSimGraceRequest, db: Session = De
 @router.post("/manual-sim/action/finalize-eliminations")
 def manual_sim_action_finalize_eliminations(db: Session = Depends(get_db)):
     """
-    G_CLOSE — the guillotine confirmation.
+    G_CLOSE — the guillotine.
 
-    Read-only: the eliminations were written atomically by the grace settlement
-    (production apply_abc_model eliminates A + failed-C in one settlement, exactly
-    as the live engine does).  This surfaces the EliminationEvent rows finalized in
-    THIS cycle — count, split by reason, and total forfeited — so the developer can
-    confirm the guillotine before the draw prepares.  It mutates nothing.
+    SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    Bug #2 close.  This is no longer a read-only surface — it is the REAL
+    elimination cycle, driven by the SAME shared production core the live admin
+    ``POST /admin/elimination/execute`` endpoint uses.  At the simulated G_CLOSE
+    instant it (1) sweeps every grace window that has now expired unpaid (bucket B)
+    → reason grace_expired, (2) eliminates every still-at-risk member who was never
+    granted grace (bucket A) → reason non_payment, writing one immutable
+    EliminationEvent per member, and (3) refills the freed pool seats from the
+    waitlist via the production Double-FIFO engine.  AFTER this runs, NO member is
+    left Active-and-Unpaid (A and B are eliminated; C was saved Paid) — exactly the
+    production lifecycle "eliminate all risk=True AND grace_active=False at T-2H".
     """
-    from app.models.elimination_event import EliminationEvent, EliminationReason
-
     def runner(ms, sim_now, chronos):
-        cycle_start, cycle_end = ms.cycle_window(db)
-        rows = (
-            db.query(EliminationEvent)
-            .filter(
-                EliminationEvent.created_at >= cycle_start,
-                EliminationEvent.created_at <= cycle_end,
-            )
-            .all()
+        from app.services.elimination_engine import (
+            run_elimination_cycle_core, _get_all_settings,
         )
-        non_payment = sum(1 for r in rows if r.reason == EliminationReason.non_payment)
-        grace_exp   = sum(1 for r in rows if r.reason == EliminationReason.grace_expired)
-        total_forfeited = sum(float(r.total_forfeited or 0) for r in rows)
+        settings = _get_all_settings(db)
+        res = run_elimination_cycle_core(db, settings, dry_run=False)
+        refill = res.get("refill") if isinstance(res.get("refill"), dict) else {}
+        seats_refilled = int(refill.get("phase1_assigned", 0)) + int(refill.get("phase2_assigned", 0))
         return {
-            "eliminations_this_cycle": len(rows),
-            "reason_non_payment":      non_payment,
-            "reason_grace_expired":    grace_exp,
-            "total_forfeited_inr":     round(total_forfeited, 2),
-            "read_only":               True,
+            "eliminated_this_cycle":  res["eliminated_count"],
+            "reason_non_payment":     res["reason_non_payment"],
+            "reason_grace_expired":   res["reason_grace_expired"],
+            "grace_expired_count":    res["grace_expired_count"],
+            "total_forfeited_inr":    round(float(res["total_forfeited_inr"]), 2),
+            "iso_week":               res["iso_week"],
+            "seats_refilled":         seats_refilled,
+            "read_only":              False,
         }
 
     return _manual_sim_run(db, "finalize_eliminations", runner)

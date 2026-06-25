@@ -24,8 +24,7 @@ Endpoints:
 All endpoints require Admin JWT.
 """
 
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -35,26 +34,32 @@ from sqlalchemy.orm import Session
 
 from app.core.security import require_admin_jwt, verify_admin_password as _verify_pw
 from app.database import get_db
+# NOTE: Token / Pool / Decimal / timedelta are no longer imported here — the seat-save
+# token-writing and elimination/grace mutation logic now lives in the shared
+# `app.services.elimination_engine` cores (see the delegation import below).
 from app.models.elimination_event import EliminationEvent, EliminationReason
-from app.models.pool import Pool
 from app.models.system_settings import SystemSettings
-from app.models.token import Token, TokenType, TokenStatus
 from app.models.user import User, UserStatus, WeeklyPaymentStatus
 
 
-def _unique_compliance_code(db: Session, prefix: str) -> str:
-    """
-    Collision-safe token code generator for Grace_Fee and Late_Fee settlement tokens.
-    Format: "{prefix}{6 uppercase alphanumeric chars}"  e.g. "GF-7MNQ2X"
-    Uses os.urandom via secrets — cryptographically random, not MT19937.
-    """
-    import secrets, string
-    from app.crud.token import get_token_by_code
-    _alpha = string.ascii_uppercase + string.digits
-    while True:
-        code = prefix + "".join(secrets.choice(_alpha) for _ in range(6))
-        if not get_token_by_code(db, code):
-            return code
+# SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
+# The settings helpers, the compliance-code generator, AND the four enforcement
+# cores now live in the shared `app.services.elimination_engine` so that the live
+# admin path and the Time Machine execute IDENTICAL production logic.  These four
+# endpoints are now thin wrappers: they keep their JWT/password gates and exact
+# response shapes, but delegate the actual member-state mutation to the engine
+# cores (which read time via sim_clock.now() — real UTC here in production).
+from app.services.elimination_engine import (
+    _ELIM_DEFAULTS,
+    _BOOL_KEYS,
+    _get_setting,
+    _get_all_settings,
+    _unique_compliance_code,
+    mark_at_risk_core,
+    grant_grace_core,
+    save_seat_core,
+    run_elimination_cycle_core,
+)
 
 router = APIRouter(
     prefix="/admin/elimination",
@@ -62,44 +67,11 @@ router = APIRouter(
     dependencies=[Depends(require_admin_jwt)],
 )
 
-# ── Default elimination configuration ─────────────────────────────────────────
-# These defaults match the plan spec.  Each key is stored as a SystemSettings row
-# so admins can tune them via the API without a code change.
-_ELIM_DEFAULTS: dict[str, int] = {
-    "payment_due_days":        4,     # days from Monday (draw opens) until due date (Thursday)
-    "payment_due_hour":        23,    # 23:00 IST on due day (= 17:30 UTC)
-    "grace_period_hours":      48,    # hours between due date and draw T-2H
-    "grace_seat_save_fee_inr": 500,   # extra ₹ to pay during grace to save seat
-    "late_fee_per_day_inr":    50,    # daily late fee accrual
-    "late_fee_max_cap_inr":    500,   # maximum total late fee (caps at ₹500)
-    "auto_eliminate_enabled":  1,     # 1=True, 0=False — auto-eliminate on due date
-    "grace_period_enabled":    1,     # 1=True, 0=False — allow grace period saving
-}
-
-_BOOL_KEYS = {"auto_eliminate_enabled", "grace_period_enabled"}
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _get_setting(db: Session, key: str) -> int:
-    """
-    Return the integer value of a settings key, creating the row with the
-    default value if it does not exist yet.  Lazy-initialises on first read.
-    """
-    row: SystemSettings | None = (
-        db.query(SystemSettings).filter(SystemSettings.key == key).first()
-    )
-    if row is None:
-        default_val = _ELIM_DEFAULTS.get(key, 0)
-        row = SystemSettings(key=key, value_int=default_val)
-        db.add(row)
-        db.flush()
-    return row.value_int if row.value_int is not None else _ELIM_DEFAULTS.get(key, 0)
-
-
-def _get_all_settings(db: Session) -> dict[str, int]:
-    """Return all 8 elimination settings as a dict, lazy-creating defaults."""
-    return {k: _get_setting(db, k) for k in _ELIM_DEFAULTS}
+# ── Defaults / settings helpers / compliance-code generator ───────────────────
+# `_ELIM_DEFAULTS`, `_BOOL_KEYS`, `_get_setting`, `_get_all_settings` and
+# `_unique_compliance_code` are imported from `app.services.elimination_engine`
+# (the single canonical definition).  Only the presentation helpers below remain
+# router-local.
 
 
 def _compute_risk_score(user: User, settings: dict[str, int]) -> float:
@@ -444,26 +416,10 @@ def mark_at_risk(db: Session = Depends(get_db)):
     Returns count of newly flagged users + running total.
     """
     settings = _get_all_settings(db)
-    min_fee  = settings.get("late_fee_per_day_inr", 50)
 
-    # Identify unpaid active members with fees exceeding one day's late fee
-    # This is a safe proxy for "payment_due_days have passed"
-    candidates = (
-        db.query(User)
-        .filter(
-            User.status                == UserStatus.Active,
-            User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
-            User.late_fees_inr         >= min_fee,
-            User.elimination_risk      == False,   # noqa: E712
-        )
-        .all()
-    )
-
-    newly_flagged = 0
-    for u in candidates:
-        u.elimination_risk = True
-        newly_flagged += 1
-
+    # Delegate the at-risk flagging to the shared production core (identical logic
+    # to the Time Machine path; FLUSHES, the wrapper owns the commit).
+    newly_flagged = mark_at_risk_core(db, settings)
     if newly_flagged:
         db.commit()
 
@@ -518,15 +474,12 @@ def grant_grace_period(
                    f"{'Expires in %ds.' % remaining if remaining else 'Expiry unknown.'}"
         )
 
-    settings      = _get_all_settings(db)
-    grace_hours   = body.hours_until_expiry or settings.get("grace_period_hours", 48)
-    grace_expires = datetime.now(timezone.utc) + timedelta(hours=grace_hours)
+    settings    = _get_all_settings(db)
+    grace_hours = body.hours_until_expiry or settings.get("grace_period_hours", 48)
 
-    user.grace_active     = True
-    user.grace_expires_at = grace_expires
-    user.grace_fee_paid   = False   # must pay grace fee to save seat
-    user.elimination_risk = True    # remains at-risk until grace fee paid
-
+    # Delegate to the shared production core (grace_expires_at = sim_clock.now() +
+    # grace_hours, which is real UTC here in production).  FLUSHES; wrapper commits.
+    grant_grace_core(db, user, hours=grace_hours, settings=settings)
     db.commit()
     db.refresh(user)
 
@@ -580,83 +533,17 @@ def confirm_grace_payment(
             detail="User is not currently in the grace period. Use grant-grace first."
         )
 
-    late_fees_cleared = float(user.late_fees_inr or 0)
-    settings          = _get_all_settings(db)
-    grace_fee_inr     = settings["grace_seat_save_fee_inr"]
-    total_paid        = grace_fee_inr + late_fees_cleared
+    settings = _get_all_settings(db)
 
-    # ── POINT 6 FIX: Track collected revenue BEFORE clearing the fields ────────
-    #
-    # Late fees PAID (before/during grace) = business revenue.
-    # Grace seat-save fee PAID = business revenue.
-    # These must be persisted to system_settings cumulative counters so that
-    # the revenue analytics endpoint can report them accurately.
-    #
-    # Previously: late_fees_inr was set to 0 without recording what was collected.
-    # Fix: increment running totals in system_settings before clearing.
-    #
-    # Keys used:
-    #   "revenue_late_fees_collected_inr"   — cumulative late fees collected (₹)
-    #   "revenue_grace_fees_collected_inr"  — cumulative grace fees collected (₹)
-    # These are INT keys (rupees, no decimal needed for summary).
-
-    def _increment_revenue(key: str, amount: float) -> None:
-        """Atomically add `amount` (rounded to nearest rupee) to a revenue counter."""
-        amt_int = int(round(amount))
-        if amt_int <= 0:
-            return
-        row: SystemSettings | None = (
-            db.query(SystemSettings).filter(SystemSettings.key == key).first()
-        )
-        if row is None:
-            row = SystemSettings(key=key, value_int=amt_int)
-            db.add(row)
-        else:
-            row.value_int = (row.value_int or 0) + amt_int
-
-    _increment_revenue("revenue_late_fees_collected_inr",  late_fees_cleared)
-    _increment_revenue("revenue_grace_fees_collected_inr", grace_fee_inr)
-
-    # ── Create immutable compliance tokens (receipt / audit trail) ────────────
-    #
-    # Late_Fee settlement token — represents the accumulated late fees NOW PAID.
-    # This is the final "collected" record for fees that were accruing daily.
-    # Value = exact amount cleared (may be ₹0 if member had no late fees yet).
-    #
-    # Grace_Fee token — represents the ₹500 seat-save fee confirmed received.
-    # Created ONLY here (grace payment) — never at registration or weekly draw.
-    # This token is the canonical proof of grace period settlement.
-    #
-    # Both tokens are immediately Burned (cash already physically confirmed
-    # by admin via this endpoint — no pending state needed).
-    if late_fees_cleared > 0:
-        lf_code = _unique_compliance_code(db, "LFC-")   # LFC = Late Fee Collected
-        db.add(Token(
-            code      = lf_code,
-            type      = TokenType.Late_Fee,
-            status    = TokenStatus.Burned,
-            value_inr = Decimal(str(int(round(late_fees_cleared)))),
-            user_id   = user.id,
-            pool_id   = user.current_pool_id,
-        ))
-
-    gf_code = _unique_compliance_code(db, "GF-")
-    db.add(Token(
-        code      = gf_code,
-        type      = TokenType.Grace_Fee,
-        status    = TokenStatus.Burned,
-        value_inr = Decimal(str(grace_fee_inr)),
-        user_id   = user.id,
-        pool_id   = user.current_pool_id,
-    ))
-
-    # ── Clear all elimination flags and settle payment ────────────────────────
-    user.grace_fee_paid          = True
-    user.grace_active            = False   # grace period fulfilled
-    user.grace_expires_at        = None
-    user.elimination_risk        = False   # seat is saved — no longer at risk
-    user.late_fees_inr           = Decimal("0")
-    user.weekly_payment_status   = WeeklyPaymentStatus.Paid
+    # Delegate the financial settlement to the shared production core: increments
+    # the revenue counters, writes the immutable LFC-/GF- Burned tokens, and clears
+    # every elimination flag (grace_fee_paid=True, grace_active=False,
+    # elimination_risk=False, late_fees_inr=0, weekly_payment_status=Paid).
+    # FLUSHES; this wrapper owns the commit + refresh.
+    saved             = save_seat_core(db, user, settings)
+    grace_fee_inr     = saved["grace_fee_paid_inr"]
+    late_fees_cleared = saved["late_fees_cleared"]
+    total_paid        = saved["total_paid_inr"]
 
     db.commit()
     db.refresh(user)
@@ -781,130 +668,35 @@ def execute_elimination(
 
     settings = _get_all_settings(db)
 
-    # ── First: expire any grace periods that have passed their deadline ───────
-    now = datetime.now(timezone.utc)
-    expired_grace = (
-        db.query(User)
-        .filter(
-            User.status           == UserStatus.Active,
-            User.grace_active     == True,             # noqa: E712
-            User.grace_fee_paid   == False,            # noqa: E712
-            User.grace_expires_at <= now,
-        )
-        .all()
-    )
-    grace_expired_count = 0
-    # Track IDs of users whose grace window just closed so we can correctly set
-    # EliminationReason below.  After u.grace_active = False is flushed, the ORM
-    # field is False for ALL to_eliminate candidates — we cannot use the field to
-    # distinguish "was in grace / grace expired" from "was never in grace" at that
-    # point, hence this explicit set.
-    grace_expired_ids: set = set()
-    for u in expired_grace:
-        u.grace_active = False  # grace window closed without payment
-        grace_expired_ids.add(u.id)
-        grace_expired_count += 1
-
-    if grace_expired_count:
-        db.flush()
-
-    # ── Identify users to eliminate ───────────────────────────────────────────
-    to_eliminate = (
-        db.query(User)
-        .filter(
-            User.status           == UserStatus.Active,
-            User.elimination_risk == True,              # noqa: E712
-            User.grace_active     == False,             # noqa: E712
-            User.grace_fee_paid   == False,             # noqa: E712
-        )
-        .all()
-    )
+    # Delegate the entire guillotine to the shared production core: expire-grace
+    # sweep (now = sim_clock.now() == real UTC here), EliminationEvent audit writes,
+    # flag clearing, and — on a real run — waitlist refill of the freed seats via
+    # assign_waitlist_to_pools.  dry_run reports the cohort and rolls back inside
+    # the core, exactly as before.
+    result = run_elimination_cycle_core(db, settings, dry_run=body.dry_run)
 
     if body.dry_run:
-        # Report only — no DB changes are committed (the flush above is rolled back).
-        db.rollback()
         return {
             "dry_run":             True,
-            "would_eliminate":     len(to_eliminate),
-            "grace_expired_count": grace_expired_count,
-            "users": [
-                {
-                    "id":         u.id,
-                    "username":   u.username,
-                    "level":      u.current_level,
-                    "pool_id":    u.current_pool_id,
-                    "late_fees":  float(u.late_fees_inr or 0),
-                    # Use the set — u.grace_active is False for everyone in this list
-                    "reason":     "grace_expired" if u.id in grace_expired_ids else "non_payment",
-                }
-                for u in to_eliminate
-            ],
+            "would_eliminate":     result["would_eliminate"],
+            "grace_expired_count": result["grace_expired_count"],
+            "users":               result["users"],
         }
 
-    # ── Execute eliminations ──────────────────────────────────────────────────
-    eliminated_count    = 0
-    total_forfeited     = Decimal("0")
-    iso_week            = now.strftime("%G-W%V")   # e.g. "2026-W24"
-    grace_sv_fee_cfg    = Decimal(str(settings.get("grace_seat_save_fee_inr", 500)))
+    # Real run: the core already committed (via assign_waitlist_to_pools) when any
+    # member was eliminated; commit defensively for the zero-elimination case.
+    db.commit()
 
-    for u in to_eliminate:
-        # Determine reason — users in grace_expired_ids had their grace window
-        # close without payment in the loop above.  All others never entered grace.
-        # IMPORTANT: u.grace_active is False for EVERY member in to_eliminate (it's
-        # a query filter condition).  We MUST use grace_expired_ids to distinguish.
-        was_grace   = u.id in grace_expired_ids
-        reason      = EliminationReason.grace_expired if was_grace else EliminationReason.non_payment
-        # Grace seat-save fee is forfeited only for members who entered the grace
-        # window but then let it expire without paying.
-        seat_sv_fee = grace_sv_fee_cfg if was_grace else Decimal("0")
-
-        # Fetch pool name for snapshot
-        pool_name = None
-        if u.current_pool_id:
-            pool = db.query(Pool).filter(Pool.id == u.current_pool_id).first()
-            pool_name = pool.name if pool else None
-
-        late_fees = Decimal(str(u.late_fees_inr or 0))
-        # Total forfeited = ₹1,000 deposit + accrued late fees + grace seat-save fee
-        total_ev  = Decimal("1000") + late_fees + seat_sv_fee
-
-        # ── Write EliminationEvent audit record ───────────────────────────────
-        event = EliminationEvent(
-            user_id                   = u.id,
-            username_snapshot         = u.username,
-            user_level_at_elimination = u.current_level,
-            pool_id                   = u.current_pool_id,
-            pool_name_snapshot        = pool_name,
-            draw_week_id              = iso_week,
-            reason                    = reason,
-            late_fees_forfeited       = late_fees,
-            seat_save_fee             = seat_sv_fee,
-            deposit_forfeited         = Decimal("1000"),
-            total_forfeited           = total_ev,
-            was_in_grace_period       = was_grace,
-        )
-        db.add(event)
-
-        # ── Update user record ────────────────────────────────────────────────
-        u.status           = UserStatus.Eliminated
-        u.current_pool_id  = None
-        u.elimination_risk = False
-        u.grace_active     = False
-        u.grace_expires_at = None
-        u.grace_fee_paid   = False
-        u.late_fees_inr    = Decimal("0")
-
-        total_forfeited  += total_ev
-        eliminated_count += 1
-
-    if eliminated_count > 0:
-        db.commit()
+    eliminated_count    = result["eliminated_count"]
+    grace_expired_count = result["grace_expired_count"]
+    total_forfeited     = result["total_forfeited_inr"]
+    iso_week            = result["iso_week"]
 
     return {
         "dry_run":             False,
         "eliminated_count":    eliminated_count,
         "grace_expired_count": grace_expired_count,
-        "total_forfeited_inr": float(total_forfeited),
+        "total_forfeited_inr": total_forfeited,
         "iso_week":            iso_week,
         "message": (
             f"Elimination cycle complete. "

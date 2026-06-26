@@ -1301,6 +1301,10 @@ function TimeMachineTab({ toast }) {
   // SESSION EDIT [Claude Session Jun-25 — Soheb Khan User 2 / Sohebkhan.sk11]:
   // Per-action truthful dim reason (e.g. "All members already paid — nothing due").
   const disabledReasons = active ? (state.disabled_reasons || {}) : {}
+  // [Jun-25] live per-action member counts ("pay-all · 24 members") + the reason the
+  // gate is open with no action run ("auto-settled — nothing to do this cycle").
+  const actionPreview   = active ? (state.action_preview || {}) : {}
+  const satisfiedReason = active ? (state.required_satisfied_reason || '') : ''
   const compliance      = active ? state.compliance : null
   const tasks           = active ? (state.task_list || []) : []
   const settlement      = active ? (state.settlement || {}) : {}
@@ -1376,6 +1380,18 @@ function TimeMachineTab({ toast }) {
                   {requiredAction.length > 0 && (
                     <> Complete <span className="font-semibold text-amber-100">{requiredAction.map(actLabel).join(' or ')}</span> in the actions below to unlock. No skipping — event-driven only.</>
                   )}
+                </p>
+              </div>
+            )}
+            {/* SESSION EDIT [Jun-25]: when the gate is OPEN because the event's required
+                action is intrinsically satisfied by state (nothing owed / at-risk /
+                pending), say so — controls are dimmed, advancing skips nothing. */}
+            {canAdvance && satisfiedReason && (
+              <div className="flex items-start gap-2 rounded-xl border border-emerald-700/50 bg-emerald-950/40 px-3 py-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0 mt-0.5" />
+                <p className="text-xs text-emerald-200/90 leading-relaxed">
+                  <span className="font-bold">Auto-settled — nothing to do here:</span> {satisfiedReason}.
+                  The actions below are dimmed (no overwrite / no no-op run) — advance when ready.
                 </p>
               </div>
             )}
@@ -1557,6 +1573,12 @@ function TimeMachineTab({ toast }) {
               // disabled_actions). Required = the gating action still pending.
               const locked = disabledActions.includes(key)
               const isRequired = requiredAction.includes(key) && !requiredDone
+              // SESSION EDIT [Jun-25]: live count of members this action will act on
+              // (pay-all 24 · pay-remaining 18 · settle 12) — backend action_preview.
+              const previewN = (key in actionPreview) ? actionPreview[key] : null
+              const countLabel = previewN != null
+                ? `${reg.label} · ${previewN} member${previewN === 1 ? '' : 's'}`
+                : reg.label
               return (
                 <div key={key}
                   className={`flex flex-wrap items-end gap-3 rounded-xl p-3 border transition-colors ${
@@ -1585,14 +1607,16 @@ function TimeMachineTab({ toast }) {
                       </span>
                     )}
                     {isRequired && !locked && (
-                      <span className="text-[11px] font-semibold text-amber-300">required here</span>
+                      <span className="text-[11px] font-semibold text-amber-300">
+                        required here{previewN != null ? ` · ${previewN} member${previewN === 1 ? '' : 's'}` : ''}
+                      </span>
                     )}
                     <button onClick={() => runAction(key)} disabled={!!busy || locked}
-                      title={locked ? (disabledReasons[key] || 'Already completed at this event — no override / overwrite') : reg.label}
+                      title={locked ? (disabledReasons[key] || 'Already completed at this event — no override / overwrite') : countLabel}
                       className={`flex items-center gap-2 px-4 py-2 rounded-lg text-white text-sm font-semibold disabled:opacity-40 transition-colors ${
                         locked ? 'bg-slate-700 cursor-not-allowed' : (_btnAccent[reg.accent] || _btnAccent.slate)
                       }`}>
-                      {busy === key ? <Spinner className="w-4 h-4" /> : <Icon className="w-4 h-4" />} {reg.label}
+                      {busy === key ? <Spinner className="w-4 h-4" /> : <Icon className="w-4 h-4" />} {countLabel}
                     </button>
                   </div>
                 </div>

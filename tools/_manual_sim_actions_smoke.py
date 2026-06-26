@@ -83,24 +83,6 @@ def active_at_risk_paid_ids(db):
 def all_user_ids(db):
     return {r[0] for r in db.query(User.id).all()}
 
-def walk_to_rollover(db):
-    """Drive the rest of THIS cycle (grace → G_CLOSE → draw → cleanup) doing the
-    minimum required action at each event, then jump_next to roll into the next
-    cycle's DUE_DATE.  Used to advance cycle 1 into cycle 2.  Each action is run
-    AT the event that offers it (the server hard-gates action→event)."""
-    manual_sim.jump_to(db, "GRACE_PERIOD_START")
-    dev.manual_sim_action_grace_settle(
-        dev.ManualSimGraceRequest(late_pct=None, elim_pct_a=0.0, grace_pct_c=0.0), db)
-    manual_sim.jump_to(db, "G_CLOSE")
-    dev.manual_sim_action_finalize_eliminations(db)
-    manual_sim.jump_to(db, "T_02H")
-    dev.manual_sim_action_prepare_draw(db)
-    manual_sim.jump_to(db, "T_00H")
-    dev.manual_sim_action_execute_draw(db)
-    manual_sim.jump_to(db, "T_05M")
-    dev.manual_sim_action_cleanup(db)
-    return manual_sim.jump_next(db)   # T_05M → next cycle DUE_DATE
-
 db = SessionLocal()
 try:
     print("\n== CYCLE 1 — start + inject at CYCLE_START ==")
@@ -178,9 +160,57 @@ try:
     state_paid = manual_sim.compute_state(db)
     check("no-dues: still advance-able after the idempotent pay-all", state_paid["can_advance"] is True)
 
+    print("\n== CYCLE 1 GRACE / G_CLOSE — no at-risk → auto-settled (cascade of no-dues) ==")
+    # SESSION EDIT [Claude Session Jun-25 — Soheb Khan User 2 / Sohebkhan.sk11]:
+    # Because cycle-1 had nothing owed, nobody became at-risk — so the grace window's
+    # A/B/C settlement and the G_CLOSE guillotine have NOTHING to act on.  The same
+    # state-derived satisfaction that unlocked the due-date must cascade here: the
+    # gate UNLOCKS and the settle/finalize controls DIM — the operator is never asked
+    # to run an empty settlement or an empty guillotine (the user's reported bug).
+    manual_sim.jump_to(db, "GRACE_PERIOD_START")
+    g_state = manual_sim.compute_state(db)
+    _NO_ATRISK = "No at-risk members — nothing to settle this cycle"
+    check("grace auto-settle: 0 at-risk this cycle (only late old members ever enter grace)",
+          g_state["compliance"]["at_risk"] == 0)
+    check("grace auto-settle: required action reads DONE by state",
+          g_state["required_done"] is True)
+    check("grace auto-settle: gate UNLOCKS without running settlement (can_advance True)",
+          g_state["can_advance"] is True)
+    check("grace auto-settle: grace_settlement is DIMMED with the truthful reason",
+          "grace_settlement" in g_state["disabled_actions"]
+          and g_state["disabled_reasons"].get("grace_settlement") == _NO_ATRISK)
+    check("grace auto-settle: required_satisfied_reason surfaced for the panel",
+          g_state["required_satisfied_reason"] == _NO_ATRISK)
+    check("grace auto-settle: task_list states nothing to settle this cycle",
+          any("nothing to settle" in t.lower() or "no a/b/c" in t.lower()
+              for t in g_state["task_list"]))
+
+    # Advance to G_CLOSE WITHOUT running grace settlement (it is auto-satisfied).
+    manual_sim.jump_to(db, "G_CLOSE")
+    gc_state = manual_sim.compute_state(db)
+    _NO_PENDING = "No pending eliminations — nothing to finalize this cycle"
+    check("g_close auto-settle: gate UNLOCKS without running the guillotine (can_advance True)",
+          gc_state["can_advance"] is True)
+    check("g_close auto-settle: finalize_eliminations is DIMMED with the truthful reason",
+          "finalize_eliminations" in gc_state["disabled_actions"]
+          and gc_state["disabled_reasons"].get("finalize_eliminations") == _NO_PENDING)
+    check("g_close auto-settle: required_satisfied_reason surfaced for the panel",
+          gc_state["required_satisfied_reason"] == _NO_PENDING)
+    check("g_close auto-settle: task_list states nothing to finalize this cycle",
+          any("nothing to finalize" in t.lower() or "no pending" in t.lower()
+              for t in gc_state["task_list"]))
+
     print("\n== CYCLE 1 → CYCLE 2 rollover (carry-forward reset) ==")
+    # The genuine operational steps (prepare / execute / cleanup) NEVER auto-settle —
+    # they always run.  Drive them, then roll over into cycle 2's DUE_DATE.
     active_c1 = manual_sim.compute_state(db)["compliance"]["active"]
-    st2 = walk_to_rollover(db)
+    manual_sim.jump_to(db, "T_02H")
+    dev.manual_sim_action_prepare_draw(db)
+    manual_sim.jump_to(db, "T_00H")
+    dev.manual_sim_action_execute_draw(db)
+    manual_sim.jump_to(db, "T_05M")
+    dev.manual_sim_action_cleanup(db)
+    st2 = manual_sim.jump_next(db)
     check("rolled into cycle 2 at DUE_DATE",
           st2["cycle_num"] == 2 and st2["current_event"] == "DUE_DATE")
     comp_due2 = manual_sim.compute_state(db)["compliance"]
@@ -206,6 +236,8 @@ try:
     check("real-dues: no pay control is dimmed while a genuine balance is owed",
           "pay_all_installments" not in state_owed["disabled_actions"]
           and "pay_remaining" not in state_owed["disabled_actions"])
+    check("action_preview: pay-all self-labels with the exact Unpaid count it will settle",
+          state_owed.get("action_preview", {}).get("pay_all_installments") == carried)
     blocked = False
     try:
         manual_sim.jump_next(db)
@@ -266,6 +298,8 @@ try:
           "pay_all_installments" in state_late["disabled_actions"])
     check("still cannot advance — stragglers must pay (can_advance False)",
           state_late["can_advance"] is False)
+    check("action_preview: pay-remaining self-labels with the NON-late count (Unpaid − late cohort)",
+          state_late.get("action_preview", {}).get("pay_remaining") == carried - expect_late)
 
     print("\n== CYCLE 2 DUE_DATE — pay-remaining (late cohort carries forward) ==")
     out = dev.manual_sim_action_pay_remaining(db)
@@ -282,6 +316,12 @@ try:
 
     print("\n== CYCLE 2 GRACE — A/B/C settlement on the REAL at-risk cohort ==")
     manual_sim.jump_to(db, "GRACE_PERIOD_START")
+    grace_state = manual_sim.compute_state(db)
+    check("real at-risk: grace gate HARD-BLOCKS (a genuine cohort must be settled)",
+          grace_state["can_advance"] is False
+          and "grace_settlement" not in grace_state["disabled_actions"])
+    check("action_preview: grace settlement self-labels with the at-risk cohort size",
+          grace_state.get("action_preview", {}).get("grace_settlement") == expect_late)
     paid_active_before_grace = active_paid_ids(db)
     out = dev.manual_sim_action_grace_settle(
         dev.ManualSimGraceRequest(late_pct=None, elim_pct_a=50.0, grace_pct_c=25.0), db)

@@ -134,9 +134,10 @@ EVENT_META: dict[str, dict] = {
         "label": "Grace open",
         "short": "grace open",
         "icon":  "ti-hourglass-high",
-        # A/B/C settlement — EVERY late member accrues a late fee; the buckets are
-        # A (eliminated) / B (late fee, stay Unpaid in pool) / C (grace-pay survive).
-        "note":  "A/B/C settlement — eliminate (A) · late-fee stay (B) · grace-pay survive (C)",
+        # SESSION EDIT [Jun-25]: truthful A/B/C model.  ONLY genuinely-late old members
+        # enter grace (paid/fresh members never do).  A eliminated (non-payment) · C
+        # pays grace-fee & survives · B grace-expires at G_CLOSE → eliminated.
+        "note":  "A/B/C on the at-risk cohort only — eliminate (A) · grace-pay survive (C) · grace-expire (B)",
         "actions": ["grace_settlement", "inject_users"],
     },
     "G_CLOSE": {
@@ -498,27 +499,89 @@ def _compliance(db: Session, *, window: "Optional[tuple[datetime, datetime]]" = 
 
 
 # SESSION EDIT [Claude Session Jun-25 — Soheb Khan User 2 / Sohebkhan.sk11]:
-def _due_date_settled(db: Session) -> bool:
-    """True when NO Active member is Unpaid — the due-date's installment
-    requirement is intrinsically met and there is nothing left to collect.
+def _required_satisfied(db: Session, event: str) -> tuple[bool, str]:
+    """Whether ``event``'s REQUIRED action is intrinsically met by STATE — i.e.
+    there is genuinely nothing left for it to act on — plus the human reason to
+    surface beside the (now-dimmed) control.
 
-    This is the legitimate "everyone has already paid" state (e.g. cycle-1 joiners,
-    who join with weekly_payment_status=Paid because their joining installment IS
-    this week's installment; or any cycle after a full pay-all).  In that state the
-    settle actions (pay-all / set-late / pay-remaining) are pure no-ops — re-running
-    them would only re-touch already-Paid rows — so the clock may advance without
-    them and the panel must DIM them.  This is state-DERIVED satisfaction, NOT an
-    override: when even one Active member is still Unpaid this returns False and the
-    hard-block gate stands (no due-date with money owed can ever be skipped).  The
-    carry-forward reset makes every cycle≥2 start Unpaid, so collection is never
-    silently bypassed.
+    This is state-DERIVED satisfaction, NEVER an override.  Three settlement-bearing
+    events can be "already done by virtue of the live roster":
+
+      • DUE_DATE            — 0 Active members Unpaid → nothing to collect (e.g.
+                              cycle-1 joiners, whose joining installment IS this
+                              week's installment, or any cycle after a full pay-all).
+      • GRACE_PERIOD_START  — 0 Active members at-risk → there is no A/B/C cohort to
+                              settle.  Only genuinely-late OLD members ever enter the
+                              grace window; members who paid on time and brand-new
+                              joiners are NEVER pulled into grace — so when nobody is
+                              at-risk the settlement is a pure no-op.
+      • G_CLOSE             — 0 at-risk AND 0 grace-active → the guillotine would
+                              eliminate nobody and sweep no expired grace (no-op).
+
+    When even one member still owes / is at-risk / is in grace, this returns
+    ``(False, "")`` and the hard-block gate stands — a real collection or
+    elimination can NEVER be silently skipped.  Carry-forward resets every survivor
+    to Unpaid at rollover, so cycle≥2 always starts genuinely owed.  Returns
+    ``(False, "")`` for every non-settlement event (their required action is a
+    genuine operational step — prepare / execute / cleanup — that always runs).
     """
     from sqlalchemy import func
     from app.models.user import User, UserStatus, WeeklyPaymentStatus
-    return (db.query(func.count(User.id)).filter(
-        User.status == UserStatus.Active,
-        User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
-    ).scalar() or 0) == 0
+
+    if event == "DUE_DATE":
+        unpaid = db.query(func.count(User.id)).filter(
+            User.status == UserStatus.Active,
+            User.weekly_payment_status == WeeklyPaymentStatus.Unpaid,
+        ).scalar() or 0
+        if unpaid == 0:
+            return True, "All members already paid — nothing due this cycle"
+    elif event == "GRACE_PERIOD_START":
+        at_risk = db.query(func.count(User.id)).filter(
+            User.status == UserStatus.Active,
+            User.elimination_risk.is_(True),
+        ).scalar() or 0
+        if at_risk == 0:
+            return True, "No at-risk members — nothing to settle this cycle"
+    elif event == "G_CLOSE":
+        pending = db.query(func.count(User.id)).filter(
+            User.status == UserStatus.Active,
+            (User.elimination_risk.is_(True)) | (User.grace_active.is_(True)),
+        ).scalar() or 0
+        if pending == 0:
+            return True, "No pending eliminations — nothing to finalize this cycle"
+    return False, ""
+
+
+def _due_date_settled(db: Session) -> bool:
+    """Back-compat shim — the DUE_DATE arm of :func:`_required_satisfied`."""
+    return _required_satisfied(db, "DUE_DATE")[0]
+
+
+def _action_preview(event: str, c: dict, settlement: dict, st: dict) -> dict[str, int]:
+    """How many members each action AT ``event`` will actually act on, so the panel
+    can label every control with the live count (the user's "pay-all along with how
+    many members we are paying; pay-remaining after late% how many we pay").
+
+    Pure projection off ``_compliance`` (production tables) + the chosen late-ratio
+    + the already-designated late cohort in session — never a synthetic guess.
+    """
+    late_ratio      = float(settlement.get("late_ratio", 0.0) or 0.0)
+    unpaid          = int(c.get("unpaid", 0))
+    at_risk         = int(c.get("at_risk", 0))
+    late_designated = len(st.get("late_cohort_ids") or [])
+    prev: dict[str, int] = {}
+    if event == "DUE_DATE":
+        # Pay-all settles EVERY currently-Unpaid member; set-late designates a
+        # projected slice; pay-remaining settles the non-late stragglers (the Unpaid
+        # set minus whatever late cohort has already been designated this cycle).
+        prev["pay_all_installments"] = unpaid
+        prev["set_late_pct"]         = int(round(unpaid * late_ratio))
+        prev["pay_remaining"]        = max(0, unpaid - late_designated)
+    elif event == "GRACE_PERIOD_START":
+        prev["grace_settlement"]     = at_risk          # the A/B/C cohort
+    elif event == "G_CLOSE":
+        prev["finalize_eliminations"] = at_risk         # pending A+B eliminations
+    return prev
 
 
 def task_list(event: str, c: dict, settlement: dict) -> list[str]:
@@ -541,29 +604,53 @@ def task_list(event: str, c: dict, settlement: dict) -> list[str]:
         # asking the operator to re-pay (which would only overwrite Paid rows).
         if c["unpaid"] == 0:
             tasks.append(f"All {c['active']} active member(s) have already paid — nothing due this cycle.")
+            tasks.append(f"Summary — paid on time: {c['paid_on_time']} · unpaid: 0.")
             tasks.append("No settlement needed (pay actions are dimmed) — advance to Grace open.")
         else:
             tasks.append(f"{c['unpaid']} of {c['active']} active members must pay this week's installment.")
-            tasks.append(f"Projected late this cycle (knob): {int(c['active'] * late_ratio)} @ late-ratio {late_ratio:.0%}.")
-            tasks.append("Settle: Pay-all (everyone on time) OR Set-late % then Pay-remaining.")
+            tasks.append(f"Summary — paid on time: {c['paid_on_time']} · unpaid (owe EMI): {c['unpaid']}.")
+            tasks.append(f"Projected late this cycle (knob): {int(c['unpaid'] * late_ratio)} @ late-ratio {late_ratio:.0%}.")
+            tasks.append(f"Settle: Pay-all ({c['unpaid']} members) on time OR Set-late % then Pay-remaining.")
     elif event == "GRACE_PERIOD_START":
-        # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
-        # Truthful A/B/C model — bucket B no longer "pays late-fee & stays Unpaid".
-        # B is granted grace that EXPIRES at G_CLOSE → swept (grace_expired) by the
-        # guillotine.  Only C (grace-fee paid) survives; A & B are both eliminated.
-        tasks.append(f"{c['at_risk']} at-risk (Unpaid) member(s) to settle via A/B/C.")
-        tasks.append("A% eliminate (non-payment) · C% grace-pay & survive · "
-                     "B remainder grace-expires at G_CLOSE → eliminated.")
-        tasks.append(f"Grace-active now: {c['grace_active']} · grace-fee paid: {c['grace_fee_paid']}.")
+        # SESSION EDIT [Claude Session Jun-25 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Only genuinely-late OLD members enter the grace window — members who paid
+        # on time and fresh joiners are NEVER pulled in.  So when nobody is at-risk
+        # there is NOTHING to settle via A/B/C: surface "nothing to settle" + dim,
+        # instead of asking the operator to run a no-op settlement (the reported bug).
+        if c["at_risk"] == 0:
+            tasks.append(f"No at-risk members — all {c['active']} active member(s) are paid; "
+                         "nobody entered grace this cycle.")
+            tasks.append("No A/B/C settlement needed (grace settlement is dimmed) — advance to Grace close.")
+        else:
+            # Truthful A/B/C model — bucket B no longer "pays late-fee & stays Unpaid".
+            # B is granted grace that EXPIRES at G_CLOSE → swept (grace_expired) by the
+            # guillotine.  Only C (grace-fee paid) survives; A & B are both eliminated.
+            tasks.append(f"{c['at_risk']} at-risk member(s) (Unpaid + late-fee) enter the A/B/C "
+                         "settlement — only late old members, never paid/fresh joiners.")
+            tasks.append("A → eliminate (non-payment) · C → late-fee + grace-fee + EMI → survive · "
+                         "B remainder → grace-expires at G_CLOSE → eliminated.")
+            # Clear per-phase money summary the user asked for, in ABC terms.
+            tasks.append(
+                f"Summary — paid: {c['paid_on_time']} · at-risk (EMI+late-fee): {c['at_risk']} · "
+                f"grace-paid (EMI+late+grace): {c['grace_fee_paid']} · grace-active: {c['grace_active']}.")
     elif event == "G_CLOSE":
-        # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
-        # Finalize is the REAL guillotine now: eliminate every Active member still
+        # SESSION EDIT [Claude Session Jun-25 — Soheb Khan User 2 / Sohebkhan.sk11]:
+        # Finalize is the REAL guillotine: eliminate every Active member still
         # risk=True AND grace_active=False (A → non_payment) plus those whose grace
         # expired at this instant (B → grace_expired).  After close, NO Unpaid member
-        # may remain Active — that is the production invariant we assert.
-        tasks.append(f"Finalize the guillotine — {c['at_risk']} at-risk member(s) pending: "
-                     "A → non-payment, B → grace-expired; C (grace-paid) survives.")
-        tasks.append("After G_CLOSE no Unpaid member may stay Active (vacancies refill from waitlist).")
+        # may remain Active.  When nothing is at-risk / in grace the guillotine is a
+        # no-op → surface "nothing to finalize" + dim (cascade of the grace fix).
+        pending = c["at_risk"] + c["grace_active"]
+        if pending == 0:
+            tasks.append(f"No pending eliminations — all {c['active']} active member(s) are settled; "
+                         "nobody is at-risk or in grace.")
+            tasks.append("Guillotine is a no-op (finalize is dimmed) — advance to Draw prep.")
+        else:
+            tasks.append(f"Finalize the guillotine — {c['at_risk']} at-risk member(s) pending: "
+                         "A → non-payment, B → grace-expired; C (grace-paid) survives.")
+            tasks.append(f"Summary — eliminate now: {c['at_risk']} · grace-saved (survive): "
+                         f"{c['grace_fee_paid']}.  After G_CLOSE no Unpaid member may stay Active "
+                         "(vacancies refill from waitlist).")
     elif event == "T_02H":
         tasks.append(f"Prepare draw — {c['active']} active across {c['pools_active']} pool(s).")
         tasks.append("Acquires draw lock, flags L4, plans SDE meta-pool, freezes LPI snapshot.")
@@ -597,9 +684,19 @@ def _disabled_actions(
         for locked in ACTION_LOCKS.get(done, ()):
             disabled.setdefault(
                 locked, f"{ACTION_LABELS.get(done, done)} already done — no overwrite")
-    if event == "DUE_DATE" and db is not None and _due_date_settled(db):
-        for k in ("pay_all_installments", "set_late_pct", "pay_remaining"):
-            disabled.setdefault(k, "All members already paid — nothing due this cycle")
+    # SESSION EDIT [Jun-25]: state-derived dim, generalised across the three
+    # settlement-bearing events.  When the event's required action has nothing to
+    # act on (_required_satisfied), dim every control it offers with the truthful
+    # reason — the operator can never re-pay an already-Paid roster, re-settle an
+    # empty at-risk cohort, or run an empty guillotine (no overwrite / no no-op run).
+    if db is not None:
+        satisfied, reason = _required_satisfied(db, event)
+        if satisfied:
+            for k in REQUIRED_ACTION.get(event) or ():
+                disabled.setdefault(k, reason)
+            if event == "DUE_DATE":
+                # the late-knob is not in REQUIRED_ACTION but is equally moot here.
+                disabled.setdefault("set_late_pct", reason)
     disabled.pop("inject_users", None)
     return {a: r for a, r in disabled.items() if a in EVENT_META[event]["actions"]}
 
@@ -641,9 +738,11 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
         ttl_remaining = max(0, int((_parse(exp) - datetime.now(timezone.utc)).total_seconds()))
 
     cyc = int(st.get("cycle_num", 1))
-    # SESSION EDIT [Jun-25]: the due-date is also satisfied by STATE — when no active
-    # member is Unpaid there is nothing to collect (joiners join Paid).  Compute once.
-    due_settled = _due_date_settled(db)
+    # SESSION EDIT [Jun-25]: the CURRENT event's required action is ALSO satisfied by
+    # STATE when there is nothing left for it to act on — generalised across the three
+    # settlement events (due-date nothing owed · grace nobody at-risk · g-close no
+    # pending eliminations).  Computed once; drives the gate, the dim, and the node.
+    cur_satisfied, cur_satisfied_reason = _required_satisfied(db, cur)
     events: list[dict] = []
     for name, dt in _ordered_milestones(ms):
         meta = EVENT_META[name]
@@ -660,10 +759,11 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
             "is_past":    (dt < sim_now) and name != cur,
             "actions":    meta["actions"],
             # SESSION EDIT [Jun-24]: per-event gating telemetry for the timeline.
-            # [Jun-25] the CURRENT due-date node also reads "done" when nothing is owed.
+            # [Jun-25] the CURRENT node also reads "done" when its required action is
+            # intrinsically satisfied by state (nothing owed / at-risk / pending).
             "required":      list(req) if req else [],
             "required_done": (not req) or any(a in ev_done for a in req)
-                             or (name == cur and name == "DUE_DATE" and due_settled),
+                             or (name == cur and cur_satisfied),
         })
 
     # SESSION EDIT [Claude Session Jun-24 — Soheb Khan User 2 / Sohebkhan.sk11]:
@@ -696,9 +796,13 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
         "ttl_remaining_seconds": ttl_remaining,
         # ── Event-driven gating (hard-block, no override) ────────────────────
         "required_action":     list(cur_required) if cur_required else [],
-        # [Jun-25] required is also "done" when the due-date has nothing owed.
+        # [Jun-25] required is also "done" when the current event is intrinsically
+        # satisfied by state (nothing owed / at-risk / pending to act on).
         "required_done":       (not cur_required) or any(a in done_here for a in cur_required)
-                               or (cur == "DUE_DATE" and due_settled),
+                               or cur_satisfied,
+        # [Jun-25] the human reason WHY the gate is open with no action run (""
+        # when a genuine action is still required) — for the panel's "auto-settled".
+        "required_satisfied_reason": cur_satisfied_reason,
         "can_advance":         can_adv,
         "advance_block_reason": adv_reason,
         "actions_done":        done_here,
@@ -713,6 +817,9 @@ def compute_state(db: Session, *, include_snapshot: bool = True) -> dict:
         compliance = _compliance(db, window=(ms.CYCLE_START, ms.T_05M))
         out["compliance"] = compliance
         out["task_list"]  = task_list(cur, compliance, settlement)
+        # [Jun-25] live per-action member counts so each control self-labels with the
+        # exact population it will act on (pay-all N · pay-remaining M · settle K).
+        out["action_preview"] = _action_preview(cur, compliance, settlement, st)
     return out
 
 
@@ -885,10 +992,11 @@ def advance_gate(st: dict, db: "Optional[Session]" = None) -> tuple[bool, str]:
     one of its options must already be recorded for this cycle:event.  Returns
     ``(can_advance, reason)`` — reason is "" when advancement is allowed.
 
-    SESSION EDIT [Jun-25]: the due-date is ALSO satisfied by state — when ``db`` is
-    given and no active member is Unpaid, the installment is fully collected and the
-    clock may advance without re-running a settle action (which would be a no-op).
-    This is not an override: with any Unpaid member the gate still hard-blocks.
+    SESSION EDIT [Jun-25]: a settlement event is ALSO satisfied by state — when
+    ``db`` is given and its required action has nothing to act on (nothing owed at
+    the due-date · nobody at-risk at grace-open · nothing pending at grace-close),
+    the clock may advance without re-running a no-op action.  This is NOT an
+    override: with any owed / at-risk / in-grace member the gate still hard-blocks.
     """
     cur = st.get("current_event")
     required = REQUIRED_ACTION.get(cur)
@@ -897,7 +1005,7 @@ def advance_gate(st: dict, db: "Optional[Session]" = None) -> tuple[bool, str]:
     done = _event_done(st, st.get("cycle_num", 1), cur)
     if any(a in done for a in required):
         return True, ""
-    if cur == "DUE_DATE" and db is not None and _due_date_settled(db):
+    if db is not None and _required_satisfied(db, cur)[0]:
         return True, ""
     labels = " or ".join(ACTION_LABELS.get(a, a) for a in required)
     return False, f"Complete “{labels}” at {EVENT_META[cur]['label']} before advancing — no override."
@@ -911,9 +1019,10 @@ def _path_gate(st: dict, target_event: str, db: "Optional[Session]" = None) -> t
     rule even for a timeline shortcut that skips intermediate nodes — you cannot
     leap past an event whose work is still pending.
 
-    SESSION EDIT [Jun-25]: a due-date with nothing owed (``_due_date_settled``) is
-    treated as satisfied so a no-dues cycle can be jumped past without a redundant
-    pay action — still a hard-block when any active member is Unpaid.
+    SESSION EDIT [Jun-25]: any settlement event whose required action is intrinsically
+    satisfied by state (``_required_satisfied`` — nothing owed / at-risk / pending) is
+    treated as done so a no-work cycle can be jumped past without a redundant action —
+    still a hard-block when any member still owes / is at-risk / is in grace.
     """
     cur_idx = EVENT_SPINE.index(st["current_event"])
     tgt_idx = EVENT_SPINE.index(target_event)
@@ -925,7 +1034,7 @@ def _path_gate(st: dict, target_event: str, db: "Optional[Session]" = None) -> t
             continue
         if any(a in _event_done(st, cyc, ev) for a in required):
             continue
-        if ev == "DUE_DATE" and db is not None and _due_date_settled(db):
+        if db is not None and _required_satisfied(db, ev)[0]:
             continue
         labels = " or ".join(ACTION_LABELS.get(a, a) for a in required)
         return False, (f"Complete “{labels}” at {EVENT_META[ev]['label']} "
